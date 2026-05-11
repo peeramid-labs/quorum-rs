@@ -1,0 +1,20 @@
+[package]
+name = "llm-repair"
+version = "0.1.0"
+description = "JSON-repair, markdown-extraction, and tool-call recovery helpers for malformed LLM output"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/peeramid-labs/quorum-rs"
+rust-version = "1.85"
+authors = ["Peeramid Labs"]
+readme = "../../README.md"
+
+[dependencies]
+anyhow = "1.0.99"
+async-openai = "0.29.1"
+regex = "1.12.2"
+rustpython-parser = "0.4.0"
+serde_json = "1.0.117"
+tracing = "0.1.40"
+uuid = { version = "1.8.0", features = ["v4"] }
+
