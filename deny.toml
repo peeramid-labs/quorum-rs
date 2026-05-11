@@ -1,0 +1,130 @@
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny/
+#
+# Run: cargo deny check
+# Install: cargo install cargo-deny
+
+[advisories]
+version = 2
+yanked = "warn"
+ignore = [
+    # rustpython-parser → unic-* crates (unmaintained, no fix available)
+    # These are transitive deps; upstream rustpython-parser must migrate first
+    "RUSTSEC-2025-0081",   # unic-char-property
+    "RUSTSEC-2025-0075",   # unic-char-range
+    "RUSTSEC-2025-0080",   # unic-common
+    "RUSTSEC-2025-0090",   # unic-emoji-char
+    "RUSTSEC-2025-0098",   # unic-ucd-version
+    "RUSTSEC-2025-0100",   # unic-ucd-ident
+
+    # Transitive unmaintained deps — no safe upgrade, waiting on upstream
+    "RUSTSEC-2024-0436",   # paste (via malachite-bigint, rav1e)
+    "RUSTSEC-2024-0384",   # instant (via backoff → async-openai)
+    "RUSTSEC-2025-0134",   # rustls-pemfile (via bollard, async-nats)
+    "RUSTSEC-2025-0012",   # backoff (via async-openai)
+    "RUSTSEC-2026-0066",   # astral-tokio-tar 0.5.6 (via testcontainers — dev-only, low severity)
+    "RUSTSEC-2026-0112",   # astral-tokio-tar 0.5.6 PAX header desync (via testcontainers — dev-only, no upgrade: testcontainers pins 0.5.x)
+    "RUSTSEC-2026-0113",   # astral-tokio-tar 0.5.6 unpack_in chmod symlink (via testcontainers — dev-only, no upgrade: testcontainers pins 0.5.x)
+    "RUSTSEC-2026-0105",   # core2 (via bitstream-io 4.9.0 → AV1/AVIF encoding chain in image). Maintainer retired the crate and yanked all versions on 2026-04-22; `no-std-io2` is the suggested fork but bitstream-io hasn't migrated yet. No upgrade path. REMOVE once bitstream-io publishes a release depending on `no-std-io2` (or alternative) instead of `core2` — tracker: https://github.com/tbr/bitstream-io/issues (search "core2" or "no-std-io2"). Re-run `cargo deny check` after any bitstream-io bump; if it passes with this entry removed, drop the entry.
+    # (RUSTSEC-2026-0049 rustls-webpki 0.102.8 was removed after bumping
+    # async-nats 0.46.0 → 0.47.0 — the new version pulls rustls-webpki
+    # 0.103.12 which is not affected.)
+
+    # rand 0.7..<0.9.3 + 0.10.0 have a theoretical UB in ThreadRng
+    # reseed that can only fire when ALL of these conditions hold
+    # simultaneously:
+    #   1. The `log` crate is in use (we use `tracing`, not `log`)
+    #   2. A custom `log::Log` implementation is defined
+    #   3. That logger calls rand::rng() / rand::thread_rng() from
+    #      inside its output path
+    #   4. The reseed actually fires (every 64 kB)
+    #   5. Trace/warn logging is enabled at the reseed moment
+    #
+    # Patched versions exist (rand >= 0.9.3, rand >= 0.10.1) but both
+    # were published within the last 7 days — adopting them now fails
+    # the supply-chain freshness check in `scripts/check-dep-age.py`,
+    # which deliberately enforces a cooldown so a just-uploaded
+    # malicious release can't sneak into production.
+    #
+    # Affected versions in our lockfile:
+    #   * rand 0.8.5 — transitive via ark-std, async-nats, backoff,
+    #     nkeys, nuid, phf_generator, tokio-websockets,
+    #     unicode_names2_generator. No 0.8.x patch exists; upstream fix
+    #     requires each parent crate to bump its rand pin.
+    #   * rand 0.9.2 — transitive via async-openai, bollard, ferroid,
+    #     governor, nsed-cli-common, rav1e. Holding at 0.9.2 until
+    #     0.9.3 passes the dep-age cooldown.
+    #   * rand 0.10.0 — transitive via image (via openai-harmony).
+    #     Holding at 0.10.0 until 0.10.1 passes the dep-age cooldown.
+    #
+    # Audit confirms this workspace does NOT meet the advisory
+    # preconditions: no `log` crate dependency, no custom `log::Log`
+    # implementation, and the only two `rand::thread_rng()` call sites
+    # (ed25519 / secp256k1 key generation in nsed-crypto-core) are
+    # outside any logger output path. The theoretical UB cannot be
+    # triggered by our code paths.
+    #
+    # The advisory ignore is keyed by ID (not version), so it
+    # automatically covers all three affected versions in-lockfile.
+    # This entry should be removed once rand 0.9.3 / 0.10.1 have aged
+    # past the 7-day cooldown and `cargo update` can bump both.
+    "RUSTSEC-2026-0097",   # rand 0.8.5 / 0.9.2 / 0.10.0 (preconditions not met)
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+# nsed-benchmarks uses a path-only dep on nsed-orchestrator (no version constraint)
+# since both are workspace crates bumped together by cargo set-version --workspace
+allow-wildcard-paths = true
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",          # Boost Software License (ryu crate, not MariaDB BSL)
+    "0BSD",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+]
+
+exceptions = [
+    # rustpython-parser → malachite (arbitrary-precision integers)
+    # LGPL-3.0-only permits dynamic linking; our binary distribution is compliant
+    { allow = ["LGPL-3.0-only"], crate = "malachite" },
+    { allow = ["LGPL-3.0-only"], crate = "malachite-base" },
+    { allow = ["LGPL-3.0-only"], crate = "malachite-nz" },
+    { allow = ["LGPL-3.0-only"], crate = "malachite-q" },
+    { allow = ["LGPL-3.0-only"], crate = "malachite-bigint" },
+
+    # Fuzzing support
+    { allow = ["NCSA"], crate = "libfuzzer-sys" },
+
+    # CC0 — public domain dedication
+    { allow = ["CC0-1.0"], crate = "tiny-keccak" },
+    { allow = ["CC0-1.0"], crate = "imgref" },
+
+    # Our own crates — scoped exceptions, not in global allowlist
+    # so we catch any other BUSL-1.1 dependencies from third parties
+    { allow = ["BUSL-1.1"], crate = "nsed-agent" },
+    { allow = ["BUSL-1.1"], crate = "nsed-cli-common" },
+    { allow = ["BUSL-1.1"], crate = "nsed-orchestrator" },
+    { allow = ["BUSL-1.1"], crate = "nsed-crypto"},
+    { allow = ["BUSL-1.1"], crate = "nsed-cli" },
+    { allow = ["BUSL-1.1"], crate = "nsed-telemetry-forwarder" }
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []

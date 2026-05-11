@@ -1,0 +1,57 @@
+# Configuration for typos spell checker
+# https://github.com/crate-ci/typos
+
+[files]
+extend-exclude = [
+    ".git",
+    "target",
+    "*.json",
+    "*.lock",
+    "*.yml",
+    "*.yaml",
+    "CHANGELOG.md",
+    "benchmarks/analysis/.venv/**",
+    "benchmarks/results/**",
+    "benchmarks/harness/**",       # vendored third-party benchmark code
+    # Test fixtures mirror external prompts verbatim (coding
+    # challenges, upstream evaluation suites). Typos within the
+    # body are part of the fixture, not the codebase.
+    "crates/nsed-orchestrator/tests/fixtures/**",
+    # Third-party kernel patches imported as bundle fixtures — the
+    # corpus/raw/ tree mirrors upstream LKML mailing-list submissions
+    # verbatim. Hardware identifiers (EMAC0, THR, THRE, TRU…) and
+    # any upstream comment typos are part of the artifact, not ours
+    # to edit.
+    "crates/nsed-agent/config/nsed_linux_patcher_0v1/corpus/raw/**",
+]
+
+[default]
+# Accept any English dialect (US, UK, CA, AU) for variant corrections
+# handled by the varcon dataset: colour/color, behaviour/behavior,
+# analyse/analyze, organise/organize, etc. This is typos' default, but
+# we set it explicitly so a future tightening to `en-us` is a visible
+# opt-in rather than a silent config drift.
+locale = "en"
+
+[default.extend-words]
+# Domain-specific terms that are not typos
+ser = "ser"                   # serde serialization
+ba = "ba"                     # byte array abbreviation
+hom = "hom"                   # homogeneous (benchmark analytics)
+groth = "groth"               # Groth16 ZK proof system (named after Jens Groth)
+ratatui = "ratatui"           # Rust TUI framework (crate name, not a typo of ratatouille)
+MAPE = "MAPE"                 # Mean Absolute Percentage Error (statistics)
+# Programmer-style spellings that typos-dict flags as typos but are
+# widely used in technical writing. These are NOT UK/US locale variants
+# (so `locale = "en"` above does not cover them) — they are alternate
+# spellings that preserve the root word's final `e` (parse → parseable).
+unparseable = "unparseable"   # alternate of `unparsable`
+parseable = "parseable"       # alternate of `parsable`
+# ADI ADSP-SC598 hardware peripheral identifiers — used in the kernel
+# patcher bundle's prompts and personas (kernel-review-prompt.txt,
+# agent.yml peripheral lists). These are real peripheral names from
+# the SC598 hardware reference manual, not typos. Adding them lets
+# typos run cleanly on prompts/configs without excluding those files.
+EMAC = "EMAC"                 # Ethernet MAC peripheral
+EMAC0 = "EMAC0"               # First EMAC instance
+EMAC1 = "EMAC1"               # Second EMAC instance
