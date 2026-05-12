@@ -73,11 +73,11 @@ jobs:
         with:
           key: "ci-test-v1"
 
-      - name: Build
+      - name: Build (incl. tests)
         run: cargo build --workspace --all-targets
 
-      - name: Test
-        run: cargo test --workspace --all-targets
+      - name: Test (lib + bins; nats integration tests need NATS — covered by parent monorepo CI)
+        run: cargo test --workspace --lib --bins
 
   typos:
     name: Spell Check
