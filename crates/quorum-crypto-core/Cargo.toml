@@ -1,0 +1,25 @@
+[package]
+name = "quorum-crypto-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0 OR MIT"
+description = "Cryptographic primitives and traits for agent signing and verification (ed25519, secp256k1, SHA3)"
+repository = "https://github.com/peeramid-labs/quorum-rs"
+categories = ["cryptography", "authentication"]
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+hex = "0.4"
+k256 = { version = "0.13", features = ["ecdsa", "sha256", "ecdsa-core"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sha3 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
