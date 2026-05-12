@@ -27,6 +27,7 @@ pub mod events;
 pub mod llms;
 pub mod middleware;
 pub mod nats_utils;
+pub mod orchestrator_registry;
 pub mod prompts;
 pub mod scheduling;
 pub mod status;

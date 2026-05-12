@@ -7,11 +7,17 @@
 //! For a quick-start model implementation, see [`SimpleOpenAIModel`].
 
 pub mod error;
+pub mod rate_limiter;
 pub mod simple_model;
+pub mod simulated;
 pub mod span;
+pub mod strategies;
+pub mod stub;
 pub use error::LlmError;
+pub use rate_limiter::RateLimiter;
 pub use simple_model::SimpleOpenAIModel;
 pub use span::LlmRequestSpan;
+pub use stub::StubModel;
 
 use crate::agents::AgentConfig;
 use async_openai::types::{

@@ -5,6 +5,8 @@
 //! created and injected into an agent, allowing for model-specific tuning without
 //! changing the agent's core implementation.
 
+pub mod defaults;
+
 use dyn_clone::DynClone;
 use std::fmt::Debug;
 
