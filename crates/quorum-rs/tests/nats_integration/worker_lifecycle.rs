@@ -122,10 +122,9 @@ async fn test_worker_new_idempotent_bucket_creation() {
     let worker_config1 = test_worker_config(&uid, &agent_name);
 
     // First creation
-    let _worker1 =
-        quorum_rs::workers::NatsNsedWorker::new(agent1, config1, worker_config1, None)
-            .await
-            .expect("First NatsNsedWorker::new should succeed");
+    let _worker1 = quorum_rs::workers::NatsNsedWorker::new(agent1, config1, worker_config1, None)
+        .await
+        .expect("First NatsNsedWorker::new should succeed");
 
     // Second creation with the same agent name (buckets already exist)
     let agent2 = MockAgent {
@@ -134,10 +133,9 @@ async fn test_worker_new_idempotent_bucket_creation() {
     let config2 = test_agent_config(&agent_name);
     let worker_config2 = test_worker_config(&uid, &agent_name);
 
-    let _worker2 =
-        quorum_rs::workers::NatsNsedWorker::new(agent2, config2, worker_config2, None)
-            .await
-            .expect("Second NatsNsedWorker::new should succeed (idempotent)");
+    let _worker2 = quorum_rs::workers::NatsNsedWorker::new(agent2, config2, worker_config2, None)
+        .await
+        .expect("Second NatsNsedWorker::new should succeed (idempotent)");
 
     // Clean up
     cleanup_nats_resources(&js, &uid, &agent_name).await;

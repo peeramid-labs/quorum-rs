@@ -314,13 +314,8 @@ fn sample_events() -> Vec<TelemetryEvent> {
         // task tuple via `TelemetryContext::new(...)` which is what
         // the worker uses at runtime.
         TelemetryEvent::NatsConnectionStateChanged(NatsConnectionStateChanged {
-            common: quorum_rs::telemetry::TelemetryContext::new(
-                &agent.agent_id,
-                None,
-                None,
-                None,
-            )
-            .common(),
+            common: quorum_rs::telemetry::TelemetryContext::new(&agent.agent_id, None, None, None)
+                .common(),
             state: NatsConnectionState::Reconnecting,
             reconnects_so_far: 2,
             pending_publish_depth: Some(7),

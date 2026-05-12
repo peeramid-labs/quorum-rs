@@ -1,6 +1,4 @@
-use quorum_rs::agents::{
-    AgentConfig, AgentContext, Evaluation, NsedAgent, Proposal, TokenUsage,
-};
+use quorum_rs::agents::{AgentConfig, AgentContext, Evaluation, NsedAgent, Proposal, TokenUsage};
 use quorum_rs::nats_utils::connect_nats;
 use quorum_rs::workers::WorkerConfig;
 
