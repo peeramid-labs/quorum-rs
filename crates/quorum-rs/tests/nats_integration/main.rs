@@ -1,0 +1,12 @@
+mod agent_emission_full;
+mod common;
+mod g15_g17_g19_extensions;
+mod llm_stalled_heartbeat;
+mod multi_endpoint_emit;
+mod nats_connection;
+mod registration;
+mod scratchpad_store;
+mod telemetry_emit;
+mod worker_coverage;
+mod worker_lifecycle;
+mod worker_messaging;
