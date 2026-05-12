@@ -416,21 +416,16 @@ mod tests {
         assert_eq!(out, "ok");
     }
 
-    /// Local copy of nsed-agent's `agents::nsed_agent::is_openai_family_provider`
-    /// since that fn is `pub(crate)` in the BSL crate. Kept identical.
-    fn is_openai_family_provider(config: &crate::agents::AgentConfig) -> bool {
-        config.exec.is_none() && config.mcp.is_none() && config.claude.is_none()
-    }
-
     #[test]
     fn openai_family_predicate_accepts_no_provider_section() {
+        use crate::agents::config::is_openai_family_provider;
         let cfg = crate::agents::AgentConfig::default();
         assert!(is_openai_family_provider(&cfg));
     }
 
     #[test]
     fn openai_family_predicate_rejects_claude_provider() {
-        use crate::agents::config::ClaudeProviderConfig;
+        use crate::agents::config::{ClaudeProviderConfig, is_openai_family_provider};
         let cfg = crate::agents::AgentConfig {
             claude: Some(ClaudeProviderConfig::default()),
             ..Default::default()

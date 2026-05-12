@@ -867,6 +867,14 @@ impl Default for AgentConfig {
     }
 }
 
+/// True when the agent runs through the native OpenAI-compatible LLM path
+/// (no `exec`, no `mcp`, no `claude` provider section). Used by features
+/// like the sandboxed `read_file` tool that don't apply to providers
+/// with their own native filesystem affordances.
+pub fn is_openai_family_provider(config: &AgentConfig) -> bool {
+    config.exec.is_none() && config.mcp.is_none() && config.claude.is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
