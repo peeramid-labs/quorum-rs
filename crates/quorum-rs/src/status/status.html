@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NSED Agent Status</title>
+<style>
+:root {
+  --bg: #0d1117; --surface: #161b22; --border: #30363d;
+  --text: #e6edf3; --text-dim: #8b949e;
+  --green: #3fb950; --red: #f85149; --blue: #58a6ff; --yellow: #d29922;
+  --accent: #8957e5; --radius: 8px;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+.header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
+.header h1 { font-size: 18px; font-weight: 600; }
+.header .agent-badge { background: var(--accent); color: #fff; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: 700; }
+.header .meta { font-size: 13px; color: var(--text-dim); margin-left: auto; display: flex; gap: 16px; }
+.status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.status-dot.online { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.status-dot.offline { background: var(--red); box-shadow: 0 0 6px var(--red); }
+.container { max-width: 1200px; margin: 24px auto; padding: 0 24px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; }
+.card .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); margin-bottom: 4px; }
+.card .value { font-size: 24px; font-weight: 700; }
+.card .value.green { color: var(--green); }
+.card .value.red { color: var(--red); }
+.card .value.blue { color: var(--blue); }
+.job-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; margin-bottom: 24px; }
+.job-card .job-header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+.job-card .phase-badge { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
+.phase-badge.propose { background: rgba(88,166,255,0.15); color: var(--blue); }
+.phase-badge.evaluate { background: rgba(137,87,229,0.15); color: var(--accent); }
+.phase-badge.idle { background: rgba(139,148,158,0.15); color: var(--text-dim); }
+.log-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.log-table th { text-align: left; color: var(--text-dim); font-weight: 600; font-size: 11px; text-transform: uppercase; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+.log-table td { padding: 6px 12px; border-bottom: 1px solid var(--border); }
+.log-table tr:last-child td { border-bottom: none; }
+.log-table .status-ok { color: var(--green); }
+.log-table .status-error { color: var(--red); }
+.section-title { font-size: 14px; font-weight: 600; margin-bottom: 12px; color: var(--text-dim); }
+
+/* Tabs */
+.tabs { display: flex; gap: 0; margin-bottom: 0; border-bottom: 1px solid var(--border); margin-top: 24px; }
+.tab-btn { background: none; border: none; color: var(--text-dim); padding: 10px 20px; font-size: 13px; font-weight: 600; cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.15s; font-family: inherit; }
+.tab-btn:hover { color: var(--text); }
+.tab-btn.active { color: var(--blue); border-bottom-color: var(--blue); }
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+
+/* Event log */
+.event-log { max-height: 400px; overflow-y: auto; background: var(--surface); border: 1px solid var(--border); border-top: none; border-radius: 0 0 var(--radius) var(--radius); font-size: 12px; font-family: 'SF Mono', 'Menlo', 'Monaco', 'Consolas', monospace; }
+.event-entry { padding: 4px 12px; border-bottom: 1px solid rgba(48,54,61,0.5); display: flex; gap: 10px; line-height: 1.6; }
+.event-entry:last-child { border-bottom: none; }
+.event-time { color: var(--text-dim); white-space: nowrap; min-width: 80px; }
+.event-type { font-weight: 600; min-width: 120px; white-space: nowrap; }
+.event-type.agent_accepted { color: var(--green); }
+.event-type.agent_working { color: var(--blue); }
+.event-type.task_complete { color: var(--green); }
+.event-type.agent_error { color: var(--red); }
+.event-type.heartbeat { color: var(--text-dim); }
+.event-type.connected { color: var(--yellow); }
+.event-job { color: var(--accent); min-width: 70px; }
+.event-detail { color: var(--text); flex: 1; }
+
+/* Chat */
+.chat-container { background: var(--surface); border: 1px solid var(--border); border-top: none; border-radius: 0 0 var(--radius) var(--radius); display: flex; flex-direction: column; height: 500px; }
+.chat-messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.chat-msg { max-width: 80%; padding: 10px 14px; border-radius: 12px; font-size: 14px; line-height: 1.5; word-wrap: break-word; white-space: pre-wrap; }
+.chat-msg.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+.chat-msg.assistant { align-self: flex-start; background: var(--border); color: var(--text); border-bottom-left-radius: 4px; }
+.chat-msg.system { align-self: center; color: var(--text-dim); font-size: 12px; font-style: italic; padding: 4px 12px; }
+.chat-input-row { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); }
+.chat-input { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; color: var(--text); font-size: 14px; font-family: inherit; resize: none; outline: none; }
+.chat-input:focus { border-color: var(--blue); }
+.chat-send { background: var(--accent); color: #fff; border: none; border-radius: var(--radius); padding: 10px 20px; font-weight: 600; cursor: pointer; font-size: 14px; font-family: inherit; white-space: nowrap; }
+.chat-send:hover { opacity: 0.9; }
+.chat-send:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Config */
+.config-panel { background: var(--surface); border: 1px solid var(--border); border-top: none; border-radius: 0 0 var(--radius) var(--radius); padding: 20px; }
+.config-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+.config-item { display: flex; flex-direction: column; gap: 2px; }
+.config-item .config-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); }
+.config-item .config-value { font-size: 14px; color: var(--text); font-family: 'SF Mono', 'Menlo', monospace; padding: 6px 0; }
+.config-item .config-value.persona { font-family: inherit; font-style: italic; color: var(--yellow); white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>NSED Agent</h1>
+  <span class="agent-badge" id="agent-id">--</span>
+  <span id="nats-status"><span class="status-dot offline"></span> NATS</span>
+  <div class="meta">
+    <span id="model-info">--</span>
+    <span id="uptime-info">Uptime: --</span>
+  </div>
+</div>
+
+<div class="container">
+  <div class="grid">
+    <div class="card">
+      <div class="label">Tasks Completed</div>
+      <div class="value green" id="tasks-completed">0</div>
+    </div>
+    <div class="card">
+      <div class="label">Tasks Failed</div>
+      <div class="value red" id="tasks-failed">0</div>
+    </div>
+    <div class="card">
+      <div class="label">Success Rate</div>
+      <div class="value green" id="success-rate">N/A</div>
+    </div>
+    <div class="card">
+      <div class="label">Scratchpad Keys</div>
+      <div class="value blue" id="scratchpad-keys">0</div>
+    </div>
+  </div>
+  <div id="last-error-bar" style="display:none;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:10px 16px;margin-bottom:24px;font-size:13px;">
+    <span style="color:var(--red);font-weight:600;">Last Error:</span> <span id="last-error-text" style="color:var(--text-dim);"></span>
+  </div>
+
+  <div class="job-card" id="current-job">
+    <div class="job-header">
+      <span class="phase-badge idle" id="phase-badge">Idle</span>
+      <span id="job-id" style="font-weight:600;">No active job</span>
+    </div>
+    <div id="job-detail" style="font-size:13px;color:var(--text-dim);"></div>
+  </div>
+
+  <div class="section-title">Recent Tasks</div>
+  <div class="card" style="padding:0;overflow:auto;margin-bottom:0;">
+    <table class="log-table">
+      <thead><tr><th>Time</th><th>Action</th><th>Job</th><th>Round</th><th>Status</th><th>Duration</th></tr></thead>
+      <tbody id="log-body"><tr><td colspan="6" style="color:var(--text-dim);text-align:center;padding:16px;">No tasks yet</td></tr></tbody>
+    </table>
+  </div>
+
+  <!-- Tabs: Events | Chat | Config -->
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="events">Event Stream</button>
+    <button class="tab-btn" data-tab="chat">Chat</button>
+    <button class="tab-btn" data-tab="config">Config</button>
+  </div>
+
+  <!-- Event Stream Tab -->
+  <div class="tab-content active" id="tab-events">
+    <div class="event-log" id="event-log">
+      <div class="event-entry"><span class="event-detail" style="color:var(--text-dim);padding:12px;text-align:center;width:100%;">Waiting for events...</span></div>
+    </div>
+  </div>
+
+  <!-- Chat Tab -->
+  <div class="tab-content" id="tab-chat">
+    <div class="chat-container">
+      <div class="chat-messages" id="chat-messages">
+        <div class="chat-msg system">Direct conversation with this agent's LLM. Messages bypass NSED deliberation.</div>
+      </div>
+      <div class="chat-input-row">
+        <textarea class="chat-input" id="chat-input" rows="1" placeholder="Type a message..." onkeydown="chatKeydown(event)"></textarea>
+        <button class="chat-send" id="chat-send" onclick="sendChat()">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Config Tab -->
+  <div class="tab-content" id="tab-config">
+    <div class="config-panel" id="config-panel">
+      <div style="color:var(--text-dim);text-align:center;padding:12px;">Loading configuration...</div>
+    </div>
+  </div>
+</div>
+
+<script>
+function $(id) { return document.getElementById(id); }
+function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function fmtUptime(s) {
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
+  var h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
+  return h + 'h ' + m + 'm';
+}
+function fmtTime(ts) {
+  try { var d = new Date(ts); return d.toLocaleTimeString(); } catch(e) { return ts; }
+}
+
+// --- Tabs ---
+document.querySelectorAll('.tab-btn').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
+    document.querySelectorAll('.tab-content').forEach(function(c) { c.classList.remove('active'); });
+    btn.classList.add('active');
+    $('tab-' + btn.dataset.tab).classList.add('active');
+    // Load config on first open
+    if (btn.dataset.tab === 'config' && !configLoaded) loadConfig();
+  });
+});
+
+// --- Event Log ---
+var lastEventSig = '';
+var hideHeartbeats = true;
+
+function renderEvents(events) {
+  var log = $('event-log');
+  if (!events || events.length === 0) {
+    log.innerHTML = '<div class="event-entry"><span class="event-detail" style="color:var(--text-dim);padding:12px;text-align:center;width:100%;">Waiting for events...</span></div>';
+    return;
+  }
+  var wasAtBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  var filtered = hideHeartbeats ? events.filter(function(e) { return e.event_type !== 'heartbeat'; }) : events;
+  if (filtered.length === 0) {
+    log.innerHTML = '<div class="event-entry"><span class="event-detail" style="color:var(--text-dim);padding:12px;text-align:center;width:100%;">Waiting for events...</span></div>';
+    return;
+  }
+  log.innerHTML = filtered.map(function(ev) {
+    return '<div class="event-entry">' +
+      '<span class="event-time">' + esc(fmtTime(ev.timestamp)) + '</span>' +
+      '<span class="event-type ' + esc(ev.event_type) + '">' + esc(ev.event_type) + '</span>' +
+      '<span class="event-job">' + (ev.job_id ? esc(ev.job_id.substring(0, 12)) : '') + '</span>' +
+      '<span class="event-detail">' + esc(ev.detail) + '</span>' +
+      '</div>';
+  }).join('');
+  if (wasAtBottom) log.scrollTop = log.scrollHeight;
+}
+
+// --- Chat ---
+var chatHistory = []; // {role, content} for API
+var chatSending = false;
+
+function addChatBubble(role, text) {
+  var msgs = $('chat-messages');
+  var div = document.createElement('div');
+  div.className = 'chat-msg ' + role;
+  div.textContent = text;
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+async function sendChat() {
+  var input = $('chat-input');
+  var text = input.value.trim();
+  if (!text || chatSending) return;
+  chatSending = true;
+  $('chat-send').disabled = true;
+  input.value = '';
+  input.style.height = 'auto';
+
+  chatHistory.push({ role: 'user', content: text });
+  addChatBubble('user', text);
+
+  // Show typing indicator
+  var typing = document.createElement('div');
+  typing.className = 'chat-msg system';
+  typing.textContent = 'Thinking...';
+  typing.id = 'chat-typing';
+  $('chat-messages').appendChild(typing);
+  $('chat-messages').scrollTop = $('chat-messages').scrollHeight;
+
+  try {
+    var resp = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: chatHistory })
+    });
+    var data = await resp.json();
+    // Remove typing indicator
+    var t = $('chat-typing');
+    if (t) t.remove();
+    if (!resp.ok) {
+      var errMsg = data.error || data.response || data.message || resp.statusText;
+      addChatBubble('system', 'Error (' + resp.status + '): ' + errMsg);
+    } else {
+      var reply = data.response || '(empty response)';
+      chatHistory.push({ role: 'assistant', content: reply });
+      addChatBubble('assistant', reply);
+    }
+  } catch (e) {
+    var t = $('chat-typing');
+    if (t) t.remove();
+    addChatBubble('system', 'Error: ' + e.message);
+  }
+  chatSending = false;
+  $('chat-send').disabled = false;
+  input.focus();
+}
+
+function chatKeydown(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendChat();
+  }
+  // Auto-resize textarea
+  var el = e.target;
+  setTimeout(function() {
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+  }, 0);
+}
+
+// --- Config ---
+var configLoaded = false;
+
+async function loadConfig() {
+  try {
+    var resp = await fetch('/api/config');
+    if (!resp.ok) {
+      $('config-panel').innerHTML = '<div style="color:var(--red);padding:12px;">Config error: ' + esc(resp.status + ' ' + resp.statusText) + '</div>';
+      return;
+    }
+    var cfg = await resp.json();
+    configLoaded = true;
+    // Render all config fields dynamically from the JSON response.
+    // Skip internal/empty fields; show persona full-width at the end.
+    var skip = { persona: 1, system_prompt_override: 1, task_precision: 1 };
+    var labels = {
+      name: 'Agent Name', model_name: 'Model', provider_id: 'Provider',
+      temperature: 'Temperature', max_tokens: 'Max Tokens', context_window: 'Context Window',
+      frequency_penalty: 'Frequency Penalty', presence_penalty: 'Presence Penalty',
+      supports_native_thinking: 'Native Thinking', merge_system_prompt: 'Merge System Prompt',
+      tool_format: 'Tool Format', textual_feedback: 'Textual Feedback',
+      use_streaming: 'Streaming', json_mode: 'JSON Mode',
+      disable_native_tools: 'Disable Native Tools', repair_invalid_escapes: 'Repair Invalid Escapes',
+      unwrap_hallucinated_tool_calls: 'Unwrap Hallucinated Tool Calls',
+      max_react_iterations: 'Max React Iterations', max_retries: 'Max Retries',
+      max_scratchpad_size: 'Max Scratchpad Size', scratchpad_limit: 'Scratchpad Limit',
+      reasoning_effort: 'Reasoning Effort',
+      input_price_per_mtok: 'Input $/MTok', output_price_per_mtok: 'Output $/MTok',
+      chars_per_token: 'Chars/Token',
+    };
+    function fmtVal(v) {
+      if (v === true) return 'Yes';
+      if (v === false) return 'No';
+      if (v == null) return 'default';
+      return String(v);
+    }
+    var items = [];
+    Object.keys(cfg).forEach(function(k) {
+      if (skip[k] || cfg[k] == null && !labels[k]) return;
+      items.push({ label: labels[k] || k, value: fmtVal(cfg[k]) });
+    });
+    var personaItem = cfg.persona ?
+      '<div class="config-item" style="grid-column:1/-1;"><span class="config-label">Persona</span><span class="config-value persona">' + esc(cfg.persona) + '</span></div>' : '';
+    $('config-panel').innerHTML =
+      '<div class="config-grid">' +
+      items.map(function(i) {
+        return '<div class="config-item"><span class="config-label">' + esc(i.label) + '</span><span class="config-value">' + esc(i.value) + '</span></div>';
+      }).join('') +
+      '</div>' + personaItem;
+  } catch(e) {
+    $('config-panel').innerHTML = '<div style="color:var(--red);padding:12px;">Failed to load config: ' + esc(e.message) + '</div>';
+  }
+}
+
+// --- Status Polling ---
+var isPolling = false;
+async function poll() {
+  if (isPolling) return;
+  isPolling = true;
+  try {
+    var resp = await fetch('/api/status');
+    if (!resp.ok) throw new Error('Status ' + resp.status);
+    var d = await resp.json();
+
+    $('agent-id').textContent = d.agent_id || '--';
+    $('model-info').textContent = (d.provider_id || '--') + ' / ' + (d.model_name || '--');
+    $('uptime-info').textContent = 'Uptime: ' + fmtUptime(d.uptime_secs || 0);
+
+    var natsDot = d.nats_connected ? '<span class="status-dot online"></span>' : '<span class="status-dot offline"></span>';
+    $('nats-status').innerHTML = natsDot + ' NATS';
+
+    var tc = d.tasks_completed || 0;
+    var tf = d.tasks_failed || 0;
+    var total = tc + tf;
+    $('tasks-completed').textContent = tc;
+    $('tasks-failed').textContent = tf;
+    $('scratchpad-keys').textContent = d.scratchpad_keys || 0;
+
+    // Success rate
+    var srEl = $('success-rate');
+    if (total > 0) {
+      var sr = (tc / total) * 100;
+      srEl.textContent = sr.toFixed(1) + '%';
+      srEl.className = 'value ' + (sr > 95 ? 'green' : (sr >= 80 ? '' : 'red'));
+    } else {
+      srEl.textContent = 'N/A';
+      srEl.className = 'value green';
+    }
+
+    // Last error from recent_tasks
+    var tasks = d.recent_tasks || [];
+    var lastErr = null;
+    for (var i = tasks.length - 1; i >= 0; i--) {
+      if (tasks[i].status === 'error') {
+        lastErr = tasks[i].action + ' (' + (tasks[i].job_id || '').substring(0, 8) + ')';
+        break;
+      }
+    }
+    if (lastErr) {
+      $('last-error-bar').style.display = 'block';
+      $('last-error-text').textContent = lastErr;
+    } else {
+      $('last-error-bar').style.display = 'none';
+    }
+
+    if (d.current_job) {
+      var phase = d.current_phase || 'busy';
+      var cls = phase === 'propose' ? 'propose' : phase === 'evaluate' ? 'evaluate' : 'idle';
+      $('phase-badge').className = 'phase-badge ' + cls;
+      $('phase-badge').textContent = phase;
+      $('job-id').textContent = d.current_job;
+      $('job-detail').textContent = d.current_round != null ? 'Round ' + d.current_round : '';
+    } else {
+      $('phase-badge').className = 'phase-badge idle';
+      $('phase-badge').textContent = 'Idle';
+      $('job-id').textContent = 'No active job';
+      $('job-detail').textContent = '';
+    }
+
+    var tasks = d.recent_tasks || [];
+    if (tasks.length === 0) {
+      $('log-body').innerHTML = '<tr><td colspan="6" style="color:var(--text-dim);text-align:center;padding:16px;">No tasks yet</td></tr>';
+    } else {
+      $('log-body').innerHTML = tasks.map(function(t) {
+        var cls = t.status === 'ok' ? 'status-ok' : 'status-error';
+        return '<tr>' +
+          '<td>' + esc(fmtTime(t.timestamp)) + '</td>' +
+          '<td>' + esc(t.action) + '</td>' +
+          '<td style="font-family:monospace;font-size:12px;">' + esc((t.job_id || '-').substring(0, 8)) + '</td>' +
+          '<td>' + (t.round != null ? esc(String(t.round)) : '-') + '</td>' +
+          '<td class="' + cls + '">' + esc(t.status) + '</td>' +
+          '<td>' + (t.duration_ms != null ? esc(String(t.duration_ms)) + 'ms' : '-') + '</td>' +
+          '</tr>';
+      }).join('');
+    }
+
+    // Update event log — detect both count changes and content rotation
+    var events = d.event_log || [];
+    var first = events.length > 0 ? events[0].timestamp : '';
+    var last = events.length > 0 ? events[events.length - 1].timestamp : '';
+    var sig = events.length + ':' + first + ':' + last;
+    if (sig !== lastEventSig) {
+      lastEventSig = sig;
+      renderEvents(events);
+    }
+  } catch (e) {
+    $('agent-id').textContent = '--';
+    $('model-info').textContent = '--';
+    $('uptime-info').textContent = 'Offline';
+    $('nats-status').innerHTML = '<span class="status-dot offline"></span> NATS';
+    $('phase-badge').className = 'phase-badge idle';
+    $('phase-badge').textContent = 'Offline';
+    $('job-id').textContent = 'No active job';
+    $('job-detail').textContent = '';
+    lastEventSig = '';
+    renderEvents([]);
+  } finally {
+    isPolling = false;
+  }
+}
+
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>

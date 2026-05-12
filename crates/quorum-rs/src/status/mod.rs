@@ -1,7 +1,16 @@
-//! Agent status monitoring types.
+//! Agent status monitoring types + optional HTTP dashboard.
 //!
 //! Provides [`AgentStatusSnapshot`] — a real-time view of agent state for
 //! operator monitoring — and the associated event/task log entry types.
+//!
+//! Enable the `status-server` feature to serve a lightweight dashboard
+//! via an embedded axum server (see [`server`] / [`multi_server`]).
+
+#[cfg(feature = "status-server")]
+pub mod server;
+
+#[cfg(feature = "status-server")]
+pub mod multi_server;
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
