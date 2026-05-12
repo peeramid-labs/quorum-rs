@@ -4,6 +4,9 @@ pub mod exec_agent;
 pub mod mcp_agent;
 pub mod mcp_tools;
 pub mod session_store;
+pub mod user_tools;
+
+pub use user_tools::{NatsUserToolHandlerFactory, UserToolHandler};
 
 use anyhow::Result;
 use async_trait::async_trait;

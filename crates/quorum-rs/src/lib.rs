@@ -17,6 +17,7 @@
 //! The reference `ProposerEvaluatorAgent` (native LLM) lives in the `nsed-agent` crate (BSL 1.1).
 //! This SDK is MIT-licensed — you can implement these traits without any licensing obligation.
 
+pub mod agent_manager;
 pub mod agents;
 pub mod api_error_middleware;
 pub mod config;
@@ -26,6 +27,7 @@ pub mod crypto;
 pub mod events;
 pub mod llms;
 pub mod middleware;
+pub mod multi_agent;
 pub mod nats_utils;
 pub mod orchestrator_registry;
 pub mod prompts;
