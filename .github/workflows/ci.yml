@@ -16,6 +16,7 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # ── Fast lint & audit (no NATS, no instrumentation) ────────────────
   lint:
     name: Lint & Audit
     if: >
@@ -54,31 +55,195 @@ jobs:
       - name: License & Advisory Audit
         run: cargo deny check
 
+  # ── Supply-chain freshness (only when Cargo.lock changes) ──────────
+  dep-age:
+    name: Dependency Age Check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need enough history for the dep-age script to resolve the
+          # diff target (PR base or HEAD~1 on push events) via
+          # `git show <ref>:Cargo.lock`. Depth 2 covers push events;
+          # for PR events GitHub Actions already fetches the base
+          # commit as part of the merge-commit setup.
+          fetch-depth: 2
+
+      - name: Check if Cargo.lock changed
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            lockfile:
+              - 'Cargo.lock'
+
+      - name: Dependency Age Check (supply-chain freshness)
+        if: steps.filter.outputs.lockfile == 'true'
+        env:
+          # Only set on pull_request events; empty on pushes.
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          target_arg=""
+          if [ -n "${PR_BASE_SHA}" ]; then
+            target_arg="--target ${PR_BASE_SHA}"
+          elif git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+            target_arg="--target HEAD~1"
+          fi
+          # shellcheck disable=SC2086
+          python3 scripts/check-dep-age.py --min-age-days 7 $target_arg
+
+      - name: Skip (Cargo.lock unchanged)
+        if: steps.filter.outputs.lockfile != 'true'
+        run: echo "Cargo.lock unchanged — skipping dep-age check"
+
+  # ── Tests + coverage (NATS required, LLVM instrumentation) ─────────
   test:
-    name: Test
+    name: Test & Coverage
     if: >
       !startsWith(github.event.head_commit.message, 'chore(release):') &&
       !startsWith(github.event.pull_request.head.ref, 'release/')
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
+
     steps:
       - uses: actions/checkout@v4
 
+      - name: Pull NATS Image
+        run: docker pull nats:alpine
+
+      - name: Start NATS (JetStream)
+        run: |
+          # Start NATS with JetStream enabled (-js)
+          docker run -d --name nats-ci -p 4222:4222 -p 8222:8222 nats:alpine -js -m 8222
+
+          # Verify container is actually running (catches immediate crashes)
+          sleep 2
+          if ! docker ps --filter "name=nats-ci" --filter "status=running" -q | grep -q .; then
+            echo "❌ NATS container failed to start. Logs:"
+            docker logs nats-ci
+            exit 1
+          fi
+
+          # Wait for NATS HTTP monitoring to be ready
+          echo "Waiting for NATS..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8222/varz > /dev/null 2>&1; then
+              echo "NATS is up."
+              exit 0
+            fi
+            # Check container is still running each iteration
+            if ! docker ps --filter "name=nats-ci" --filter "status=running" -q | grep -q .; then
+              echo "❌ NATS container died. Logs:"
+              docker logs nats-ci
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "❌ NATS failed to respond within 30s. Logs:"
+          docker logs nats-ci
+          exit 1
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
         with:
           key: "ci-test-v1"
 
-      - name: Build (incl. tests)
-        run: cargo build --workspace --all-targets
+      - name: Install Tools (binstall)
+        uses: cargo-bins/cargo-binstall@v1.17.9
 
-      - name: Test (lib + bins; nats integration tests need NATS — covered by parent monorepo CI)
-        run: cargo test --workspace --lib --bins
+      - name: Install cargo-llvm-cov
+        run: |
+          cargo binstall --no-confirm --force cargo-llvm-cov
+          cargo llvm-cov --version
 
+      - name: Set up Environment Variables
+        run: |
+          # Point NATS to the local docker container
+          echo "NATS_URL=nats://localhost:4222" >> $GITHUB_ENV
+          echo "RUST_LOG=info" >> $GITHUB_ENV
+          echo "CARGO_BUILD_JOBS=4" >> $GITHUB_ENV
+
+      - name: Run Tests & Coverage
+        run: |
+          # Run workspace tests with LLVM source-based coverage.
+          # cargo llvm-cov compiles with instrumentation in a single pass.
+          #
+          # --ignore-filename-regex excludes generator/main entry points from
+          # the coverage view (none in submodule today; placeholder preserved
+          # for consistency with parent monorepo CI).
+          IGNORE_RE="(src/main\.rs|src/bin/)"
+
+          cargo llvm-cov --workspace --no-report --all-targets
+
+          mkdir -p coverage
+          cargo llvm-cov report \
+            --ignore-filename-regex "$IGNORE_RE" \
+            --cobertura --output-path coverage/cobertura.xml
+
+          cargo llvm-cov report \
+            --ignore-filename-regex "$IGNORE_RE" \
+            --html --output-dir coverage
+
+      - name: Extract coverage
+        id: coverage
+        run: python3 scripts/extract-coverage.py coverage/cobertura.xml
+
+      # Stores badge data + HTML report on gh-pages branch.
+      # Use `scripts/update-badges.sh` locally to update README badges from this data.
+      - name: Publish coverage to gh-pages
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          PERCENT: ${{ steps.coverage.outputs.percent }}
+          COLOR: ${{ steps.coverage.outputs.color }}
+          PACKAGES_JSON: ${{ steps.coverage.outputs.packages_json }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          mkdir -p /tmp/ghpages
+
+          # badges.json — consumed by scripts/update-badges.sh
+          jq -n \
+            --arg cov "$PERCENT" \
+            --arg color "$COLOR" \
+            --argjson pkgs "${PACKAGES_JSON:-{\}}" \
+            --arg branch "$BRANCH" \
+            '{coverage:$cov, coverage_color:$color, packages:$pkgs, branch:$branch}' \
+            > /tmp/ghpages/badges.json
+
+          # Legacy coverage.json for backward compatibility
+          jq -n \
+            --arg pct "${PERCENT}%" \
+            --arg color "$COLOR" \
+            --arg branch "$BRANCH" \
+            '{schemaVersion:1, label:"coverage", message:$pct, color:$color, branch:$branch}' \
+            > /tmp/ghpages/coverage.json
+
+          # Copy HTML coverage report if available (llvm-cov outputs to html/ subdir)
+          if [ -f coverage/html/index.html ]; then
+            cp -r coverage/html/* /tmp/ghpages/
+            echo "📄 HTML coverage report included"
+          fi
+
+          cd /tmp/ghpages
+          git init -q
+          git checkout --orphan gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "ci: coverage ${PERCENT}% (${BRANCH}) [skip ci]"
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push origin gh-pages --force
+
+  # ── Conventional-commit PR title gate ──────────────────────────────
   typos:
     name: Spell Check
     if: >

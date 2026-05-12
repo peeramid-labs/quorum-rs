@@ -1,0 +1,44 @@
+# Supply-chain fast-track allowlist
+#
+# Versions listed here are exempted from the `scripts/check-dep-age.py`
+# cooldown (default 7 days). Reserved for security patches where leaving
+# the cooldown in place would keep us exposed to a known advisory for
+# longer than the risk of a compromised fresh release.
+#
+# ## Entry schema
+#
+# Each entry MUST include:
+#   - name     — crate name as it appears in Cargo.lock
+#   - version  — exact version string to fast-track (not a range)
+#   - reason   — short justification, ideally citing a RUSTSEC advisory
+#                ID so a reviewer can verify the exposure
+#   - expires  — YYYY-MM-DD date after which the entry is considered
+#                stale. Pick a date a day or two past when the version
+#                would naturally age out of the cooldown, so the next
+#                CI run after that date flags the entry for cleanup.
+#
+# ## Hygiene rules
+#
+# - **Stale entries** (`expires < today`) are skipped with a warning.
+#   They do not bypass the check, and they get called out in CI logs
+#   so an operator can prune them.
+# - **Unused entries** (version no longer present in Cargo.lock) are
+#   also warned about so the file stays in sync with the dep graph.
+# - **Redundant entries** (version is in Cargo.lock but filtered out
+#   by the diff scope — i.e. the PR target branch already ships it)
+#   are warned about separately: the allowlist entry is no longer
+#   protecting anything and should be removed.
+#
+# ## Example
+#
+# Copy this block, uncomment, and edit when fast-tracking a security
+# patch. Keep the `reason` on one line for clean CI log output.
+#
+#   [[fasttrack]]
+#   name    = "rustls-webpki"
+#   version = "0.103.12"
+#   reason  = "RUSTSEC-2026-0098 — name-constraints URI bypass. Blocking on the full 7-day cooldown would keep us on the vulnerable 0.102.8/0.103.10 chain that cargo-deny already rejects."
+#   expires = 2026-04-23
+#
+# The active list is intentionally empty in day-to-day operation —
+# every new fast-track should land as a separate, auditable commit.
