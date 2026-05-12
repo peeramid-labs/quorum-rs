@@ -6422,3 +6422,5 @@ mod tests {
         assert!(is_transient_error(&err));
     }
 }
+pub mod nsed_worker;
+pub use nsed_worker::{NatsNsedWorkerExt, NatsNsedWorkerStatusExt};

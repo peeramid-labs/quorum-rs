@@ -3,9 +3,13 @@ pub mod config;
 pub mod exec_agent;
 pub mod mcp_agent;
 pub mod mcp_tools;
+pub mod nsed_agent;
+pub mod output_guard;
 pub mod session_store;
 pub mod user_tools;
 
+pub use nsed_agent::{AgentResponse, ProposerEvaluatorAgent};
+pub use output_guard::{OutputLeakDetector, OutputScanResult};
 pub use user_tools::{NatsUserToolHandlerFactory, UserToolHandler};
 
 use anyhow::Result;
