@@ -1,22 +1,36 @@
 # quorum-rs
 
-A Rust workspace of crates for building **multi-agent deliberation systems**: tools for running cohorts of LLM-backed agents that propose, evaluate, and reach quorum on outcomes.
+A Rust workspace for building **multi-agent deliberation systems** — cohorts of LLM-backed agents that propose, evaluate, and reach quorum on outcomes.
 
 ## Crates
 
-| Crate | Status | Description |
+| Crate | Version | Description |
 |---|---|---|
-| [`llm-repair`](crates/llm-repair) | `0.1.0` — usable today | JSON-repair, markdown-extraction, and tool-call recovery for malformed LLM output. Useful for any Rust project that calls real-world LLMs and has to deal with whatever they actually return. |
-| [`quorum-rs`](crates/quorum-rs) | placeholder — in development | Top-level SDK: agent trait + reference implementation, LLM dispatch, tool framework, prompt sets, worker runtime. Lands incrementally. |
+| [`quorum-rs`](crates/quorum-rs) | `0.6.0` | The SDK: agent traits (`NsedAgent`, `Tool`, `AiModel`, `PromptSet`), data types (`AgentContext`, `Proposal`, `Evaluation`), reference agent implementations (`ExecAgent`, `McpAgent`, `ClaudeAgent`), NATS-based worker runtime, telemetry catalog, middleware framework. |
+| [`llm-repair`](crates/llm-repair) | `0.6.0` | JSON-repair, markdown-extraction, and tool-call recovery for malformed LLM output. Useful for any Rust project that calls real-world LLMs and has to handle whatever they actually return. |
+| [`quorum-crypto-core`](crates/quorum-crypto-core) | `0.6.0` | Ed25519 / secp256k1 / SHA3 cryptographic primitives + audit envelope. Optional dep of `quorum-rs` (gated behind the `audit` feature). |
 
-More crates land here as the SDK grows — a crypto-core for agent signing/verification, a CLI for running agents against an orchestrator, and middleware framework. See [Roadmap](#roadmap).
-
-## Use `llm-repair` today
+## Install
 
 ```toml
 [dependencies]
-llm-repair = "0.1"
+quorum-rs = "0.6"
 ```
+
+For the JSON-repair helpers in isolation:
+
+```toml
+[dependencies]
+llm-repair = "0.6"
+```
+
+## What's "deliberation"?
+
+A protocol where multiple LLM-backed agents — each potentially a different model, prompt, or toolchain — independently propose answers to a task, then evaluate each other's proposals, then converge on a quorum-selected outcome. Useful for tasks where single-model failure modes are expensive (security review, technical decisions, content moderation).
+
+`quorum-rs` is the open-source SDK for building agents against this protocol. The protocol itself is implemented by a separate orchestrator service.
+
+## Quick example: `llm-repair`
 
 ```rust
 use llm_repair::{extract_python_tool_calls, repair_truncated_json, clean_json_string};
@@ -24,7 +38,6 @@ use llm_repair::{extract_python_tool_calls, repair_truncated_json, clean_json_st
 // LLM returned a malformed JSON tool-call payload? Recover it.
 let raw = r#"{"name":"search","arguments":{"q":"hello"#;  // truncated
 let repaired = repair_truncated_json(raw);
-// → {"name":"search","arguments":{"q":"hello"}}
 
 // Model emitted a Python-style tool call instead of JSON? Extract it.
 let py = r#"search(q="hello", limit=10)"#;
@@ -37,30 +50,22 @@ let clean = clean_json_string(dirty, false, None);
 
 Built for the failure modes of small + open-weight models: truncation, invalid escapes (LaTeX), conversational wrappers, Python-syntax tool calls, markdown wrapping. Battle-tested in production deliberation runs.
 
-See [`crates/llm-repair/src/lib.rs`](crates/llm-repair/src/lib.rs) for the full API.
-
-## What's "deliberation"?
-
-A protocol where multiple LLM-backed agents — each potentially a different model, prompt, or toolchain — independently propose answers to a task, then evaluate each other's proposals, then converge on a quorum-selected outcome. Useful for tasks where single-model failure modes are expensive (security review, technical decisions, content moderation).
-
-`quorum-rs` is the open-source SDK for building agents against this protocol. The protocol itself is implemented by a separate orchestrator service.
-
-## Roadmap
-
-The SDK rolls out incrementally from the [`nsed` proprietary monorepo](https://github.com/peeramid-labs/nsed). Order of arrival:
-
-1. **`llm-repair`** ✅ shipped
-2. **`quorum-rs`** SDK content — agent traits, LLM dispatch, tool framework, prompt sets, worker runtime
-3. **`quorum-crypto-core`** — Ed25519 / secp256k1 / SHA3 primitives for agent signing
-4. **`quorum-cli`** — CLI for running agents against an orchestrator
-5. **Documentation** — tutorials, how-tos, reference, explanation (see [`docs/`](docs/))
-6. **Publication** — all crates to crates.io with stable APIs
-
-Breaking changes are expected on `quorum-rs` itself during this rollout. `llm-repair` follows semver from `0.1.0`.
+See [`crates/llm-repair/README.md`](crates/llm-repair/README.md) for the full API.
 
 ## Documentation
 
-See [`docs/`](docs/) — organized by the [Diátaxis](https://diataxis.fr) framework (tutorials, how-to, reference, explanation). Content lands alongside the SDK crates it documents.
+See [`docs/`](docs/) — organized by the [Diátaxis](https://diataxis.fr) framework:
+
+- [Tutorials](docs/tutorials/) — learning-by-doing lessons
+- [How-to guides](docs/how-to/) — task-oriented recipes
+- [Reference](docs/reference/) — API surface, types, schemas
+- [Explanation](docs/explanation/) — design rationale, tradeoffs
+
+Per-crate rustdoc: <https://docs.rs/quorum-rs>, <https://docs.rs/llm-repair>, <https://docs.rs/quorum-crypto-core>.
+
+## Status
+
+`quorum-rs` is a fresh extraction from a proprietary monorepo. The published `0.6` series mirrors the parent project's release line at the time of extraction. Breaking changes are expected as the public API surface is polished — semver-respecting versions begin at `1.0` once the API stabilises.
 
 ## Contributing
 

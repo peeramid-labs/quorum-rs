@@ -4,7 +4,7 @@
 //! Run:
 //!
 //! ```bash
-//! cargo run -p nsed-agent-sdk --example telemetry_demo
+//! cargo run -p quorum-rs --example telemetry_demo
 //! ```
 //!
 //! What it demonstrates:
@@ -45,7 +45,7 @@ fn main() {
     section("4. Redaction invariant");
     demo_redaction();
 
-    section("5. Config parse — real mid_0v1.yml + opt-out overlay");
+    section("5. Config parse — sample fleet + opt-out overlay");
     demo_config();
 
     println!();
@@ -144,10 +144,24 @@ fn demo_redaction() {
 }
 
 fn demo_config() {
-    let mid_yml = include_str!("mid_0v1.yml");
-    let fleet: AgentFleetConfig = serde_yaml::from_str(mid_yml).expect("mid_0v1.yml must parse");
+    // Minimal OSS-safe fleet config: two agents, telemetry on by default.
+    // Demonstrates the AgentFleetConfig + TelemetryConfig parse contract
+    // without exposing any proprietary multi-agent model definitions.
+    let sample_yml = r#"
+telemetry:
+  enabled: true
+agents:
+  - name: proposer-a
+    provider_id: openai
+    model_name: gpt-4o-mini
+  - name: evaluator-b
+    provider_id: openai
+    model_name: gpt-4o-mini
+"#;
+    let fleet: AgentFleetConfig =
+        serde_yaml::from_str(sample_yml).expect("sample fleet config must parse");
     println!(
-        "mid_0v1.yml             -> telemetry.enabled = {}  ({} agents)",
+        "sample fleet config      -> telemetry.enabled = {}  ({} agents)",
         fleet.telemetry.enabled,
         fleet.agents.len()
     );

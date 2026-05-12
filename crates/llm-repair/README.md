@@ -14,7 +14,7 @@ Real-world LLMs — especially smaller and open-weight ones — don't always ret
 
 ```toml
 [dependencies]
-llm-repair = "0.1"
+llm-repair = "0.6"
 ```
 
 MSRV: Rust 1.85 (uses Edition 2024).
