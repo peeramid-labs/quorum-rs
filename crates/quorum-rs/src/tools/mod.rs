@@ -4,9 +4,11 @@ use dyn_clone::DynClone;
 use serde_json::Value;
 use std::error::Error;
 
+pub mod context;
 pub mod sandbox;
 pub mod scoped_grep;
 pub mod scoped_read;
+pub mod user_call;
 
 pub use scoped_grep::ScopedGrepTool;
 pub use scoped_read::ScopedReadFileTool;

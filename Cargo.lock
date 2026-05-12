@@ -2570,6 +2570,7 @@ dependencies = [
  "dyn-clone",
  "fs4",
  "futures",
+ "futures-util",
  "hex",
  "libc",
  "llm-repair",

@@ -7,6 +7,7 @@
 //! For a quick-start model implementation, see [`SimpleOpenAIModel`].
 
 pub mod error;
+pub mod openai_compatible;
 pub mod rate_limiter;
 pub mod simple_model;
 pub mod simulated;
@@ -14,6 +15,7 @@ pub mod span;
 pub mod strategies;
 pub mod stub;
 pub use error::LlmError;
+pub use openai_compatible::OpenAICompatibleModel;
 pub use rate_limiter::RateLimiter;
 pub use simple_model::SimpleOpenAIModel;
 pub use span::LlmRequestSpan;
