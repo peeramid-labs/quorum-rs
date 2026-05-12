@@ -2,4 +2,4 @@
 
 Discussion-mode material — why, design rationale, tradeoffs, history.
 
-Migrates wholesale from `nsed/docs/agent-sdk/explanation/` in Phase 4.
+Read these when you want to understand a design decision rather than just use the resulting code. Lands as the SDK grows.

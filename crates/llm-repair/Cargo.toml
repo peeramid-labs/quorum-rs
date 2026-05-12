@@ -7,7 +7,7 @@ license = "Apache-2.0 OR MIT"
 repository = "https://github.com/peeramid-labs/quorum-rs"
 rust-version = "1.85"
 authors = ["Peeramid Labs"]
-readme = "../../README.md"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.99"
