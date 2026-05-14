@@ -703,11 +703,10 @@ pub struct NatsConnectionStateChanged {
 
 /// Prompt-exposure guardrail fired on an agent's terminal-tool content.
 ///
-/// Mirrors the `PromptExposureMiddleware` in
-/// `crates/nsed-agent/src/middleware/builtin/prompt_exposure.rs`: it
-/// reports that the guardrail saw one or more dictionary hits on the
-/// agent's final response content, whether that tripped the retry
-/// threshold, and how many hits landed in each category.
+/// Emitted by any [`OutputLeakDetector`] implementation: it reports that the
+/// guardrail saw one or more dictionary hits on the agent's final response
+/// content, whether that tripped the retry threshold, and how many hits
+/// landed in each category.
 ///
 /// **Redaction posture.** The only text this event carries is
 /// `sample_hits`, which is drawn from the guardrail's *fixed

@@ -1,6 +1,6 @@
-# Telemetry event catalog — `nsed-agent-sdk`
+# Telemetry event catalog — `quorum-rs`
 
-Every event type published by `nsed-agent-sdk::telemetry`.
+Every event type published by `quorum-rs::telemetry`.
 
 ## Subject layout
 
@@ -301,7 +301,7 @@ text. Only the path-shaped `session_id` is emitted.
 
 Paired with the `PromptExposureMiddleware` guardrail. Fires when the guardrail sees dictionary hits on terminal-tool content.
 
-> **Cross-crate note.** `PromptExposureMiddleware` lives in `crates/nsed-agent/src/middleware/builtin/prompt_exposure.rs`, not in `nsed-agent-sdk`. The `prompt_exposure_detected` event variant is defined in the SDK so that the event catalog is complete, but the middleware that triggers it is part of the agent binary. For OSS-split SDK users: this event is specific to the NSED agent's guardrail — a custom agent implementation may or may not emit it.
+> **Note.** The event variant exists in the SDK schema for completeness, but `quorum-rs` does not ship a default detector that emits it. Agents can attach any [`OutputLeakDetector`](https://docs.rs/quorum-rs/latest/quorum_rs/agents/trait.OutputLeakDetector.html) implementation via `ProposerEvaluatorAgent::with_output_guard(...)`; whether this event fires depends on the chosen detector.
 
 | Field | Type | Description |
 |---|---|---|

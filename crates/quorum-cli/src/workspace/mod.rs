@@ -38,7 +38,7 @@ pub struct AgentsConfig {
     pub dashboard_port: Option<u16>,
 }
 
-/// Execution mode for a policy — mirrors `nsed_orchestrator::scheduling::policy_registry::PolicyMode`.
+/// Execution mode for a policy.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyMode {

@@ -7,7 +7,7 @@ Usage:
 Outputs (when GITHUB_OUTPUT is set):
     percent=51.2
     color=orange
-    packages_json={"nsed-orchestrator":"48.3","nsed-agent":"60.1",...}
+    packages_json={"quorum-rs":"48.3","quorum-cli":"60.1",...}
 
 Outputs (when run locally without GITHUB_OUTPUT):
     Prints human-readable summary to stdout.
@@ -67,7 +67,7 @@ def extract(xml_path: str) -> dict:
                 continue  # malformed path like bare "crates/" — skip
             crate = parts[1]
         else:
-            crate = "nsed-orchestrator"  # root src/ belongs to the workspace crate
+            crate = "workspace-root"  # files outside crates/<name>/src/
 
         if crate not in crate_hits:
             crate_hits[crate] = [0, 0]

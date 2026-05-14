@@ -5,8 +5,8 @@
 //!
 //! Agent-side events omit `operator_principal` — agent dashboards
 //! are typically loopback-bound and not authenticated as operators.
-//! The orchestrator's mirror event in `nsed_orchestrator::telemetry`
-//! carries the principal field when its auth layer resolves one.
+//! Orchestrators emitting the mirror event populate the principal
+//! field from their own auth layer.
 
 use std::sync::Arc;
 

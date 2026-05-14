@@ -8,7 +8,7 @@
 
 use crate::workers::WorkerHook;
 use anyhow::Result;
-use nsed_crypto_core::{AuditEnvelope, AuditSigner, signer::ed25519::Ed25519Signer};
+use quorum_crypto_core::{AuditEnvelope, AuditSigner, signer::ed25519::Ed25519Signer};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -323,7 +323,7 @@ mod tests {
         assert_eq!(envelope.subject(), "proposal");
         assert_eq!(envelope.payload()["content"], "hello");
         assert_eq!(envelope.signature_count(), 1);
-        assert!(envelope.has_role(&nsed_crypto_core::envelope::SignerRole::Author));
+        assert!(envelope.has_role(&quorum_crypto_core::envelope::SignerRole::Author));
     }
 
     #[tokio::test]
@@ -340,7 +340,7 @@ mod tests {
         let mut envelope: AuditEnvelope<serde_json::Value> =
             serde_json::from_slice(&payload).unwrap();
 
-        let registry = nsed_crypto_core::VerifierRegistry::with_defaults();
+        let registry = quorum_crypto_core::VerifierRegistry::with_defaults();
         assert!(envelope.verify_chain(&registry).unwrap());
     }
 

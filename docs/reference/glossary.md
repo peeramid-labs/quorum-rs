@@ -5,7 +5,7 @@ Key terms used across the NSED documentation and CLI output.
 ---
 
 **Agent**
-A process that participates in deliberation. Each agent has a unique name, a backing language model (LLM), and a set of capability tags. Agents propose answers and evaluate each other's proposals. The reference implementation is built on `nsed-agent-sdk`.
+A process that participates in deliberation. Each agent has a unique name, a backing language model (LLM), and a set of capability tags. Agents propose answers and evaluate each other's proposals. The reference implementation is built on `quorum-rs`.
 
 **Budget**
 The combined resource envelope for a deliberation: wall-clock time (Phase 1), and optionally token counts and cost (Phase 2). The budget manager allocates per-round and per-phase timeouts adaptively based on observed agent latencies.
@@ -53,7 +53,7 @@ Acronym: **N-Way Self-Evaluating Deliberation**. A Runtime Mixture-of-Models pro
 The per-proposal signed aggregate of evaluations. Positive net support means evaluators collectively favoured this proposal; negative means they rejected it. Used to rank proposals within a round. See [scoring-variables.md](scoring-variables.md).
 
 **Orchestrator**
-The server component (running as `nsed-orchestrator` or embedded via `nsed serve`) that manages the NATS infrastructure, exposes the REST API and dashboard, dispatches jobs, and runs deliberation workers. One orchestrator can serve many simultaneous deliberations.
+The server component (running as `the orchestrator` or embedded via the orchestrator server) that manages the NATS infrastructure, exposes the REST API and dashboard, dispatches jobs, and runs deliberation workers. One orchestrator can serve many simultaneous deliberations.
 
 **Phase**
 One half of a deliberation round. The **propose phase** is when agents generate their answers; the **evaluate phase** is when agents score each other's answers. Each phase has an independent timeout derived from the budget manager.

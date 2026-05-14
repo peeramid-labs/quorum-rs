@@ -92,9 +92,8 @@ pub struct PassthroughError {
 /// Trait for intercepting worker lifecycle events.
 ///
 /// Implementations can wrap, encrypt, or transform payloads before they are
-/// published to NATS.  The default implementation is a no-op passthrough.
-///
-/// The concrete crypto-wrapping implementation lives in `nsed-agent` (BSL).
+/// published to NATS. The default implementation is a no-op passthrough;
+/// crypto-wrapping implementations can be plugged in by callers.
 #[async_trait]
 pub trait WorkerHook: Send + Sync + Debug {
     /// Called before publishing a proposal/evaluation result.
@@ -109,8 +108,8 @@ pub trait WorkerHook: Send + Sync + Debug {
 
 /// Factory for creating per-task user tool handlers.
 ///
-/// The concrete implementation lives in `nsed-agent` (BSL) and wraps
-/// `UserToolHandler` which depends on NATS internals.
+/// The reference implementation [`NatsUserToolHandlerFactory`](crate::agents::NatsUserToolHandlerFactory)
+/// wraps [`UserToolHandler`](crate::agents::UserToolHandler), which depends on NATS internals.
 #[async_trait]
 pub trait UserToolHandlerFactory: Send + Sync + Debug {
     /// Create a handler scoped to a specific task execution.
@@ -552,8 +551,8 @@ impl NatsNsedWorker {
 
     /// Enables the embedded status dashboard on the given port.
     ///
-    /// Note: The actual HTTP server requires the `status-server` feature on
-    /// `nsed-agent`. Without that feature, this method only creates the shared
+    /// Note: The actual HTTP server requires the `status-server` cargo
+    /// feature. Without that feature, this method only creates the shared
     /// status snapshot (heartbeats and events are still recorded).
     pub fn with_status(mut self, _port: u16) -> Self {
         let shared = new_shared_status(

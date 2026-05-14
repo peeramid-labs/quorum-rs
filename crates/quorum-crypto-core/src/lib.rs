@@ -1,6 +1,6 @@
-//! # nsed-crypto-core
+//! # quorum-crypto-core
 //!
-//! Cryptographic primitives and traits for NSED agent signing and verification.
+//! Cryptographic primitives and traits for agent signing and verification.
 //!
 //! - [`AuditSigner`] — sign messages (Ed25519, Secp256k1)
 //! - [`AuditVerifier`] — verify signatures from unknown agents

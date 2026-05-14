@@ -880,9 +880,8 @@ pub struct ProposerEvaluatorAgent {
     pub extra_context_tools: Vec<Box<dyn Tool>>,
     pub sandbox_tools: Vec<Box<dyn Tool>>,
     /// Optional output-leak detector used by `prompt_exposure_guard`.
-    /// OSS users pass `None` (no guarding) or supply their own; BSL
-    /// nsed-agent ships `PromptExposureMiddleware` which impls the
-    /// `OutputLeakDetector` trait.
+    /// `None` disables guarding; attach any `OutputLeakDetector` impl
+    /// via [`ProposerEvaluatorAgent::with_output_guard`].
     output_guard: Option<std::sync::Arc<dyn crate::agents::OutputLeakDetector>>,
 }
 
@@ -1004,8 +1003,7 @@ impl ProposerEvaluatorAgent {
     /// trigger a retry if the detector blocks.
     ///
     /// Without a detector, `config.prompt_exposure_guard = true` is a no-op
-    /// (pass-through). The reference NSED detector lives in the BSL
-    /// `nsed-agent` crate as `PromptExposureMiddleware`.
+    /// (pass-through). Callers can supply any `OutputLeakDetector` impl.
     pub fn with_output_guard(
         mut self,
         detector: std::sync::Arc<dyn crate::agents::OutputLeakDetector>,
@@ -1703,11 +1701,7 @@ where
         // ERROR` user message.
         //
         // Gated by `agent_config.prompt_exposure_guard` so existing
-        // deployments are unaffected until they opt in. The mid_0v1 prod
-        // deployment enables this for all three Cortex agents.
-        //
-        // See `crates/nsed-agent/src/middleware/builtin/prompt_exposure.rs`
-        // and `docs/middleware.md#prompt_exposure-config`.
+        // deployments are unaffected until they opt in.
         if let Ok(ref parsed) = parse_result
             && agent_config.prompt_exposure_guard
             && let Some(detector) = output_guard
@@ -2076,9 +2070,9 @@ where
                     if let Some(assessments) =
                         ev.get("claim_assessments").and_then(|v| v.as_array())
                     {
-                        // The canonical schema (see `ClaimAssessment` in
-                        // nsed-agent-sdk) stores the user-visible
-                        // rationale under `reason`. That struct already
+                        // The canonical schema (see `ClaimAssessment`)
+                        // stores the user-visible rationale under
+                        // `reason`. That struct already
                         // declares serde aliases (`disagreement`,
                         // `explanation`, `reasoning`) so deserialization
                         // normalises every off-schema key the models
@@ -4017,9 +4011,9 @@ mod tests {
         assert!(output.len() < 200, "marker must be short");
     }
 
-    // Prompt-exposure guardrail tests moved to BSL crate nsed-agent
-    // (see crates/nsed-agent/tests/prompt_exposure_via_agent.rs) since they exercise
-    // the concrete PromptExposureMiddleware impl which is no longer in this crate.
+    // Prompt-exposure guardrail tests live alongside any concrete
+    // `OutputLeakDetector` implementations — see the `with_output_guard`
+    // doc-comment on `ProposerEvaluatorAgent`.
 
     // ─── empty_terminal_tool_content — max-iterations fallback ───────
     //

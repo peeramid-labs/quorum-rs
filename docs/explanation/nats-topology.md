@@ -18,11 +18,11 @@ The system is built around a "Hub-and-Spoke" model where **NATS JetStream** acts
 | `nsed.{job_id}.result.{round}.{agent}.{action}` | **Data** | The output from an agent (e.g., the proposal JSON). 6 segments. | NSED Worker | Orchestrator |
 | `nsed.{job_id}.result.event.{type}` | **Data** | Lifecycle events for history replay and real-time SSE streaming. | Orchestrator | SSE Handler / History API |
 | `telemetry.orch.{event_type}` | **Telemetry** | Orchestrator-side metrics-only events (#309). Independent stream from the result/event tree above. | Orchestrator | Forwarder |
-| `telemetry.agent.{agent_id}.{event_type}` | **Telemetry** | Per-agent metrics-only events (#309). The `agent_id` subtree is JWT-bound — the telemetry `Agent { agent_id }` role grants `publish("telemetry.agent.{agent_id}.>")` only, so an agent cannot forge events under a peer's id. Roles are minted by `nsed-orchestrator::credentials::issue_telemetry_jwt`. | NSED Worker (per agent) | Forwarder |
+| `telemetry.agent.{agent_id}.{event_type}` | **Telemetry** | Per-agent metrics-only events (#309). The `agent_id` subtree is JWT-bound — the telemetry `Agent { agent_id }` role grants `publish("telemetry.agent.{agent_id}.>")` only, so an agent cannot forge events under a peer's id. Roles are minted by `<orchestrator>::credentials::issue_telemetry_jwt`. | NSED Worker (per agent) | Forwarder |
 
 **SSE Event Types**: `round_start`, `proposal_submitted`, `evaluation_submitted`, `round_complete`, `job_complete`, `agent_accepted`, `agent_working`, `agent_error`, `budget_update`, `budget_phase_complete`, `tool_call_pending`, `tool_call_responded`, `tool_call_expired`, `user_injection`.
 
-**Telemetry Event Types** (#309 — see [`docs/agent-telemetry.md`](agent-telemetry.md) for the full contract): orch tree — `round_started`, `phase_complete`, `agent_responded`, `agent_timed_out`, `eval_injected_synthetic`, `convergence_sample`, `job_finalized`, `submission_received`, `phase_quorum_reached`, `phase_tail_closed`. Agent tree — `llm_request_start` / `_complete` / `_failed` / `_stalled`, `tool_call_executed`, `retry_loop_attempt`, `task_accepted` / `_completed` / `_failed`, `nats_connection_state`, `prompt_exposure_detected`. Telemetry events carry **no** prompt / proposal / `thought_process` / secret content; redaction is enforced at the type layer in `nsed-agent-sdk::telemetry`.
+**Telemetry Event Types** (#309 — see [`docs/agent-telemetry.md`](agent-telemetry.md) for the full contract): orch tree — `round_started`, `phase_complete`, `agent_responded`, `agent_timed_out`, `eval_injected_synthetic`, `convergence_sample`, `job_finalized`, `submission_received`, `phase_quorum_reached`, `phase_tail_closed`. Agent tree — `llm_request_start` / `_complete` / `_failed` / `_stalled`, `tool_call_executed`, `retry_loop_attempt`, `task_accepted` / `_completed` / `_failed`, `nats_connection_state`, `prompt_exposure_detected`. Telemetry events carry **no** prompt / proposal / `thought_process` / secret content; redaction is enforced at the type layer in `quorum-rs::telemetry`.
 
 ### **Subject Naming Convention**
 
@@ -52,7 +52,7 @@ The subject structure follows a base pattern with variations by message type:
 
 ### **Input Validation (NATS Naming Rules)**
 
-All user-supplied identifiers (`room_id`, `agent_names`, `scope_id`, `job_id`) are validated at the API handler boundary **before** they reach NATS. The `validate_nats_name()` function (in `crates/nsed-orchestrator/src/nats.rs`) enforces the NATS protocol naming rules:
+All user-supplied identifiers (`room_id`, `agent_names`, `scope_id`, `job_id`) are validated at the API handler boundary **before** they reach NATS. The `validate_nats_name()` function (in `the orchestrator`) enforces the NATS protocol naming rules:
 
 | Character | Status | Reason |
 | :-------- | :----- | :----- |
@@ -88,7 +88,7 @@ The execution flow moves between distinct Rust modules via NATS messages.
 
 ### **Phase 1: Job Submission**
 
-1. **Entry**: crates/nsed-orchestrator/src/handlers/deliberation.rs receives a HTTP POST request.
+1. **Entry**: crates/the orchestrator/src/handlers/deliberation.rs receives a HTTP POST request.
 2. **Validation**: `validate_nats_name()` checks `room_id`, `agent_names`, and `scope_id` for NATS-incompatible characters. Returns 400 if any fail.
 3. **Action**: Calls broker::add\_job\_to\_queue.
 4. **NATS**: Publishes JSON payload to **sphera.jobs.submit** (with double-await for JetStream ack confirmation).
@@ -96,16 +96,16 @@ The execution flow moves between distinct Rust modules via NATS messages.
 
 ### **Phase 2: Orchestration Pickup**
 
-1. **Entry**: crates/nsed-orchestrator/src/workers/orchestrator.rs (running in background).
+1. **Entry**: crates/the orchestrator/src/workers/orchestrator.rs (running in background).
 2. **Trigger**: Consumes message from **sphera.jobs.submit** via shared pull consumer.
 3. **Setup**:
    * Creates/Checks KV Buckets using `ensure_kv_bucket()` (idempotent: create, fallback to get).
    * Claims the job in nsed\_job\_ownership (Distributed Lock).
-4. **Handover**: Instantiates the Orchestrator struct (crates/nsed-orchestrator/src/orchestrator.rs) and calls run\_deliberation().
+4. **Handover**: Instantiates the Orchestrator struct (crates/the orchestrator/src/orchestrator.rs) and calls run\_deliberation().
 
 ### **Phase 3: The Deliberation Loop (Round Execution)**
 
-Inside crates/nsed-orchestrator/src/orchestrator.rs:
+Inside crates/the orchestrator/src/orchestrator.rs:
 
 1. **Stream Init**: Creates a transient JetStream stream nsed\_results\_{session\_id} to capture all results and events for this specific job.
 2. **Task Dispatch**:
@@ -115,20 +115,20 @@ Inside crates/nsed-orchestrator/src/orchestrator.rs:
 
 ### **Phase 4: Agent Execution**
 
-1. **Entry**: `crates/nsed-agent/src/workers/nsed_worker.rs` (standalone agent) or `crates/nsed-orchestrator/src/workers/nsed_worker.rs` (embedded agent). Both use the same `NatsNsedWorker` implementation.
+1. **Entry**: `crates/quorum-rs/src/workers/nsed_worker.rs` (standalone agent) or `crates/quorum-rs/src/workers/nsed_worker.rs` (embedded agent). Both use the same `NatsNsedWorker` implementation.
 2. **Trigger**: Wildcard subscription matches **nsed.\*.task.{my\_id}.\***.
 3. **Deduplication**: Each message is checked against a processed-messages KV store using the key `{stream}-{sequence}-{subject}` (the subject component prevents cross-session collisions when stream sequence numbers are reused).
 4. **Logic**:
    * Deserializes context.
    * Calls agent.propose() or agent.evaluate() (LLM interaction).
-   * Accesses `NatsScratchpadStore` (`crates/nsed-agent/src/workers/nsed_worker.rs`) for persistent memory.
+   * Accesses `NatsScratchpadStore` (`crates/quorum-rs/src/workers/nsed_worker.rs`) for persistent memory.
 5. **NATS**: Publishes output to **nsed.{id}.result.{my\_id}.propose**.
 
-> **Note:** Agents can run as standalone processes (using `nsed-agent` crate directly) or embedded in the orchestrator. The NATS protocol is identical in both cases — the orchestrator doesn't know or care whether an agent runs in-process or on a remote GPU node.
+> **Note:** Agents can run as standalone processes (using `quorum-rs` crate directly) or embedded in the orchestrator. The NATS protocol is identical in both cases — the orchestrator doesn't know or care whether an agent runs in-process or on a remote GPU node.
 
 ### **Phase 5: Result Aggregation & Events**
 
-1. **Re-Entry**: crates/nsed-orchestrator/src/orchestrator.rs (which was waiting).
+1. **Re-Entry**: crates/the orchestrator/src/orchestrator.rs (which was waiting).
 2. **Trigger**: The Pull Consumer sees the new message in the nsed\_results\_{id} stream.
 3. **Processing**: Aggregates the proposal/evaluation.
 4. **Persistence**: Writes the full round history to the KV Store (nsed\_hist\_{id}).
@@ -183,7 +183,7 @@ The system uses a **two-layer** strategy for Job ID / Room ID safety:
 
 ## **4\. SSE Event Streaming**
 
-The SSE (Server-Sent Events) handler in `crates/nsed-orchestrator/src/handlers/stream.rs` subscribes to **Core NATS** (not JetStream) on the subject pattern:
+The SSE (Server-Sent Events) handler in `crates/the orchestrator/src/handlers/stream.rs` subscribes to **Core NATS** (not JetStream) on the subject pattern:
 
 ```
 nsed.{job_id}.result.event.>

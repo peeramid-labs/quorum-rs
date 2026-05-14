@@ -327,12 +327,11 @@ pub fn session_jsonl_size(working_dir: &Path, claude_session_uuid: &str) -> u64 
 
 /// Best-effort unwrap of an `input` Value pulled from the claude
 /// session jsonl into the inner-most arguments object before
-/// permissive extraction runs. Mirrors the part of
-/// `nsed-agent::llm_repair::clean_json_string` that still applies
-/// once the transcript writer has parsed the wire payload into a
-/// Value (the textual repair stages — invalid-escape patching,
-/// truncation patching — are no-ops on already-parsed JSON, so
-/// they don't help here).
+/// permissive extraction runs. Mirrors the part of `clean_json_string`
+/// (in the `llm_repair` crate) that still applies once the transcript
+/// writer has parsed the wire payload into a Value — the textual
+/// repair stages (invalid-escape patching, truncation patching) are
+/// no-ops on already-parsed JSON, so they don't help here.
 ///
 /// Two shapes the model occasionally emits that look unrecoverable
 /// but contain a salvageable payload one or two steps in:
@@ -347,10 +346,7 @@ pub fn session_jsonl_size(working_dir: &Path, claude_session_uuid: &str) -> u64 
 ///      args. Detect by an `arguments` object key; return that
 ///      and recurse.
 ///
-/// Recursion is depth-capped to avoid pathological inputs. CR PR
-/// #349 finding (recovery used to skip the malformed-args repair
-/// stage); kept in this crate because adding `nsed-agent` as a
-/// dep would create a circular dependency.
+/// Recursion is depth-capped to avoid pathological inputs.
 pub fn unwrap_recovered_input(value: serde_json::Value) -> serde_json::Value {
     fn inner(v: serde_json::Value, depth: u8) -> serde_json::Value {
         if depth > 4 {

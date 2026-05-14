@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn script_path() -> PathBuf {
-    // `CARGO_MANIFEST_DIR` is `crates/nsed-agent-sdk`; go up two levels
+    // `CARGO_MANIFEST_DIR` is `crates/quorum-rs`; go up two levels
     // to the workspace root and then into `scripts/`.
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()

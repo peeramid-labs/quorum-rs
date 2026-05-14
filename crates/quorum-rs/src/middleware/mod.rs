@@ -14,8 +14,8 @@
 //! # Middleware types
 //!
 //! - **Builtin**: compiled into the binary (fastest, zero-overhead)
-//! - **BinaryMiddleware** (`nsed-agent`): external process via stdin/stdout JSON protocol
-//! - **DylibMiddleware** (`nsed-agent`): FFI dynamic library via C ABI (`nsed_middleware_execute`)
+//! - **BinaryMiddleware**: external process via stdin/stdout JSON protocol
+//! - **DylibMiddleware**: FFI dynamic library via C ABI (`nsed_middleware_execute`)
 //!
 //! # Design influences
 //!

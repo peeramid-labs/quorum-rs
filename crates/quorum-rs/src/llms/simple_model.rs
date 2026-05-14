@@ -5,7 +5,8 @@
 //! limiting, no retry logic, no provider-specific strategies — just the
 //! bare minimum to build and test a custom agent.
 //!
-//! For production use, see `OpenAICompatibleModel` in the `nsed-agent` crate.
+//! For production use (streaming, rate limiting, provider strategies), see
+//! [`OpenAICompatibleModel`](crate::llms::OpenAICompatibleModel) in this crate.
 
 use crate::agents::AgentConfig;
 use crate::llms::{AiModel, ChatCompletionResult, RequestConfig, TimingMetadata};

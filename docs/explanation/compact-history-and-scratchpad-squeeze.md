@@ -173,13 +173,12 @@ behavior at runtime.
 
 ## Implementation surface
 
-- `crates/nsed-agent/src/agents/nsed_agent.rs::compact_message_history`
+- `crates/quorum-rs/src/agents/nsed_agent.rs::compact_message_history`
   — the fold itself, including the assistant-boundary cut and the
   user-message tool-output detection.
-- `crates/nsed-agent/src/agents/nsed_agent.rs::squeeze_scratchpad_if_full`
+- `crates/quorum-rs/src/agents/nsed_agent.rs::squeeze_scratchpad_if_full`
   — the paired scratchpad compaction.
-- `crates/nsed-agent-sdk/src/agents/config.rs::AgentConfig::validate_compaction_knobs`
+- `crates/quorum-rs/src/agents/config.rs::AgentConfig::validate_compaction_knobs`
   — fail-fast bounds check on the two configurable knobs.
-- `crates/nsed-agent/tests/openrouter_models/compact_history.rs`
-  — live integration test asserting the 7-section template
-  round-trips through a real OpenRouter model.
+- Live integration tests (under `crates/quorum-rs/tests/openrouter_models/`)
+  assert the 7-section template round-trips through real OpenRouter models.

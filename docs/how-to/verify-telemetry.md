@@ -25,7 +25,7 @@ nats sub --creds=/path/to/auditor.creds \
 To inspect the event shapes without a live NATS server:
 
 ```bash
-cargo run -p nsed-agent-sdk --example telemetry_demo   # full walkthrough
+cargo run -p quorum-rs --example telemetry_demo   # full walkthrough
 scripts/telemetry_demo.sh types        # distinct event `type` tags (needs jq)
 scripts/telemetry_demo.sh subjects     # distinct NATS subjects (portable, no jq)
 scripts/telemetry_demo.sh agent-only   # jq-filtered to agent tree only

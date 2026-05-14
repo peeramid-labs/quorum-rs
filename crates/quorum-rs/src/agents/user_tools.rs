@@ -476,8 +476,9 @@ impl UserToolHandlerTrait for UserToolHandler {
 
 /// Factory that creates [`UserToolHandler`] instances for each task execution.
 ///
-/// This implements the SDK's [`UserToolHandlerFactory`] trait, allowing the
-/// MIT worker to construct BSL user tool handlers without direct dependency.
+/// Reference implementation of the [`UserToolHandlerFactory`] trait — the
+/// worker uses this to materialise a handler per task without depending on
+/// NATS internals at the trait level.
 #[derive(Debug)]
 pub struct NatsUserToolHandlerFactory;
 

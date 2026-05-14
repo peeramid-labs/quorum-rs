@@ -1,10 +1,10 @@
 //! Pluggable detector for "leaked internal prompt" patterns in LLM output.
 //!
-//! The SDK defines the [`OutputLeakDetector`] trait; concrete implementations
-//! live in downstream crates. The reference NSED implementation
-//! (`PromptExposureMiddleware`) is in `nsed-agent` (BSL). OSS users who don't
-//! ship a detector get no output guarding — wire one in via
-//! [`ProposerEvaluatorAgent::with_output_guard`] when constructing the agent.
+//! This module defines the [`OutputLeakDetector`] trait. Concrete
+//! implementations are supplied by callers; if no detector is attached
+//! the agent runs without output guarding. Wire one in via
+//! [`ProposerEvaluatorAgent::with_output_guard`](crate::agents::ProposerEvaluatorAgent::with_output_guard)
+//! when constructing the agent.
 
 use crate::middleware::{MiddlewareContext, MiddlewareVerdict};
 use async_trait::async_trait;

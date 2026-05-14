@@ -144,9 +144,8 @@ fn demo_redaction() {
 }
 
 fn demo_config() {
-    // Minimal OSS-safe fleet config: two agents, telemetry on by default.
-    // Demonstrates the AgentFleetConfig + TelemetryConfig parse contract
-    // without exposing any proprietary multi-agent model definitions.
+    // Minimal fleet config: two agents, telemetry on by default.
+    // Demonstrates the AgentFleetConfig + TelemetryConfig parse contract.
     let sample_yml = r#"
 telemetry:
   enabled: true

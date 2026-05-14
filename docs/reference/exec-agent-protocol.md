@@ -211,7 +211,7 @@ agents:
     provider_id: exec_local
     model_name: custom
     exec:
-      command: ["python3", "crates/nsed-cli/examples/exec_agent.py"]
+      command: ["python3", "examples/exec_agent.py"]
       # working_dir: "/opt/agents"           # optional
       # timeout_secs: 30                      # optional (default: phase budget)
       # env:                                  # optional (additive)
@@ -229,7 +229,7 @@ agents:
 
 ## Reference Implementation
 
-See [`crates/nsed-cli/examples/exec_agent.py`](../crates/nsed-cli/examples/exec_agent.py) for a complete Python reference that demonstrates:
+See [`examples/exec_agent.py`](../examples/exec_agent.py) for a complete Python reference that demonstrates:
 
 - Reading the JSON envelope from stdin
 - Dispatching by `phase` field
@@ -241,7 +241,7 @@ See [`crates/nsed-cli/examples/exec_agent.py`](../crates/nsed-cli/examples/exec_
 ```bash
 # 1. Test the reference agent manually
 echo '{"phase":"propose","context":{"task_description":"test","round_number":1,"phase":"Propose","candidates":[],"previous_round_matrix":null,"previous_critiques":[],"user_injections":[],"phase_budget_remaining_secs":60.0}}' \
-  | python3 crates/nsed-cli/examples/exec_agent.py
+  | python3 examples/exec_agent.py
 
 # 2. Configure in agent.yml
 # providers:
@@ -254,8 +254,8 @@ echo '{"phase":"propose","context":{"task_description":"test","round_number":1,"
 #     exec:
 #       command: ["python3", "my_agent.py"]
 
-# 3. Run with nsed serve
-nsed serve --config agent.yml
+# 3. Run via your orchestrator
+# Start the orchestrator with this agent config
 ```
 
 ## Provider Envelope Unwrapping

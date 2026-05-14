@@ -294,7 +294,7 @@ async fn connect_endpoints_builds_mux_that_publishes() {
 /// Construction with duplicate endpoint names must fail. Exercises
 /// the `TelemetryEmitterMux::new` Result path with real emitters —
 /// the synchronous unit-test variant lives in
-/// `crates/nsed-agent-sdk/src/telemetry.rs`.
+/// `crates/quorum-rs/src/telemetry.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mux_new_with_duplicate_names_returns_err() {
     let Some(client) = try_connect_nats().await else {

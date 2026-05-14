@@ -1,7 +1,7 @@
 //! Shared scheduling types used by both orchestrators and agents.
 //!
-//! These types are the canonical definitions — both `nsed-orchestrator` and `nsed-cli`
-//! re-use them to avoid schema drift.
+//! Canonical definitions of policy / SLA / deadline shapes so that any
+//! orchestrator and agent built on this crate stay in sync.
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;

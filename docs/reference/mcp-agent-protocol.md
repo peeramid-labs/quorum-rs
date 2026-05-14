@@ -419,7 +419,7 @@ This maps to `--agents '<JSON>'`, enabling Claude to spawn specialized sub-agent
 
 ## Example: Python MCP Client
 
-See [`crates/nsed-cli/examples/mcp_agent.py`](../crates/nsed-cli/examples/mcp_agent.py) for a complete reference implementation using the Python `mcp` package.
+See [`examples/mcp_agent.py`](../examples/mcp_agent.py) for a complete reference implementation using the Python `mcp` package.
 
 Minimal structure:
 

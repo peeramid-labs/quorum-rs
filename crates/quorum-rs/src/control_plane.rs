@@ -4,9 +4,9 @@
 //! (pause, config patching, buffer management) and the [`ConfigPatch`] struct
 //! for partial live-updates to [`AgentConfig`](crate::AgentConfig) fields.
 //!
-//! These are defined in the MIT-licensed SDK so any agent implementation can
-//! provide a control plane — the reference implementation lives in the BSL
-//! `nsed-agent` crate.
+//! Any agent implementation can satisfy [`AgentControlPlane`] to expose a
+//! control plane; the reference implementation ships with the embedded
+//! status server in this crate.
 
 use crate::workers::buffer::BufferEntrySummary;
 use serde::{Deserialize, Serialize};
@@ -115,7 +115,7 @@ impl ConfigPatch {
 
 /// Trait for controlling agents at runtime (pause, config, buffer ops).
 ///
-/// Defined in the MIT SDK; implemented by the BSL agent crate's status server.
+/// Reference implementation: the embedded status server (feature `status-server`).
 #[async_trait::async_trait]
 pub trait AgentControlPlane: Send + Sync {
     /// Pause or resume an agent by name.

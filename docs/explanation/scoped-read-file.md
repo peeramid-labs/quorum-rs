@@ -159,13 +159,13 @@ Two log-key conventions, depending on when the call failed:
 
 ## Implementation surface
 
-- `crates/nsed-agent/src/tools/scoped_read.rs` — the tool itself
+- `crates/quorum-rs/src/tools/scoped_read.rs` — the tool itself
   (`ScopedReadFileTool`), the canonical-prefix check, and the
   `O_NOFOLLOW` open path.
-- `crates/nsed-agent-sdk/src/agents/config.rs` — the
+- `crates/quorum-rs/src/agents/config.rs` — the
   `read_file_roots: Vec<PathBuf>` field on `AgentConfig`.
 - `is_openai_family_provider` and `aggregate_tools` in
-  `crates/nsed-agent/src/agents/nsed_agent.rs` — conditional
+  `crates/quorum-rs/src/agents/nsed_agent.rs` — conditional
   registration gated on the openai-class predicate plus a non-empty
   `read_file_roots`.
 

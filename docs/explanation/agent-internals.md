@@ -1,17 +1,16 @@
 # Agent Internals — Library API & Architecture
 
-This document covers the internal architecture of the `nsed-agent` crate for developers who want to use it as a Rust library or understand how the reference agent works under the hood.
+This document covers the internal architecture of the `quorum-rs` crate for developers who want to use it as a Rust library or understand how the reference agent works under the hood.
 
-For running an agent from the CLI, see the [nsed-agent README](../crates/nsed-agent/README.md).
+For running an agent from the CLI, see [`quorum-cli`](https://crates.io/crates/quorum-cli).
 
 ## Library Quick Start
 
 ```rust
-use nsed_agent::agents::ProposerEvaluatorAgent;
-use nsed_agent::llms::OpenAICompatibleModel;
-use nsed_agent::prompts::defaults::DefaultPromptSet;
-use nsed_agent::workers::{NatsNsedWorker, NatsNsedWorkerExt, WorkerConfig};
-use nsed_agent_sdk::agents::AgentConfig;
+use quorum_rs::agents::{AgentConfig, ProposerEvaluatorAgent};
+use quorum_rs::llms::OpenAICompatibleModel;
+use quorum_rs::prompts::defaults::DefaultPromptSet;
+use quorum_rs::workers::{NatsNsedWorker, NatsNsedWorkerExt, WorkerConfig};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -46,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
         "my_agent_consumer".into(),
     );
 
-    // from_agent() auto-wires BSL extensions (user tool handler, chat support)
+    // from_agent() auto-wires extensions (user tool handler, chat support)
     let worker = NatsNsedWorker::from_agent(agent, config).await?;
     worker.run().await
 }
@@ -88,11 +87,9 @@ The orchestrator can run **without any agents**. Agents can **join and leave at 
 | `tools::sandbox` | `ListFilesTool`, `ReadFileTool`, `WriteFileTool`, `ExecuteCommandTool` | Sandboxed execution tools |
 | `tools::user_call` | `UserCallTool` | External tool forwarding via NATS KV |
 | `llm_repair` | `repair_tool_calls`, `extract_xml_tool_calls`, `strip_thinking_prefix`, ... | Multi-stage JSON repair for unreliable model output (6 stages: truncation repair → escape repair → lossy sanitization → conversational/markdown extraction → merged field splitting → thinking-token prefix stripping) |
-| `workers` | `NatsNsedWorkerExt`, `NatsNsedWorkerStatusExt` | BSL extension traits (re-exports SDK worker types) |
-| `status` | Re-exports from SDK | Status types (re-exported from `nsed-agent-sdk`) |
+| `workers` | `NatsNsedWorker`, `WorkerConfig`, `NatsScratchpadStore`, `JobManifest`, `NatsNsedWorkerExt`, `NatsNsedWorkerStatusExt` | NATS JetStream worker runtime + ergonomic extension traits |
+| `status` | `AgentStatusSnapshot`, `EventLogEntry`, `SharedAgentStatus` | Real-time agent status types |
 | `status::server` | `StatusServer` | Embedded HTTP dashboard with chat + config API (feature: `status-server`) |
-
-> **Note:** Core worker types (`NatsNsedWorker`, `WorkerConfig`, `NatsScratchpadStore`, `JobManifest`) and status types (`AgentStatusSnapshot`, `EventLogEntry`) now live in `nsed-agent-sdk` (MIT). This crate re-exports them and adds BSL extension traits.
 
 ## How the Agent Works
 
@@ -147,8 +144,8 @@ The `status` module provides real-time agent monitoring, gated behind the `statu
                              └───────────────────────────┘
 ```
 
-- **`AgentStatusSnapshot`** — Shared state with identity, counters, current job, recent tasks (max 20), and event log (max 200 entries). Defined in `nsed-agent-sdk`.
-- **`EventLogEntry`** — Timestamped lifecycle event (`event_type`, `job_id`, `detail`). Defined in `nsed-agent-sdk`.
+- **`AgentStatusSnapshot`** — Shared state with identity, counters, current job, recent tasks (max 20), and event log (max 200 entries). Defined in `quorum-rs`.
+- **`EventLogEntry`** — Timestamped lifecycle event (`event_type`, `job_id`, `detail`). Defined in `quorum-rs`.
 - **`StatusServer::run(port, status, chat_agent, agent_config)`** — Spawns an embedded axum HTTP server. Uses `Option<Arc<dyn ChatCapable>>` for chat support.
 
 ### Event Types
@@ -207,34 +204,19 @@ WorkerConfig::new(
 .with_scratchpad_retention(86400 * 7)  // Scratchpad TTL in seconds (default: 7 days)
 ```
 
-## Relationship to `nsed-agent-sdk`
+## Trait / implementation map
 
-This crate **implements** the traits defined in `nsed-agent-sdk` and **re-exports** the SDK's runtime types:
+The agent contract is defined by traits in `quorum_rs::agents` and friends. The reference implementations shipped in this crate map as follows:
 
-| SDK Trait / Type | BSL Implementation |
+| Trait | Reference impl |
 |---|---|
 | `NsedAgent` | `ProposerEvaluatorAgent` |
-| `AiModel` | `OpenAICompatibleModel`, `SimulatedModel` |
+| `AiModel` | `OpenAICompatibleModel`, `SimulatedModel`, `SimpleOpenAIModel` |
 | `PromptSet` | `DefaultPromptSet` |
-| `Tool` | `ReadProposalTool`, `UserCallTool`, sandbox tools, ... |
+| `Tool` | `ReadProposalTool`, `UserCallTool`, sandbox tools, … |
 | `UserToolHandlerTrait` | `UserToolHandler` |
 | `UserToolHandlerFactory` | `NatsUserToolHandlerFactory` |
 | `ChatCapable` | `ProposerEvaluatorAgent` (via `impl ChatCapable`) |
 | `ChatStrategy` | `NativeStrategy`, `HarmonyStrategy`, `XmlRegexStrategy` |
 
-Types that now live in the SDK (MIT) and are re-exported here:
-
-| SDK Type | Purpose |
-|---|---|
-| `NatsNsedWorker` | NATS JetStream worker runtime |
-| `WorkerConfig` | Worker connection configuration |
-| `NatsScratchpadStore` | `PersistenceStore` backed by NATS KV |
-| `JobManifest` | Job manifest from orchestrator |
-| `AgentStatusSnapshot` | Real-time agent status |
-| `SimpleOpenAIModel` | Minimal compatible LLM client |
-
-This crate adds extension traits for BSL features:
-- `NatsNsedWorkerExt` — convenience constructor from `ProposerEvaluatorAgent` (auto-wires user tool factory + chat)
-- `NatsNsedWorkerStatusExt` — `with_status_server()` that spawns the embedded HTTP dashboard
-
-To build a **custom agent** with your own logic, depend on `nsed-agent-sdk` only (MIT). To use the **reference implementations** (rate-limited LLM, default prompts, tool implementations), depend on this crate (BSL).
+Custom agents can implement `NsedAgent` directly. To start from a ready-made ReAct loop with rate-limited LLM access, default prompts, and built-in tools, use `ProposerEvaluatorAgent` (see [`how-to/agent-development.md`](../how-to/agent-development.md)).

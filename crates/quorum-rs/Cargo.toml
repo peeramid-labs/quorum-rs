@@ -13,7 +13,7 @@ categories = ["api-bindings", "development-tools"]
 
 [features]
 default = ["audit"]
-audit = ["dep:nsed-crypto-core", "dep:hex"]
+audit = ["dep:quorum-crypto-core", "dep:hex"]
 status-server = ["dep:open", "dep:utoipa-swagger-ui"]
 
 [dependencies]
@@ -28,7 +28,7 @@ fs4 = "0.13"
 futures = "0.3.31"
 hex = { version = "0.4", optional = true }
 nkeys = "0.4"
-nsed-crypto-core = { package = "quorum-crypto-core", version = "0.6.0", path = "../quorum-crypto-core", optional = true }
+quorum-crypto-core = { version = "0.6.0", path = "../quorum-crypto-core", optional = true }
 llm-repair = { version = "0.6.0", path = "../llm-repair" }
 regex = "1.12.2"
 openai-harmony = "0.0.8"

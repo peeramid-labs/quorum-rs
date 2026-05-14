@@ -13,8 +13,8 @@ For a single chat call, every OpenAI-compatible provider tokenizes:
 - **Tool schemas** — the JSON-schema body of every entry in the
   request's `tools` array. The provider has to send these into the
   model so it knows what tools are callable, so they consume budget
-  too. Each non-trivial schema (`read_file`, `grep_search`,
-  `pdf_query`) lands at a few hundred tokens.
+  too. Each non-trivial schema (`read_file`, `grep_search`) lands at
+  a few hundred tokens.
 - **Output budget** — `max_tokens` reserves space for the model's
   reply. The provider rejects with HTTP 400 when
   `input_tokens + tool_tokens + max_tokens > context_window`.

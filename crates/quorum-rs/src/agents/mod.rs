@@ -60,7 +60,8 @@ pub struct AgentContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_feedback: Option<StructuredFeedback>,
     /// Runtime-only: handler for user tool calls (injected by agent worker, not serialized).
-    /// The concrete type is in the `nsed-agent` crate; this field holds an opaque Arc wrapper.
+    /// The concrete type is supplied via [`UserToolHandlerFactory`](crate::workers::UserToolHandlerFactory);
+    /// this field holds an opaque Arc wrapper.
     #[serde(skip)]
     #[schema(ignore)]
     #[schemars(skip)]
@@ -786,8 +787,8 @@ dyn_clone::clone_trait_object!(NsedAgent);
 
 /// Optional trait for agents that support direct chat (bypassing NSED deliberation).
 ///
-/// Implemented by `ProposerEvaluatorAgent` in `nsed-agent`. Third-party agents can
-/// also implement this to enable the dashboard chat feature.
+/// Implemented by [`ProposerEvaluatorAgent`](crate::agents::ProposerEvaluatorAgent).
+/// Third-party agents can also implement this to enable the dashboard chat feature.
 #[async_trait]
 pub trait ChatCapable: Send + Sync {
     /// Send a direct conversation to the agent's underlying LLM.
@@ -798,8 +799,9 @@ pub trait ChatCapable: Send + Sync {
     ) -> Result<String>;
 }
 
-/// Trait for user tool call handling — the concrete implementation lives in `nsed-agent`.
-/// This trait allows `AgentContext` to hold a handler without depending on NATS internals.
+/// Trait for user tool call handling. The reference implementation is
+/// [`UserToolHandler`](crate::agents::UserToolHandler); this trait lets `AgentContext`
+/// hold a handler without leaking NATS internals into the public type.
 #[async_trait]
 pub trait UserToolHandlerTrait: Send + Sync + Debug {
     /// Handle a user tool call: publish to KV, wait for response, return result string.

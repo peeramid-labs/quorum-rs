@@ -1,9 +1,10 @@
-//! # NSED Agent SDK
+//! # quorum-rs
 //!
-//! Trait definitions, data types, and utilities for building custom NSED agents.
+//! Trait definitions, data types, and runtime for building deliberation agents.
 //!
-//! This crate provides the **interface layer** that third-party developers code against
-//! to build custom agents for the NSED deliberation protocol. It contains:
+//! This crate provides the agent SDK plus a reference runtime: traits to code
+//! against, batteries-included implementations to compose with, and the NATS
+//! JetStream worker that ties them together.
 //!
 //! - **Agent traits**: [`NsedAgent`], [`PersistenceStore`], [`TokenEstimator`]
 //! - **LLM traits**: [`AiModel`], [`ChatStrategy`]
@@ -11,11 +12,10 @@
 //! - **Prompt trait**: [`PromptSet`]
 //! - **Data types**: [`AgentContext`], [`Proposal`], [`Evaluation`], [`AgentConfig`], etc.
 //! - **NATS utilities**: [`nats_utils::sanitize_subject_component`], [`nats_utils::ensure_kv_bucket`]
+//! - **Agent implementations**: [`ExecAgent`], [`McpAgent`], [`ClaudeAgent`], and the
+//!   reference `ProposerEvaluatorAgent` (native LLM via `OpenAICompatibleModel`).
 //!
-//! - **Agent implementations**: [`ExecAgent`], [`McpAgent`], [`ClaudeAgent`]
-//!
-//! The reference `ProposerEvaluatorAgent` (native LLM) lives in the `nsed-agent` crate (BSL 1.1).
-//! This SDK is MIT-licensed — you can implement these traits without any licensing obligation.
+//! Dual-licensed Apache-2.0 OR MIT.
 
 pub mod agent_manager;
 pub mod agents;
@@ -76,4 +76,4 @@ pub use workers::{
 };
 // Re-export crypto-core for downstream consumers
 #[cfg(feature = "audit")]
-pub use nsed_crypto_core;
+pub use quorum_crypto_core;

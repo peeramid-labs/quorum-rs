@@ -6,7 +6,7 @@
 //! **Costs real API tokens.** Only runs when `NSED_CLAUDE_E2E=1` is set.
 //! Uses haiku model + $0.15 budget cap per test.
 //!
-//! Run: `NSED_CLAUDE_E2E=1 cargo test -p nsed-agent-sdk --test claude_access_e2e -- --test-threads=1`
+//! Run: `NSED_CLAUDE_E2E=1 cargo test -p quorum-rs --test claude_access_e2e -- --test-threads=1`
 //!
 //! ## Verified behavior (from real runs):
 //!

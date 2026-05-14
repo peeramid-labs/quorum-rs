@@ -1,5 +1,16 @@
 # Explanation
 
-Discussion-mode material — why, design rationale, tradeoffs, history.
+Discussion-mode material — why, design rationale, tradeoffs.
 
-Read these when you want to understand a design decision rather than just use the resulting code. Lands as the SDK grows.
+Read these away from the keyboard when you want to understand a design decision rather than just use the resulting code.
+
+| Article | Topic |
+|---|---|
+| [Agent internals](agent-internals.md) | Library API surface + ReAct loop architecture inside `quorum-rs`. |
+| [Agent ranking](agent-ranking.md) | Capability declaration + how agents earn rank through deliberation outcomes. |
+| [NATS topology](nats-topology.md) | Subjects, JetStream streams, JWT scopes, dispatch model. |
+| [Middleware system](middleware.md) | Pluggable validation/moderation pipeline and the design rationale behind it. |
+| [About telemetry design](telemetry-design.md) | Principles, trace correlation, retention, and what is intentionally *not* emitted. |
+| [About scoped `read_file`](scoped-read-file.md) | Sandbox semantics for non-Claude agents reading from configured roots. |
+| [About LLM context-window guards](llm-context-window-guards.md) | Why the shrink-guard counts tool schemas and why `max_tokens` isn't capped defensively. |
+| [About `compact_history` & scratchpad squeeze](compact-history-and-scratchpad-squeeze.md) | Why agents self-fold older tool results, and the shape of the structured summarisation prompt. |

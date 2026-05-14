@@ -217,11 +217,10 @@ Default stage: `provider_response` (after the LLM returns, before buffer entry c
     # instruction_phrases: ["Proposing Phase", ...]
     extra_instruction_phrases: ["vector alignment protocol"]
 
-    # Override or extend the list of hallucinated NSED acronym expansions.
-    # Matched case-insensitively. See DEFAULT_KNOWN_WRONG_ACRONYMS in
-    # crates/nsed-agent/src/middleware/builtin/prompt_exposure.rs for the
-    # current curated defaults (Neural Swarm, Natural Semantic, etc.).
-    # known_wrong_acronyms: ["Neural Swarm", ...]
+    # Override or extend the list of hallucinated acronym expansions.
+    # Matched case-insensitively. Defaults are detector-specific —
+    # consult your `OutputLeakDetector` implementation.
+    # known_wrong_acronyms: ["Foo Bar", ...]
     extra_known_wrong_acronyms: ["Some Other Hallucinated Expansion"]
 
     # --- Trigger gates ---
@@ -269,7 +268,7 @@ Default stage: `provider_response` (after the LLM returns, before buffer entry c
 
 **False-positive design**: the XML matcher requires `<tag>` angle-bracket form, so prose like "our strategy" does not hit; the tool-name matcher uses a snake_case-aware delimiter class, so user phrases like "read proposal" (space) or embedded identifiers like `my_submit_proposal_runner` do not hit.
 
-**Keeping defaults in sync**: the default tag and tool-name lists live in `crates/nsed-agent/src/middleware/builtin/prompt_exposure.rs`. If you add a new prompt-internal XML section or a new orchestrator tool, add it to the defaults there or this guardrail will silently let the new leak through.
+**Keeping defaults in sync**: detectors that ship with default tag/tool-name lists need updating when you add a new prompt-internal XML section or a new orchestrator tool — otherwise the guardrail silently lets the new leak through.
 
 #### Per-agent `prompt_exposure_guard` (wired into the agent loop)
 
@@ -302,7 +301,6 @@ Do not return raw text. Please try again.
 
 where `{reason}` carries the detected indicators, the length-aware suspicion score, and the approved nsed explainer (paper URL + whitepaper abstract). The model therefore has (a) the specific terminal tool it must call, (b) a schema-shaped example it can fill in, and (c) the sanctioned description to paraphrase if the original question was "what is nsed?" — all in a single retry turn, so it regenerates without the leak before the retry budget is exhausted.
 
-The live prod `nsed:mid:0v1` deployment (`crates/nsed-agent/config/mid_0v1.yml`) turns this on for all three Cortex agents.
 
 ### Recommended Pipeline Order
 

@@ -2396,9 +2396,8 @@
                     '<div style="font-size:16px;font-weight:600;color:' + color + ';margin-top:4px;">' + value + '</div></div>';
             }
 
-            // Mirrors `Scope::timeout_seconds()` in nsed-orchestrator/src/sla.rs.
-            // Keep in sync with the Rust source of truth and with the matching
-            // copy in nsed-orchestrator/src/handlers/{dashboard.html,budget_utils.js}.
+            // Mirrors `Scope::timeout_seconds()` in `quorum-rs` (`scheduling.rs`).
+            // Keep in sync with the Rust source of truth.
             var SCOPE_TIMEOUTS = { quick: 300, standard: 1800, thorough: 3600, unlimited: 86400 };
 
             function toggleAllOrchAgents(checked) {

@@ -1,9 +1,7 @@
 //! Agent fleet configuration loading and resolution.
 //!
-//! Types and helpers for loading agent configuration from YAML files.
-//! These were extracted from `nsed-agent`'s standalone agent example to the
-//! MIT-licensed SDK so that third-party tooling (e.g. `nsed serve`) can parse
-//! and use agent config without depending on BSL-licensed code.
+//! Types and helpers for loading agent configuration from YAML files,
+//! so any tooling can parse and use the same agent configuration shape.
 
 use std::collections::HashMap;
 use std::path::Path;

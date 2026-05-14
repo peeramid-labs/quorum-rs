@@ -199,20 +199,19 @@ pub struct AgentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openrouter: Option<OpenRouterConfig>,
 
-    /// Per-agent grants for SDK-builtin sandboxed tools. Attached to an
-    /// agent's tool list **only** in the LLM-based provider branch of
-    /// `crates/nsed-cli/src/commands/serve.rs`; `provider_type: claude` /
-    /// `exec` / `mcp` route their tools through provider-native channels
-    /// (claude sub-agents, the exec subprocess's own tool surface, MCP
-    /// server) and serve.rs emits a warning if grants are configured on
-    /// those agents — they are otherwise silently ignored at runtime.
+    /// Per-agent grants for built-in sandboxed tools. Attached to an
+    /// agent's tool list **only** for the native-LLM provider branch;
+    /// `provider_type: claude` / `exec` / `mcp` route their tools through
+    /// provider-native channels (claude sub-agents, the exec subprocess's
+    /// own tool surface, MCP server) so grants configured on those agents
+    /// are silently ignored at runtime (loaders are expected to warn).
     /// Use this to give native-LLM agents scoped runtime capabilities
     /// (e.g. read files confined to a specific filesystem root) without
     /// going through the user_tools NATS dispatcher pipeline.
     ///
     /// Each grant becomes a tool in the agent's tool list at startup.
-    /// See `crates/nsed-agent/src/tools/scoped_read.rs` for the
-    /// `read_file` implementation and its security model.
+    /// See `crate::tools::scoped_read` for the `read_file`
+    /// implementation and its security model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub builtin_tools: Vec<BuiltinToolGrant>,
 

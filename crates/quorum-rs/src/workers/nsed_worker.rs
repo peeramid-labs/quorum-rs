@@ -1,11 +1,9 @@
 //! NATS JetStream worker that bridges the orchestrator's task subjects to the
 //! agent's propose/evaluate methods.
 //!
-//! This module re-exports the core worker types from `nsed-agent-sdk` and
-//! provides convenience constructors that wire up BSL extensions (user tool
-//! handler factory, chat capability, status server).
+//! Re-exports the core worker types plus convenience constructors that wire up
+//! the user tool handler factory, chat capability, and embedded status server.
 
-// Re-export all SDK worker types for backward compatibility
 pub use crate::workers::{
     JobManifest, NatsNsedWorker, NatsScratchpadStore, UserToolHandlerFactory, WorkerConfig,
     WorkerHook,
@@ -19,14 +17,14 @@ use anyhow::Result;
 use std::sync::Arc;
 
 /// Extension trait that provides a convenience constructor for
-/// [`NatsNsedWorker`] pre-configured with BSL extensions.
+/// [`NatsNsedWorker`] pre-configured with the reference agent extensions.
 ///
 /// This wires up:
 /// - `ProposerEvaluatorAgent` as both the agent and the `ChatCapable` implementation
 /// - `NatsUserToolHandlerFactory` for user tool support
 pub trait NatsNsedWorkerExt {
     /// Creates a new worker from a `ProposerEvaluatorAgent`, automatically
-    /// configuring BSL extensions (user tool handler factory + chat).
+    /// configuring the user tool handler factory + chat capability.
     /// `telemetry` is the per-agent multi-endpoint mux built by
     /// `connect_endpoints` at the loader; pass `None` to disable
     /// telemetry emission for this worker.
@@ -55,7 +53,7 @@ impl NatsNsedWorkerExt for NatsNsedWorker {
     }
 }
 
-/// Extension trait for enabling the status server with BSL chat support.
+/// Extension trait for enabling the status server with chat support.
 pub trait NatsNsedWorkerStatusExt {
     /// Enables the embedded status dashboard on the given port.
     ///
