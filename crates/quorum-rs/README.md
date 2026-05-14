@@ -1,23 +1,36 @@
-# nsed-agent-sdk
+# quorum-rs
 
-![Coverage](https://img.shields.io/badge/coverage-89.3%25-brightgreen?logo=rust)
+[![Crates.io](https://img.shields.io/crates/v/quorum-rs.svg)](https://crates.io/crates/quorum-rs)
+[![Docs.rs](https://docs.rs/quorum-rs/badge.svg)](https://docs.rs/quorum-rs)
+[![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
 
-Trait definitions, data types, and runtime for building NSED-compatible deliberation agents. Implement the traits, connect to an orchestrator, and your agent participates in multi-agent deliberation sessions.
+Rust SDK for building multi-agent deliberation systems — agents that propose, evaluate, and reach quorum on outcomes over a NATS-based orchestration protocol.
 
-## What's Inside
+## Install
 
-| Module | Key Types | Purpose |
+```toml
+[dependencies]
+quorum-rs = "0.6"
+```
+
+MSRV: Rust 1.85 (uses Edition 2024).
+
+## What's inside
+
+| Module | Key types | Purpose |
 |---|---|---|
-| `agents` | `NsedAgent`, `AgentContext`, `Proposal`, `Evaluation`, `ChatCapable`, `ClaimAssessment`, `DisagreementPoint`, `CategoryScores`, `Stance`, `ClaimVerdict` | Agent trait + deliberation data structures (including structured evaluation types) |
+| `agents` | `NsedAgent`, `AgentContext`, `Proposal`, `Evaluation`, `ChatCapable`, `OutputLeakDetector` | Agent trait + deliberation data structures + pluggable output guard |
 | `agents::config` | `AgentConfig`, `TaskPrecision` | Agent configuration (model, provider, limits) |
-| `llms` | `AiModel`, `RequestConfig`, `SimpleOpenAIModel` | Language model abstraction + minimal client |
-| `prompts` | `PromptSet` | Prompt template interface |
-| `tools` | `Tool`, `ToolDefinition` | Tool-use interface (OpenAI function calling format) |
-| `workers` | `NatsNsedWorker`, `WorkerConfig`, `NatsScratchpadStore`, `WorkerHook` | NATS JetStream worker runtime |
-| `status` | `AgentStatusSnapshot`, `EventLogEntry`, `SharedAgentStatus` | Real-time status monitoring types |
-| `nats_utils` | `validate_nats_name`, `sanitize_subject_component`, `connect_nats` | NATS helpers + authentication |
+| `llms` | `AiModel`, `RequestConfig`, `SimpleOpenAIModel`, `OpenAICompatibleModel`, `RateLimiter` | LLM abstraction + production streaming client + simulator / stub for tests |
+| `prompts` | `PromptSet`, `DefaultPromptSet` | Prompt template interface + benchmark-validated default proposer/evaluator templates |
+| `tools` | `Tool`, `ToolDefinition`, `ScopedGrepTool`, `ScopedReadFileTool` | Tool-use interface (OpenAI function calling) + sandboxed filesystem tools |
+| `workers` | `NatsNsedWorker`, `WorkerConfig`, `NatsScratchpadStore`, `WorkerHook`, `UserToolHandlerFactory` | NATS JetStream worker runtime |
+| `middleware` | `AgentMiddleware`, `MiddlewarePipeline`, `MiddlewareConfig`, `RuleBasedMiddleware`, `LlmModerationMiddleware`, `BinaryMiddleware`, `DylibMiddleware` | Pluggable validation/moderation + YAML config + external-process dispatch |
+| `status` | `AgentStatusSnapshot`, `SharedAgentStatus`, `server`, `multi_server` | Real-time status types + optional HTTP dashboard (feature `status-server`) |
+| `nats_utils` | `connect_nats`, `sanitize_subject_component`, `NatsAuth` | NATS helpers + authentication |
+| `telemetry` | `TelemetryEvent`, `TelemetryConfig`, `TelemetryEmitter` | Per-agent telemetry event catalog |
 
-## Quick Start — Build a Custom Agent
+## Quick start — build a custom agent
 
 ```rust
 use quorum_rs::agents::{NsedAgent, AgentContext, AgentConfig, Proposal, Evaluation, Stance};
@@ -28,30 +41,27 @@ use anyhow::Result;
 
 struct MyAgent {
     name: String,
-    model: SimpleOpenAIModel,
+    llm: SimpleOpenAIModel,
 }
 
 #[async_trait]
 impl NsedAgent for MyAgent {
-    fn name(&self) -> String { self.name.clone() }
-
-    async fn propose(&self, ctx: &AgentContext) -> Result<Proposal> {
-        // Your proposal logic — call self.model, use ctx.task_description, etc.
-        Ok(Proposal {
-            content: format!("My solution to: {}", ctx.task_description),
-            thought_process: "Reasoning...".into(),
-            token_usage: None,
-        })
+    fn name(&self) -> &str {
+        &self.name
     }
 
-    async fn evaluate(&self, ctx: &AgentContext) -> Result<Vec<Evaluation>> {
-        // Score each candidate proposal
-        Ok(ctx.candidate_proposals.iter().map(|_p| Evaluation {
-            score: 0.8,
-            justification: "Solid approach.".into(),
-            stance: Some(Stance::Agree),
-            ..Default::default()
-        }).collect())
+    async fn propose(&self, context: &AgentContext) -> Result<Proposal> {
+        // your proposal logic — call self.llm, return a Proposal
+        unimplemented!()
+    }
+
+    async fn evaluate(
+        &self,
+        context: &AgentContext,
+        proposals: &[Proposal],
+    ) -> Result<Vec<Evaluation>> {
+        // your evaluation logic — return Vec<Evaluation> with stance + scores
+        unimplemented!()
     }
 }
 
@@ -59,17 +69,11 @@ impl NsedAgent for MyAgent {
 async fn main() -> Result<()> {
     let agent = MyAgent {
         name: "my-agent".into(),
-        model: SimpleOpenAIModel::new(
+        llm: SimpleOpenAIModel::new(
             "https://api.openai.com/v1".into(),
             std::env::var("OPENAI_API_KEY")?,
+            "gpt-4o-mini".into(),
         ),
-    };
-
-    let agent_config = AgentConfig {
-        name: "my-agent".into(),
-        provider_id: "openai".into(),
-        model_name: "gpt-4o-mini".into(),
-        ..Default::default()
     };
 
     let config = WorkerConfig::new(
@@ -78,91 +82,83 @@ async fn main() -> Result<()> {
         "my_agent_consumer".into(),
     );
 
-    let worker = NatsNsedWorker::new(agent, agent_config, config).await?;
+    let worker = NatsNsedWorker::new(agent, AgentConfig::default(), config, None).await?;
     worker.run().await
 }
 ```
 
-## Implement a Custom LLM
+## Use the reference agent
+
+If you want the full ReAct loop, structured proposer/evaluator outputs, retry + repair, tool injection, and benchmark-validated prompts, use `ProposerEvaluatorAgent` instead of implementing `NsedAgent` from scratch:
 
 ```rust
-use quorum_rs::llms::{AiModel, RequestConfig};
-use quorum_rs::agents::AgentConfig;
-use async_trait::async_trait;
-use async_openai::types::CreateChatCompletionResponse;
+use quorum_rs::agents::{AgentConfig, ProposerEvaluatorAgent};
+use quorum_rs::llms::OpenAICompatibleModel;
+use quorum_rs::prompts::defaults::DefaultPromptSet;
+use quorum_rs::workers::{NatsNsedWorker, NatsNsedWorkerExt, WorkerConfig};
 
-struct MyModel { /* ... */ }
+# async fn run() -> anyhow::Result<()> {
+let agent_config = AgentConfig {
+    name: "cortex-a".into(),
+    provider_id: "openai".into(),
+    model_name: "gpt-4o".into(),
+    ..Default::default()
+};
 
-#[async_trait]
-impl AiModel for MyModel {
-    async fn chat_completion(
-        &self,
-        config: &AgentConfig,
-        request: RequestConfig,
-    ) -> Result<(CreateChatCompletionResponse, String), Box<dyn std::error::Error + Send + Sync>> {
-        // Your LLM call here
-        todo!()
-    }
-}
+let agent = ProposerEvaluatorAgent::new(
+    agent_config,
+    Box::new(OpenAICompatibleModel::new(
+        "https://api.openai.com/v1".into(),
+        std::env::var("OPENAI_API_KEY")?,
+        None,
+    )),
+    Box::new(DefaultPromptSet::new()),
+    vec![],
+    vec![],
+);
+
+let worker_config = WorkerConfig::new(
+    "nats://localhost:4222".into(),
+    "sphera_jobs".into(),
+    "cortex_a_consumer".into(),
+);
+let worker = NatsNsedWorker::from_agent(agent, worker_config).await?;
+worker.run().await
+# }
 ```
 
-## Traits Overview
+## Pre-built agent shells
 
-| Trait | Required Methods | Purpose |
-|---|---|---|
-| `NsedAgent` | `propose()`, `evaluate()`, `name()` | Core agent logic — your main implementation target |
-| `AiModel` | `chat_completion()` | LLM provider abstraction |
-| `PromptSet` | `get_system_message()`, `get_proposer_prompt()`, `get_batch_evaluator_prompt()`, `get_summarizer_prompt()` | Prompt template collection |
-| `Tool` | `name()`, `schema()`, `call()` | Tool-use in OpenAI function calling format |
-| `PersistenceStore` | `get()`, `set()`, `append()`, `get_round_history()` | Durable key-value storage for agent memory |
-| `ChatStrategy` | `prepare_request()`, `parse_response()` | Provider-specific request/response adaptation |
-| `TokenEstimator` | `estimate_tokens()` | Token counting for budget management |
-| `WorkerHook` | `before_publish()` | Intercept NATS publishes (default: passthrough) |
-| `ChatCapable` | `chat()` | Direct LLM conversation (bypasses deliberation) |
-| `UserToolHandlerFactory` | `create()` | Factory for per-task user tool handlers |
+For agents you don't write in Rust:
 
-All DynClone-enabled traits (`NsedAgent`, `AiModel`, `PromptSet`, `Tool`) can be used as `Box<dyn Trait>` and cloned.
-
-## Runtime Types
-
-| Type | Purpose |
+| Type | Use when |
 |---|---|
-| `NatsNsedWorker` | NATS JetStream worker — connects agent to orchestrator, handles task dispatch, idempotency, scratchpad, heartbeats |
-| `WorkerConfig` | Connection config: NATS URL, stream name, consumer name, subject prefix, auth |
-| `NatsScratchpadStore` | `PersistenceStore` backed by NATS KV — durable agent memory across rounds |
-| `JobManifest` | Job manifest broadcast by orchestrator — lists selected agents and task |
-| `SimpleOpenAIModel` | Minimal `AiModel` — direct POST to `/chat/completions`, no streaming/rate limiting |
-| `AgentStatusSnapshot` | Real-time agent state: identity, counters, current job, event log |
+| `ExecAgent` | The agent is a process you exec (any language); deliberation I/O via stdin/stdout JSON |
+| `McpAgent` / `ClaudeAgent` | The agent is an MCP server (Claude Code, generic MCP) wrapped via the SDK runtime |
 
-## Crate Relationships
+## Features
 
-```text
-nsed-agent-sdk  <--  nsed-agent  <--  nsed-orchestrator
-   traits             impls              server
-   + runtime          + extensions
-```
+- `default = ["audit"]`
+- `audit` — enables cryptographic signing of agent outputs via `quorum-crypto-core`
+- `status-server` — embedded axum dashboard for live agent + fleet status (HTTP)
 
-- **This crate** (`nsed-agent-sdk`): Trait definitions, data types, worker runtime, and minimal LLM client. **MIT licensed** — safe to depend on without any commercial restrictions.
-- **`nsed-agent`**: Reference implementations (OpenAI-compatible model with rate limiting + strategies, default prompts, LLM repair, tool implementations, user tool handler). Re-exports SDK types and adds extension traits.
-- **`nsed-orchestrator`**: The NATS-based orchestrator server.
+## Sister crates
 
-### What You Need
+Part of the [`quorum-rs` workspace](https://github.com/peeramid-labs/quorum-rs):
 
-| Goal | Depend On |
-|---|---|
-| Build a fully custom agent from scratch | `nsed-agent-sdk` only |
-| Use the reference agent + LLM client | `nsed-agent` |
-| Run the orchestrator | `nsed-orchestrator` |
+- [`llm-repair`](https://crates.io/crates/llm-repair) — JSON-repair / markdown-extraction / tool-call recovery for malformed LLM output
+- [`quorum-crypto-core`](https://crates.io/crates/quorum-crypto-core) — ed25519 / secp256k1 / SHA3 + audit envelope (used by the `audit` feature)
+- [`quorum-cli`](https://crates.io/crates/quorum-cli) — `quorum` binary for running deliberation jobs from the command line
 
-### Extension Points
+## License
 
-The worker runtime provides trait-based hooks so `nsed-agent` can inject additional functionality without modifying SDK code:
+Dual-licensed under either:
 
-| Trait | Purpose | Implementation in `nsed-agent` |
-|---|---|---|
-| `WorkerHook` | Intercept NATS publishes before send | Crypto wrapping for commit-reveal |
-| `UserToolHandlerFactory` | Create per-task user tool handlers | `NatsUserToolHandlerFactory` |
-| `ChatCapable` | Direct LLM chat for status dashboard | `ProposerEvaluatorAgent::chat()` |
+- Apache License, Version 2.0 ([LICENSE-APACHE](../../LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](../../LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
 
-See the [Agent Development Guide](../../docs/agent-development.md) for complete examples of both approaches.
+at your option.
 
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

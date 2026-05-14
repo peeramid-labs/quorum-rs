@@ -113,12 +113,12 @@ async fn main() {
 }
 ```
 
-This is how the BSL `nsed-cli` (which adds operator subcommands like `serve` and `validate`) embeds the agent-side functionality.
+Operator-style CLIs that add their own subcommands (workspace deploy, ledger ops, etc.) can depend on `quorum-cli` as a library and wire the agent-side commands through `quorum_cli::commands::*`.
 
 ## Non-goals
 
 - Not a deliberation engine. The orchestrator implements the deliberation protocol; this CLI just talks to it.
-- Not bundled with an orchestrator. To run agents + orchestrator in one process, see `nsed serve` (BSL).
+- Not bundled with an orchestrator. Point the CLI at any reachable `quorum-rs` orchestrator endpoint via `nsed.yaml`.
 
 ## License
 

@@ -65,7 +65,7 @@ Per-crate rustdoc: <https://docs.rs/quorum-rs>, <https://docs.rs/llm-repair>, <h
 
 ## Status
 
-`quorum-rs` is a fresh extraction from a proprietary monorepo. The published `0.6` series mirrors the parent project's release line at the time of extraction. Breaking changes are expected as the public API surface is polished — semver-respecting versions begin at `1.0` once the API stabilises.
+The published `0.6` series is the initial public release. Breaking changes are expected as the public API surface is polished — semver-respecting versions begin at `1.0` once the API stabilises.
 
 ## Contributing
 
