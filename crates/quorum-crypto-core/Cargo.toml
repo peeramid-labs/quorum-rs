@@ -6,6 +6,8 @@ rust-version = "1.88"
 license = "Apache-2.0 OR MIT"
 description = "Cryptographic primitives and traits for agent signing and verification (ed25519, secp256k1, SHA3)"
 repository = "https://github.com/peeramid-labs/quorum-rs"
+readme = "README.md"
+keywords = ["cryptography", "signing", "ed25519", "secp256k1", "audit"]
 categories = ["cryptography", "authentication"]
 
 [dependencies]

@@ -8,8 +8,9 @@
 //! - [`AuditEnvelope`] — multi-signature chained envelope for any serializable payload
 //! - [`ChainHasher`] — pluggable hash function for commitment chains
 //!
-//! `nsed-crypto` extends this crate with post-quantum signing (ML-DSA-65),
-//! Poseidon hashing, commitment chains, and settlement provers.
+//! Downstream crates can extend this surface with post-quantum signing
+//! (e.g. ML-DSA-65), Poseidon-style hashing, commitment chains, and
+//! settlement provers without changing the core trait shapes here.
 
 pub mod canonical;
 pub mod chain;
