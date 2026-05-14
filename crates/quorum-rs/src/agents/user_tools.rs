@@ -476,9 +476,9 @@ impl UserToolHandlerTrait for UserToolHandler {
 
 /// Factory that creates [`UserToolHandler`] instances for each task execution.
 ///
-/// Reference implementation of the [`UserToolHandlerFactory`] trait — the
-/// worker uses this to materialise a handler per task without depending on
-/// NATS internals at the trait level.
+/// Reference implementation of the [`UserToolHandlerFactory`](crate::workers::UserToolHandlerFactory)
+/// trait — the worker uses this to materialise a handler per task without
+/// depending on NATS internals at the trait level.
 #[derive(Debug)]
 pub struct NatsUserToolHandlerFactory;
 

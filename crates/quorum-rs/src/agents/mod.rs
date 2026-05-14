@@ -787,8 +787,8 @@ dyn_clone::clone_trait_object!(NsedAgent);
 
 /// Optional trait for agents that support direct chat (bypassing NSED deliberation).
 ///
-/// Implemented by [`ProposerEvaluatorAgent`](crate::agents::ProposerEvaluatorAgent).
-/// Third-party agents can also implement this to enable the dashboard chat feature.
+/// Implemented by [`ProposerEvaluatorAgent`]. Third-party agents can also
+/// implement this to enable the dashboard chat feature.
 #[async_trait]
 pub trait ChatCapable: Send + Sync {
     /// Send a direct conversation to the agent's underlying LLM.
@@ -800,7 +800,7 @@ pub trait ChatCapable: Send + Sync {
 }
 
 /// Trait for user tool call handling. The reference implementation is
-/// [`UserToolHandler`](crate::agents::UserToolHandler); this trait lets `AgentContext`
+/// [`UserToolHandler`]; this trait lets `AgentContext`
 /// hold a handler without leaking NATS internals into the public type.
 #[async_trait]
 pub trait UserToolHandlerTrait: Send + Sync + Debug {
