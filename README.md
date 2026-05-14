@@ -6,11 +6,14 @@ A Rust workspace for building **multi-agent deliberation systems** — cohorts o
 
 | Crate | Version | Description |
 |---|---|---|
-| [`quorum-rs`](crates/quorum-rs) | `0.6.0` | The SDK: agent traits (`NsedAgent`, `Tool`, `AiModel`, `PromptSet`), data types (`AgentContext`, `Proposal`, `Evaluation`), reference agent implementations (`ExecAgent`, `McpAgent`, `ClaudeAgent`), NATS-based worker runtime, telemetry catalog, middleware framework. |
+| [`quorum-rs`](crates/quorum-rs) | `0.6.0` | The SDK + reference runtime: agent traits (`NsedAgent`, `Tool`, `AiModel`, `PromptSet`), data types (`AgentContext`, `Proposal`, `Evaluation`), the reference `ProposerEvaluatorAgent` (ReAct loop over any OpenAI-compatible LLM), additional `ExecAgent` / `McpAgent` / `ClaudeAgent` integrations, NATS-based worker runtime, telemetry catalog, and middleware framework. |
+| [`quorum-cli`](crates/quorum-cli) | `0.6.0` | User-facing CLI that loads an `agent.yml`, spawns workers, and exposes a local status dashboard. Distribution surface for the reference agent runtime. |
 | [`llm-repair`](crates/llm-repair) | `0.6.0` | JSON-repair, markdown-extraction, and tool-call recovery for malformed LLM output. Useful for any Rust project that calls real-world LLMs and has to handle whatever they actually return. |
 | [`quorum-crypto-core`](crates/quorum-crypto-core) | `0.6.0` | Ed25519 / secp256k1 / SHA3 cryptographic primitives + audit envelope. Optional dep of `quorum-rs` (gated behind the `audit` feature). |
 
 ## Install
+
+As a library:
 
 ```toml
 [dependencies]
@@ -22,6 +25,12 @@ For the JSON-repair helpers in isolation:
 ```toml
 [dependencies]
 llm-repair = "0.6"
+```
+
+As a CLI binary:
+
+```bash
+cargo install quorum-cli
 ```
 
 ## What's "deliberation"?
@@ -56,12 +65,15 @@ See [`crates/llm-repair/README.md`](crates/llm-repair/README.md) for the full AP
 
 See [`docs/`](docs/) — organized by the [Diátaxis](https://diataxis.fr) framework:
 
-- [Tutorials](docs/tutorials/) — learning-by-doing lessons
-- [How-to guides](docs/how-to/) — task-oriented recipes
-- [Reference](docs/reference/) — API surface, types, schemas
+- [Tutorials](docs/tutorials/) — learning-by-doing lessons _(coming as the SDK content stabilises)_
+- [How-to guides](docs/how-to/) — task-oriented recipes (agent development, telemetry inspection, opt-out)
+- [Reference](docs/reference/) — API surface, types, schemas, wire protocols
 - [Explanation](docs/explanation/) — design rationale, tradeoffs
 
-Per-crate rustdoc: <https://docs.rs/quorum-rs>, <https://docs.rs/llm-repair>, <https://docs.rs/quorum-crypto-core>.
+Runnable examples in [`examples/`](examples/) (Python exec + MCP agents) and
+[`crates/quorum-rs/examples/`](crates/quorum-rs/examples/) (`cargo run --example` programs).
+
+Per-crate rustdoc: <https://docs.rs/quorum-rs>, <https://docs.rs/quorum-cli>, <https://docs.rs/llm-repair>, <https://docs.rs/quorum-crypto-core>.
 
 ## Status
 
