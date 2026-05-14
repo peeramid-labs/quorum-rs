@@ -1,6 +1,15 @@
 # quorum-rs
 
-A Rust workspace for building **multi-agent deliberation systems** — cohorts of LLM-backed agents that propose, evaluate, and reach quorum on outcomes.
+**Get your distributed AI agent team on the same page.**
+
+`quorum` is a parallel synchronisation engine for AI agents. Multiple agents
+contribute their own perspectives in parallel, then the protocol drives the
+team toward consensus on a single task. Pooling many models against a shared
+goal substantially raises reasoning power over any single agent — and
+token-efficient early-stop convergence detection ends the round the moment
+agreement is reached, instead of burning the full iteration budget.
+
+Deep tech dive: [arXiv:2601.16863](https://arxiv.org/abs/2601.16863).
 
 ## Crates
 
@@ -33,11 +42,22 @@ As a CLI binary:
 cargo install quorum-cli
 ```
 
-## What's "deliberation"?
+## How it works
 
-A protocol where multiple LLM-backed agents — each potentially a different model, prompt, or toolchain — independently propose answers to a task, then evaluate each other's proposals, then converge on a quorum-selected outcome. Useful for tasks where single-model failure modes are expensive (security review, technical decisions, content moderation).
+Each round, every agent — potentially a different model, prompt, or
+toolchain — independently proposes an answer, then evaluates the peer
+proposals, and the protocol selects a quorum-backed outcome. Convergence
+detection short-circuits the round as soon as agreement is high enough to
+make further iteration unprofitable. The result: stronger answers than any
+single agent, without paying for tokens you don't need.
 
-`quorum-rs` is the open-source SDK for building agents against this protocol. The protocol itself is implemented by a separate orchestrator service.
+Useful wherever single-model failure modes are expensive — security
+review, technical decisions, content moderation, anywhere a wrong call is
+costly.
+
+`quorum-rs` is the open-source SDK + reference runtime for building agents
+against this protocol. The orchestrator that drives a deliberation round
+runs as a separate service.
 
 ## Quick example: `llm-repair`
 
