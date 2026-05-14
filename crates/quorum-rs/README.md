@@ -154,8 +154,8 @@ Part of the [`quorum-rs` workspace](https://github.com/peeramid-labs/quorum-rs):
 
 Dual-licensed under either:
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](../../LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](../../LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+- Apache License, Version 2.0 ([LICENSE-APACHE](https://github.com/peeramid-labs/quorum-rs/blob/HEAD/LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](https://github.com/peeramid-labs/quorum-rs/blob/HEAD/LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
 
 at your option.
 
