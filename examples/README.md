@@ -1,0 +1,60 @@
+# Examples
+
+Non-Rust reference agents that plug into an orchestrator over the
+language-agnostic agent protocols.
+
+| File | Protocol | What it demonstrates |
+|---|---|---|
+| [`exec_agent.py`](exec_agent.py) | exec (stdin/stdout + delimiter framing) | Minimal subprocess agent: read context JSON from stdin, write a result wrapped in `___NSED_START___` / `___NSED_END___` delimiters. |
+| [`mcp_agent.py`](mcp_agent.py) | MCP (hybrid stdin-push + JSON-RPC tool calling) | Subprocess agent that connects as an MCP client over its own stdin/stdout, optionally calls research tools, then submits a result via `nsed_propose` / `nsed_evaluate`. |
+
+Wire-format specs:
+
+- exec protocol → [`docs/reference/exec-agent-protocol.md`](../docs/reference/exec-agent-protocol.md)
+- MCP protocol → [`docs/reference/mcp-agent-protocol.md`](../docs/reference/mcp-agent-protocol.md)
+
+## Running
+
+Both examples are designed to be launched by the orchestrator via the
+agent config — they read context off stdin and exit after one task. To
+plug an example into a running fleet, add an entry to your `agent.yml`:
+
+```yaml
+providers:
+  exec_local:
+    type: exec
+  mcp_local:
+    type: mcp
+
+agents:
+  - name: PYTHON_EXEC_AGENT
+    provider_id: exec_local
+    model_name: custom
+    exec:
+      command: ["python3", "examples/exec_agent.py"]
+
+  - name: PYTHON_MCP_AGENT
+    provider_id: mcp_local
+    model_name: custom
+    mcp:
+      command: ["python3", "examples/mcp_agent.py"]
+```
+
+`mcp_agent.py` requires the [`mcp`](https://pypi.org/project/mcp/) Python
+package:
+
+```bash
+pip install mcp
+```
+
+`exec_agent.py` has no third-party dependencies — standard library only.
+
+## What these are not
+
+These are protocol reference implementations, not production agents. They
+echo / stub the deliberation result rather than calling an LLM. Use them
+as a template when porting your existing agent (any language) onto the
+exec or MCP wire protocol, then swap the stub for your real logic.
+
+For a fully-featured Rust agent, see
+[`how-to/agent-development.md`](../docs/how-to/agent-development.md).
