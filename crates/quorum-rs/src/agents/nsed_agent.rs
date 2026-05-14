@@ -4021,7 +4021,6 @@ mod tests {
     // (see crates/nsed-agent/tests/prompt_exposure_via_agent.rs) since they exercise
     // the concrete PromptExposureMiddleware impl which is no longer in this crate.
 
-
     // ─── empty_terminal_tool_content — max-iterations fallback ───────
     //
     // On exhaustion, `react_loop` emits a schema-valid but semantically
