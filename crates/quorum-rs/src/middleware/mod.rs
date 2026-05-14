@@ -299,3 +299,12 @@ mod tests {
         );
     }
 }
+
+pub mod binary;
+pub mod builtin;
+pub mod config;
+pub mod dylib;
+
+pub use binary::BinaryMiddleware;
+pub use config::{MiddlewareConfig, MiddlewareEntry};
+pub use dylib::DylibMiddleware;

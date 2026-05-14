@@ -33,6 +33,7 @@ llm-repair = { version = "0.6.0", path = "../llm-repair" }
 regex = "1.12.2"
 openai-harmony = "0.0.8"
 libc = "0.2"
+libloading = "0.8"
 futures-util = "0.3.31"
 open = { version = "5", optional = true }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"], optional = true }
