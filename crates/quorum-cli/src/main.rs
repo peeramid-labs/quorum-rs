@@ -107,6 +107,14 @@ enum Commands {
         #[arg(long, default_value = commands::init::DEFAULT_TOKEN_ENV)]
         token_env: String,
 
+        /// Agent names the default policy dispatches to. Repeat or
+        /// comma-separate (e.g. `--agents CortexA,CortexB,CortexC`).
+        /// When omitted, the generated file has `agents: []` and a
+        /// commented edit hint — `quorum run` will refuse cleanly
+        /// until the user populates this list.
+        #[arg(long, value_delimiter = ',', num_args = 0..)]
+        agents: Vec<String>,
+
         /// Overwrite an existing workspace file.
         #[arg(long)]
         force: bool,
@@ -188,7 +196,15 @@ async fn main() -> ExitCode {
             ref orchestrator_url,
             ref room,
             ref token_env,
+            ref agents,
             force,
-        } => commands::init::run(cli.config_path(), orchestrator_url, room, token_env, force),
+        } => commands::init::run(
+            cli.config_path(),
+            orchestrator_url,
+            room,
+            token_env,
+            agents,
+            force,
+        ),
     }
 }

@@ -33,16 +33,23 @@ All commands except `init` read `./nsed.yaml` by default (`--config <path>` to o
 # Defaults: api.peeramid.xyz orchestrator, room "demo", token-env QUORUM_DEMO_TOKEN
 quorum init
 
-# Custom orchestrator + room + token-env name
+# Bake the agent list into the default policy so the workspace is
+# usable end-to-end without editing
+quorum init --agents CortexA,CortexB,CortexC
+
+# Custom orchestrator + room + token-env name + agents
 quorum init --orchestrator-url https://api.my-orch.example \
             --room my-team \
-            --token-env MY_ORCH_TOKEN
+            --token-env MY_ORCH_TOKEN \
+            --agents Alice,Bob,Carol
 
 # Overwrite an existing nsed.yaml
 quorum init --force
 ```
 
 Writes a minimal `nsed.yaml` at the current `--config` path (default `./nsed.yaml`). Non-interactive — pass flags or take defaults; no prompts. The bearer token is referenced by env-var name (the value is only resolved at `quorum run` time), so the file is safe to commit if the URL + room are not sensitive.
+
+When `--agents` is omitted, the generated file has `agents: []` with an inline edit hint. `quorum run` will refuse cleanly with "policy 'default': must specify either agents or roles" until the list is populated — either by re-running `quorum init --agents ...` or by editing `nsed.yaml` directly.
 
 ### `run` — submit a task
 
