@@ -18,13 +18,31 @@ MSRV: Rust 1.85 (uses Edition 2024).
 ## Commands
 
 ```text
+quorum init                Bootstrap a workspace config (nsed.yaml) — non-interactive
 quorum run <task>          Submit a deliberation task to the orchestrator
 quorum status              Health check + agent status
 quorum trace <job_id>      Show a deliberation trace (verdict + evaluations)
 quorum tui                 Interactive terminal UI (live deliberation view)
 ```
 
-All commands read `./nsed.yaml` by default (`--config <path>` to override). The config declares which orchestrators to talk to, which room or policy to use, and any shared context.
+All commands except `init` read `./nsed.yaml` by default (`--config <path>` to override). The config declares which orchestrators to talk to, which room or policy to use, and any shared context.
+
+### `init` — bootstrap a workspace config
+
+```bash
+# Defaults: api.peeramid.xyz orchestrator, room "demo", token-env QUORUM_DEMO_TOKEN
+quorum init
+
+# Custom orchestrator + room + token-env name
+quorum init --orchestrator-url https://api.my-orch.example \
+            --room my-team \
+            --token-env MY_ORCH_TOKEN
+
+# Overwrite an existing nsed.yaml
+quorum init --force
+```
+
+Writes a minimal `nsed.yaml` at the current `--config` path (default `./nsed.yaml`). Non-interactive — pass flags or take defaults; no prompts. The bearer token is referenced by env-var name (the value is only resolved at `quorum run` time), so the file is safe to commit if the URL + room are not sensitive.
 
 ### `run` — submit a task
 
