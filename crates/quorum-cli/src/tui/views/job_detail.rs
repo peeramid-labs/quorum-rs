@@ -444,13 +444,17 @@ impl View for JobDetailView {
                 if event::is_escape(event) || event::is_key(event, 'q') {
                     return Some(ViewAction::Pop);
                 }
-                // Round history navigation. PgUp / `[` step back one
-                // round; PgDn / `]` step forward; `=` returns to live.
-                if event::is_page_up(event) || event::is_key(event, '[') {
+                // Round history navigation. ← (or `h`, or `[`, or
+                // PgUp) steps back one round; → (or `l`, or `]`, or
+                // PgDn) steps forward; `=` returns to live. Arrow keys
+                // are the booth-friendly default — works on Mac
+                // keyboards that have no PgUp/PgDn.
+                if event::is_left(event) || event::is_page_up(event) || event::is_key(event, '[') {
                     self.view_previous_round();
                     return None;
                 }
-                if event::is_page_down(event) || event::is_key(event, ']') {
+                if event::is_right(event) || event::is_page_down(event) || event::is_key(event, ']')
+                {
                     self.view_next_round();
                     return None;
                 }
@@ -923,8 +927,8 @@ impl JobDetailView {
                 .borders(Borders::ALL)
                 .border_style(border_style)
                 .title(format!(
-                    " Proposals R{} ({}) ",
-                    self.current_round,
+                    " Options R{} ({}) ",
+                    self.viewed_round_value(),
                     current.len()
                 )),
         );
@@ -976,7 +980,7 @@ impl JobDetailView {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(border_style)
-                    .title(" Evaluations "),
+                    .title(" Opinions "),
             );
         frame.render_widget(paragraph, area);
     }
@@ -1036,9 +1040,10 @@ impl JobDetailView {
             Some(e) => e,
             None => return,
         };
+        let target_round = self.viewed_round_value();
         let filtered_evals: Vec<_> = all_evals
             .iter()
-            .filter(|(round, _, _, _)| *round == self.current_round)
+            .filter(|(round, _, _, _)| *round == target_round)
             .collect();
 
         let mut lines: Vec<Line> = Vec::new();
@@ -1077,7 +1082,7 @@ impl JobDetailView {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan))
                     .title(format!(
-                        " Evaluations for {target_id} ({} evaluators) ",
+                        " Opinions on {target_id} ({} voices) ",
                         filtered_evals.len()
                     )),
             );
@@ -1137,9 +1142,9 @@ impl JobDetailView {
             lines.push(Line::from(""));
         }
 
-        // Proposal content section
+        // Option content section
         lines.push(Line::from(Span::styled(
-            "  Proposal",
+            "  Option",
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
@@ -1149,11 +1154,12 @@ impl JobDetailView {
             lines.push(Line::from(format!("    {text_line}")));
         }
 
-        // Show evaluations received by this proposal (current round only)
+        // Show opinions on this option (viewed round only)
         if let Some(all_evals) = self.evaluations.get(&proposal.agent_id) {
+            let target = self.viewed_round_value();
             let filtered: Vec<_> = all_evals
                 .iter()
-                .filter(|(round, _, _, _)| *round == self.current_round)
+                .filter(|(round, _, _, _)| *round == target)
                 .collect();
             if !filtered.is_empty() {
                 lines.push(Line::from(""));
@@ -1163,7 +1169,7 @@ impl JobDetailView {
                 )));
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    format!("  Evaluations Received ({})", filtered.len()),
+                    format!("  Opinions Received ({})", filtered.len()),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
