@@ -33,6 +33,11 @@ pub enum ViewAction {
         task: String,
         room: Option<String>,
         policy: Option<String>,
+        /// Optional override for the room/policy's `effort` (convergence
+        /// threshold, in `[0.0, 1.0]`). `None` uses the policy's default.
+        /// Set from the main-menu launcher when the operator types a
+        /// custom threshold before submitting.
+        effort_override: Option<f32>,
     },
     /// Apply a config mutation to nsed.yaml.
     WriteConfig(ConfigMutation),

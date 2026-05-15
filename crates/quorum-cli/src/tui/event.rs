@@ -344,6 +344,50 @@ pub fn is_tab(event: &Event) -> bool {
     )
 }
 
+/// Helper to check for PageUp.
+pub fn is_page_up(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::PageUp,
+            ..
+        })
+    )
+}
+
+/// Helper to check for PageDown.
+pub fn is_page_down(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::PageDown,
+            ..
+        })
+    )
+}
+
+/// Helper to check for Left arrow (or `h`, vim-style).
+pub fn is_left(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::Left | KeyCode::Char('h'),
+            ..
+        })
+    )
+}
+
+/// Helper to check for Right arrow (or `l`, vim-style).
+pub fn is_right(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::Right | KeyCode::Char('l'),
+            ..
+        })
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

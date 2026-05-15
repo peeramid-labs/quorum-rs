@@ -367,6 +367,7 @@ fn handle_action(
             task,
             room,
             policy: _,
+            effort_override,
         } => {
             // Resolve room → policy from config
             let room_name = match room {
@@ -387,7 +388,7 @@ fn handle_action(
                 }
             };
             let policy_name = &room_config.policy;
-            let policy_config = match app.config.policies.get(policy_name) {
+            let mut policy_config = match app.config.policies.get(policy_name) {
                 Some(p) => p.clone(),
                 None => {
                     app.status_message = Some((
@@ -397,6 +398,15 @@ fn handle_action(
                     return;
                 }
             };
+
+            // Override the convergence threshold (`effort`) when the
+            // operator typed a custom value in the launcher. Out-of-
+            // range values are clamped to the orchestrator's accepted
+            // band (`[0.0, 1.0]`) — the request validation rejects
+            // anything else.
+            if let Some(custom) = effort_override {
+                policy_config.effort = custom.clamp(0.0, 1.0);
+            }
 
             // Build the deliberation request
             let req = match build_request(&room_name, &policy_config, task) {
@@ -675,6 +685,7 @@ mod tests {
                 task: "do something".into(),
                 room: None,
                 policy: None,
+                effort_override: None,
             },
             Path::new("/tmp/test.yaml"),
         );
@@ -700,6 +711,7 @@ mod tests {
                 task: "do something".into(),
                 room: Some("nonexistent".into()),
                 policy: None,
+                effort_override: None,
             },
             Path::new("/tmp/test.yaml"),
         );
@@ -733,6 +745,7 @@ mod tests {
                 task: "do something".into(),
                 room: Some("bad-room".into()),
                 policy: None,
+                effort_override: None,
             },
             Path::new("/tmp/test.yaml"),
         );
@@ -758,6 +771,7 @@ mod tests {
                 task: "review my code".into(),
                 room: Some("test-room".into()),
                 policy: None,
+                effort_override: None,
             },
             Path::new("/tmp/test.yaml"),
         );
