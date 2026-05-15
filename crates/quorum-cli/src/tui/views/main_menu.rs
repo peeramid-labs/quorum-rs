@@ -22,6 +22,16 @@ pub struct MainMenuView {
     task_input_active: bool,
     task_text: String,
     detail_visible: bool,
+    /// Convergence threshold (`effort`) the operator wants for the
+    /// deliberation. Stored as a string while the user types so
+    /// partial input (`"0."`) doesn't get rounded away. Parsed on
+    /// submit. Defaults to `"0.7"` — the same number every
+    /// generated `workspace.yaml` ships with.
+    pub threshold_text: String,
+    /// `true` when Tab has moved focus from the task input to the
+    /// threshold field. Keystrokes route to `threshold_text` instead
+    /// of `task_text`.
+    pub threshold_input_active: bool,
 }
 
 impl MainMenuView {
@@ -36,7 +46,20 @@ impl MainMenuView {
             task_input_active: false,
             task_text: String::new(),
             detail_visible: false,
+            threshold_text: String::from("0.7"),
+            threshold_input_active: false,
         }
+    }
+
+    /// Parse the threshold field. Returns `None` (use policy default)
+    /// when the field is empty or unparseable; clamped to `[0.0, 1.0]`
+    /// when valid.
+    fn parsed_threshold(&self) -> Option<f32> {
+        let trimmed = self.threshold_text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        trimmed.parse::<f32>().ok().map(|v| v.clamp(0.0, 1.0))
     }
 
     /// Get the currently selected room, if any.
@@ -119,11 +142,16 @@ impl View for MainMenuView {
             0
         };
 
+        // Single-line threshold input below the task input. Visible
+        // whenever the task input is active.
+        let threshold_height = if self.task_input_active { 3 } else { 0 };
+
         let chunks = Layout::vertical([
-            Constraint::Length(2),            // title
-            Constraint::Length(input_height), // task input (grows with text)
-            Constraint::Min(0),               // rooms table
-            Constraint::Length(1),            // key hints
+            Constraint::Length(2),                // title
+            Constraint::Length(input_height),     // task input
+            Constraint::Length(threshold_height), // threshold input
+            Constraint::Min(0),                   // rooms table
+            Constraint::Length(1),                // key hints
         ])
         .split(area);
 
@@ -151,28 +179,62 @@ impl View for MainMenuView {
                 .get(self.list_state.selected)
                 .map(|(n, _)| n.as_str())
                 .unwrap_or("?");
+            let task_focused = !self.threshold_input_active;
+            let task_style = if task_focused {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let task_border = if task_focused {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
             let input = Paragraph::new(self.task_text.as_str())
-                .style(Style::default().fg(Color::Yellow))
+                .style(task_style)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(format!(" Deliberation task for '{room_name}' ")),
+                        .border_style(task_border)
+                        .title(format!(" Task for '{room_name}' (Tab → threshold) ")),
                 )
                 .wrap(Wrap { trim: false });
             frame.render_widget(input, chunks[1]);
+
+            // Threshold input (always shown while in task mode).
+            let threshold_focused = self.threshold_input_active;
+            let threshold_style = if threshold_focused {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let threshold_border = if threshold_focused {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let threshold_paragraph = Paragraph::new(self.threshold_text.as_str())
+                .style(threshold_style)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(threshold_border)
+                        .title(" Convergence threshold (0.0–1.0, default 0.7) "),
+                );
+            frame.render_widget(threshold_paragraph, chunks[2]);
         }
 
         // Rooms table + optional detail
         if self.rooms.is_empty() {
             render_error(
                 frame,
-                chunks[2],
+                chunks[3],
                 "No rooms configured — add rooms to nsed.yaml",
             );
         } else if self.detail_visible {
             let h_chunks =
                 Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
-                    .split(chunks[2]);
+                    .split(chunks[3]);
             self.draw_table(frame, h_chunks[0]);
             if let Some((name, config)) = self.selected_room() {
                 draw_room_detail(
@@ -184,12 +246,16 @@ impl View for MainMenuView {
                 );
             }
         } else {
-            self.draw_table(frame, chunks[2]);
+            self.draw_table(frame, chunks[3]);
         }
 
         // Key hints
         let hints = if self.task_input_active {
-            vec![("Enter", "Start"), ("Esc", "Cancel")]
+            vec![
+                ("Enter", "Start"),
+                ("Tab", "Task↔Threshold"),
+                ("Esc", "Cancel"),
+            ]
         } else if self.detail_visible {
             vec![
                 ("↑↓", "Navigate"),
@@ -205,7 +271,7 @@ impl View for MainMenuView {
                 ("q", "Quit"),
             ]
         };
-        render_key_hints(frame, chunks[3], &hints);
+        render_key_hints(frame, chunks[4], &hints);
     }
 }
 
@@ -213,10 +279,19 @@ impl MainMenuView {
     fn update_task_input(&mut self, event: &crossterm::event::Event) -> Option<ViewAction> {
         if event::is_escape(event) {
             self.task_input_active = false;
+            self.threshold_input_active = false;
+            return None;
+        }
+        // Tab toggles focus between the task field and the threshold
+        // field. Threshold field auto-selects all on focus so retyping
+        // is easy (clear is achieved with Backspace once focused).
+        if event::is_tab(event) {
+            self.threshold_input_active = !self.threshold_input_active;
             return None;
         }
         if event::is_enter(event) && !self.task_text.is_empty() {
             self.task_input_active = false;
+            self.threshold_input_active = false;
             if self.rooms.is_empty() || self.list_state.selected >= self.rooms.len() {
                 return Some(ViewAction::SetStatus(
                     "No rooms available".into(),
@@ -233,20 +308,33 @@ impl MainMenuView {
                     ));
                 }
             };
+            let effort_override = self.parsed_threshold();
             return Some(ViewAction::LaunchJob {
                 orchestrator,
                 task: self.task_text.clone(),
                 room: Some(room_name.clone()),
                 policy: None,
+                effort_override,
             });
         }
         if let crossterm::event::Event::Key(key) = event
             && key.kind == crossterm::event::KeyEventKind::Press
         {
+            // Route printable / backspace keystrokes into whichever
+            // field is currently focused.
+            let target: &mut String = if self.threshold_input_active {
+                &mut self.threshold_text
+            } else {
+                &mut self.task_text
+            };
             match key.code {
-                crossterm::event::KeyCode::Char(c) => self.task_text.push(c),
+                crossterm::event::KeyCode::Char(c) => {
+                    target.push(c);
+                    return None;
+                }
                 crossterm::event::KeyCode::Backspace => {
-                    self.task_text.pop();
+                    target.pop();
+                    return None;
                 }
                 _ => {}
             }
@@ -474,9 +562,72 @@ mod tests {
                 task: "Review my code".into(),
                 room: Some("local".into()),
                 policy: None,
+                effort_override: Some(0.7),
             })
         );
         assert!(!view.task_input_active);
+    }
+
+    #[test]
+    fn task_input_threshold_parsed_into_effort_override() {
+        let mut view = MainMenuView::new(sample_rooms(), None);
+        view.task_input_active = true;
+        view.task_text = "spicy debate".into();
+        view.threshold_text = "0.42".into();
+
+        let action = view.update(&make_key(KeyCode::Enter));
+        match action {
+            Some(ViewAction::LaunchJob {
+                effort_override, ..
+            }) => assert_eq!(effort_override, Some(0.42)),
+            other => panic!("expected LaunchJob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn threshold_parse_empty_yields_none() {
+        let mut view = MainMenuView::new(sample_rooms(), None);
+        view.threshold_text.clear();
+        assert!(view.parsed_threshold().is_none());
+    }
+
+    #[test]
+    fn threshold_parse_clamps_above_one() {
+        let mut view = MainMenuView::new(sample_rooms(), None);
+        view.threshold_text = "1.5".into();
+        assert_eq!(view.parsed_threshold(), Some(1.0));
+    }
+
+    #[test]
+    fn threshold_parse_clamps_negative() {
+        let mut view = MainMenuView::new(sample_rooms(), None);
+        view.threshold_text = "-0.5".into();
+        assert_eq!(view.parsed_threshold(), Some(0.0));
+    }
+
+    #[test]
+    fn tab_in_task_input_toggles_threshold_focus() {
+        let mut view = MainMenuView::new(sample_rooms(), None);
+        view.task_input_active = true;
+        assert!(!view.threshold_input_active);
+        view.update(&make_key(KeyCode::Tab));
+        assert!(view.threshold_input_active);
+        view.update(&make_key(KeyCode::Tab));
+        assert!(!view.threshold_input_active);
+    }
+
+    #[test]
+    fn keystrokes_in_threshold_focus_edit_threshold_text() {
+        let mut view = MainMenuView::new(sample_rooms(), None);
+        view.task_input_active = true;
+        view.threshold_input_active = true;
+        view.threshold_text.clear();
+        view.update(&make_key(KeyCode::Char('0')));
+        view.update(&make_key(KeyCode::Char('.')));
+        view.update(&make_key(KeyCode::Char('9')));
+        assert_eq!(view.threshold_text, "0.9");
+        // The task field shouldn't have been touched.
+        assert_eq!(view.task_text, "");
     }
 
     #[test]
