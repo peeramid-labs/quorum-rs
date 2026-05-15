@@ -624,37 +624,24 @@ fn convergence_heart(score: f32) -> &'static str {
 ///
 /// Used as the background tint on the header so the audience reads
 /// the room temperature at a glance.
-fn convergence_color(score: f32) -> Color {
+/// Header bg + fg for a given convergence score. Discrete buckets
+/// using indexed colors only — Rgb() rendering breaks on terminals
+/// without truecolor (SSH sessions, Terminal.app, low-color TERM),
+/// where it can fall back to near-black and make the header unreadable.
+/// Indexed colors are guaranteed to render across every terminal
+/// ratatui supports.
+fn convergence_palette(score: f32) -> (Color, Color) {
     let s = score.clamp(0.0, 1.0);
-    // Two-segment lerp: red→amber for 0..0.5, amber→green for 0.5..1.
-    let (r, g, b) = if s < 0.5 {
-        let t = s / 0.5;
-        (220, (180.0 * t).round() as u8, 40)
+    if s < 0.30 {
+        (Color::Red, Color::White)
+    } else if s < 0.50 {
+        (Color::LightRed, Color::Black)
+    } else if s < 0.70 {
+        (Color::Yellow, Color::Black)
+    } else if s < 0.85 {
+        (Color::LightGreen, Color::Black)
     } else {
-        let t = (s - 0.5) / 0.5;
-        (
-            (220.0 * (1.0 - t)).round() as u8 + (40.0 * t).round() as u8,
-            180 + ((220 - 180) as f32 * t).round() as u8,
-            40 + ((90 - 40) as f32 * t).round() as u8,
-        )
-    };
-    Color::Rgb(r, g, b)
-}
-
-/// Pick a readable foreground (white or black) to pair with a given
-/// RGB background, using ITU-R BT.601 luma. The convergence bg goes
-/// dark-red at low scores — black text on that is unreadable, so we
-/// flip to white below the midpoint.
-fn contrasting_fg(bg: Color) -> Color {
-    if let Color::Rgb(r, g, b) = bg {
-        let luma = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
-        if luma < 128.0 {
-            Color::White
-        } else {
-            Color::Black
-        }
-    } else {
-        Color::Reset
+        (Color::Green, Color::Black)
     }
 }
 
@@ -712,7 +699,7 @@ impl JobDetailView {
             .map(|c| format!("  Convergence: {c:.2}"))
             .unwrap_or_default();
         let heart = conv_score.map(|c| format!(" {} ", convergence_heart(c)));
-        let header_bg = conv_score.map(convergence_color);
+        let header_palette = conv_score.map(convergence_palette);
 
         // Round info: show whether the viewer is pinned to a past round.
         // `Round 1/3 (live)` while following, `Round 1/3 (history)` when
@@ -735,14 +722,14 @@ impl JobDetailView {
             String::new()
         };
 
-        // When the convergence bg is active it carries the signal; the
-        // per-span semantic colors (status green/red, cyan, magenta)
-        // become low-contrast noise against a saturated bg. Drop them
-        // and let the contrasting fg on header_style paint everything.
-        let bg_active = header_bg.is_some();
+        // When the convergence palette is active it carries the signal;
+        // the per-span semantic colors (status green/red, cyan, magenta)
+        // become low-contrast noise against a saturated bg. Force every
+        // span to the palette's fg so the bg always reads cleanly.
+        let forced_fg = header_palette.map(|(_, fg)| fg);
         let styled = |text: String, color: Color| -> Span<'_> {
-            if bg_active {
-                Span::raw(text)
+            if let Some(fg) = forced_fg {
+                Span::styled(text, Style::default().fg(fg))
             } else {
                 Span::styled(text, Style::default().fg(color))
             }
@@ -759,8 +746,8 @@ impl JobDetailView {
 
         let block = Block::default().borders(Borders::ALL);
         let mut header_style = Style::default();
-        if let Some(bg) = header_bg {
-            header_style = header_style.bg(bg).fg(contrasting_fg(bg));
+        if let Some((bg, fg)) = header_palette {
+            header_style = header_style.bg(bg).fg(fg);
         }
         let header = Paragraph::new(Line::from(spans))
             .style(header_style)
@@ -2169,48 +2156,46 @@ mod tests {
     }
 
     #[test]
-    fn convergence_color_endpoints() {
-        // Red end (hatred).
-        if let Color::Rgb(r, g, b) = convergence_color(0.0) {
-            assert!(r >= 200, "low convergence should be heavily red, got r={r}");
-            assert!(b < 100, "low convergence should not be blue, got b={b}");
-            assert!(g < 100, "low convergence should not be green, got g={g}");
-        } else {
-            panic!("expected Rgb color");
-        }
-        // Green end (consensus).
-        if let Color::Rgb(r, g, b) = convergence_color(1.0) {
+    fn convergence_palette_endpoints() {
+        // Red end — bright red bg + white text, must NOT be a Rgb color
+        // (truecolor fallback was the original bug).
+        let (bg, fg) = convergence_palette(0.0);
+        assert_eq!(bg, Color::Red);
+        assert_eq!(fg, Color::White);
+        // Green end — bright green bg + black text.
+        let (bg, fg) = convergence_palette(1.0);
+        assert_eq!(bg, Color::Green);
+        assert_eq!(fg, Color::Black);
+    }
+
+    #[test]
+    fn convergence_palette_uses_indexed_colors_only() {
+        // No Rgb anywhere — that's the whole point of this refactor.
+        // Sample the full range; if any bucket sneaks in an Rgb the
+        // truecolor-fallback bug returns.
+        for s in [
+            0.0, 0.1, 0.29, 0.3, 0.49, 0.5, 0.69, 0.7, 0.84, 0.85, 0.95, 1.0,
+        ] {
+            let (bg, fg) = convergence_palette(s);
             assert!(
-                g >= 200,
-                "high convergence should be heavily green, got g={g}"
+                !matches!(bg, Color::Rgb(..)),
+                "bg at s={s} is Rgb — terminals without truecolor render that as near-black"
             );
-            assert!(r < 100, "high convergence should not be red, got r={r}");
-            assert!(b < 150, "high convergence should be muted blue, got b={b}");
-        } else {
-            panic!("expected Rgb color");
+            assert!(
+                !matches!(fg, Color::Rgb(..)),
+                "fg at s={s} is Rgb — terminals without truecolor render that as near-black"
+            );
         }
     }
 
     #[test]
-    fn contrasting_fg_dark_bg_returns_white() {
-        // The red end of the convergence gradient — black text on this
-        // was unreadable. Must flip to white.
-        assert_eq!(contrasting_fg(convergence_color(0.0)), Color::White);
-        assert_eq!(contrasting_fg(convergence_color(0.25)), Color::White);
-    }
-
-    #[test]
-    fn contrasting_fg_light_bg_returns_black() {
-        // Amber and green ends are bright enough that black reads fine.
-        assert_eq!(contrasting_fg(convergence_color(0.5)), Color::Black);
-        assert_eq!(contrasting_fg(convergence_color(1.0)), Color::Black);
-    }
-
-    #[test]
-    fn contrasting_fg_non_rgb_returns_reset() {
-        // Non-Rgb inputs shouldn't happen in practice (convergence_color
-        // always returns Rgb), but the helper should degrade gracefully.
-        assert_eq!(contrasting_fg(Color::Reset), Color::Reset);
-        assert_eq!(contrasting_fg(Color::Yellow), Color::Reset);
+    fn convergence_palette_buckets_progress_monotonically() {
+        // Walk through buckets — every bucket boundary must yield a
+        // different bg (no gaps where two adjacent scores share a palette).
+        let probes = [0.0, 0.4, 0.6, 0.8, 1.0];
+        let bgs: Vec<Color> = probes.iter().map(|&s| convergence_palette(s).0).collect();
+        for window in bgs.windows(2) {
+            assert_ne!(window[0], window[1], "palette buckets collapsed: {bgs:?}");
+        }
     }
 }
