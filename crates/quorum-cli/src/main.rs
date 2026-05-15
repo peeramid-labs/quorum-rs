@@ -88,6 +88,37 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
     },
+
+    /// Bootstrap a workspace config file (nsed.yaml) pointing at a
+    /// remote orchestrator + room. Non-interactive: pass flags or
+    /// take defaults; no prompts.
+    Init {
+        /// Orchestrator base URL.
+        #[arg(long, default_value = commands::init::DEFAULT_ORCHESTRATOR_URL)]
+        orchestrator_url: String,
+
+        /// Room name (becomes both the room key + `default_room`).
+        #[arg(short, long, default_value = commands::init::DEFAULT_ROOM)]
+        room: String,
+
+        /// Env-var name the generated YAML interpolates for the
+        /// bearer token. The value of this variable is NOT read by
+        /// `init` itself — only its name is embedded in the config.
+        #[arg(long, default_value = commands::init::DEFAULT_TOKEN_ENV)]
+        token_env: String,
+
+        /// Agent names the default policy dispatches to. Repeat or
+        /// comma-separate (e.g. `--agents CortexA,CortexB,CortexC`).
+        /// When omitted, the generated file has `agents: []` and a
+        /// commented edit hint — `quorum run` will refuse cleanly
+        /// until the user populates this list.
+        #[arg(long, value_delimiter = ',', num_args = 0..)]
+        agents: Vec<String>,
+
+        /// Overwrite an existing workspace file.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 impl Cli {
@@ -161,5 +192,19 @@ async fn main() -> ExitCode {
         } => {
             commands::trace::run(cli.config_path(), job_id, orchestrator.as_deref(), verbose).await
         }
+        Commands::Init {
+            ref orchestrator_url,
+            ref room,
+            ref token_env,
+            ref agents,
+            force,
+        } => commands::init::run(
+            cli.config_path(),
+            orchestrator_url,
+            room,
+            token_env,
+            agents,
+            force,
+        ),
     }
 }
