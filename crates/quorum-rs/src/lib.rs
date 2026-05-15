@@ -20,6 +20,8 @@
 pub mod agent_manager;
 pub mod agents;
 pub mod api_error_middleware;
+#[cfg(feature = "cli")]
+pub mod cli;
 pub mod config;
 pub mod control_plane;
 #[cfg(feature = "audit")]

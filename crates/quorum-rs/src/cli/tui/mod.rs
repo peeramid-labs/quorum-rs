@@ -17,9 +17,9 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
-use crate::remote::RemoteOrchestrator;
-use crate::request::build_request;
-use crate::workspace::{OrchestratorMode, WorkspaceConfig};
+use crate::cli::remote::RemoteOrchestrator;
+use crate::cli::request::build_request;
+use crate::cli::workspace::{OrchestratorMode, WorkspaceConfig};
 use app::{App, ViewId};
 use client::TuiClient;
 use event::{AppEvent, DataEvent, EventLoopConfig, spawn_terminal_event_loop};
@@ -478,10 +478,10 @@ fn restore_terminal() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace::{OrchestratorConfig, OrchestratorMode};
+    use crate::cli::workspace::{OrchestratorConfig, OrchestratorMode};
     use std::collections::HashMap;
 
-    use crate::workspace::{PolicyConfig, RoomConfig};
+    use crate::cli::workspace::{PolicyConfig, RoomConfig};
 
     fn test_app(orchestrators: HashMap<String, OrchestratorConfig>) -> App {
         let config = WorkspaceConfig {

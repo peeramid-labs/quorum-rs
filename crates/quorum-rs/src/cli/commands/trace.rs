@@ -1,8 +1,8 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::remote::{RemoteError, TraceRecord};
-use crate::workspace::WorkspaceConfig;
+use crate::cli::remote::{RemoteError, TraceRecord};
+use crate::cli::workspace::WorkspaceConfig;
 
 use super::common::{build_remote, resolve_single_orchestrator};
 

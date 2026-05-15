@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::workspace::WorkspaceConfig;
+use crate::cli::workspace::WorkspaceConfig;
 
 use super::common::{build_remote, resolve_orchestrators};
 

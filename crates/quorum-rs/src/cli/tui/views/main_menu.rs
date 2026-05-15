@@ -8,9 +8,9 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, 
 
 use super::common::{ListState, render_error, render_key_hints, truncate};
 use super::{View, ViewAction};
-use crate::tui::app::ViewId;
-use crate::tui::event::{self, AppEvent};
-use crate::workspace::RoomConfig;
+use crate::cli::tui::app::ViewId;
+use crate::cli::tui::event::{self, AppEvent};
+use crate::cli::workspace::RoomConfig;
 
 /// Main menu — rooms table as the primary screen.
 ///
@@ -452,7 +452,7 @@ fn draw_room_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::views::StatusLevel;
+    use crate::cli::tui::views::StatusLevel;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
     fn make_key(code: KeyCode) -> AppEvent {

@@ -4,7 +4,7 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc;
 
-use crate::remote::{AgentInfo, HealthResponse};
+use crate::cli::remote::{AgentInfo, HealthResponse};
 
 /// Unified event type for the TUI event loop.
 #[derive(Debug)]

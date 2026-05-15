@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod parsing {
-    use crate::workspace::*;
+    use crate::cli::workspace::*;
 
     fn minimal_static_yaml() -> &'static str {
         r#"
@@ -328,7 +328,7 @@ rooms:
 
 #[cfg(test)]
 mod validation {
-    use crate::workspace::*;
+    use crate::cli::workspace::*;
 
     fn valid_static_config() -> WorkspaceConfig {
         serde_yaml::from_str(
@@ -987,7 +987,7 @@ default_room: nonexistent
 
 #[cfg(test)]
 mod resolve_room {
-    use crate::workspace::*;
+    use crate::cli::workspace::*;
 
     fn single_room_config() -> WorkspaceConfig {
         serde_yaml::from_str(
@@ -1110,7 +1110,7 @@ default_room: review
 
 #[cfg(test)]
 mod load {
-    use crate::workspace::*;
+    use crate::cli::workspace::*;
     use std::io::Write;
 
     #[test]

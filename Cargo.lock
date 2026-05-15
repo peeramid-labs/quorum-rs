@@ -2881,34 +2881,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quorum-cli"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "clap",
- "crossterm",
- "dotenvy",
- "futures-util",
- "inquire",
- "predicates",
- "quorum-rs",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "utoipa",
- "wiremock",
-]
-
-[[package]]
 name = "quorum-crypto-core"
 version = "0.6.0"
 dependencies = [
@@ -2931,25 +2903,32 @@ name = "quorum-rs"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "assert_cmd",
  "async-nats",
  "async-openai",
  "async-trait",
  "axum",
  "bytes",
  "chrono",
+ "clap",
+ "crossterm",
+ "dotenvy",
  "dyn-clone",
  "fs4",
  "futures",
  "futures-util",
  "hex",
  "http-body-util",
+ "inquire",
  "libc",
  "libloading",
  "llm-repair",
  "nkeys",
  "open",
  "openai-harmony",
+ "predicates",
  "quorum-crypto-core",
+ "ratatui",
  "regex",
  "reqwest",
  "rmcp",

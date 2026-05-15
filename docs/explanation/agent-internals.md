@@ -2,7 +2,7 @@
 
 This document covers the internal architecture of the `quorum-rs` crate for developers who want to use it as a Rust library or understand how the reference agent works under the hood.
 
-For running an agent from the CLI, see [`quorum-cli`](https://crates.io/crates/quorum-cli).
+For running an agent from the CLI, install the `quorum` binary via `cargo install quorum-rs` — the CLI ships in the same crate as the SDK.
 
 ## Library Quick Start
 

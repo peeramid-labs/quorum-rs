@@ -9,7 +9,7 @@ use thiserror::Error;
 use utoipa::ToSchema;
 
 // Re-export shared SLA type from SDK — single source of truth.
-pub use quorum_rs::scheduling::PolicySla;
+pub use crate::scheduling::PolicySla;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceConfig {

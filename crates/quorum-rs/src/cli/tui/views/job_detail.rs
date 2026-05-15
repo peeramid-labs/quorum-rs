@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 
 use super::common::{ListState, render_key_hints, truncate};
 use super::{FetchRequest, View, ViewAction};
-use crate::tui::event::{self, AgentPhaseStatus, AppEvent, DataEvent, PhaseTracker, SseEvent};
+use crate::cli::tui::event::{self, AgentPhaseStatus, AppEvent, DataEvent, PhaseTracker, SseEvent};
 
 /// Job status in the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1218,7 +1218,7 @@ impl JobDetailView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::event::{EvaluationEntry, ProposalScore};
+    use crate::cli::tui::event::{EvaluationEntry, ProposalScore};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
     fn make_key(code: KeyCode) -> AppEvent {

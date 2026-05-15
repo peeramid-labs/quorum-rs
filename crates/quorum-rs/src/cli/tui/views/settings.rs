@@ -6,8 +6,8 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::common::render_key_hints;
 use super::{View, ViewAction};
-use crate::tui::event::{self, AppEvent};
-use crate::workspace::WorkspaceConfig;
+use crate::cli::tui::event::{self, AppEvent};
+use crate::cli::workspace::WorkspaceConfig;
 
 /// Settings view — read-only display of workspace configuration.
 pub struct SettingsView {

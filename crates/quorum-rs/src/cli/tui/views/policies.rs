@@ -6,8 +6,8 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 
 use super::common::{ListState, render_error, render_key_hints, render_loading, truncate};
 use super::{ConfigMutation, FetchRequest, View, ViewAction};
-use crate::tui::event::{self, AppEvent, DataEvent, PolicyInfo};
-use crate::tui::views::agents::LoadState;
+use crate::cli::tui::event::{self, AppEvent, DataEvent, PolicyInfo};
+use crate::cli::tui::views::agents::LoadState;
 
 /// Policies list view with tag filtering and inline detail panel.
 pub struct PoliciesView {

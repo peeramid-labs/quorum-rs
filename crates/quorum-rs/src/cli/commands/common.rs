@@ -1,5 +1,5 @@
-use crate::remote::RemoteOrchestrator;
-use crate::workspace::{OrchestratorConfig, OrchestratorMode, WorkspaceConfig};
+use crate::cli::remote::RemoteOrchestrator;
+use crate::cli::workspace::{OrchestratorConfig, OrchestratorMode, WorkspaceConfig};
 
 /// Resolve which orchestrators to target.
 ///
@@ -82,7 +82,7 @@ pub fn build_remote(name: &str, orch: &OrchestratorConfig) -> Result<RemoteOrche
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace::{OrchestratorConfig, OrchestratorMode, PolicyConfig, RoomConfig};
+    use crate::cli::workspace::{OrchestratorConfig, OrchestratorMode, PolicyConfig, RoomConfig};
     use std::collections::HashMap;
 
     fn make_config(orchestrators: Vec<(&str, OrchestratorConfig)>) -> WorkspaceConfig {

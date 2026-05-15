@@ -42,7 +42,7 @@ jobs:
           # must have a matching version. Fail fast if they drift.
           tag="${GITHUB_REF_NAME#v}"
           echo "Tag version: ${tag}"
-          for crate in llm-repair quorum-crypto-core quorum-rs quorum-cli; do
+          for crate in llm-repair quorum-crypto-core quorum-rs; do
             cargo_ver=$(grep -m1 '^version' "crates/${crate}/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')
             echo "  ${crate}: ${cargo_ver}"
             if [ "${cargo_ver}" != "${tag}" ]; then
@@ -55,14 +55,14 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
         run: |
           # Dry-run packaging only — does NOT touch the registry.
-          # quorum-rs + quorum-cli have path deps to the other workspace
-          # crates; dry-run for those fails until the deps exist on
-          # crates.io, so we skip them here. The actual publish run below
-          # publishes in topological order so subsequent crates can resolve
-          # their published siblings.
+          # quorum-rs has path deps to the other workspace crates;
+          # its dry-run fails until those deps exist on crates.io,
+          # so we skip it here. The actual publish run below publishes
+          # in topological order so quorum-rs can resolve its
+          # published siblings.
           cargo publish --dry-run -p llm-repair
           cargo publish --dry-run -p quorum-crypto-core
-          echo "ℹ️ quorum-rs + quorum-cli dry-run skipped (need siblings on crates.io)"
+          echo "ℹ️ quorum-rs dry-run skipped (needs siblings on crates.io)"
 
       - name: Publish llm-repair
         if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
@@ -92,26 +92,8 @@ jobs:
             done
           done
 
-      - name: Publish quorum-rs
+      - name: Publish quorum-rs (lib + `quorum` binary)
         if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish -p quorum-rs
-
-      - name: Wait for quorum-rs index refresh
-        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
-        run: |
-          echo "Waiting for quorum-rs to land on the index…"
-          for i in $(seq 1 30); do
-            if curl -sf "https://crates.io/api/v1/crates/quorum-rs" > /dev/null; then
-              echo "  quorum-rs visible after ~${i}0s"
-              break
-            fi
-            sleep 10
-          done
-
-      - name: Publish quorum-cli
-        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p quorum-cli
