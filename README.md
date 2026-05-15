@@ -15,8 +15,7 @@ Deep tech dive: [arXiv:2601.16863](https://arxiv.org/abs/2601.16863).
 
 | Crate | Version | Description |
 |---|---|---|
-| [`quorum-rs`](crates/quorum-rs) | `0.6.0` | The SDK + reference runtime: agent traits (`NsedAgent`, `Tool`, `AiModel`, `PromptSet`), data types (`AgentContext`, `Proposal`, `Evaluation`), the reference `ProposerEvaluatorAgent` (ReAct loop over any OpenAI-compatible LLM), additional `ExecAgent` / `McpAgent` / `ClaudeAgent` integrations, NATS-based worker runtime, telemetry catalog, and middleware framework. |
-| [`quorum-cli`](crates/quorum-cli) | `0.6.0` | User-facing CLI that loads an `agent.yml`, spawns workers, and exposes a local status dashboard. Distribution surface for the reference agent runtime. |
+| [`quorum-rs`](crates/quorum-rs) | `0.6.0` | The SDK + reference runtime + `quorum` CLI: agent traits (`NsedAgent`, `Tool`, `AiModel`, `PromptSet`), data types (`AgentContext`, `Proposal`, `Evaluation`), the reference `ProposerEvaluatorAgent` (ReAct loop over any OpenAI-compatible LLM), additional `ExecAgent` / `McpAgent` / `ClaudeAgent` integrations, NATS-based worker runtime, telemetry catalog, middleware framework, and the user-facing `quorum` binary (`run` / `status` / `trace` / `tui` / `init`). Library and CLI ship as one crate so `cargo install quorum-rs` gives you the binary and `cargo add quorum-rs` gives you the SDK. |
 | [`llm-repair`](crates/llm-repair) | `0.6.0` | JSON-repair, markdown-extraction, and tool-call recovery for malformed LLM output. Useful for any Rust project that calls real-world LLMs and has to handle whatever they actually return. |
 | [`quorum-crypto-core`](crates/quorum-crypto-core) | `0.6.0` | Ed25519 / secp256k1 / SHA3 cryptographic primitives + audit envelope. Optional dep of `quorum-rs` (gated behind the `audit` feature). |
 
@@ -36,10 +35,10 @@ For the JSON-repair helpers in isolation:
 llm-repair = "0.6"
 ```
 
-As a CLI binary:
+As a CLI binary (same crate, default features build the `quorum` binary):
 
 ```bash
-cargo install quorum-cli
+cargo install quorum-rs
 ```
 
 ## How it works
@@ -93,7 +92,7 @@ See [`docs/`](docs/) — organized by the [Diátaxis](https://diataxis.fr) frame
 Runnable examples in [`examples/`](examples/) (Python exec + MCP agents) and
 [`crates/quorum-rs/examples/`](crates/quorum-rs/examples/) (`cargo run --example` programs).
 
-Per-crate rustdoc: <https://docs.rs/quorum-rs>, <https://docs.rs/quorum-cli>, <https://docs.rs/llm-repair>, <https://docs.rs/quorum-crypto-core>.
+Per-crate rustdoc: <https://docs.rs/quorum-rs>, <https://docs.rs/llm-repair>, <https://docs.rs/quorum-crypto-core>.
 
 ## Status
 

@@ -7,8 +7,8 @@ use thiserror::Error;
 
 use serde::Serialize;
 
-use crate::request::DeliberationRequest;
-use crate::workspace::PolicyConfig;
+use crate::cli::request::DeliberationRequest;
+use crate::cli::workspace::PolicyConfig;
 
 // ── Response structs for status / trace commands ──────────────────────
 
@@ -151,7 +151,7 @@ pub struct PushPolicyResult {
 /// Build the JSON body for `POST /policies`, converting CLI's `PolicyConfig`
 /// to the orchestrator's format (strips CLI-only fields like `context` on roles).
 fn build_policy_push_body(name: &str, config: &PolicyConfig) -> serde_json::Value {
-    use crate::workspace::PolicyMode;
+    use crate::cli::workspace::PolicyMode;
 
     // Minimal role struct matching orchestrator's PolicyRole
     #[derive(Serialize)]
@@ -270,9 +270,9 @@ impl RemoteOrchestrator {
     /// Build from a workspace orchestrator config entry, resolving env tokens.
     pub fn from_config(
         name: &str,
-        orch: &crate::workspace::OrchestratorConfig,
+        orch: &crate::cli::workspace::OrchestratorConfig,
     ) -> Result<Self, String> {
-        use crate::workspace::OrchestratorMode;
+        use crate::cli::workspace::OrchestratorMode;
 
         if orch.mode.as_ref() != Some(&OrchestratorMode::Remote) {
             return Err(format!(
@@ -282,7 +282,7 @@ impl RemoteOrchestrator {
 
         let address = match &orch.address {
             Some(a) => {
-                let resolved = quorum_rs::config::resolve_env_token("address", a);
+                let resolved = crate::config::resolve_env_token("address", a);
                 if resolved.trim().is_empty() {
                     return Err(format!(
                         "orchestrator '{name}' has empty address after env expansion of '{a}'"
@@ -295,7 +295,7 @@ impl RemoteOrchestrator {
 
         let token = match &orch.token {
             Some(t) => {
-                let resolved = quorum_rs::config::resolve_env_token("token", t);
+                let resolved = crate::config::resolve_env_token("token", t);
                 if resolved.trim().is_empty() {
                     return Err(format!(
                         "orchestrator '{name}' has empty token after env expansion of '{t}'"
@@ -558,7 +558,7 @@ impl RemoteOrchestrator {
     pub async fn policies(
         &self,
         tag: Option<&str>,
-    ) -> Result<Vec<crate::tui::event::PolicyInfo>, RemoteError> {
+    ) -> Result<Vec<crate::cli::tui::event::PolicyInfo>, RemoteError> {
         let url = format!("{}/policies", self.base_url);
         let mut request = self
             .client
@@ -589,9 +589,9 @@ impl RemoteOrchestrator {
     pub async fn open_sse_stream(
         &self,
         job_id: &str,
-    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<crate::tui::event::SseEvent>, RemoteError>
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<crate::cli::tui::event::SseEvent>, RemoteError>
     {
-        use crate::tui::event::{EvaluationEntry, ProposalScore, SseEvent};
+        use crate::cli::tui::event::{EvaluationEntry, ProposalScore, SseEvent};
 
         let url = format!("{}/job/{}/stream", self.base_url, job_id);
 
@@ -1742,8 +1742,8 @@ mod tests {
 
     // ── push_policy tests ────────────────────────────────────────────
 
-    fn sample_cli_policy() -> crate::workspace::PolicyConfig {
-        crate::workspace::PolicyConfig {
+    fn sample_cli_policy() -> crate::cli::workspace::PolicyConfig {
+        crate::cli::workspace::PolicyConfig {
             agents: Some(vec!["alice".into(), "bob".into()]),
             roles: None,
             max_rounds: 2,
@@ -1822,14 +1822,14 @@ mod tests {
 
     #[test]
     fn build_policy_push_body_strips_context() {
-        use crate::workspace::RoleConfig;
-        let policy = crate::workspace::PolicyConfig {
+        use crate::cli::workspace::RoleConfig;
+        let policy = crate::cli::workspace::PolicyConfig {
             agents: None,
             roles: Some(vec![RoleConfig {
                 role: "reviewer".into(),
                 count: 2,
                 capabilities: vec!["lang:rust".into()],
-                context: Some(vec![crate::workspace::ContextRef {
+                context: Some(vec![crate::cli::workspace::ContextRef {
                     name: "docs".into(),
                     path: "docs/".into(),
                 }]),

@@ -1,10 +1,10 @@
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::remote::RemoteOrchestrator;
-use crate::request::DeliberationRequest;
-use crate::tui::event::DataEvent;
-use crate::workspace::PolicyConfig;
+use crate::cli::remote::RemoteOrchestrator;
+use crate::cli::request::DeliberationRequest;
+use crate::cli::tui::event::DataEvent;
+use crate::cli::workspace::PolicyConfig;
 
 /// Async bridge between `RemoteOrchestrator` and the TUI event loop.
 ///

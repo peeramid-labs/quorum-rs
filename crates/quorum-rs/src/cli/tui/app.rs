@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::workspace::WorkspaceConfig;
+use crate::cli::workspace::WorkspaceConfig;
 
 /// Identifies a view in the navigation stack.
 #[derive(Debug, Clone, PartialEq, Eq)]

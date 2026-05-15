@@ -1,10 +1,10 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::remote::{JobOutcome, RemoteOrchestrator};
-use crate::request::{DeliberationRequest, build_request, build_request_raw_policy_id};
-use crate::workspace::{OrchestratorConfig, OrchestratorMode, PolicyConfig, WorkspaceConfig};
-use quorum_rs::config::resolve_env_token;
+use crate::cli::remote::{JobOutcome, RemoteOrchestrator};
+use crate::cli::request::{DeliberationRequest, build_request, build_request_raw_policy_id};
+use crate::cli::workspace::{OrchestratorConfig, OrchestratorMode, PolicyConfig, WorkspaceConfig};
+use crate::config::resolve_env_token;
 
 /// Resolved run context: the request, orchestrator info, and optionally the
 /// role-based policy that needs to be pushed to the remote before submission.
@@ -428,7 +428,7 @@ fn resolve_orch_field(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace::{
+    use crate::cli::workspace::{
         OrchestratorConfig, OrchestratorMode, PolicyConfig, RoleConfig, RoomConfig, WorkspaceConfig,
     };
     use std::collections::HashMap;

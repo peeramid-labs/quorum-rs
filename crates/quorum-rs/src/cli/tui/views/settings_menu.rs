@@ -7,8 +7,8 @@ use ratatui::widgets::{Block, Borders, List, ListItem};
 
 use super::common::{ListState, render_key_hints};
 use super::{View, ViewAction};
-use crate::tui::app::ViewId;
-use crate::tui::event::{self, AppEvent};
+use crate::cli::tui::app::ViewId;
+use crate::cli::tui::event::{self, AppEvent};
 
 const MENU_ITEMS: &[(&str, &str, ViewId)] = &[
     (

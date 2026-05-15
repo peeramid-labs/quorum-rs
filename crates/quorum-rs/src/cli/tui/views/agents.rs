@@ -6,8 +6,8 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 
 use super::common::{ListState, render_error, render_key_hints, render_loading, truncate};
 use super::{FetchRequest, View, ViewAction};
-use crate::remote::AgentInfo;
-use crate::tui::event::{self, AppEvent, DataEvent};
+use crate::cli::remote::AgentInfo;
+use crate::cli::tui::event::{self, AppEvent, DataEvent};
 
 /// Loading state for async data.
 #[derive(Debug, Clone)]

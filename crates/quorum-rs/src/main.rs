@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use quorum_cli::commands;
+use quorum_rs::cli::commands;
 
 #[derive(Parser)]
 #[command(
@@ -160,7 +160,7 @@ async fn main() -> ExitCode {
             };
             #[cfg(feature = "tui")]
             if tui {
-                return quorum_cli::tui::run_tui_with_task(
+                return quorum_rs::cli::tui::run_tui_with_task(
                     config_path,
                     Some(&resolved_task),
                     room.as_deref(),
@@ -181,7 +181,7 @@ async fn main() -> ExitCode {
             .await
         }
         #[cfg(feature = "tui")]
-        Commands::Tui => quorum_cli::tui::run_tui(cli.config_path()).await,
+        Commands::Tui => quorum_rs::cli::tui::run_tui(cli.config_path()).await,
         Commands::Status { ref orchestrator } => {
             commands::status::run(cli.config_path(), orchestrator.as_deref()).await
         }

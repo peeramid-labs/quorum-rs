@@ -4,16 +4,43 @@
 [![Docs.rs](https://docs.rs/quorum-rs/badge.svg)](https://docs.rs/quorum-rs)
 [![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
 
-Rust SDK for building multi-agent deliberation systems — agents that propose, evaluate, and reach quorum on outcomes over a NATS-based orchestration protocol.
+Rust SDK **and** CLI for multi-agent deliberation systems — agents that propose, evaluate, and reach quorum on outcomes over a NATS-based orchestration protocol. Library and binary ship in the same crate.
 
 ## Install
+
+As a library:
 
 ```toml
 [dependencies]
 quorum-rs = "0.6"
 ```
 
+As the `quorum` CLI (`run`, `status`, `trace`, `tui`, `init`):
+
+```bash
+cargo install quorum-rs
+```
+
+Default features build the binary (`cli` + `tui`). To use as a pure library and skip the CLI deps (clap, ratatui, etc.):
+
+```toml
+[dependencies]
+quorum-rs = { version = "0.6", default-features = false, features = ["audit"] }
+```
+
 MSRV: Rust 1.85 (uses Edition 2024).
+
+## CLI quick reference
+
+```text
+quorum init                Bootstrap an `nsed.yaml` workspace config
+quorum run <task>          Submit a deliberation task to the orchestrator
+quorum status              Health check + agent status
+quorum trace <job_id>      Show a deliberation trace (verdict + evaluations)
+quorum tui                 Interactive terminal UI (live deliberation view)
+```
+
+All commands read `./nsed.yaml` by default (`--config <path>` to override).
 
 ## What's inside
 
@@ -148,7 +175,6 @@ Part of the [`quorum-rs` workspace](https://github.com/peeramid-labs/quorum-rs):
 
 - [`llm-repair`](https://crates.io/crates/llm-repair) — JSON-repair / markdown-extraction / tool-call recovery for malformed LLM output
 - [`quorum-crypto-core`](https://crates.io/crates/quorum-crypto-core) — ed25519 / secp256k1 / SHA3 + audit envelope (used by the `audit` feature)
-- [`quorum-cli`](https://crates.io/crates/quorum-cli) — `quorum` binary for running deliberation jobs from the command line
 
 ## License
 

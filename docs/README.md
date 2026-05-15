@@ -30,7 +30,7 @@ Authoritative descriptions — API surface, types, schemas.
 | [MCP agent protocol](reference/mcp-agent-protocol.md) | Wire protocol for tool-calling-aware external agents |
 | [Glossary](reference/glossary.md) | Key terms used across the documentation |
 
-Per-crate rustdoc: <https://docs.rs/quorum-rs>, <https://docs.rs/quorum-cli>, <https://docs.rs/llm-repair>, <https://docs.rs/quorum-crypto-core>.
+Per-crate rustdoc: <https://docs.rs/quorum-rs>, <https://docs.rs/llm-repair>, <https://docs.rs/quorum-crypto-core>.
 
 ## Explanation
 

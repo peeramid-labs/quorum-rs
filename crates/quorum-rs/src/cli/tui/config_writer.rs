@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use crate::tui::views::ConfigMutation;
-use crate::workspace::{RoomConfig, WorkspaceConfig};
+use crate::cli::tui::views::ConfigMutation;
+use crate::cli::workspace::{RoomConfig, WorkspaceConfig};
 
 /// Apply a config mutation atomically to the workspace config file.
 ///
@@ -100,7 +100,7 @@ mod tests {
                 let mut m = HashMap::new();
                 m.insert(
                     "review".into(),
-                    crate::workspace::PolicyConfig {
+                    crate::cli::workspace::PolicyConfig {
                         agents: Some(vec!["Agent1".into(), "Agent2".into()]),
                         roles: None,
                         max_rounds: 2,
@@ -117,7 +117,7 @@ mod tests {
                 let mut m = HashMap::new();
                 m.insert(
                     "local".into(),
-                    crate::workspace::OrchestratorConfig {
+                    crate::cli::workspace::OrchestratorConfig {
                         mode: None,
                         address: None,
                         token: None,

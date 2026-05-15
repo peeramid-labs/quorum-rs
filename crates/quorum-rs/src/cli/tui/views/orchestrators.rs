@@ -8,9 +8,9 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 
 use super::common::{ListState, render_error, render_key_hints};
 use super::{FetchRequest, View, ViewAction};
-use crate::remote::HealthResponse;
-use crate::tui::event::{self, AppEvent, DataEvent};
-use crate::workspace::{OrchestratorConfig, OrchestratorMode};
+use crate::cli::remote::HealthResponse;
+use crate::cli::tui::event::{self, AppEvent, DataEvent};
+use crate::cli::workspace::{OrchestratorConfig, OrchestratorMode};
 
 /// Health check result for an orchestrator.
 #[derive(Debug, Clone)]
