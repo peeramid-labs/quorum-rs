@@ -629,11 +629,7 @@ fn convergence_color(score: f32) -> Color {
     // Two-segment lerp: red→amber for 0..0.5, amber→green for 0.5..1.
     let (r, g, b) = if s < 0.5 {
         let t = s / 0.5;
-        (
-            220 + ((255 - 220) as f32 * t).round() as u8 - ((255 - 220) as f32 * t).round() as u8,
-            (180.0 * t).round() as u8,
-            40,
-        )
+        (220, (180.0 * t).round() as u8, 40)
     } else {
         let t = (s - 0.5) / 0.5;
         (
@@ -643,6 +639,23 @@ fn convergence_color(score: f32) -> Color {
         )
     };
     Color::Rgb(r, g, b)
+}
+
+/// Pick a readable foreground (white or black) to pair with a given
+/// RGB background, using ITU-R BT.601 luma. The convergence bg goes
+/// dark-red at low scores — black text on that is unreadable, so we
+/// flip to white below the midpoint.
+fn contrasting_fg(bg: Color) -> Color {
+    if let Color::Rgb(r, g, b) = bg {
+        let luma = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
+        if luma < 128.0 {
+            Color::White
+        } else {
+            Color::Black
+        }
+    } else {
+        Color::Reset
+    }
 }
 
 impl JobDetailView {
@@ -681,7 +694,7 @@ impl JobDetailView {
         let status_str = match self.status {
             JobStatus::Connecting => "⟳ Connecting...",
             JobStatus::Running => "● Running",
-            JobStatus::Complete => "✓ Complete",
+            JobStatus::Complete => "✨ Converged",
             JobStatus::Failed => "✗ Failed",
             JobStatus::Disconnected => "⚡ Disconnected",
         };
@@ -722,25 +735,32 @@ impl JobDetailView {
             String::new()
         };
 
-        let mut spans = vec![Span::styled(status_str, Style::default().fg(status_color))];
+        // When the convergence bg is active it carries the signal; the
+        // per-span semantic colors (status green/red, cyan, magenta)
+        // become low-contrast noise against a saturated bg. Drop them
+        // and let the contrasting fg on header_style paint everything.
+        let bg_active = header_bg.is_some();
+        let styled = |text: String, color: Color| -> Span<'_> {
+            if bg_active {
+                Span::raw(text)
+            } else {
+                Span::styled(text, Style::default().fg(color))
+            }
+        };
+
+        let mut spans = vec![styled(status_str.to_string(), status_color)];
         if let Some(h) = heart {
             spans.push(Span::raw(h));
         }
         spans.push(Span::raw(round_info));
-        spans.push(Span::styled(
-            convergence_text,
-            Style::default().fg(Color::Cyan),
-        ));
-        spans.push(Span::styled(
-            inject_info,
-            Style::default().fg(Color::Magenta),
-        ));
+        spans.push(styled(convergence_text, Color::Cyan));
+        spans.push(styled(inject_info, Color::Magenta));
         spans.push(Span::raw(format!("  Job: {}", truncate(&self.job_id, 20))));
 
         let block = Block::default().borders(Borders::ALL);
         let mut header_style = Style::default();
         if let Some(bg) = header_bg {
-            header_style = header_style.bg(bg).fg(Color::Black);
+            header_style = header_style.bg(bg).fg(contrasting_fg(bg));
         }
         let header = Paragraph::new(Line::from(spans))
             .style(header_style)
@@ -988,7 +1008,7 @@ impl JobDetailView {
     fn draw_result(&self, frame: &mut Frame, area: Rect, result: &JobCompleteData) {
         // Use the derived JobStatus for consistent display
         let (status_label, status_color) = match self.status {
-            JobStatus::Complete => ("✓ Success", Color::Green),
+            JobStatus::Complete => ("✨ Converged", Color::Green),
             JobStatus::Failed => ("✗ Failed", Color::Red),
             JobStatus::Disconnected => ("⚡ Disconnected", Color::Red),
             _ => ("● Running", Color::Yellow),
@@ -1006,7 +1026,7 @@ impl JobDetailView {
             Line::from(""),
             Line::from(vec![
                 Span::styled(
-                    "  Best proposal ",
+                    "  💎 Crystallized option ",
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
@@ -1025,7 +1045,7 @@ impl JobDetailView {
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Deliberation Result "),
+                .title(" ✨ Quorum Convergence ✨ "),
         );
         frame.render_widget(paragraph, area);
     }
@@ -2169,5 +2189,28 @@ mod tests {
         } else {
             panic!("expected Rgb color");
         }
+    }
+
+    #[test]
+    fn contrasting_fg_dark_bg_returns_white() {
+        // The red end of the convergence gradient — black text on this
+        // was unreadable. Must flip to white.
+        assert_eq!(contrasting_fg(convergence_color(0.0)), Color::White);
+        assert_eq!(contrasting_fg(convergence_color(0.25)), Color::White);
+    }
+
+    #[test]
+    fn contrasting_fg_light_bg_returns_black() {
+        // Amber and green ends are bright enough that black reads fine.
+        assert_eq!(contrasting_fg(convergence_color(0.5)), Color::Black);
+        assert_eq!(contrasting_fg(convergence_color(1.0)), Color::Black);
+    }
+
+    #[test]
+    fn contrasting_fg_non_rgb_returns_reset() {
+        // Non-Rgb inputs shouldn't happen in practice (convergence_color
+        // always returns Rgb), but the helper should degrade gracefully.
+        assert_eq!(contrasting_fg(Color::Reset), Color::Reset);
+        assert_eq!(contrasting_fg(Color::Yellow), Color::Reset);
     }
 }
