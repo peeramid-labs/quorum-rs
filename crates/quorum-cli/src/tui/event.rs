@@ -344,6 +344,28 @@ pub fn is_tab(event: &Event) -> bool {
     )
 }
 
+/// Helper to check for PageUp.
+pub fn is_page_up(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::PageUp,
+            ..
+        })
+    )
+}
+
+/// Helper to check for PageDown.
+pub fn is_page_down(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::PageDown,
+            ..
+        })
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -79,6 +79,12 @@ pub struct JobDetailView {
     pub inject_input_active: bool,
     pub inject_text: String,
     pub injection_count: usize,
+    /// Which round the user is currently browsing. `None` = follow the
+    /// live round (auto-advance as new rounds start). `Some(n)` = pin
+    /// the view to round `n` so the audience can study previous-round
+    /// proposals + evaluations without losing them when the deliberation
+    /// advances.
+    pub viewed_round: Option<u32>,
     /// When true (default after completion), show the result summary.
     /// Tab toggles to the detailed panels view.
     pub show_result: bool,
@@ -123,6 +129,7 @@ impl JobDetailView {
             inject_input_active: false,
             inject_text: String::new(),
             injection_count: 0,
+            viewed_round: None,
             show_result: true,
             eval_detail_target: None,
             eval_detail_scroll: 0,
@@ -267,27 +274,75 @@ impl JobDetailView {
         }
     }
 
-    /// Current round proposals only.
+    /// The round number the user is currently looking at — pinned to
+    /// [`Self::viewed_round`] if set, otherwise follows the live
+    /// [`Self::current_round`].
+    pub fn viewed_round_value(&self) -> u32 {
+        self.viewed_round.unwrap_or(self.current_round)
+    }
+
+    /// `true` when the user is browsing live, `false` when pinned to a
+    /// previous round.
+    pub fn is_viewing_live(&self) -> bool {
+        self.viewed_round.is_none() || self.viewed_round == Some(self.current_round)
+    }
+
+    /// Step one round backwards in the history. Pins [`viewed_round`]
+    /// the first time it's called (otherwise the view would race against
+    /// the live `current_round` advancing on every SSE event).
+    pub fn view_previous_round(&mut self) {
+        let target = self.viewed_round_value().saturating_sub(1).max(1);
+        self.viewed_round = Some(target);
+        self.proposal_scroll
+            .set_count(self.current_proposals().len());
+        self.eval_scroll.set_count(self.current_evaluations().len());
+    }
+
+    /// Step one round forwards in history. Clears the pin (returns to
+    /// live-follow) when we hit the current round.
+    pub fn view_next_round(&mut self) {
+        let next = self.viewed_round_value().saturating_add(1);
+        if next >= self.current_round {
+            self.viewed_round = None; // back to live-follow
+        } else {
+            self.viewed_round = Some(next);
+        }
+        self.proposal_scroll
+            .set_count(self.current_proposals().len());
+        self.eval_scroll.set_count(self.current_evaluations().len());
+    }
+
+    /// Reset to live-follow (latest round).
+    pub fn view_live(&mut self) {
+        self.viewed_round = None;
+        self.proposal_scroll
+            .set_count(self.current_proposals().len());
+        self.eval_scroll.set_count(self.current_evaluations().len());
+    }
+
+    /// Proposals for the round the user is currently viewing.
     fn current_proposals(&self) -> Vec<&ProposalEntry> {
+        let target = self.viewed_round_value();
         self.proposals
             .iter()
-            .filter(|p| p.round == self.current_round)
+            .filter(|p| p.round == target)
             .collect()
     }
 
-    /// Current round evaluations: target_id → Vec<(evaluator, score, justification)>.
+    /// Evaluations for the round the user is currently viewing.
     fn current_evaluations(&self) -> HashMap<&str, Vec<(&str, f32, &str)>> {
+        let target = self.viewed_round_value();
         let mut result: HashMap<&str, Vec<(&str, f32, &str)>> = HashMap::new();
-        for (target, evals) in &self.evaluations {
+        for (target_agent, evals) in &self.evaluations {
             let round_evals: Vec<_> = evals
                 .iter()
-                .filter(|(round, _, _, _)| *round == self.current_round)
+                .filter(|(round, _, _, _)| *round == target)
                 .map(|(_, evaluator, score, justification)| {
                     (evaluator.as_str(), *score, justification.as_str())
                 })
                 .collect();
             if !round_evals.is_empty() {
-                result.insert(target.as_str(), round_evals);
+                result.insert(target_agent.as_str(), round_evals);
             }
         }
         result
@@ -389,6 +444,20 @@ impl View for JobDetailView {
                 if event::is_escape(event) || event::is_key(event, 'q') {
                     return Some(ViewAction::Pop);
                 }
+                // Round history navigation. PgUp / `[` step back one
+                // round; PgDn / `]` step forward; `=` returns to live.
+                if event::is_page_up(event) || event::is_key(event, '[') {
+                    self.view_previous_round();
+                    return None;
+                }
+                if event::is_page_down(event) || event::is_key(event, ']') {
+                    self.view_next_round();
+                    return None;
+                }
+                if event::is_key(event, '=') {
+                    self.view_live();
+                    return None;
+                }
                 if event::is_tab(event) {
                     if self.final_result.is_some() && self.show_result {
                         // First Tab press after completion: switch to panels
@@ -411,8 +480,13 @@ impl View for JobDetailView {
                 }
                 if event::is_key(event, 'j') && self.active_panel == Panel::Evaluations {
                     self.show_justifications = !self.show_justifications;
-                } else if event::is_key(event, 'i') && self.status == JobStatus::Running {
-                    // `i` activates injection input (only while running)
+                } else if (event::is_key(event, '/') || event::is_key(event, 'i'))
+                    && self.status == JobStatus::Running
+                {
+                    // `/` (chat convention) or `i` (legacy) activates the
+                    // chat-style input. The input bar is always visible
+                    // at the bottom while the job is running — this just
+                    // routes keystrokes into it.
                     self.inject_input_active = true;
                     self.inject_text.clear();
                 } else if (event::is_enter(event) || event::is_key(event, 'd'))
@@ -470,43 +544,42 @@ impl View for JobDetailView {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        let inject_height = if self.inject_input_active { 3 } else { 0 };
+        // Chat-style input is always visible while the job is running.
+        // 3 rows: top + bottom border + 1 line of text.
+        let chat_height = if self.status == JobStatus::Running {
+            3
+        } else {
+            0
+        };
         let chunks = Layout::vertical([
-            Constraint::Length(3),             // header bar
-            Constraint::Length(inject_height), // injection input
-            Constraint::Min(0),                // panels
-            Constraint::Length(1),             // hints
+            Constraint::Length(3),           // header bar
+            Constraint::Min(0),              // panels
+            Constraint::Length(chat_height), // chat-style input bar
+            Constraint::Length(1),           // hints
         ])
         .split(area);
 
         self.draw_header(frame, chunks[0]);
 
-        if self.inject_input_active {
-            let input = Paragraph::new(self.inject_text.as_str())
-                .style(Style::default().fg(Color::Yellow))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Inject message into deliberation "),
-                );
-            frame.render_widget(input, chunks[1]);
-        }
-
         // Detail views take over the panels area
         if self.eval_detail_target.is_some() {
-            self.draw_eval_detail(frame, chunks[2]);
+            self.draw_eval_detail(frame, chunks[1]);
         } else if self.proposal_detail_visible {
-            self.draw_proposal_detail(frame, chunks[2]);
+            self.draw_proposal_detail(frame, chunks[1]);
         } else {
-            self.draw_panels(frame, chunks[2]);
+            self.draw_panels(frame, chunks[1]);
         }
 
-        let hints = if self.inject_input_active {
-            vec![("Enter", "Send"), ("Esc", "Cancel")]
-        } else if self.eval_detail_target.is_some() || self.proposal_detail_visible {
+        if self.status == JobStatus::Running {
+            self.draw_chat_input(frame, chunks[2]);
+        }
+
+        let hints = if self.eval_detail_target.is_some() || self.proposal_detail_visible {
             vec![("↑↓", "Scroll"), ("Esc", "Close")]
         } else if self.final_result.is_some() && self.show_result {
             vec![("Tab", "Details"), ("t", "Thoughts"), ("Esc", "Back")]
+        } else if self.inject_input_active {
+            vec![("Enter", "Send"), ("Esc", "Cancel"), ("PgUp/PgDn", "Round")]
         } else {
             let mut h = vec![("Tab", "Panel"), ("↑↓", "Scroll")];
             if self.active_panel == Panel::Proposals || self.active_panel == Panel::Evaluations {
@@ -516,8 +589,9 @@ impl View for JobDetailView {
             if self.active_panel == Panel::Evaluations {
                 h.push(("j", "Justify"));
             }
+            h.push(("PgUp/PgDn", "Round"));
             if self.status == JobStatus::Running {
-                h.push(("i", "Inject"));
+                h.push(("/", "Chat"));
             }
             h.push(("Esc", "Back"));
             h
@@ -526,7 +600,79 @@ impl View for JobDetailView {
     }
 }
 
+/// Map a convergence score in `[0.0, 1.0]` to a "vibes" emoji.
+///
+/// Used in the booth-friendly header — the audience can see at a glance
+/// whether the team is fighting (broken-heart) or agreeing (sparkle).
+fn convergence_heart(score: f32) -> &'static str {
+    match score {
+        s if s < 0.30 => "💔", // hatred / strong disagreement
+        s if s < 0.50 => "🥺", // shaky, watching
+        s if s < 0.70 => "🤔", // hmm, thinking
+        s if s < 0.85 => "💛", // warming up
+        s if s < 0.95 => "❤️", // there it is
+        _ => "💖✨",           // perfect alignment
+    }
+}
+
+/// Map a convergence score in `[0.0, 1.0]` to an RGB color that lerps
+/// from hatred-red (0.0) through amber (~0.5) to vibrant green (1.0).
+///
+/// Used as the background tint on the header so the audience reads
+/// the room temperature at a glance.
+fn convergence_color(score: f32) -> Color {
+    let s = score.clamp(0.0, 1.0);
+    // Two-segment lerp: red→amber for 0..0.5, amber→green for 0.5..1.
+    let (r, g, b) = if s < 0.5 {
+        let t = s / 0.5;
+        (
+            220 + ((255 - 220) as f32 * t).round() as u8 - ((255 - 220) as f32 * t).round() as u8,
+            (180.0 * t).round() as u8,
+            40,
+        )
+    } else {
+        let t = (s - 0.5) / 0.5;
+        (
+            (220.0 * (1.0 - t)).round() as u8 + (40.0 * t).round() as u8,
+            180 + ((220 - 180) as f32 * t).round() as u8,
+            40 + ((90 - 40) as f32 * t).round() as u8,
+        )
+    };
+    Color::Rgb(r, g, b)
+}
+
 impl JobDetailView {
+    /// Render the always-on chat-style input bar at the bottom.
+    /// Visible whenever the job is running. Pressing `/` (or any
+    /// printable character that isn't a registered hotkey) activates
+    /// input mode; Enter sends; Esc cancels.
+    fn draw_chat_input(&self, frame: &mut Frame, area: Rect) {
+        let (text, title, style) = if self.inject_input_active {
+            (
+                self.inject_text.clone(),
+                " 💬 chatting (Enter=send · Esc=cancel) ",
+                Style::default().fg(Color::Yellow),
+            )
+        } else {
+            (
+                String::from("press / to chat with the team…"),
+                " 💬 ",
+                Style::default().fg(Color::DarkGray),
+            )
+        };
+        let input = Paragraph::new(text).style(style).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(if self.inject_input_active {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                }),
+        );
+        frame.render_widget(input, area);
+    }
+
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
         let status_str = match self.status {
             JobStatus::Connecting => "⟳ Connecting...",
@@ -542,13 +688,26 @@ impl JobDetailView {
             JobStatus::Failed | JobStatus::Disconnected => Color::Red,
         };
 
-        let convergence = self
-            .latest_convergence()
+        // Heart + colored bg encode convergence as room-temperature
+        // for booth audiences — fight (red 💔) → consensus (green 💖).
+        let conv_score = self.latest_convergence();
+        let convergence_text = conv_score
             .map(|c| format!("  Convergence: {c:.2}"))
             .unwrap_or_default();
+        let heart = conv_score.map(|c| format!(" {} ", convergence_heart(c)));
+        let header_bg = conv_score.map(convergence_color);
 
+        // Round info: show whether the viewer is pinned to a past round.
+        // `Round 1/3 (live)` while following, `Round 1/3 (history)` when
+        // pinned. PgUp/PgDn navigates.
         let round_info = if self.total_rounds > 0 {
-            format!("  [Round {}/{}]", self.current_round, self.total_rounds)
+            let viewing = self.viewed_round_value();
+            let suffix = if self.is_viewing_live() {
+                "live"
+            } else {
+                "history"
+            };
+            format!("  [Round {viewing}/{} · {suffix}]", self.total_rounds)
         } else {
             String::new()
         };
@@ -559,14 +718,29 @@ impl JobDetailView {
             String::new()
         };
 
-        let header = Paragraph::new(Line::from(vec![
-            Span::styled(status_str, Style::default().fg(status_color)),
-            Span::raw(round_info),
-            Span::styled(convergence, Style::default().fg(Color::Cyan)),
-            Span::styled(inject_info, Style::default().fg(Color::Magenta)),
-            Span::raw(format!("  Job: {}", truncate(&self.job_id, 20))),
-        ]))
-        .block(Block::default().borders(Borders::ALL));
+        let mut spans = vec![Span::styled(status_str, Style::default().fg(status_color))];
+        if let Some(h) = heart {
+            spans.push(Span::raw(h));
+        }
+        spans.push(Span::raw(round_info));
+        spans.push(Span::styled(
+            convergence_text,
+            Style::default().fg(Color::Cyan),
+        ));
+        spans.push(Span::styled(
+            inject_info,
+            Style::default().fg(Color::Magenta),
+        ));
+        spans.push(Span::raw(format!("  Job: {}", truncate(&self.job_id, 20))));
+
+        let block = Block::default().borders(Borders::ALL);
+        let mut header_style = Style::default();
+        if let Some(bg) = header_bg {
+            header_style = header_style.bg(bg).fg(Color::Black);
+        }
+        let header = Paragraph::new(Line::from(spans))
+            .style(header_style)
+            .block(block);
 
         frame.render_widget(header, area);
     }
@@ -1823,5 +1997,171 @@ mod tests {
         view.update(&make_key(KeyCode::Tab));
         assert_eq!(view.active_panel, panel_before);
         assert!(view.proposal_detail_visible);
+    }
+
+    // ---- Round history navigation -----------------------------------
+
+    fn view_at_round(round: u32) -> JobDetailView {
+        let mut view = new_view();
+        view.status = JobStatus::Running;
+        view.current_round = round;
+        view.total_rounds = round;
+        view
+    }
+
+    #[test]
+    fn defaults_to_following_live_round() {
+        let view = view_at_round(2);
+        assert!(view.viewed_round.is_none());
+        assert_eq!(view.viewed_round_value(), 2);
+        assert!(view.is_viewing_live());
+    }
+
+    #[test]
+    fn page_up_pins_view_to_previous_round() {
+        let mut view = view_at_round(3);
+        view.update(&make_key(KeyCode::PageUp));
+        assert_eq!(view.viewed_round, Some(2));
+        assert!(!view.is_viewing_live());
+    }
+
+    #[test]
+    fn page_up_clamps_at_round_one() {
+        let mut view = view_at_round(1);
+        view.update(&make_key(KeyCode::PageUp));
+        // current=1, target = max(1.saturating_sub(1), 1) = 1.
+        assert_eq!(view.viewed_round, Some(1));
+    }
+
+    #[test]
+    fn page_down_returns_to_live_when_caught_up() {
+        let mut view = view_at_round(3);
+        view.viewed_round = Some(1);
+        view.update(&make_key(KeyCode::PageDown));
+        assert_eq!(view.viewed_round, Some(2));
+        view.update(&make_key(KeyCode::PageDown));
+        // next would be 3 = current_round → resets to None (live-follow).
+        assert!(view.viewed_round.is_none());
+        assert!(view.is_viewing_live());
+    }
+
+    #[test]
+    fn equals_key_resets_to_live() {
+        let mut view = view_at_round(5);
+        view.viewed_round = Some(2);
+        view.update(&make_key(KeyCode::Char('=')));
+        assert!(view.viewed_round.is_none());
+        assert!(view.is_viewing_live());
+    }
+
+    #[test]
+    fn current_proposals_filter_by_viewed_round() {
+        let mut view = view_at_round(3);
+        view.proposals = vec![
+            ProposalEntry {
+                round: 1,
+                agent_id: "A".into(),
+                content: "R1".into(),
+                thought_process: String::new(),
+                score: None,
+            },
+            ProposalEntry {
+                round: 2,
+                agent_id: "A".into(),
+                content: "R2".into(),
+                thought_process: String::new(),
+                score: None,
+            },
+            ProposalEntry {
+                round: 3,
+                agent_id: "A".into(),
+                content: "R3".into(),
+                thought_process: String::new(),
+                score: None,
+            },
+        ];
+
+        // Live-follow at round 3.
+        assert_eq!(view.current_proposals().len(), 1);
+        assert_eq!(view.current_proposals()[0].content, "R3");
+
+        // Pin to round 1 → only the R1 proposal.
+        view.viewed_round = Some(1);
+        assert_eq!(view.current_proposals().len(), 1);
+        assert_eq!(view.current_proposals()[0].content, "R1");
+    }
+
+    // ---- Chat-style input -------------------------------------------
+
+    #[test]
+    fn slash_activates_chat_input_when_running() {
+        let mut view = view_at_round(1);
+        assert!(!view.inject_input_active);
+        view.update(&make_key(KeyCode::Char('/')));
+        assert!(view.inject_input_active);
+    }
+
+    #[test]
+    fn slash_ignored_when_not_running() {
+        let mut view = new_view(); // status = Connecting
+        view.update(&make_key(KeyCode::Char('/')));
+        assert!(!view.inject_input_active);
+    }
+
+    #[test]
+    fn legacy_i_still_activates_input() {
+        let mut view = view_at_round(1);
+        view.update(&make_key(KeyCode::Char('i')));
+        assert!(view.inject_input_active);
+    }
+
+    // ---- Heart + color helpers --------------------------------------
+
+    #[test]
+    fn convergence_heart_low_score_is_broken() {
+        assert_eq!(convergence_heart(0.0), "💔");
+        assert_eq!(convergence_heart(0.29), "💔");
+    }
+
+    #[test]
+    fn convergence_heart_high_score_is_sparkle() {
+        assert_eq!(convergence_heart(0.96), "💖✨");
+        assert_eq!(convergence_heart(1.0), "💖✨");
+    }
+
+    #[test]
+    fn convergence_heart_monotonic_across_buckets() {
+        // Pick one representative from each bucket; the emoji must
+        // change as the score climbs through the thresholds.
+        let buckets = [0.0, 0.3, 0.5, 0.7, 0.85, 0.95]
+            .iter()
+            .map(|&s| convergence_heart(s))
+            .collect::<Vec<_>>();
+        for window in buckets.windows(2) {
+            assert_ne!(window[0], window[1], "buckets must differ: {buckets:?}");
+        }
+    }
+
+    #[test]
+    fn convergence_color_endpoints() {
+        // Red end (hatred).
+        if let Color::Rgb(r, g, b) = convergence_color(0.0) {
+            assert!(r >= 200, "low convergence should be heavily red, got r={r}");
+            assert!(b < 100, "low convergence should not be blue, got b={b}");
+            assert!(g < 100, "low convergence should not be green, got g={g}");
+        } else {
+            panic!("expected Rgb color");
+        }
+        // Green end (consensus).
+        if let Color::Rgb(r, g, b) = convergence_color(1.0) {
+            assert!(
+                g >= 200,
+                "high convergence should be heavily green, got g={g}"
+            );
+            assert!(r < 100, "high convergence should not be red, got r={r}");
+            assert!(b < 150, "high convergence should be muted blue, got b={b}");
+        } else {
+            panic!("expected Rgb color");
+        }
     }
 }
