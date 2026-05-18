@@ -61,15 +61,37 @@ impl NatsAuth {
 }
 
 /// An orchestrator endpoint that an agent can register with to obtain
-/// NATS connection credentials via the JWT challenge-response protocol.
+/// NATS connection credentials.
 ///
-/// Used in agent YAML configuration:
+/// Two mutually-exclusive credential channels:
+///
+/// **Challenge-response** — agent already has a long-lived bearer
+/// token. The orchestrator issues a NATS User JWT after the agent
+/// proves possession of a freshly-generated NKey.
+///
 /// ```yaml
 /// orchestrators:
 ///   - id: "primary"
 ///     url: "http://localhost:8080"
 ///     bearer_token: "${NSED_BEARER_TOKEN}"
 /// ```
+///
+/// **Invite-code redemption** — admin shares a single-use, signed
+/// invite code over a messenger; the agent redeems it for a NATS
+/// User JWT scoped to the pubkey the admin pinned at mint time.
+/// Designed for 3rd party agent operators where shipping a
+/// long-lived bearer token over a messenger is the wrong shape.
+///
+/// ```yaml
+/// orchestrators:
+///   - id: "primary"
+///     url: "http://localhost:8080"
+///     invite_code: "${NSED_INVITE_CODE}"
+/// ```
+///
+/// When both are set, `invite_code` wins (it's single-use, so a
+/// successful redeem on first boot persists `.creds` and the agent
+/// never needs to redeem again).
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct OrchestratorEntry {
     /// Human-readable identifier. Derived from URL hostname if omitted.
@@ -78,10 +100,21 @@ pub struct OrchestratorEntry {
     /// HTTP base URL of the orchestrator (e.g. `"http://localhost:8080"`).
     #[serde(default)]
     pub url: String,
-    /// Bearer token for API authentication.
+    /// Bearer token for API authentication (challenge-response path).
     /// Supports `${ENV_VAR}` syntax for environment variable expansion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearer_token: Option<String>,
+    /// Single-use JWT invite code (invite-code redemption path —
+    /// see [`redeem_invite_with_orchestrator`]). Supports
+    /// `${ENV_VAR}` syntax for environment variable expansion so the
+    /// code itself isn't committed to the YAML.
+    ///
+    /// Codes are intentionally short-TTL and revocable. The
+    /// orchestrator's admin minted this with the agent's `user_pub_key`
+    /// already pinned in the JWT claim, so redeeming it requires the
+    /// matching seed loaded locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite_code: Option<String>,
 }
 
 /// Connect to NATS with optional authentication.
@@ -459,6 +492,128 @@ pub async fn register_with_orchestrator_with_retry(
 // Invite-code redemption (companion to nsed#444)
 // ---------------------------------------------------------------------------
 
+/// Typed outcome from [`redeem_invite_with_orchestrator`].
+///
+/// 3rd parties consuming the SDK get a clean `match` over the
+/// orchestrator's documented error surface instead of having to walk an
+/// `anyhow::Error` chain and downcast `reqwest::Error` to check the
+/// status code + body. The variants mirror the `error` payloads
+/// documented at `docs/invites.md` in the nsed repo.
+#[derive(Debug)]
+pub enum RedeemInviteError {
+    /// Code signature is invalid, malformed, or the audience pin
+    /// doesn't match (e.g. an operator code presented at
+    /// `/redeem-agent`). HTTP 401 with `error: "invalid_code"`.
+    InvalidCode,
+    /// Code's `exp` claim is in the past. HTTP 401 with `error: "expired"`.
+    Expired,
+    /// Admin revoked the code pre-redemption. HTTP 403 with `error: "revoked"`.
+    Revoked,
+    /// Code was already consumed by a previous redeem attempt. HTTP 409
+    /// with `error: "replayed"`. Treat as "ask admin for a fresh code".
+    Replayed,
+    /// Orchestrator is not configured to issue invites (no signing
+    /// secret, credentials disabled, …). HTTP 503 with `error:
+    /// "not_configured"` or `"credentials_disabled"`.
+    NotConfigured,
+    /// Orchestrator's KV store is temporarily unreachable. HTTP 503
+    /// with `error: "kv_unavailable"`. Caller's retry policy
+    /// ([`redeem_invite_with_orchestrator_with_retry`]) treats this as
+    /// transient.
+    KvUnavailable,
+    /// Orchestrator returned an HTTP status the SDK doesn't know about.
+    /// Carries the raw status + body so the caller can log / forward.
+    Unexpected {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    /// Network / transport / serde failure — the request never produced
+    /// a structured response. Wraps the underlying error.
+    Transport(anyhow::Error),
+}
+
+impl RedeemInviteError {
+    /// `true` when retrying could plausibly succeed. Matches the
+    /// orchestrator's documented retry semantics:
+    ///
+    /// - Retryable: transport errors, `KvUnavailable` (503), and
+    ///   `Unexpected` whose status is 5xx (a future server-side bug or
+    ///   a not-yet-classified backend issue).
+    /// - Non-retryable: `InvalidCode`, `Expired`, `Revoked`,
+    ///   `Replayed` (4xx — won't self-heal), `NotConfigured` (admin
+    ///   action required, no point retrying), and `Unexpected` whose
+    ///   status is 4xx (probable caller bug, not transient).
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            RedeemInviteError::Transport(_) | RedeemInviteError::KvUnavailable => true,
+            RedeemInviteError::Unexpected { status, .. } => status.is_server_error(),
+            RedeemInviteError::InvalidCode
+            | RedeemInviteError::Expired
+            | RedeemInviteError::Revoked
+            | RedeemInviteError::Replayed
+            | RedeemInviteError::NotConfigured => false,
+        }
+    }
+}
+
+impl std::fmt::Display for RedeemInviteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RedeemInviteError::InvalidCode => write!(f, "invite code invalid"),
+            RedeemInviteError::Expired => write!(f, "invite code expired"),
+            RedeemInviteError::Revoked => write!(f, "invite code revoked"),
+            RedeemInviteError::Replayed => write!(f, "invite code already redeemed"),
+            RedeemInviteError::NotConfigured => {
+                write!(f, "orchestrator does not have invites configured")
+            }
+            RedeemInviteError::KvUnavailable => {
+                write!(f, "orchestrator KV store temporarily unreachable")
+            }
+            RedeemInviteError::Unexpected { status, body } => {
+                write!(f, "unexpected redeem response: {status} body={body:?}")
+            }
+            RedeemInviteError::Transport(e) => write!(f, "transport error: {e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for RedeemInviteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RedeemInviteError::Transport(e) => Some(e.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+/// Map an orchestrator HTTP response to a [`RedeemInviteError`].
+///
+/// Reads the JSON body's `error` field. Falls back to
+/// [`RedeemInviteError::Unexpected`] when the status isn't one we
+/// recognise (so a future orchestrator-side status addition surfaces
+/// raw instead of being misclassified).
+async fn classify_redeem_error(resp: reqwest::Response) -> RedeemInviteError {
+    let status = resp.status();
+    // Best-effort body read. Failure here just yields an empty
+    // discriminator string, which falls through to Unexpected.
+    let body_text = resp.text().await.unwrap_or_default();
+    let body_error: Option<String> = serde_json::from_str::<serde_json::Value>(&body_text)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from));
+    match (status.as_u16(), body_error.as_deref()) {
+        (401, Some("expired")) => RedeemInviteError::Expired,
+        (401, _) => RedeemInviteError::InvalidCode,
+        (403, _) => RedeemInviteError::Revoked,
+        (409, _) => RedeemInviteError::Replayed,
+        (503, Some("kv_unavailable")) => RedeemInviteError::KvUnavailable,
+        (503, _) => RedeemInviteError::NotConfigured,
+        _ => RedeemInviteError::Unexpected {
+            status,
+            body: body_text,
+        },
+    }
+}
+
 /// Response from `POST /redeem-agent` on a nsed orchestrator (#444).
 ///
 /// The agent's `user_pub_key` was pinned in the JWT invite code by the
@@ -506,69 +661,98 @@ pub struct RedeemAgentInviteResponse {
 ///
 /// # Errors
 ///
-/// - 401 → `anyhow::Error` chain contains a `reqwest::Error` with
-///   `client_error() == true`. Body's `error` field discriminates
-///   `invalid_code` vs `expired`.
-/// - 403 → revoked. Same shape, body `error == "revoked"`.
-/// - 409 → replayed. Body `error == "replayed"`.
-/// - 503 → server-side dependency unavailable (no signing secret,
-///   credentials disabled, or KV unreachable). Treated as retryable
-///   by [`redeem_invite_with_orchestrator_with_retry`].
-/// - Any other I/O error from `reqwest` (connect failed, timeout).
+/// Returns a typed [`RedeemInviteError`] so callers can `match` on
+/// outcome cleanly without parsing the orchestrator's JSON error
+/// body. Use [`RedeemInviteError::is_retryable`] to decide whether
+/// to back off and retry (see also
+/// [`redeem_invite_with_orchestrator_with_retry`]).
 ///
 /// # Example
 ///
 /// ```ignore
+/// use quorum_rs::nats_utils::{redeem_invite_with_orchestrator, RedeemInviteError, NatsAuth, connect_nats};
+///
 /// // 1. Agent generates its own NKey *before* asking the admin for
 /// //    a code. The public half goes to the admin out-of-band.
 /// let kp = nkeys::KeyPair::new_user();
 /// let pub_key = kp.public_key();
+/// println!("Send this to the admin: {pub_key}");
 /// // ... admin pastes pub_key into POST /admin/api/agent-invites
 /// // ... admin shares the resulting invite code back to the agent
 ///
-/// // 2. Agent redeems. Caller-owned keypair is required; the
-/// //    orchestrator already pinned `pub_key` into the code.
-/// let result = nats_utils::redeem_invite_with_orchestrator(
+/// // 2. Agent redeems. Pattern-match on the typed error so retry /
+/// //    UX logic is one match away.
+/// let result = match redeem_invite_with_orchestrator(
 ///     "http://localhost:8080",
 ///     &invite_code,
 ///     &kp,
-/// ).await?;
+/// ).await {
+///     Ok(r) => r,
+///     Err(RedeemInviteError::Expired) => {
+///         eprintln!("Invite expired — ask the admin for a fresh code.");
+///         return Ok(());
+///     }
+///     Err(RedeemInviteError::Replayed) => {
+///         eprintln!("This invite was already redeemed on another host.");
+///         return Ok(());
+///     }
+///     Err(RedeemInviteError::Revoked) => {
+///         eprintln!("Admin revoked this invite.");
+///         return Ok(());
+///     }
+///     Err(e) if e.is_retryable() => {
+///         eprintln!("Transient: {e}. Try again in a minute.");
+///         return Ok(());
+///     }
+///     Err(e) => return Err(e.into()),
+/// };
 ///
 /// // 3. result.creds is a complete `.creds` blob ready for
 /// //    NatsAuth::inline_creds; result.nats_url is the orchestrator-
 /// //    advertised NATS URL the agent should connect to.
+/// let auth = NatsAuth { inline_creds: Some(result.creds), ..Default::default() };
+/// let nats = connect_nats(&result.nats_url, Some(&auth)).await?;
 /// ```
 pub async fn redeem_invite_with_orchestrator(
     orchestrator_url: &str,
     invite_code: &str,
     keypair: &nkeys::KeyPair,
-) -> Result<RegistrationResult> {
+) -> std::result::Result<RegistrationResult, RedeemInviteError> {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .context("Failed to build HTTP client")?;
+        .map_err(|e| RedeemInviteError::Transport(anyhow::Error::new(e)))?;
     let base = orchestrator_url.trim_end_matches('/');
 
     let body = serde_json::json!({ "code": invite_code });
 
-    let resp: RedeemAgentInviteResponse = http
+    let response = http
         .post(format!("{base}/redeem-agent"))
         .json(&body)
         .send()
         .await
-        .context("Failed to send /redeem-agent request")?
-        .error_for_status()
-        .context("/redeem-agent request rejected")?
-        .json()
-        .await
-        .context("Failed to parse /redeem-agent response")?;
+        .map_err(|e| {
+            RedeemInviteError::Transport(
+                anyhow::Error::new(e).context("Failed to send /redeem-agent request"),
+            )
+        })?;
+
+    if !response.status().is_success() {
+        return Err(classify_redeem_error(response).await);
+    }
+
+    let resp: RedeemAgentInviteResponse = response.json().await.map_err(|e| {
+        RedeemInviteError::Transport(
+            anyhow::Error::new(e).context("Failed to parse /redeem-agent response"),
+        )
+    })?;
 
     // Combine the orchestrator-issued User JWT with the caller's
     // local seed into `.creds` format. The seed never crosses the
     // network — only the public half was pinned in the JWT.
-    let seed_str = keypair
-        .seed()
-        .map_err(|e| anyhow::anyhow!("Failed to extract user seed: {e}"))?;
+    let seed_str = keypair.seed().map_err(|e| {
+        RedeemInviteError::Transport(anyhow::anyhow!("Failed to extract user seed: {e}"))
+    })?;
     let creds = format_nats_creds(&resp.user_jwt, &seed_str);
 
     Ok(RegistrationResult {
@@ -577,29 +761,33 @@ pub async fn redeem_invite_with_orchestrator(
         // KeyPair doesn't implement Clone; reconstruct from the seed
         // so the caller gets an owned KeyPair back without having
         // to also pass an explicit clone helper.
-        keypair: nkeys::KeyPair::from_seed(&seed_str)
-            .map_err(|e| anyhow::anyhow!("Failed to reconstruct keypair from seed: {e}"))?,
+        keypair: nkeys::KeyPair::from_seed(&seed_str).map_err(|e| {
+            RedeemInviteError::Transport(anyhow::anyhow!(
+                "Failed to reconstruct keypair from seed: {e}"
+            ))
+        })?,
     })
 }
 
 /// Like [`redeem_invite_with_orchestrator`] but retries on transient
-/// failures with exponential backoff. Reuses the same retry policy as
-/// [`register_with_orchestrator_with_retry`] — does NOT retry on 4xx
-/// HTTP responses (invalid / expired / replayed / revoked codes
-/// won't self-heal).
+/// failures with exponential backoff. Backoff matches the
+/// challenge-response retry helper (1 s, 2 s, 4 s, …). Permanent
+/// failures (invalid / expired / replayed / revoked codes; not-
+/// configured) short-circuit — they won't self-heal. See
+/// [`RedeemInviteError::is_retryable`] for the policy.
 pub async fn redeem_invite_with_orchestrator_with_retry(
     orchestrator_url: &str,
     invite_code: &str,
     keypair: &nkeys::KeyPair,
     max_attempts: u32,
-) -> Result<RegistrationResult> {
+) -> std::result::Result<RegistrationResult, RedeemInviteError> {
     let base_delay_ms = 1_000u64;
-    let mut last_err = anyhow::anyhow!("No attempts made");
+    let mut last_err = RedeemInviteError::Transport(anyhow::anyhow!("No attempts made"));
     for attempt in 1..=max_attempts {
         match redeem_invite_with_orchestrator(orchestrator_url, invite_code, keypair).await {
             Ok(result) => return Ok(result),
             Err(e) => {
-                if !is_retryable_registration_error(&e) || attempt == max_attempts {
+                if !e.is_retryable() || attempt == max_attempts {
                     return Err(e);
                 }
                 let wait = Duration::from_millis(base_delay_ms * 2u64.pow(attempt.min(6) - 1));
@@ -893,6 +1081,7 @@ mod tests {
             id: Some("primary".into()),
             url: "http://localhost:8080".into(),
             bearer_token: Some("secret-token".into()),
+            invite_code: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: OrchestratorEntry = serde_json::from_str(&json).unwrap();
@@ -1159,9 +1348,10 @@ mod tests {
         assert_eq!(result.keypair.public_key(), kp.public_key());
     }
 
-    /// 401 invalid_code surfaces as a non-retryable client error.
+    /// 401 invalid_code surfaces as the typed `InvalidCode` variant.
+    /// Single attempt — non-retryable.
     #[tokio::test]
-    async fn redeem_invite_401_invalid_code_does_not_retry() {
+    async fn redeem_invite_401_invalid_code_returns_typed_variant() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1176,25 +1366,47 @@ mod tests {
             .await;
 
         let kp = nkeys::KeyPair::new_user();
-        let result = redeem_invite_with_orchestrator_with_retry(
+        let err = redeem_invite_with_orchestrator_with_retry(
             &mock_server.uri(),
             "tampered.code.here",
             &kp,
             5,
         )
-        .await;
-        let err = result.expect_err("401 must surface as error");
-        assert!(
-            !is_retryable_registration_error(&err),
-            "401 must be classified as non-retryable"
-        );
+        .await
+        .expect_err("401 must surface as error");
+        assert!(matches!(err, RedeemInviteError::InvalidCode), "got {err:?}");
+        assert!(!err.is_retryable());
     }
 
-    /// 409 replayed — caller can distinguish via the response body
-    /// (handled at the application layer). The helper itself surfaces
-    /// it as a non-retryable client error.
+    /// 401 expired — distinguished from invalid_code via the body
+    /// discriminator. Lets SDK consumers say "ask for a fresh code"
+    /// instead of "tampered code suspected".
     #[tokio::test]
-    async fn redeem_invite_409_replayed_does_not_retry() {
+    async fn redeem_invite_401_expired_returns_typed_variant() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/redeem-agent"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": "expired",
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let kp = nkeys::KeyPair::new_user();
+        let err = redeem_invite_with_orchestrator(&mock_server.uri(), "stale.code", &kp)
+            .await
+            .expect_err("401 expired must surface as error");
+        assert!(matches!(err, RedeemInviteError::Expired), "got {err:?}");
+        assert!(!err.is_retryable());
+    }
+
+    /// 409 replayed → `Replayed` variant. Non-retryable.
+    #[tokio::test]
+    async fn redeem_invite_409_replayed_returns_typed_variant() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1209,18 +1421,17 @@ mod tests {
             .await;
 
         let kp = nkeys::KeyPair::new_user();
-        let result =
+        let err =
             redeem_invite_with_orchestrator_with_retry(&mock_server.uri(), "used.up.code", &kp, 5)
-                .await;
-        let err = result.expect_err("409 must surface as error");
-        assert!(!is_retryable_registration_error(&err));
+                .await
+                .expect_err("409 must surface as error");
+        assert!(matches!(err, RedeemInviteError::Replayed), "got {err:?}");
+        assert!(!err.is_retryable());
     }
 
-    /// 403 revoked — non-retryable. Sibling to 409 above, kept as a
-    /// separate test so a regression on one classification surfaces
-    /// without masking the other.
+    /// 403 revoked → `Revoked` variant. Non-retryable.
     #[tokio::test]
-    async fn redeem_invite_403_revoked_does_not_retry() {
+    async fn redeem_invite_403_revoked_returns_typed_variant() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1235,11 +1446,41 @@ mod tests {
             .await;
 
         let kp = nkeys::KeyPair::new_user();
-        let result =
+        let err =
             redeem_invite_with_orchestrator_with_retry(&mock_server.uri(), "revoked.code", &kp, 5)
-                .await;
-        let err = result.expect_err("403 must surface as error");
-        assert!(!is_retryable_registration_error(&err));
+                .await
+                .expect_err("403 must surface as error");
+        assert!(matches!(err, RedeemInviteError::Revoked), "got {err:?}");
+        assert!(!err.is_retryable());
+    }
+
+    /// 503 not_configured → `NotConfigured` variant. NOT retryable —
+    /// the secret isn't going to materialise on a retry.
+    #[tokio::test]
+    async fn redeem_invite_503_not_configured_does_not_retry() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/redeem-agent"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "error": "not_configured",
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let kp = nkeys::KeyPair::new_user();
+        let err =
+            redeem_invite_with_orchestrator_with_retry(&mock_server.uri(), "valid.code", &kp, 5)
+                .await
+                .expect_err("503 not_configured must surface as error");
+        assert!(
+            matches!(err, RedeemInviteError::NotConfigured),
+            "got {err:?}"
+        );
+        assert!(!err.is_retryable());
     }
 
     /// 503 service-unavailable on the redeem path IS retried (the
@@ -1333,5 +1574,70 @@ mod tests {
             .unwrap();
         assert_eq!(result.keypair.public_key(), input_pub);
         assert_eq!(result.keypair.seed().unwrap(), input_seed);
+    }
+
+    // ── OrchestratorEntry YAML schema (workspace-config consumers) ──
+
+    #[test]
+    fn orchestrator_entry_deserializes_with_bearer_token_only() {
+        // Existing workspace-config consumers (challenge-response
+        // flow) keep working with no invite_code field at all.
+        let yaml = r#"
+id: primary
+url: http://localhost:8080
+bearer_token: ${NSED_BEARER_TOKEN}
+"#;
+        let e: OrchestratorEntry = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(e.id.as_deref(), Some("primary"));
+        assert_eq!(e.bearer_token.as_deref(), Some("${NSED_BEARER_TOKEN}"));
+        assert!(e.invite_code.is_none());
+    }
+
+    #[test]
+    fn orchestrator_entry_deserializes_with_invite_code_only() {
+        // The brainless 3rd-party path: paste the env-var name into
+        // YAML, no bearer token required.
+        let yaml = r#"
+id: primary
+url: http://localhost:8080
+invite_code: ${NSED_INVITE_CODE}
+"#;
+        let e: OrchestratorEntry = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(e.invite_code.as_deref(), Some("${NSED_INVITE_CODE}"));
+        assert!(e.bearer_token.is_none());
+    }
+
+    #[test]
+    fn orchestrator_entry_deserializes_with_both_fields() {
+        // Both set is legal — `serve.rs`-style consumers pick
+        // invite_code (single-use, redeemed-then-persisted) over
+        // bearer_token. Schema doesn't reject; precedence is the
+        // caller's policy decision.
+        let yaml = r#"
+url: http://localhost:8080
+bearer_token: ${BT}
+invite_code: ${IC}
+"#;
+        let e: OrchestratorEntry = serde_yaml::from_str(yaml).unwrap();
+        assert!(e.bearer_token.is_some());
+        assert!(e.invite_code.is_some());
+    }
+
+    #[test]
+    fn orchestrator_entry_omits_invite_code_when_none() {
+        // skip_serializing_if guard — workspaces that don't use the
+        // invite-code flow should round-trip without the field
+        // appearing in serialised YAML.
+        let e = OrchestratorEntry {
+            id: Some("primary".into()),
+            url: "http://localhost:8080".into(),
+            bearer_token: Some("${BT}".into()),
+            invite_code: None,
+        };
+        let yaml = serde_yaml::to_string(&e).unwrap();
+        assert!(
+            !yaml.contains("invite_code"),
+            "None invite_code must be skipped from output, got:\n{yaml}"
+        );
     }
 }
