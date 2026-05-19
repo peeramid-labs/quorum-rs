@@ -696,6 +696,7 @@ pub struct RedeemAgentInviteResponse {
 pub async fn redeem_invite_with_orchestrator(
     orchestrator_url: &str,
     invite_code: &str,
+    keypair: &nkeys::KeyPair,
 ) -> std::result::Result<RegistrationResult, RedeemInviteError> {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -703,10 +704,13 @@ pub async fn redeem_invite_with_orchestrator(
         .map_err(|e| RedeemInviteError::Transport(anyhow::Error::new(e)))?;
     let base = orchestrator_url.trim_end_matches('/');
 
-    // Generate the NKey locally — the seed never crosses the network.
-    // We send only the public half in the redeem body for the
+    // Caller-supplied keypair. The seed never crosses the network —
+    // we send only the public half in the redeem body for the
     // orchestrator to embed in the scoped User JWT it mints.
-    let keypair = nkeys::KeyPair::new_user();
+    // Caller-provided (rather than internally generated) so the
+    // retry helper can reuse the same key across attempts; otherwise
+    // a 5xx after the orchestrator already marked the JTI redeemed
+    // would strand the original key on a now-consumed invite.
     let user_pub_key = keypair.public_key();
 
     let body = serde_json::json!({
@@ -740,10 +744,17 @@ pub async fn redeem_invite_with_orchestrator(
     })?;
     let creds = format_nats_creds(&resp.user_jwt, &seed_str);
 
+    // Clone the caller's keypair into the result so callers that
+    // want the seed (e.g. to persist alongside `.creds`) don't have
+    // to thread it themselves. NKey cloning copies the 32-byte seed
+    // material.
+    let owned_kp = nkeys::KeyPair::from_seed(&seed_str).map_err(|e| {
+        RedeemInviteError::Transport(anyhow::anyhow!("Failed to clone keypair from seed: {e}"))
+    })?;
     Ok(RegistrationResult {
         creds,
         nats_url: resp.nats_url,
-        keypair,
+        keypair: owned_kp,
     })
 }
 
@@ -754,19 +765,21 @@ pub async fn redeem_invite_with_orchestrator(
 /// configured) short-circuit — they won't self-heal. See
 /// [`RedeemInviteError::is_retryable`] for the policy.
 ///
-/// Each attempt generates a fresh NKey, so a transient retry doesn't
-/// re-use the public key from a failed attempt. The orchestrator
-/// scopes the issued JWT to whichever pubkey is presented at the
-/// successful attempt.
+/// All attempts reuse the caller-supplied `keypair` so a 5xx after
+/// the orchestrator marked the JTI redeemed doesn't strand the
+/// original pubkey on a now-consumed invite — the next attempt
+/// presents the same pubkey and either succeeds or returns
+/// `Replayed`, never silently rotating keys.
 pub async fn redeem_invite_with_orchestrator_with_retry(
     orchestrator_url: &str,
     invite_code: &str,
+    keypair: &nkeys::KeyPair,
     max_attempts: u32,
 ) -> std::result::Result<RegistrationResult, RedeemInviteError> {
     let base_delay_ms = 1_000u64;
     let mut last_err = RedeemInviteError::Transport(anyhow::anyhow!("No attempts made"));
     for attempt in 1..=max_attempts {
-        match redeem_invite_with_orchestrator(orchestrator_url, invite_code).await {
+        match redeem_invite_with_orchestrator(orchestrator_url, invite_code, keypair).await {
             Ok(result) => return Ok(result),
             Err(e) => {
                 if !e.is_retryable() || attempt == max_attempts {
@@ -1411,9 +1424,13 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let result = redeem_invite_with_orchestrator(&mock_server.uri(), "eyJ.fake.invite.code")
-            .await
-            .expect("redeem must succeed on 200");
+        let result = redeem_invite_with_orchestrator(
+            &mock_server.uri(),
+            "eyJ.fake.invite.code",
+            &nkeys::KeyPair::new_user(),
+        )
+        .await
+        .expect("redeem must succeed on 200");
 
         assert_eq!(result.nats_url, "nats://api.example.com:4222");
         assert!(
@@ -1461,9 +1478,13 @@ mod tests {
         // this one gets no traffic, which is exactly what we want.
         let _ = mock_server.received_requests().await; // smoke: server is up
 
-        let result = redeem_invite_with_orchestrator(&mock_server.uri(), "eyJ.fake.invite.code")
-            .await
-            .expect("redeem must succeed");
+        let result = redeem_invite_with_orchestrator(
+            &mock_server.uri(),
+            "eyJ.fake.invite.code",
+            &nkeys::KeyPair::new_user(),
+        )
+        .await
+        .expect("redeem must succeed");
         // Inspect the actual recorded request to verify the field
         // is present and non-empty (this is the real assertion).
         let reqs = mock_server.received_requests().await.unwrap();
@@ -1494,10 +1515,14 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let err =
-            redeem_invite_with_orchestrator_with_retry(&mock_server.uri(), "tampered.code.here", 5)
-                .await
-                .expect_err("401 must surface as error");
+        let err = redeem_invite_with_orchestrator_with_retry(
+            &mock_server.uri(),
+            "tampered.code.here",
+            &nkeys::KeyPair::new_user(),
+            5,
+        )
+        .await
+        .expect_err("401 must surface as error");
         assert!(matches!(err, RedeemInviteError::InvalidCode), "got {err:?}");
         assert!(!err.is_retryable());
     }
@@ -1520,9 +1545,13 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let err = redeem_invite_with_orchestrator(&mock_server.uri(), "stale.code")
-            .await
-            .expect_err("401 expired must surface as error");
+        let err = redeem_invite_with_orchestrator(
+            &mock_server.uri(),
+            "stale.code",
+            &nkeys::KeyPair::new_user(),
+        )
+        .await
+        .expect_err("401 expired must surface as error");
         assert!(matches!(err, RedeemInviteError::Expired), "got {err:?}");
         assert!(!err.is_retryable());
     }
@@ -1543,9 +1572,14 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let err = redeem_invite_with_orchestrator_with_retry(&mock_server.uri(), "used.up.code", 5)
-            .await
-            .expect_err("409 must surface as error");
+        let err = redeem_invite_with_orchestrator_with_retry(
+            &mock_server.uri(),
+            "used.up.code",
+            &nkeys::KeyPair::new_user(),
+            5,
+        )
+        .await
+        .expect_err("409 must surface as error");
         assert!(matches!(err, RedeemInviteError::Replayed), "got {err:?}");
         assert!(!err.is_retryable());
     }
@@ -1566,9 +1600,14 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let err = redeem_invite_with_orchestrator_with_retry(&mock_server.uri(), "revoked.code", 5)
-            .await
-            .expect_err("403 must surface as error");
+        let err = redeem_invite_with_orchestrator_with_retry(
+            &mock_server.uri(),
+            "revoked.code",
+            &nkeys::KeyPair::new_user(),
+            5,
+        )
+        .await
+        .expect_err("403 must surface as error");
         assert!(matches!(err, RedeemInviteError::Revoked), "got {err:?}");
         assert!(!err.is_retryable());
     }
@@ -1590,9 +1629,14 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let err = redeem_invite_with_orchestrator_with_retry(&mock_server.uri(), "valid.code", 5)
-            .await
-            .expect_err("503 not_configured must surface as error");
+        let err = redeem_invite_with_orchestrator_with_retry(
+            &mock_server.uri(),
+            "valid.code",
+            &nkeys::KeyPair::new_user(),
+            5,
+        )
+        .await
+        .expect_err("503 not_configured must surface as error");
         assert!(
             matches!(err, RedeemInviteError::NotConfigured),
             "got {err:?}"
@@ -1619,8 +1663,13 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let result =
-            redeem_invite_with_orchestrator_with_retry(&mock_server.uri(), "valid.code", 2).await;
+        let result = redeem_invite_with_orchestrator_with_retry(
+            &mock_server.uri(),
+            "valid.code",
+            &nkeys::KeyPair::new_user(),
+            2,
+        )
+        .await;
         assert!(result.is_err(), "503 × 2 must surface as error");
     }
 
@@ -1652,10 +1701,14 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let result =
-            redeem_invite_with_orchestrator_with_retry(&mock_server.uri(), "valid.code", 3)
-                .await
-                .expect("retry must recover the 200");
+        let result = redeem_invite_with_orchestrator_with_retry(
+            &mock_server.uri(),
+            "valid.code",
+            &nkeys::KeyPair::new_user(),
+            3,
+        )
+        .await
+        .expect("retry must recover the 200");
         assert_eq!(result.nats_url, "nats://api.example.com:4222");
     }
 
@@ -1680,14 +1733,84 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let result = redeem_invite_with_orchestrator(&mock_server.uri(), "code")
-            .await
-            .unwrap();
+        let result = redeem_invite_with_orchestrator(
+            &mock_server.uri(),
+            "code",
+            &nkeys::KeyPair::new_user(),
+        )
+        .await
+        .unwrap();
         let seed = result.keypair.seed().unwrap();
         assert!(
             result.creds.contains(&seed),
             "creds blob must contain the keypair's seed verbatim"
         );
+    }
+
+    /// Retry across a 5xx → 200 sequence MUST present the SAME pubkey
+    /// on both attempts. Pre-#444 the helper allocated a fresh key per
+    /// attempt; a 5xx after the orchestrator marked the JTI redeemed
+    /// stranded the original pubkey on a now-consumed invite, and the
+    /// retry's new pubkey hit `replayed` → invite + creds lost.
+    /// Coderabbit flagged this as a critical bug. The fix moves
+    /// keypair generation to the caller; this test pins that contract.
+    #[tokio::test]
+    async fn redeem_invite_retry_reuses_caller_keypair() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // First attempt 503; second 200. The retry helper must
+        // reuse the keypair across both.
+        Mock::given(method("POST"))
+            .and(path("/redeem-agent"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "error": "kv_unavailable",
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/redeem-agent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user_jwt": "eyJ.ok.jwt",
+                "nats_url": "nats://localhost:4222",
+                "agent_id": "bot-1",
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let caller_kp = nkeys::KeyPair::new_user();
+        let expected_pub = caller_kp.public_key();
+        let expected_seed = caller_kp.seed().unwrap();
+
+        let result = redeem_invite_with_orchestrator_with_retry(
+            &mock_server.uri(),
+            "valid.code",
+            &caller_kp,
+            3,
+        )
+        .await
+        .expect("retry must succeed on attempt 2");
+
+        // Returned keypair round-trips the caller's seed (proves
+        // no internal regeneration happened anywhere in the path).
+        assert_eq!(result.keypair.public_key(), expected_pub);
+        assert_eq!(result.keypair.seed().unwrap(), expected_seed);
+
+        // Both recorded requests must carry the SAME pubkey.
+        let reqs = mock_server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 2, "expected two attempts (503 then 200)");
+        for (i, req) in reqs.iter().enumerate() {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            assert_eq!(
+                body["user_pub_key"].as_str(),
+                Some(expected_pub.as_str()),
+                "attempt {} pubkey rotated — retries must reuse caller's keypair",
+                i + 1
+            );
+        }
     }
 
     // ── /redeem (operator) — invite-code redemption (nsed #307) ────

@@ -37,10 +37,20 @@ async fn main() -> Result<()> {
 
     tracing::info!(orch_url = %orch_url, "Redeeming invite code…");
 
+    // Generate the NKey once and reuse it across retry attempts —
+    // see `redeem_invite_with_orchestrator_with_retry` docs for why.
+    let keypair = nkeys::KeyPair::new_user();
+
     // Typed RedeemInviteError keeps the caller's UX logic readable.
     // is_retryable() drives the retry helper — anything else, fall
     // through to a tailored message.
-    let result = match redeem_invite_with_orchestrator_with_retry(&orch_url, &invite_code, 5).await
+    let result = match redeem_invite_with_orchestrator_with_retry(
+        &orch_url,
+        &invite_code,
+        &keypair,
+        5,
+    )
+    .await
     {
         Ok(r) => r,
         Err(RedeemInviteError::Expired) => {

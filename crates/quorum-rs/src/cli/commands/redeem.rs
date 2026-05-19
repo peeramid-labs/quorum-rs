@@ -87,6 +87,20 @@ pub async fn run(
             anyhow::anyhow!("Cannot determine default seed path — pass --seed-out PATH explicitly.")
         })?,
     };
+    // Catch the foot-gun where a typo sets `--seed-out` and
+    // `--creds-out` to the same path: the second write would
+    // overwrite the first and the operator would silently lose
+    // either the seed or the creds depending on order. Reject
+    // upfront. Identity is checked on canonical-ish bytes; we
+    // don't resolve symlinks because the files don't exist yet at
+    // this point (and `--force` would have stripped them).
+    if resolved_creds == resolved_seed {
+        anyhow::bail!(
+            "--seed-out and --creds-out resolve to the same path ({}). The creds blob and \
+             the raw seed are different on-disk formats; one would overwrite the other.",
+            resolved_creds.display()
+        );
+    }
     for (label, path) in [("creds", &resolved_creds), ("seed", &resolved_seed)] {
         if path.exists() && !force {
             anyhow::bail!(
@@ -97,10 +111,17 @@ pub async fn run(
         }
     }
 
+    // Generate the NKey here, BEFORE the redeem call, so retries
+    // reuse the same key. Otherwise a 5xx after the orchestrator
+    // already marked the JTI redeemed would consume the invite on
+    // attempt N and the retry on attempt N+1 would present a new
+    // pubkey to a now-consumed code → 409 Replayed and lost invite.
+    let keypair = nkeys::KeyPair::new_user();
     eprintln!("Redeeming invite at {orchestrator_url}…");
     let result = match redeem_invite_with_orchestrator_with_retry(
         orchestrator_url,
         code,
+        &keypair,
         max_attempts,
     )
     .await
@@ -412,5 +433,32 @@ mod tests {
         assert!(err.to_string().contains("expired"), "got: {err}");
         assert!(!creds_path.exists());
         assert!(!seed_path.exists());
+    }
+
+    /// Coderabbit: a typo passing the SAME path to `--seed-out` and
+    /// `--creds-out` would silently overwrite one file with the
+    /// other (creds writes first, then seed clobbers it). Reject
+    /// upfront — no orchestrator round-trip, no partial state.
+    #[tokio::test]
+    async fn redeem_rejects_identical_seed_and_creds_paths() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let same = tmp.path().join("agent.both");
+        let err = run(
+            "any.code",
+            "http://orchestrator.invalid",
+            Some(&same),
+            Some(&same),
+            false,
+            1,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("same path") || msg.contains("resolve to the same"),
+            "error must explain the collision; got: {msg}"
+        );
+        // Neither file must have been touched.
+        assert!(!same.exists());
     }
 }

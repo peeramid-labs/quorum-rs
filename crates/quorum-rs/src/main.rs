@@ -239,9 +239,20 @@ async fn main() -> ExitCode {
             force,
             max_attempts,
         } => {
+            // Trim whitespace and ignore empty strings from `--url` /
+            // `$ORCH_URL` so a stray blank doesn't beat the production
+            // default and silently redeem against an unparseable URL.
             let resolved_url = url
-                .clone()
-                .or_else(|| std::env::var("ORCH_URL").ok())
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    std::env::var("ORCH_URL")
+                        .ok()
+                        .map(|s| s.trim().to_owned())
+                        .filter(|s| !s.is_empty())
+                })
                 .unwrap_or_else(commands::redeem::default_orchestrator_url);
             match commands::redeem::run(
                 code,
