@@ -1595,7 +1595,7 @@ bearer_token: ${NSED_BEARER_TOKEN}
 
     #[test]
     fn orchestrator_entry_deserializes_with_invite_code_only() {
-        // The brainless 3rd-party path: paste the env-var name into
+        // The 3rd-party redemption path: paste the env-var name into
         // YAML, no bearer token required.
         let yaml = r#"
 id: primary

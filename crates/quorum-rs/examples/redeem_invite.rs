@@ -1,7 +1,7 @@
 //! End-to-end example: bootstrap an agent's NATS credentials via a
 //! JWT invite code.
 //!
-//! This is the brainless path for 3rd party agent operators — no
+//! This is the redemption path for 3rd-party agent operators — no
 //! long-lived bearer token, no challenge-response gymnastics. The
 //! admin minted a single-use, short-TTL code carrying the agent's
 //! pre-shared `user_pub_key`; this program redeems it for a scoped

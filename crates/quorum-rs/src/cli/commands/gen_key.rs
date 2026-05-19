@@ -1,7 +1,7 @@
 //! `quorum gen-key` — generate an NKey seed for invite-code agent
 //! bootstrap.
 //!
-//! This is step 1 of the brainless 3rd-party agent flow:
+//! This is step 1 of the 3rd-party agent bootstrap flow:
 //!
 //! 1. Operator runs `quorum gen-key` → generates an Ed25519 NKey
 //!    seed, persists it locally, prints the public key.

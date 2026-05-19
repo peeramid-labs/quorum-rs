@@ -1,7 +1,7 @@
 //! `quorum redeem <code>` — redeem a JWT invite code for NATS
 //! credentials and write `.creds` to disk.
 //!
-//! Step 4 of the brainless 3rd-party agent flow (see
+//! Step 4 of the 3rd-party agent bootstrap flow (see
 //! [`super::gen_key`] for the full sequence). Reads the persisted
 //! NKey seed, POSTs to the orchestrator's `/redeem-agent`, writes a
 //! `.creds` file the agent worker can hand directly to NATS.
