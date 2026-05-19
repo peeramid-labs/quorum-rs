@@ -126,11 +126,44 @@ else is denied at the NATS server boundary.
 | "The orchestrator does not have invite codes configured." | Operator-side issue, not yours — the orchestrator needs `APP_INVITES__SIGNING_SECRET` set. |
 | "The orchestrator's backing store is temporarily unreachable." | Transient. The CLI retries with backoff; if it gives up, try again in a minute. |
 
+## Unified codes — one paste, chat + agent
+
+The `/admin/api/invites` operator endpoint (the one originally for
+HTTP bearer tokens) now accepts an optional `grants` field. Mint
+with `grants: ["chat", "agent"]` and the single code carries both
+capabilities: redeeming at `/redeem` returns the bearer token AND a
+scoped NATS User JWT + `nats_url`.
+
+For SDK consumers this is the helper:
+
+```rust,no_run
+use quorum_rs::nats_utils::redeem_operator_invite_with_orchestrator;
+
+let kp = nkeys::KeyPair::new_user();
+let resp = redeem_operator_invite_with_orchestrator(
+    "https://api.peeramid.xyz",
+    invite_code,
+    Some(&kp.public_key()),   // unified code? pass pubkey
+    Some("my-agent"),         // device hint for audit log
+).await?;
+
+// `resp.token`     — HTTP bearer (always present)
+// `resp.user_jwt`  — NATS User JWT (only when grants include "agent")
+// `resp.nats_url`  — NATS server URL (paired with user_jwt)
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Pass `Some(&pubkey)` unconditionally — chat-only codes silently
+ignore the field, so the same call site handles both flavours. The
+`nsed init` wizard uses exactly this pattern.
+
 ## Embedding instead of shelling out
 
 If your agent binary already drives its own startup and you'd
 rather not shell out to `quorum redeem`, the same flow lives
-behind `quorum_rs::nats_utils::redeem_invite_with_orchestrator`.
+behind `quorum_rs::nats_utils::redeem_invite_with_orchestrator`
+(the dedicated agent endpoint) or
+`redeem_operator_invite_with_orchestrator` (the unified one above).
 Worked example in [agent development guide §Bootstrap with an
 invite code](agent-development.md#bootstrap-with-an-invite-code).
 

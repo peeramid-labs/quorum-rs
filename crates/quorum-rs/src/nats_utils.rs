@@ -802,8 +802,10 @@ pub async fn redeem_invite_with_orchestrator_with_retry(
 /// Response from `POST /redeem` on a nsed orchestrator (#307).
 ///
 /// The bearer token here is the operator's HTTP API credential — used
-/// for chat / deliberation requests against the orchestrator. Distinct
-/// from the NATS User JWT minted by the agent flow.
+/// for chat / deliberation requests against the orchestrator. When the
+/// redeemed code is a unified code (carries the agent grant), this
+/// response also includes the optional `user_jwt` + `nats_url` for
+/// the NATS connection.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RedeemOperatorInviteResponse {
     /// Operator HTTP bearer token. Shown once — orchestrator does
@@ -814,21 +816,38 @@ pub struct RedeemOperatorInviteResponse {
     /// Budget applied to the new operator (`None` = orchestrator default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<f64>,
+    /// Scoped NATS User JWT — populated only when the redeemed code
+    /// carried the agent grant AND the request supplied a
+    /// `user_pub_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_jwt: Option<String>,
+    /// NATS server URL — paired with `user_jwt` for unified codes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nats_url: Option<String>,
+    /// Agent identity the NATS JWT is scoped to (mirrors `name` for
+    /// unified codes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
-/// Redeem an operator invite code (#307) for an HTTP bearer token.
+/// Redeem an operator invite code for an HTTP bearer token.
 ///
 /// Suitable for "I want to chat against this orchestrator" onboarding —
 /// a wizard prompts the operator for an invite code, calls this helper,
-/// and embeds the returned token in their workspace config. The agent
-/// flow ([`redeem_invite_with_orchestrator`]) is a separate endpoint
-/// returning NATS credentials; the two don't overlap.
+/// and embeds the returned token in their workspace config.
+///
+/// When the code is a *unified* code (admin minted it with
+/// `grants: ["chat","agent"]`), pass `user_pub_key = Some(pub)` — the
+/// orchestrator additionally mints a scoped NATS User JWT bound to
+/// that pubkey and returns `user_jwt` + `nats_url` in the response.
+/// For chat-only codes, pass `user_pub_key = None`.
 ///
 /// `device_hint` is an optional UA-style label captured in the
 /// orchestrator's audit log at redeem time — not used for auth.
 pub async fn redeem_operator_invite_with_orchestrator(
     orchestrator_url: &str,
     invite_code: &str,
+    user_pub_key: Option<&str>,
     device_hint: Option<&str>,
 ) -> std::result::Result<RedeemOperatorInviteResponse, RedeemInviteError> {
     let http = reqwest::Client::builder()
@@ -840,6 +859,9 @@ pub async fn redeem_operator_invite_with_orchestrator(
     let mut body = serde_json::json!({ "code": invite_code });
     if let Some(hint) = device_hint {
         body["device_hint"] = serde_json::Value::String(hint.to_string());
+    }
+    if let Some(pub_key) = user_pub_key {
+        body["user_pub_key"] = serde_json::Value::String(pub_key.to_string());
     }
 
     let response = http
@@ -1690,6 +1712,7 @@ mod tests {
         let result = redeem_operator_invite_with_orchestrator(
             &mock_server.uri(),
             "eyJ.fake.invite.code",
+            None,
             Some("nsed init / wizard"),
         )
         .await
@@ -1698,6 +1721,10 @@ mod tests {
         assert_eq!(result.token, "op-bearer-abc-123");
         assert_eq!(result.name, "alice");
         assert_eq!(result.budget, Some(5.0));
+        // Chat-only response: no agent fields populated.
+        assert!(result.user_jwt.is_none());
+        assert!(result.nats_url.is_none());
+        assert!(result.agent_id.is_none());
     }
 
     #[tokio::test]
@@ -1714,9 +1741,10 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let err = redeem_operator_invite_with_orchestrator(&mock_server.uri(), "stale.code", None)
-            .await
-            .expect_err("401 must surface as error");
+        let err =
+            redeem_operator_invite_with_orchestrator(&mock_server.uri(), "stale.code", None, None)
+                .await
+                .expect_err("401 must surface as error");
         assert!(matches!(err, RedeemInviteError::Expired), "got {err:?}");
     }
 
@@ -1734,9 +1762,10 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let err = redeem_operator_invite_with_orchestrator(&mock_server.uri(), "used.code", None)
-            .await
-            .expect_err("409 must surface as error");
+        let err =
+            redeem_operator_invite_with_orchestrator(&mock_server.uri(), "used.code", None, None)
+                .await
+                .expect_err("409 must surface as error");
         assert!(matches!(err, RedeemInviteError::Replayed), "got {err:?}");
     }
 
@@ -1754,7 +1783,7 @@ mod tests {
             })))
             .mount(&mock_server)
             .await;
-        let _ = redeem_operator_invite_with_orchestrator(&mock_server.uri(), "c", None)
+        let _ = redeem_operator_invite_with_orchestrator(&mock_server.uri(), "c", None, None)
             .await
             .expect("must succeed");
         let reqs = mock_server.received_requests().await.unwrap();
@@ -1767,6 +1796,77 @@ mod tests {
         // Sanity: code is still there.
         let _ = body_partial_json(serde_json::json!({"code": "c"}));
         assert_eq!(body.get("code").and_then(|v| v.as_str()), Some("c"));
+    }
+
+    #[tokio::test]
+    async fn redeem_operator_invite_unified_returns_both_bearer_and_nats() {
+        // Unified-code response: orchestrator returns bearer token
+        // AND the agent fields (user_jwt + nats_url + agent_id). The
+        // helper deserialises all of them.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/redeem"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "op-bearer-xyz",
+                "name": "alice",
+                "budget": 2.0,
+                "user_jwt": "eyJ.scoped.jwt",
+                "nats_url": "nats://api.example.com:4222",
+                "agent_id": "alice",
+            })))
+            .mount(&mock_server)
+            .await;
+        let result = redeem_operator_invite_with_orchestrator(
+            &mock_server.uri(),
+            "unified.code",
+            Some("UABCDEFG123"),
+            None,
+        )
+        .await
+        .expect("unified redeem must succeed");
+        assert_eq!(result.token, "op-bearer-xyz");
+        assert_eq!(result.user_jwt.as_deref(), Some("eyJ.scoped.jwt"));
+        assert_eq!(
+            result.nats_url.as_deref(),
+            Some("nats://api.example.com:4222")
+        );
+        assert_eq!(result.agent_id.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn redeem_operator_invite_passes_pub_key_in_body_when_supplied() {
+        // Guard: when user_pub_key is Some, the helper MUST put it
+        // in the request body so the orchestrator can dispatch on
+        // the agent grant. Regression test for the unified flow.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/redeem"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "op-x",
+                "name": "x",
+            })))
+            .mount(&mock_server)
+            .await;
+        let _ = redeem_operator_invite_with_orchestrator(
+            &mock_server.uri(),
+            "c",
+            Some("UPUBKEY123"),
+            None,
+        )
+        .await
+        .expect("must succeed");
+        let reqs = mock_server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(
+            body.get("user_pub_key").and_then(|v| v.as_str()),
+            Some("UPUBKEY123")
+        );
     }
 
     // ── OrchestratorEntry YAML schema (workspace-config consumers) ──
