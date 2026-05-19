@@ -1,25 +1,35 @@
-//! `quorum redeem <code>` — redeem a JWT invite code for NATS
-//! credentials and write `.creds` to disk.
+//! `quorum redeem <code>` — redeem a JWT invite code, generate a
+//! fresh NKey locally, persist `.creds` + `.seed`, and print a
+//! summary to the terminal.
 //!
-//! Step 4 of the 3rd-party agent bootstrap flow (see
-//! [`super::gen_key`] for the full sequence). Reads the persisted
-//! NKey seed, POSTs to the orchestrator's `/redeem-agent`, writes a
-//! `.creds` file the agent worker can hand directly to NATS.
+//! This is the one-step bootstrap path for 3rd-party agent
+//! operators. The operator never has to share a pubkey with the
+//! admin in advance — `quorum redeem` generates the NKey on the
+//! redeeming host and presents the public half to the orchestrator
+//! at redeem time. The seed never crosses the network.
 //!
-//! UX defaults intentionally match `gen-key`:
+//! UX defaults:
 //!
-//! - Seed at `~/.nsed/agent.seed` (override with `--seed PATH`).
+//! - Seed at `~/.nsed/agent.seed` (override with `--seed-out PATH`).
 //! - Creds at `~/.nsed/agent.creds` (override with `--creds-out PATH`).
-//! - Orchestrator URL from `--url` or `$ORCH_URL` (no default —
-//!   admins always tell the operator what to point at).
+//! - Orchestrator URL from `--url` or `$ORCH_URL` (no default — the
+//!   admin tells you what to point at).
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 use crate::nats_utils::{RedeemInviteError, redeem_invite_with_orchestrator_with_retry};
 
-/// Default creds file location. `~/.nsed/agent.creds`. See
-/// [`super::gen_key::default_seed_path`] for the parallel convention.
+/// Default seed file location. `~/.nsed/agent.seed`.
+fn default_seed_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let mut p = PathBuf::from(home);
+    p.push(".nsed");
+    p.push("agent.seed");
+    Some(p)
+}
+
+/// Default creds file location. `~/.nsed/agent.creds`.
 pub fn default_creds_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
     let mut p = PathBuf::from(home);
@@ -28,33 +38,14 @@ pub fn default_creds_path() -> Option<PathBuf> {
     Some(p)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn run(
     code: &str,
     orchestrator_url: &str,
-    seed_path: Option<&Path>,
+    seed_out: Option<&Path>,
     creds_out: Option<&Path>,
     force: bool,
     max_attempts: u32,
 ) -> Result<()> {
-    // Resolve seed path with the same default convention as `gen-key`.
-    let resolved_seed = match seed_path {
-        Some(p) => p.to_path_buf(),
-        None => super::gen_key::default_seed_path().ok_or_else(|| {
-            anyhow::anyhow!("Cannot determine default seed path — pass --seed PATH explicitly.")
-        })?,
-    };
-    let seed_str = std::fs::read_to_string(&resolved_seed).with_context(|| {
-        format!(
-            "Failed to read NKey seed at {}. Run `quorum gen-key` first.",
-            resolved_seed.display()
-        )
-    })?;
-    let seed_str = seed_str.trim();
-    let keypair = nkeys::KeyPair::from_seed(seed_str).map_err(|e| {
-        anyhow::anyhow!("Seed file at {:?} is not a valid NKey: {e}", resolved_seed)
-    })?;
-
     let resolved_creds = match creds_out {
         Some(p) => p.to_path_buf(),
         None => default_creds_path().ok_or_else(|| {
@@ -63,19 +54,26 @@ pub async fn run(
             )
         })?,
     };
-    if resolved_creds.exists() && !force {
-        anyhow::bail!(
-            "Creds file already exists at {}. Pass --force to overwrite (only do this \
-             if you're sure the existing creds are no longer needed).",
-            resolved_creds.display()
-        );
+    let resolved_seed = match seed_out {
+        Some(p) => p.to_path_buf(),
+        None => default_seed_path().ok_or_else(|| {
+            anyhow::anyhow!("Cannot determine default seed path — pass --seed-out PATH explicitly.")
+        })?,
+    };
+    for (label, path) in [("creds", &resolved_creds), ("seed", &resolved_seed)] {
+        if path.exists() && !force {
+            anyhow::bail!(
+                "{label} file already exists at {}. Pass --force to overwrite (only do this \
+                 if you're sure the existing file is no longer needed).",
+                path.display()
+            );
+        }
     }
 
-    eprintln!("Redeeming invite at {}…", orchestrator_url);
+    eprintln!("Redeeming invite at {orchestrator_url}…");
     let result = match redeem_invite_with_orchestrator_with_retry(
         orchestrator_url,
         code,
-        &keypair,
         max_attempts,
     )
     .await
@@ -84,38 +82,46 @@ pub async fn run(
         Err(e) => return Err(redeem_error_message(e)),
     };
 
-    if let Some(parent) = resolved_creds.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
-    }
-    write_creds_file(&resolved_creds, &result.creds)
-        .with_context(|| format!("Failed to write creds file at {}", resolved_creds.display()))?;
+    let seed = result
+        .keypair
+        .seed()
+        .map_err(|e| anyhow::anyhow!("Failed to extract NKey seed from redeem result: {e}"))?;
 
-    eprintln!("Wrote NATS credentials to {}", resolved_creds.display());
-    eprintln!(
-        "Connect with: nats://{}",
-        result.nats_url.trim_start_matches("nats://")
-    );
-    eprintln!();
-    eprintln!(
-        "You can now start your agent. Point it at the creds file above and the URL \
-         {}.",
-        result.nats_url
-    );
+    for (label, path, content) in [
+        ("creds", &resolved_creds, result.creds.as_str()),
+        ("seed", &resolved_seed, seed.as_str()),
+    ] {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+        }
+        write_secret_file(path, content)
+            .with_context(|| format!("Failed to write {label} file at {}", path.display()))?;
+    }
+
+    println!();
+    println!("✓ Redeemed invite. NATS credentials are ready.");
+    println!();
+    println!("  Connect URL : {}", result.nats_url);
+    println!("  Agent pubkey: {}", result.keypair.public_key());
+    println!("  Creds file  : {}", resolved_creds.display());
+    println!("  Seed file   : {}", resolved_seed.display());
+    println!();
+    println!("Both files are written mode 0600 on Unix. Keep the seed");
+    println!("private — it's the long-lived half of your NATS identity.");
     Ok(())
 }
 
 /// Map a typed [`RedeemInviteError`] to an actionable
-/// `anyhow::Error` for CLI output. The bail messages here are the
-/// human-facing UX — kept terse, action-oriented, no "see docs".
+/// `anyhow::Error` for CLI output.
 fn redeem_error_message(e: RedeemInviteError) -> anyhow::Error {
     match e {
         RedeemInviteError::Expired => {
             anyhow::anyhow!("This invite code has expired. Ask the admin for a fresh code.")
         }
         RedeemInviteError::Replayed => anyhow::anyhow!(
-            "This invite code was already redeemed on another host. Each code is single-use \
-             — ask the admin for a fresh code."
+            "This invite code was already redeemed. Each code is single-use — ask the admin \
+             for a fresh code."
         ),
         RedeemInviteError::Revoked => anyhow::anyhow!("The admin revoked this invite code."),
         RedeemInviteError::InvalidCode => anyhow::anyhow!(
@@ -137,7 +143,7 @@ fn redeem_error_message(e: RedeemInviteError) -> anyhow::Error {
     }
 }
 
-fn write_creds_file(path: &Path, creds: &str) -> std::io::Result<()> {
+fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;
@@ -148,19 +154,19 @@ fn write_creds_file(path: &Path, creds: &str) -> std::io::Result<()> {
             .truncate(true)
             .mode(0o600)
             .open(path)?;
-        f.write_all(creds.as_bytes())?;
-        if !creds.ends_with('\n') {
+        f.write_all(content.as_bytes())?;
+        if !content.ends_with('\n') {
             writeln!(f)?;
         }
         Ok(())
     }
     #[cfg(not(unix))]
     {
-        let mut content = creds.to_string();
-        if !content.ends_with('\n') {
-            content.push('\n');
+        let mut s = content.to_string();
+        if !s.ends_with('\n') {
+            s.push('\n');
         }
-        std::fs::write(path, content)
+        std::fs::write(path, s)
     }
 }
 
@@ -172,12 +178,8 @@ mod tests {
     fn redeem_error_message_translates_expired() {
         let msg = redeem_error_message(RedeemInviteError::Expired).to_string();
         assert!(
-            msg.contains("expired"),
-            "message must mention expired: {msg}"
-        );
-        assert!(
-            msg.contains("fresh code"),
-            "message must guide user to ask admin: {msg}"
+            msg.contains("expired") && msg.contains("fresh code"),
+            "{msg}"
         );
     }
 
@@ -206,7 +208,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redeem_succeeds_against_mock_orchestrator() {
+    async fn redeem_writes_creds_and_seed_on_success() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -224,9 +226,6 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let seed_path = tmp.path().join("agent.seed");
         let creds_path = tmp.path().join("agent.creds");
-        // Generate a seed first via gen-key (covers the integration
-        // between the two subcommands).
-        super::super::gen_key::run(Some(&seed_path), false).unwrap();
 
         run(
             "fake.invite.code",
@@ -239,11 +238,16 @@ mod tests {
         .await
         .expect("redeem must succeed against 200 mock");
 
-        let body = std::fs::read_to_string(&creds_path).unwrap();
-        assert!(body.contains("eyJ.test.jwt"), "creds must embed JWT");
+        let creds_body = std::fs::read_to_string(&creds_path).unwrap();
+        assert!(creds_body.contains("eyJ.test.jwt"), "creds must embed JWT");
         assert!(
-            body.contains("BEGIN USER NKEY SEED"),
+            creds_body.contains("BEGIN USER NKEY SEED"),
             "creds must embed seed"
+        );
+        let seed_body = std::fs::read_to_string(&seed_path).unwrap();
+        assert!(
+            seed_body.trim().starts_with("SU"),
+            "seed file must contain SU-prefixed nkey: {seed_body}"
         );
     }
 
@@ -266,7 +270,6 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let seed_path = tmp.path().join("agent.seed");
         let creds_path = tmp.path().join("agent.creds");
-        super::super::gen_key::run(Some(&seed_path), false).unwrap();
         std::fs::write(&creds_path, "pre-existing").unwrap();
 
         let err = run(
@@ -283,10 +286,13 @@ mod tests {
             err.to_string().contains("--force"),
             "must mention --force: {err}"
         );
-        // Original file untouched.
         assert_eq!(
             std::fs::read_to_string(&creds_path).unwrap(),
             "pre-existing"
+        );
+        assert!(
+            !seed_path.exists(),
+            "seed must not be written when creds overwrite is blocked"
         );
     }
 
@@ -307,7 +313,6 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let seed_path = tmp.path().join("agent.seed");
         let creds_path = tmp.path().join("agent.creds");
-        super::super::gen_key::run(Some(&seed_path), false).unwrap();
 
         let err = run(
             "stale.code",
@@ -320,7 +325,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("expired"), "got: {err}");
-        // No creds file written on error.
         assert!(!creds_path.exists());
+        assert!(!seed_path.exists());
     }
 }

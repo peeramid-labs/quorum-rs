@@ -120,26 +120,10 @@ enum Commands {
         force: bool,
     },
 
-    /// Generate an NKey seed for the invite-code agent flow (step 1
-    /// of 4). Persists the seed to disk (mode 0600 on Unix) and
-    /// prints the matching public key to stdout for sharing with
-    /// the orchestrator's admin.
-    GenKey {
-        /// Path to write the seed file. Defaults to
-        /// `~/.nsed/agent.seed`.
-        #[arg(long, value_name = "PATH")]
-        out: Option<PathBuf>,
-
-        /// Overwrite an existing seed file. Use with care — this
-        /// invalidates the credential of any agent currently using
-        /// the old seed.
-        #[arg(long)]
-        force: bool,
-    },
-
-    /// Redeem a JWT invite code for NATS credentials (step 4 of 4).
-    /// Reads the persisted NKey seed, POSTs to the orchestrator's
-    /// `/redeem-agent`, writes the resulting `.creds` to disk.
+    /// Redeem a JWT invite code for NATS credentials. Generates a
+    /// fresh NKey on this host, POSTs `{code, user_pub_key}` to the
+    /// orchestrator's `/redeem-agent`, writes both `.creds` and
+    /// `.seed` to disk (mode 0600 on Unix), and prints a summary.
     Redeem {
         /// The invite code provided by the admin (a JWT string,
         /// `eyJhbGc...`). Pass as a single positional argument.
@@ -150,17 +134,17 @@ enum Commands {
         #[arg(long)]
         url: Option<String>,
 
-        /// Path to read the NKey seed from. Defaults to
+        /// Path to write the `.seed` file to. Defaults to
         /// `~/.nsed/agent.seed`.
         #[arg(long, value_name = "PATH")]
-        seed: Option<PathBuf>,
+        seed_out: Option<PathBuf>,
 
         /// Path to write the `.creds` file to. Defaults to
         /// `~/.nsed/agent.creds`.
         #[arg(long, value_name = "PATH")]
         creds_out: Option<PathBuf>,
 
-        /// Overwrite an existing creds file.
+        /// Overwrite existing creds / seed files.
         #[arg(long)]
         force: bool,
 
@@ -242,19 +226,10 @@ async fn main() -> ExitCode {
         } => {
             commands::trace::run(cli.config_path(), job_id, orchestrator.as_deref(), verbose).await
         }
-        Commands::GenKey { ref out, force } => {
-            match commands::gen_key::run(out.as_deref(), force) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
         Commands::Redeem {
             ref code,
             ref url,
-            ref seed,
+            ref seed_out,
             ref creds_out,
             force,
             max_attempts,
@@ -271,7 +246,7 @@ async fn main() -> ExitCode {
             match commands::redeem::run(
                 code,
                 &resolved_url,
-                seed.as_deref(),
+                seed_out.as_deref(),
                 creds_out.as_deref(),
                 force,
                 max_attempts,
