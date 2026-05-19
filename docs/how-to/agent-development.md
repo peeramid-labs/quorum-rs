@@ -166,6 +166,63 @@ NATS_CREDS=/path/to/agent.creds ./my-agent
 
 The worker reads these from the environment if they're set; otherwise it connects anonymously.
 
+## Bootstrap with an invite code
+
+For 3rd-party agent operators where shipping a long-lived bearer token over a messenger is the wrong shape, the orchestrator can mint single-use, short-TTL JWT **invite codes** that an agent redeems on its own host for a freshly scoped NATS User JWT. The agent's NKey seed never crosses the network.
+
+Two ways to consume from the SDK:
+
+### Option A: one-shot CLI — `quorum redeem`
+
+The shipping `quorum` binary takes the operator UX off the SDK consumer's plate entirely:
+
+```bash
+$ quorum redeem eyJhbGc... --url http://orch.example.com:8080
+Redeeming invite at http://orch.example.com:8080…
+
+✓ Redeemed invite. NATS credentials are ready.
+
+  Connect URL : nats://orch.example.com:4222
+  Agent pubkey: UABCDEFG12345...
+  Creds file  : /home/operator/.nsed/agent.creds
+  Seed file   : /home/operator/.nsed/agent.seed
+```
+
+Then point the agent process at `~/.nsed/agent.creds` via `NATS_CREDS` (or via [`NatsAuth::creds_file`](../../crates/quorum-rs/src/nats_utils.rs)).
+
+### Option B: embed the SDK helper
+
+For agents that want to redeem at boot without writing files:
+
+```rust
+use quorum_rs::nats_utils::{
+    redeem_invite_with_orchestrator_with_retry, NatsAuth, connect_nats, RedeemInviteError,
+};
+
+let result = match redeem_invite_with_orchestrator_with_retry(
+    "http://orch.example.com:8080",
+    &invite_code,
+    5, // retry attempts
+).await {
+    Ok(r) => r,
+    Err(RedeemInviteError::Expired) => bail!("Invite expired; ask for a fresh code."),
+    Err(RedeemInviteError::Replayed) => bail!("Already redeemed."),
+    Err(RedeemInviteError::Revoked) => bail!("Admin revoked this invite."),
+    Err(e) if e.is_retryable() => bail!("Transient failure: {e}"),
+    Err(e) => return Err(e.into()),
+};
+
+let auth = NatsAuth { inline_creds: Some(result.creds), ..Default::default() };
+let nats = connect_nats(&result.nats_url, Some(&auth)).await?;
+// Hand `nats` to your NatsNsedWorker.
+```
+
+The helper generates a fresh `nkeys::KeyPair` on every call, presents only the public half to `/redeem-agent`, and assembles a `.creds` blob locally. The returned `RegistrationResult { creds, nats_url, keypair }` carries the keypair if you want to persist the seed.
+
+Typed [`RedeemInviteError`] variants (`InvalidCode` / `Expired` / `Revoked` / `Replayed` / `NotConfigured` / `KvUnavailable` / `Unexpected` / `Transport`) let you `match` on outcome without parsing the orchestrator's JSON error body. `is_retryable()` distinguishes transient from permanent failures.
+
+For the full operator → admin → operator handshake, see the recipe at [redeem an invite code](redeem-invite-code.md).
+
 ## Status dashboard
 
 When you build with the `status-server` feature, every `NatsNsedWorker` can serve a live status dashboard:
