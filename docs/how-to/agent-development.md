@@ -177,16 +177,21 @@ Two ways to consume from the SDK:
 The shipping `quorum` binary takes the operator UX off the SDK consumer's plate entirely:
 
 ```bash
-$ quorum redeem eyJhbGc... --url http://orch.example.com:8080
-Redeeming invite at http://orch.example.com:8080…
+# Default: hits https://api.peeramid.xyz.
+$ quorum redeem eyJhbGc...
+Redeeming invite at https://api.peeramid.xyz…
 
 ✓ Redeemed invite. NATS credentials are ready.
 
-  Connect URL : nats://orch.example.com:4222
+  Connect URL : nats://api.peeramid.xyz:4222
   Agent pubkey: UABCDEFG12345...
   Creds file  : /home/operator/.nsed/agent.creds
   Seed file   : /home/operator/.nsed/agent.seed
 ```
+
+Set `NSED_ENV=local` (or `dev` / `development`) to flip the
+default to `http://localhost:8080`; pass `--url` to override
+explicitly.
 
 Then point the agent process at `~/.nsed/agent.creds` via `NATS_CREDS` (or via [`NatsAuth::creds_file`](../../crates/quorum-rs/src/nats_utils.rs)).
 

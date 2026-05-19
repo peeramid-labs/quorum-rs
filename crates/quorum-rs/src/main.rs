@@ -129,8 +129,13 @@ enum Commands {
         /// `eyJhbGc...`). Pass as a single positional argument.
         code: String,
 
-        /// Orchestrator base URL (`http://host:8080`).
-        /// Falls back to `$ORCH_URL` when omitted.
+        /// Orchestrator base URL.
+        ///
+        /// Resolution order: `--url` > `$ORCH_URL` env > built-in
+        /// default. The default is `https://api.peeramid.xyz`;
+        /// setting `NSED_ENV=local` (or `dev` / `development`)
+        /// flips it to `http://localhost:8080` so working against
+        /// a locally-running orchestrator doesn't need the flag.
         #[arg(long)]
         url: Option<String>,
 
@@ -234,15 +239,10 @@ async fn main() -> ExitCode {
             force,
             max_attempts,
         } => {
-            let resolved_url = match url.clone().or_else(|| std::env::var("ORCH_URL").ok()) {
-                Some(u) => u,
-                None => {
-                    eprintln!(
-                        "error: orchestrator URL not set. Pass --url <URL> or export ORCH_URL."
-                    );
-                    return ExitCode::FAILURE;
-                }
-            };
+            let resolved_url = url
+                .clone()
+                .or_else(|| std::env::var("ORCH_URL").ok())
+                .unwrap_or_else(commands::redeem::default_orchestrator_url);
             match commands::redeem::run(
                 code,
                 &resolved_url,

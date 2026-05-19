@@ -30,7 +30,7 @@ The admin runs (or hits the orchestrator's `/admin/api/agent-invites`
 endpoint to mint) something like:
 
 ```bash
-curl -X POST https://orch.example.com/admin/api/agent-invites \
+curl -X POST https://api.peeramid.xyz/admin/api/agent-invites \
      -H "Authorization: Bearer $ADMIN_TOKEN" \
      -H 'Content-Type: application/json' \
      -d '{"agent_id":"researcher-bot-3","operator_name":"alice"}'
@@ -48,8 +48,21 @@ within the window they set or you'll need a fresh code.
 ### 2. Redeem on the agent host
 
 ```bash
+# Default: redeems against https://api.peeramid.xyz
+quorum redeem eyJhbGc...
+
+# Working against a locally-running orchestrator:
+NSED_ENV=local quorum redeem eyJhbGc...
+
+# Or pass --url explicitly:
 quorum redeem eyJhbGc... --url https://orch.example.com
 ```
+
+URL resolution order: `--url` flag > `$ORCH_URL` env > built-in
+default. The default is `https://api.peeramid.xyz`; setting
+`NSED_ENV=local` (or `dev` / `development`, case-insensitive) flips
+it to `http://localhost:8080` so `nsed serve` on the same host
+works without the flag.
 
 This:
 
