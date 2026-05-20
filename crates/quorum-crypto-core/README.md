@@ -13,9 +13,11 @@ agent-produced content and prove the attestation chain later.
 
 ## Install
 
+> **Status: pre-release.** Latest on crates.io is `0.7.0-rc.2`. Cargo doesn't pick pre-releases without an explicit pin, so the version below is required.
+
 ```toml
 [dependencies]
-quorum-crypto-core = "0.6"
+quorum-crypto-core = "0.7.0-rc.2"
 ```
 
 MSRV: Rust 1.88.

@@ -12,9 +12,11 @@ Real-world LLMs — especially smaller and open-weight ones — don't always ret
 
 ## Install
 
+> **Status: pre-release.** Latest on crates.io is `0.7.0-rc.2`. Cargo doesn't pick pre-releases without an explicit pin, so the version below is required.
+
 ```toml
 [dependencies]
-llm-repair = "0.6"
+llm-repair = "0.7.0-rc.2"
 ```
 
 MSRV: Rust 1.85 (uses Edition 2024).

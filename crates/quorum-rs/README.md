@@ -8,24 +8,26 @@ Rust SDK **and** CLI for multi-agent deliberation systems — agents that propos
 
 ## Install
 
+> **Status: pre-release.** No stable `0.x.y` has shipped yet — `0.7.0-rc.2` is the latest on crates.io. Cargo doesn't pick pre-releases without an explicit version pin, so commands below pin the RC.
+
 As a library:
 
 ```toml
 [dependencies]
-quorum-rs = "0.6"
+quorum-rs = "0.7.0-rc.2"
 ```
 
 As the `quorum` CLI (`run`, `status`, `trace`, `tui`, `init`):
 
 ```bash
-cargo install quorum-rs
+cargo install quorum-rs --version 0.7.0-rc.2
 ```
 
 Default features build the binary (`cli` + `tui`). To use as a pure library and skip the CLI deps (clap, ratatui, etc.):
 
 ```toml
 [dependencies]
-quorum-rs = { version = "0.6", default-features = false, features = ["audit"] }
+quorum-rs = { version = "0.7.0-rc.2", default-features = false, features = ["audit"] }
 ```
 
 MSRV: Rust 1.85 (uses Edition 2024).

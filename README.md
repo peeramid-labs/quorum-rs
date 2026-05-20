@@ -13,32 +13,34 @@ Deep tech dive: [arXiv:2601.16863](https://arxiv.org/abs/2601.16863).
 
 ## Crates
 
-| Crate | Version | Description |
+| Crate | Latest on crates.io | Description |
 |---|---|---|
-| [`quorum-rs`](crates/quorum-rs) | `0.6.0` | The SDK + reference runtime + `quorum` CLI: agent traits (`NsedAgent`, `Tool`, `AiModel`, `PromptSet`), data types (`AgentContext`, `Proposal`, `Evaluation`), the reference `ProposerEvaluatorAgent` (ReAct loop over any OpenAI-compatible LLM), additional `ExecAgent` / `McpAgent` / `ClaudeAgent` integrations, NATS-based worker runtime, telemetry catalog, middleware framework, and the user-facing `quorum` binary (`run` / `status` / `trace` / `tui` / `init`). Library and CLI ship as one crate so `cargo install quorum-rs` gives you the binary and `cargo add quorum-rs` gives you the SDK. |
-| [`llm-repair`](crates/llm-repair) | `0.6.0` | JSON-repair, markdown-extraction, and tool-call recovery for malformed LLM output. Useful for any Rust project that calls real-world LLMs and has to handle whatever they actually return. |
-| [`quorum-crypto-core`](crates/quorum-crypto-core) | `0.6.0` | Ed25519 / secp256k1 / SHA3 cryptographic primitives + audit envelope. Optional dep of `quorum-rs` (gated behind the `audit` feature). |
+| [`quorum-rs`](crates/quorum-rs) | `0.7.0-rc.2` | The SDK + reference runtime + `quorum` CLI: agent traits (`NsedAgent`, `Tool`, `AiModel`, `PromptSet`), data types (`AgentContext`, `Proposal`, `Evaluation`), the reference `ProposerEvaluatorAgent` (ReAct loop over any OpenAI-compatible LLM), additional `ExecAgent` / `McpAgent` / `ClaudeAgent` integrations, NATS-based worker runtime, telemetry catalog, middleware framework, and the user-facing `quorum` binary (`run` / `status` / `trace` / `tui` / `init`). Library and CLI ship as one crate so `cargo install quorum-rs` gives you the binary and `cargo add quorum-rs` gives you the SDK. |
+| [`llm-repair`](crates/llm-repair) | `0.7.0-rc.2` | JSON-repair, markdown-extraction, and tool-call recovery for malformed LLM output. Useful for any Rust project that calls real-world LLMs and has to handle whatever they actually return. |
+| [`quorum-crypto-core`](crates/quorum-crypto-core) | `0.7.0-rc.2` | Ed25519 / secp256k1 / SHA3 cryptographic primitives + audit envelope. Optional dep of `quorum-rs` (gated behind the `audit` feature). |
 
 ## Install
+
+> **Status: pre-release.** No stable `0.x.y` has shipped to crates.io yet — only `0.7.0-rc.2` is published. Cargo never picks a pre-release without an explicit opt-in, so the commands below pin the RC version. Drop the version once a stable lands.
 
 As a library:
 
 ```toml
 [dependencies]
-quorum-rs = "0.6"
+quorum-rs = "0.7.0-rc.2"
 ```
 
 For the JSON-repair helpers in isolation:
 
 ```toml
 [dependencies]
-llm-repair = "0.6"
+llm-repair = "0.7.0-rc.2"
 ```
 
 As a CLI binary (same crate, default features build the `quorum` binary):
 
 ```bash
-cargo install quorum-rs
+cargo install quorum-rs --version 0.7.0-rc.2
 ```
 
 ## How it works
