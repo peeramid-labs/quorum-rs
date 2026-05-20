@@ -230,30 +230,19 @@ jobs:
           fi
           exit "$rc"
 
-      # Poll for the SPECIFIC version we just published — checking only
-      # that the crate exists would return immediately (it already does)
-      # and the next publish would then fail with "could not find
-      # `llm-repair = x.y.z`". The `versions[].num` field is the
-      # authoritative list; jq makes the exact-match check trivial.
+      # No explicit index-wait between publishes: `cargo publish`
+      # (Rust ≥ 1.66) blocks until the new version is fetchable from
+      # the sparse index before exiting — the
+      # `note: waiting for <crate> v<X.Y.Z> to be available …`
+      # line in the publish output is that wait completing.
       #
-      # On timeout: hard-fail. If the version never indexes the
-      # downstream publish will fail anyway with a confusing error
-      # — better to fail HERE with an obvious "index timeout" signal.
-      - name: Wait for crates.io index refresh (llm-repair)
-        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && (needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'llm-repair') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        env:
-          WANT_VERSION: ${{ needs.tag.outputs.version }}
-        run: |
-          for i in $(seq 1 30); do
-            if curl -sf "https://crates.io/api/v1/crates/llm-repair" \
-                | jq -e --arg v "$WANT_VERSION" '.versions[]?.num | select(. == $v)' >/dev/null; then
-              echo "llm-repair@${WANT_VERSION} visible after ~${i}0s"
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "::error::llm-repair@${WANT_VERSION} not visible on crates.io after 5 minutes"
-          exit 1
+      # The previous poll against /api/v1/crates/<crate> was both
+      # redundant with cargo's own wait AND prone to false
+      # negatives: anonymous GH-Actions traffic against crates.io's
+      # HTTP API gets rate-limited / User-Agent-checked and the loop
+      # then never sees the just-published version, hard-failing an
+      # otherwise-successful release. Hit on llm-repair-v0.7.0-rc.1
+      # via PR #8's pre-release workflow.
 
       - name: Publish quorum-crypto-core
         if: ${{ env.CARGO_REGISTRY_TOKEN != '' && (needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'quorum-crypto-core') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
@@ -268,21 +257,8 @@ jobs:
           fi
           exit "$rc"
 
-      - name: Wait for crates.io index refresh (quorum-crypto-core)
-        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && (needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'quorum-crypto-core') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        env:
-          WANT_VERSION: ${{ needs.tag.outputs.version }}
-        run: |
-          for i in $(seq 1 30); do
-            if curl -sf "https://crates.io/api/v1/crates/quorum-crypto-core" \
-                | jq -e --arg v "$WANT_VERSION" '.versions[]?.num | select(. == $v)' >/dev/null; then
-              echo "quorum-crypto-core@${WANT_VERSION} visible after ~${i}0s"
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "::error::quorum-crypto-core@${WANT_VERSION} not visible on crates.io after 5 minutes"
-          exit 1
+      # See note above re: cargo's built-in publish-wait — no
+      # explicit poll step needed before publishing quorum-rs.
 
       - name: Publish quorum-rs (lib + `quorum` binary)
         if: ${{ env.CARGO_REGISTRY_TOKEN != '' && (needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'quorum-rs') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}

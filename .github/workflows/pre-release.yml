@@ -201,21 +201,17 @@ jobs:
           fi
           exit "$rc"
 
-      - name: Wait for crates.io index refresh (llm-repair)
-        if: ${{ needs.validate.outputs.crate == 'all' || needs.validate.outputs.crate == 'llm-repair' }}
-        env:
-          WANT_VERSION: ${{ needs.validate.outputs.version }}
-        run: |
-          for i in $(seq 1 30); do
-            if curl -sf "https://crates.io/api/v1/crates/llm-repair" \
-                | jq -e --arg v "$WANT_VERSION" '.versions[]?.num | select(. == $v)' >/dev/null; then
-              echo "llm-repair@${WANT_VERSION} visible after ~${i}0s"
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "::error::llm-repair@${WANT_VERSION} not visible on crates.io after 5 minutes"
-          exit 1
+      # No explicit index-wait step between publishes: `cargo publish`
+      # (Rust ≥ 1.66) blocks until the new version is fetchable from
+      # the sparse index before exiting — that's the
+      # `note: waiting for <crate> v<X.Y.Z> to be available …`
+      # line in the publish output. A separate poll against the HTTP
+      # API was redundant with that built-in wait AND prone to false
+      # negatives (anonymous GH-Actions traffic gets rate-limited /
+      # User-Agent-checked on /api/v1/crates), so it blocked
+      # otherwise-successful releases. If we ever need an extra
+      # safety margin add `sleep 30` here — don't reintroduce a
+      # polling loop without switching to the sparse index endpoint.
 
       - name: Publish quorum-crypto-core (RC)
         if: ${{ needs.validate.outputs.crate == 'all' || needs.validate.outputs.crate == 'quorum-crypto-core' }}
@@ -230,21 +226,8 @@ jobs:
           fi
           exit "$rc"
 
-      - name: Wait for crates.io index refresh (quorum-crypto-core)
-        if: ${{ needs.validate.outputs.crate == 'all' || needs.validate.outputs.crate == 'quorum-crypto-core' }}
-        env:
-          WANT_VERSION: ${{ needs.validate.outputs.version }}
-        run: |
-          for i in $(seq 1 30); do
-            if curl -sf "https://crates.io/api/v1/crates/quorum-crypto-core" \
-                | jq -e --arg v "$WANT_VERSION" '.versions[]?.num | select(. == $v)' >/dev/null; then
-              echo "quorum-crypto-core@${WANT_VERSION} visible after ~${i}0s"
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "::error::quorum-crypto-core@${WANT_VERSION} not visible on crates.io after 5 minutes"
-          exit 1
+      # See note above re: cargo's built-in publish-wait — no
+      # explicit poll step needed before publishing the next crate.
 
       - name: Publish quorum-rs (RC)
         if: ${{ needs.validate.outputs.crate == 'all' || needs.validate.outputs.crate == 'quorum-rs' }}
