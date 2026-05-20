@@ -1,178 +1,315 @@
-name: Pre-Release Preview
+name: Pre-Release
 
-# Dry-run preview pipeline. Authors can sanity-check what
-# `release-prepare.yml` would produce — version bump + changelog —
-# without touching Cargo.toml or opening a PR.
+# Publishes a pre-release (RC / alpha / beta) of one workspace crate
+# to crates.io and cuts a matching GitHub pre-release.
 #
-# Scope note: the nsed parent's `pre-release.yml` also builds release
-# binaries and pushes pre-release Docker images. Those are out of
-# scope for the SDK (issue #4) — the dry-run here is just changelog +
-# version-bump computation. Adopting the binary-build side later is a
-# separate change.
+# Lifecycle vs. the stable release flow:
+#   - Stable releases go through release-prepare → release-publish
+#     (PR-driven, version bump on dev, single canonical tag).
+#   - Pre-releases skip the PR ceremony — they're typically short-
+#     lived, sometimes mutable, and we don't want every `-rc.N`
+#     iteration to land as a permanent commit on dev. Instead the
+#     workflow bumps Cargo.toml on a TRANSIENT branch, tags the
+#     bump commit, pushes ONLY the tag, and discards the branch.
+#     `dev` keeps its release version untouched until the eventual
+#     stable bump lands via release-prepare.
+#
+# Mutability matches nsed's parent convention: re-running with the
+# same `--tag` deletes the prior tag + GitHub Release first, so an
+# author can iterate on the same `-rc.N` name during validation.
+#
+# Triggered exclusively by `workflow_dispatch`.
 
 on:
   workflow_dispatch:
     inputs:
-      crate:
-        description: 'Crate to preview (or "all" for workspace-wide bump)'
-        type: choice
-        options:
-          - all
-          - llm-repair
-          - quorum-crypto-core
-          - quorum-rs
-        default: quorum-rs
+      tag:
+        description: 'Pre-release tag (e.g. "v0.7.0-rc.1" for "all", or "llm-repair-v0.7.0-rc.1" for a per-crate RC)'
+        required: true
+        type: string
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: pre-release
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  preview:
-    name: Preview Next Version
+  validate:
+    name: Validate Pre-Release Tag
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.parse.outputs.tag }}
+      version: ${{ steps.parse.outputs.version }}
+      crate: ${{ steps.parse.outputs.crate }}
+    steps:
+      # Tag shape lives in two regexes:
+      #   - per-crate:  <crate>-vX.Y.Z-<id>(.N)*
+      #   - workspace:  vX.Y.Z-<id>(.N)*
+      # The pre-release identifier (`-<id>(.N)*`) is REQUIRED so the
+      # workflow refuses to publish a stable tag through the
+      # pre-release pipeline by accident — stable tags belong to
+      # release-publish.yml.
+      - name: Parse and validate tag shape
+        id: parse
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          TAG="$INPUT_TAG"
+          # OCI tag length cap (also a sanity ceiling for crates.io).
+          if [ "${#TAG}" -gt 128 ]; then
+            echo "::error::Tag exceeds 128 character limit (got ${#TAG})"
+            exit 1
+          fi
+          # Refuse stable semver — pre-release identifier is required.
+          if echo "$TAG" | grep -qE '^(llm-repair-|quorum-crypto-core-|quorum-rs-)?v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Tag $TAG looks like a stable release — use release-publish.yml. Pre-release identifier required (e.g. -rc.1, -alpha.2)."
+            exit 1
+          fi
+          PRE_RE='[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*'
+          case "$TAG" in
+            llm-repair-v*|quorum-crypto-core-v*|quorum-rs-v*)
+              CRATE="${TAG%-v*}"
+              VERSION="${TAG##*-v}"
+              ;;
+            v*)
+              CRATE="all"
+              VERSION="${TAG#v}"
+              ;;
+            *)
+              echo "::error::Unrecognised tag shape: $TAG"; exit 1 ;;
+          esac
+          if ! echo "$VERSION" | grep -qE "^${PRE_RE}\$"; then
+            echo "::error::VERSION ($VERSION) is not a valid pre-release semver — must look like X.Y.Z-rc.1 / X.Y.Z-alpha.2"
+            exit 1
+          fi
+          echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "crate=$CRATE"  >> "$GITHUB_OUTPUT"
+          echo "Pre-release: $TAG (crate=$CRATE, version=$VERSION)"
+
+  preflight:
+    name: Preflight (token + workspace state)
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      # Fail fast before any side effect if the token is missing.
+      # Same rationale as release-publish.yml's preflight: don't
+      # leave a phantom tag behind when there's no path to crates.io.
+      - name: CARGO_REGISTRY_TOKEN must be configured
+        env:
+          HAS_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+        run: |
+          if [ "$HAS_TOKEN" != "true" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN repository secret is missing or empty. Configure it in Settings → Secrets → Actions, then re-run."
+            exit 1
+          fi
+
+  publish:
+    name: Bump → Tag → Publish (${{ needs.validate.outputs.crate }} @ ${{ needs.validate.outputs.version }})
+    needs: [validate, preflight]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
+          # Pre-releases always cut from the default branch — same
+          # safety rationale as release-publish.yml's dispatch path.
+          # `github.sha` would let the operator publish from any
+          # ref via the manual-trigger UI.
+          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@v1.17.9
 
-      - name: Install git-cliff
-        run: cargo binstall --no-confirm git-cliff
+      - name: Install cargo-edit
+        run: cargo binstall --no-confirm cargo-edit
 
-      # Inputs flow via env: to close the command-injection vector
-      # — same pattern as release-prepare.yml.
-      - name: Resolve target crate dir
-        id: dir
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: pre-release-${{ needs.validate.outputs.tag }}
+
+      # Bump on a transient branch — never pushed, so `dev` stays
+      # clean. The tag we push points at this commit; the branch
+      # name is purely local. See module-top comment for why RCs
+      # don't get a permanent dev commit.
+      - name: Bump Cargo.toml on transient branch
         env:
-          CRATE: ${{ github.event.inputs.crate }}
+          CRATE: ${{ needs.validate.outputs.crate }}
+          VERSION: ${{ needs.validate.outputs.version }}
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "rc-bump-$$"
           case "$CRATE" in
-            llm-repair)         CRATE_DIR="crates/llm-repair" ;;
-            quorum-crypto-core) CRATE_DIR="crates/quorum-crypto-core" ;;
-            quorum-rs)          CRATE_DIR="crates/quorum-rs" ;;
-            all)                CRATE_DIR="crates/quorum-rs" ;;
-            *) echo "::error::Unknown crate: $CRATE"; exit 1 ;;
+            llm-repair)         cargo set-version -p llm-repair "$VERSION" ;;
+            quorum-crypto-core) cargo set-version -p quorum-crypto-core "$VERSION" ;;
+            quorum-rs)          cargo set-version -p quorum-rs "$VERSION" ;;
+            all)                cargo set-version --workspace "$VERSION" ;;
+            *) echo "::error::Unknown crate slug: $CRATE"; exit 1 ;;
           esac
-          echo "crate_dir=$CRATE_DIR" >> "$GITHUB_OUTPUT"
+          cargo generate-lockfile
+          git add -u Cargo.toml Cargo.lock crates/*/Cargo.toml
+          git commit -m "chore(pre-release): ${VERSION}"
 
-      - name: Compute next version (dry-run)
-        id: bump
+      # Pre-release tags are mutable per convention — force-deletes
+      # the prior tag on origin (if any) so an operator can iterate
+      # on the same `-rc.N` name during validation. Stable releases
+      # do NOT have this behaviour — release-publish.yml refuses to
+      # overwrite tags.
+      - name: Force-push pre-release tag
         env:
-          CRATE: ${{ github.event.inputs.crate }}
-          CRATE_DIR: ${{ steps.dir.outputs.crate_dir }}
+          TAG: ${{ needs.validate.outputs.tag }}
         run: |
-          CURRENT=$(grep -m1 '^version' "$CRATE_DIR/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
+          # Remove the remote tag if present, then create + push fresh.
+          git push origin ":refs/tags/${TAG}" 2>/dev/null || true
+          git tag -f "$TAG" -m "Pre-release ${TAG}"
+          git push origin "$TAG"
 
-          # Mirror release-prepare.yml's `all`-divergence guard so
-          # the preview reports what release-prepare would actually
-          # do. Without this, a dispatch with `crate=all` could
-          # show a clean preview that release-prepare immediately
-          # rejects once the operator tries to ship it.
-          if [ "$CRATE" = "all" ]; then
-            for c in llm-repair quorum-crypto-core quorum-rs; do
-              ver=$(grep -m1 '^version' "crates/${c}/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
-              if [ "$ver" != "$CURRENT" ]; then
-                echo "::error::crates/${c}/Cargo.toml is at $ver but quorum-rs is at $CURRENT — \`all\` requires every workspace crate on the same version. Bump them individually first, or pick a single crate."
-                exit 1
-              fi
-            done
+      # Cargo handles pre-release versions on crates.io natively —
+      # `cargo publish` accepts `X.Y.Z-rc.1` and the registry stores
+      # it as a separate version that `cargo add` won't pick up by
+      # default (semver opt-in required). Same per-crate topological
+      # logic as release-publish.yml so the publish order is
+      # deterministic regardless of which crate the RC targets.
+      - name: Publish llm-repair (RC)
+        if: ${{ needs.validate.outputs.crate == 'all' || needs.validate.outputs.crate == 'llm-repair' }}
+        run: |
+          set -o pipefail
+          out=$(cargo publish -p llm-repair 2>&1) && rc=0 || rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -eq 0 ]; then exit 0; fi
+          # crates.io rejects re-uploading the same version — that's
+          # the only failure mode we treat as a no-op (operator
+          # re-ran the workflow after a successful publish).
+          if printf '%s' "$out" | grep -qE 'crate version `[^`]+` is already uploaded'; then
+            echo "::notice::llm-repair@${{ needs.validate.outputs.version }} already on crates.io — treating as no-op"
+            exit 0
           fi
+          exit "$rc"
 
-          # Resolve the previous tag for THIS crate (or workspace).
-          # Crate-scoped tag scheme matches release-publish.yml:
-          # `<crate>-vX.Y.Z` for per-crate, plain `vX.Y.Z` for `all`.
-          if [ "$CRATE" = "all" ]; then
-            TAG_PATTERN='v[0-9]*'
-          else
-            TAG_PATTERN="${CRATE}-v[0-9]*"
-          fi
-          PREV_TAG=$(git tag --list --sort=-version:refname "$TAG_PATTERN" | head -1)
-
-          # `%B` captures full commit message so `BREAKING CHANGE:`
-          # footers in the body trigger the major-bump path. `%s`
-          # alone would silently miss them.
-          #
-          # `git log root..HEAD` excludes the root commit (exclusive
-          # range), so the first-release path uses `git log HEAD` to
-          # walk the entire history including root.
-          if [ -z "$PREV_TAG" ]; then
-            PREV_LABEL="<first commit>"
-            COMMITS=$(git log HEAD --format="%B%x00" 2>/dev/null \
-              | grep -v "^chore(release):" \
-              | grep -v "^Merge pull request.*release/" \
-              || true)
-          else
-            PREV_LABEL="$PREV_TAG"
-            COMMITS=$(git log "${PREV_TAG}..HEAD" --format="%B%x00" 2>/dev/null \
-              | grep -v "^chore(release):" \
-              | grep -v "^Merge pull request.*release/" \
-              || true)
-          fi
-
-          BUMP="patch"
-          if echo "$COMMITS" | grep -qiE "^feat(\(|!|:)"; then
-            BUMP="minor"
-          fi
-          if echo "$COMMITS" | grep -qiE "(^[a-z]+(\(.*\))?!:)|BREAKING CHANGE"; then
-            BUMP="major"
-          fi
-
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-          case "$BUMP" in
-            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
-            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
-            patch) PATCH=$((PATCH + 1)) ;;
-          esac
-          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
-
-          {
-            echo "## Pre-release preview: ${CRATE}"
-            echo ""
-            echo "| Field | Value |"
-            echo "|-------|-------|"
-            echo "| Current version | \`${CURRENT}\` |"
-            echo "| Previous tag    | \`${PREV_LABEL}\` |"
-            echo "| Bump type       | \`${BUMP}\` |"
-            echo "| **Next version**    | **\`${NEW_VERSION}\`** |"
-            echo ""
-            echo "### Commits since ${PREV_LABEL}"
-            echo ""
-            echo '```'
-            echo "$COMMITS" | head -50
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-
-          echo "next_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Changelog dry-run
+      - name: Wait for crates.io index refresh (llm-repair)
+        if: ${{ needs.validate.outputs.crate == 'all' || needs.validate.outputs.crate == 'llm-repair' }}
         env:
-          VERSION: ${{ steps.bump.outputs.next_version }}
-          CRATE: ${{ github.event.inputs.crate }}
+          WANT_VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          # Crate-scoped tag matches what release-prepare passes to
-          # git-cliff. Without this, the preview's section header
-          # would diverge from the real PR / GitHub Release for any
-          # non-`all` dispatch.
-          if [ "$CRATE" = "all" ]; then
-            TAG="v${VERSION}"
-          else
-            TAG="${CRATE}-v${VERSION}"
+          for i in $(seq 1 30); do
+            if curl -sf "https://crates.io/api/v1/crates/llm-repair" \
+                | jq -e --arg v "$WANT_VERSION" '.versions[]?.num | select(. == $v)' >/dev/null; then
+              echo "llm-repair@${WANT_VERSION} visible after ~${i}0s"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::llm-repair@${WANT_VERSION} not visible on crates.io after 5 minutes"
+          exit 1
+
+      - name: Publish quorum-crypto-core (RC)
+        if: ${{ needs.validate.outputs.crate == 'all' || needs.validate.outputs.crate == 'quorum-crypto-core' }}
+        run: |
+          set -o pipefail
+          out=$(cargo publish -p quorum-crypto-core 2>&1) && rc=0 || rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -eq 0 ]; then exit 0; fi
+          if printf '%s' "$out" | grep -qE 'crate version `[^`]+` is already uploaded'; then
+            echo "::notice::quorum-crypto-core@${{ needs.validate.outputs.version }} already on crates.io — treating as no-op"
+            exit 0
           fi
-          {
-            echo ""
-            echo "### Changelog dry-run (${TAG})"
-            echo ""
-            echo '```markdown'
-            git-cliff --tag "$TAG" --unreleased --strip header 2>/dev/null \
-              || echo "(git-cliff produced no output — no conventional commits since last tag?)"
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      - name: Wait for crates.io index refresh (quorum-crypto-core)
+        if: ${{ needs.validate.outputs.crate == 'all' || needs.validate.outputs.crate == 'quorum-crypto-core' }}
+        env:
+          WANT_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf "https://crates.io/api/v1/crates/quorum-crypto-core" \
+                | jq -e --arg v "$WANT_VERSION" '.versions[]?.num | select(. == $v)' >/dev/null; then
+              echo "quorum-crypto-core@${WANT_VERSION} visible after ~${i}0s"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::quorum-crypto-core@${WANT_VERSION} not visible on crates.io after 5 minutes"
+          exit 1
+
+      - name: Publish quorum-rs (RC)
+        if: ${{ needs.validate.outputs.crate == 'all' || needs.validate.outputs.crate == 'quorum-rs' }}
+        run: |
+          set -o pipefail
+          out=$(cargo publish -p quorum-rs 2>&1) && rc=0 || rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -eq 0 ]; then exit 0; fi
+          if printf '%s' "$out" | grep -qE 'crate version `[^`]+` is already uploaded'; then
+            echo "::notice::quorum-rs@${{ needs.validate.outputs.version }} already on crates.io — treating as no-op"
+            exit 0
+          fi
+          exit "$rc"
+
+  release:
+    name: Create GitHub Pre-Release
+    needs: [validate, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+          fetch-depth: 0
+
+      # Same mutability rule as the tag itself — re-running with the
+      # same `--tag` should overwrite the existing GH pre-release.
+      - name: Delete existing GH release (if any)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: gh release delete "$TAG" --yes 2>/dev/null || true
+
+      - name: Create GitHub Pre-Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          CRATE: ${{ needs.validate.outputs.crate }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          # `github.sha` is the workflow-dispatch SHA (default-branch
+          # HEAD when the dispatch fired), NOT the tagged commit. The
+          # publish job pushes the tag at a transient bump commit
+          # ON TOP of dev, so the two diverge by exactly that bump.
+          # Resolve the tag's actual commit so the release notes
+          # point at the artifact we just shipped.
+          TAG_COMMIT=$(git rev-parse "${TAG}^{commit}")
+
+          # Install hint must reflect what actually got published.
+          # `CRATE=all` ships the whole workspace at $VERSION, so
+          # the hint enumerates each crate; otherwise it's a single
+          # `cargo add` for the targeted crate.
+          if [ "$CRATE" = "all" ]; then
+            HEADER="Workspace-wide pre-release at \`${VERSION}\`."
+            INSTALL_LINES=$(printf 'cargo add llm-repair@%s\ncargo add quorum-crypto-core@%s\ncargo add quorum-rs@%s' \
+              "$VERSION" "$VERSION" "$VERSION")
+          else
+            HEADER=$(printf 'Pre-release of `%s` at `%s`.' "$CRATE" "$VERSION")
+            INSTALL_LINES=$(printf 'cargo add %s@%s' "$CRATE" "$VERSION")
+          fi
+
+          NOTES=$(printf '%s\n\n⚠️ **This is a pre-release** — not recommended for production use.\n\nInstall (semver opt-in required for pre-releases):\n\n```\n%s\n```\n\nCommit: %s' \
+            "$HEADER" "$INSTALL_LINES" "$TAG_COMMIT")
+          gh release create "$TAG" \
+            --prerelease \
+            --title "$TAG" \
+            --notes "$NOTES"
