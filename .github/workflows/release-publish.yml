@@ -1,0 +1,258 @@
+name: Publish Release
+
+# Fires when a release/* PR is merged into the default branch. Creates
+# the git tag from the branch name, then publishes the affected crates
+# to crates.io in topological order. Out of scope vs. the nsed parent:
+# Homebrew tap / apt repo / Docker images / binary tarballs — those
+# pipelines live in the proprietary nsed repo, not the SDK.
+#
+# Manual `workflow_dispatch` is also wired for the rare case where the
+# PR-merge trigger didn't fire (mirror-merge from another tool, etc.).
+
+on:
+  pull_request:
+    branches: [dev]
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.6.1). Must already exist or will be created from the current default branch."
+        required: true
+        type: string
+      dry_run:
+        description: "Dry-run packaging only (skips `cargo publish`)."
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tag:
+    name: Create Tag & Sync
+    runs-on: ubuntu-latest
+    # PR-merge path: only fire when the release branch was actually
+    # merged (not just closed). Dispatch path: always run.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
+       startsWith(github.event.pull_request.head.ref, 'release/'))
+    outputs:
+      tag: ${{ steps.extract.outputs.tag }}
+      version: ${{ steps.extract.outputs.version }}
+      crate: ${{ steps.extract.outputs.crate }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Extract version + crate from branch (or input)
+        id: extract
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+            VERSION="${TAG#v}"
+            CRATE="all"
+          else
+            BRANCH="${{ github.event.pull_request.head.ref }}"
+            # release/<crate>/v<X.Y.Z>  OR  legacy release/v<X.Y.Z>
+            SUFFIX="${BRANCH#release/}"
+            # If there's a slash, the segment before "/v" is the crate name.
+            case "$SUFFIX" in
+              */v*) CRATE="${SUFFIX%%/*}" ;;
+              *)    CRATE="all" ;;
+            esac
+            VERSION="${SUFFIX##*/v}"
+            VERSION="${VERSION#v}"
+            TAG="v${VERSION}"
+          fi
+          echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "crate=$CRATE"  >> "$GITHUB_OUTPUT"
+          echo "Release: $TAG (crate=$CRATE, version=$VERSION)"
+
+      - name: Create and push tag
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        run: |
+          TAG="${{ steps.extract.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists locally — pushing as-is."
+          else
+            git tag "$TAG"
+          fi
+          git push origin "$TAG"
+
+      - name: Delete release branch
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git push origin --delete "${{ github.event.pull_request.head.ref }}" || true
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: tag
+    runs-on: ubuntu-latest
+    if: needs.tag.outputs.tag != ''
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.tag.outputs.tag }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-publish-${{ needs.tag.outputs.tag }}
+
+      - name: Verify tag versions match the crates being published
+        run: |
+          set -euo pipefail
+          # The tag is the source of truth. Whichever crates we publish
+          # below must carry exactly that version in their Cargo.toml.
+          # Independent release cycles are supported: `release/<crate>/v…`
+          # only bumps that one crate, so a sibling crate at an older
+          # version is fine — we only assert on the crate(s) we publish.
+          TAG="${{ needs.tag.outputs.version }}"
+          CRATE="${{ needs.tag.outputs.crate }}"
+          check_one() {
+            local c="$1"
+            local ver
+            ver=$(grep -m1 '^version' "crates/${c}/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')
+            if [ "$ver" != "$TAG" ]; then
+              echo "::error::crates/${c}/Cargo.toml has version ${ver} but tag is ${TAG}"
+              exit 1
+            fi
+            echo "  ${c}: ${ver} ✓"
+          }
+          case "$CRATE" in
+            all)
+              for c in llm-repair quorum-crypto-core quorum-rs; do check_one "$c"; done ;;
+            llm-repair|quorum-crypto-core|quorum-rs)
+              check_one "$CRATE" ;;
+            *)
+              echo "::error::Unknown crate slug: $CRATE"; exit 1 ;;
+          esac
+
+      # Topological publish order: llm-repair → quorum-crypto-core →
+      # quorum-rs. Each step is gated on the workflow's crate slug so a
+      # `release/llm-repair/...` PR doesn't try to re-publish the others,
+      # and on the dispatch-only `dry_run` flag so a preview never
+      # accidentally publishes.
+      - name: Publish llm-repair
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && (needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'llm-repair') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        run: cargo publish -p llm-repair || echo "llm-repair already published at this version"
+
+      # Poll for the SPECIFIC version we just published — checking only
+      # that the crate exists would return immediately (it already does)
+      # and the next publish would then fail with "could not find
+      # `llm-repair = x.y.z`". The `versions[].num` field is the
+      # authoritative list; jq makes the exact-match check trivial.
+      - name: Wait for crates.io index refresh (llm-repair)
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && (needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'llm-repair') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        env:
+          WANT_VERSION: ${{ needs.tag.outputs.version }}
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf "https://crates.io/api/v1/crates/llm-repair" \
+                | jq -e --arg v "$WANT_VERSION" '.versions[]?.num | select(. == $v)' >/dev/null; then
+              echo "llm-repair@${WANT_VERSION} visible after ~${i}0s"; break
+            fi
+            sleep 10
+          done
+
+      - name: Publish quorum-crypto-core
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && (needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'quorum-crypto-core') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        run: cargo publish -p quorum-crypto-core || echo "quorum-crypto-core already published at this version"
+
+      - name: Wait for crates.io index refresh (quorum-crypto-core)
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && (needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'quorum-crypto-core') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        env:
+          WANT_VERSION: ${{ needs.tag.outputs.version }}
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf "https://crates.io/api/v1/crates/quorum-crypto-core" \
+                | jq -e --arg v "$WANT_VERSION" '.versions[]?.num | select(. == $v)' >/dev/null; then
+              echo "quorum-crypto-core@${WANT_VERSION} visible after ~${i}0s"; break
+            fi
+            sleep 10
+          done
+
+      - name: Publish quorum-rs (lib + `quorum` binary)
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && (needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'quorum-rs') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        run: cargo publish -p quorum-rs || echo "quorum-rs already published at this version"
+
+      - name: Dry-run (no publish)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          # `cargo publish --dry-run -p quorum-rs` fails until its
+          # sibling deps are on the registry, so we skip it.
+          cargo publish --dry-run -p llm-repair
+          cargo publish --dry-run -p quorum-crypto-core
+          echo "ℹ️ quorum-rs dry-run skipped (path-dep on siblings not yet on crates.io)"
+
+  release:
+    name: Create GitHub Release
+    needs: [tag, publish-crates]
+    runs-on: ubuntu-latest
+    # Skip on dry-run: no tag was pushed, so a GH Release would point
+    # at nothing.
+    if: ${{ needs.tag.outputs.tag != '' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.tag.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          VERSION="${{ needs.tag.outputs.version }}"
+          TAG="${{ needs.tag.outputs.tag }}"
+          BODY=""
+          # Prefer the CHANGELOG.md section when present (allows hand
+          # edits to land in the GitHub release notes).
+          if [ -f CHANGELOG.md ]; then
+            SECTION=$(sed -n "/^## \[${VERSION}\]/,/^## \[/{ /^## \[${VERSION}\]/d; /^## \[/d; p; }" CHANGELOG.md 2>/dev/null || true)
+            [ -n "$SECTION" ] && BODY="$SECTION"
+          fi
+          [ -z "$(echo "$BODY" | tr -d '[:space:]')" ] && BODY="Release ${TAG}"
+          {
+            echo "body<<RELEASE_EOF"
+            echo "$BODY"
+            echo "RELEASE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.tag.outputs.tag }}"
+          # Idempotent: skip if a release already exists for this tag.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — skipping"
+            exit 0
+          fi
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes "${{ steps.notes.outputs.body }}"

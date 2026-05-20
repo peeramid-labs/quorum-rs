@@ -1,0 +1,131 @@
+name: Pre-Release Preview
+
+# Dry-run preview pipeline. Authors can sanity-check what
+# `release-prepare.yml` would produce — version bump + changelog —
+# without touching Cargo.toml or opening a PR.
+#
+# Scope note: the nsed parent's `pre-release.yml` also builds release
+# binaries and pushes pre-release Docker images. Those are out of
+# scope for the SDK (issue #4) — the dry-run here is just changelog +
+# version-bump computation. Adopting the binary-build side later is a
+# separate change.
+
+on:
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: 'Crate to preview (or "all" for workspace-wide bump)'
+        type: choice
+        options:
+          - all
+          - llm-repair
+          - quorum-crypto-core
+          - quorum-rs
+        default: quorum-rs
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pre-release
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preview:
+    name: Preview Next Version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@v1.17.9
+
+      - name: Install git-cliff
+        run: cargo binstall --no-confirm git-cliff
+
+      - name: Resolve target crate dir
+        id: dir
+        run: |
+          CRATE="${{ github.event.inputs.crate }}"
+          case "$CRATE" in
+            llm-repair)         CRATE_DIR="crates/llm-repair" ;;
+            quorum-crypto-core) CRATE_DIR="crates/quorum-crypto-core" ;;
+            quorum-rs)          CRATE_DIR="crates/quorum-rs" ;;
+            all)                CRATE_DIR="crates/quorum-rs" ;;
+            *) echo "::error::Unknown crate: $CRATE"; exit 1 ;;
+          esac
+          echo "crate_dir=$CRATE_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Compute next version (dry-run)
+        id: bump
+        run: |
+          CRATE="${{ github.event.inputs.crate }}"
+          CRATE_DIR="${{ steps.dir.outputs.crate_dir }}"
+
+          CURRENT=$(grep -m1 '^version' "$CRATE_DIR/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            PREV_REF=$(git rev-list --max-parents=0 HEAD)
+            PREV_LABEL="<first commit>"
+          else
+            PREV_REF="$PREV_TAG"
+            PREV_LABEL="$PREV_TAG"
+          fi
+
+          COMMITS=$(git log "${PREV_REF}..HEAD" --format="%s" 2>/dev/null \
+            | grep -v "^chore(release):" \
+            | grep -v "^Merge pull request.*release/" \
+            || true)
+
+          BUMP="patch"
+          if echo "$COMMITS" | grep -qiE "^feat(\(|!|:)"; then
+            BUMP="minor"
+          fi
+          if echo "$COMMITS" | grep -qiE "(^[a-z]+(\(.*\))?!:)|BREAKING CHANGE"; then
+            BUMP="major"
+          fi
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+
+          {
+            echo "## Pre-release preview: ${CRATE}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Current version | \`${CURRENT}\` |"
+            echo "| Previous tag    | \`${PREV_LABEL}\` |"
+            echo "| Bump type       | \`${BUMP}\` |"
+            echo "| **Next version**    | **\`${NEW_VERSION}\`** |"
+            echo ""
+            echo "### Commits since ${PREV_LABEL}"
+            echo ""
+            echo '```'
+            echo "$COMMITS" | head -50
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+          echo "next_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Changelog dry-run
+        run: |
+          VERSION="${{ steps.bump.outputs.next_version }}"
+          {
+            echo ""
+            echo "### Changelog dry-run (v${VERSION})"
+            echo ""
+            echo '```markdown'
+            git-cliff --tag "v${VERSION}" --unreleased --strip header 2>/dev/null \
+              || echo "(git-cliff produced no output — no conventional commits since last tag?)"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
