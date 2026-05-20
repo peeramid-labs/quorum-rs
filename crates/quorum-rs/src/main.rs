@@ -119,6 +119,57 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Redeem a JWT invite code for NATS credentials. Generates a
+    /// fresh NKey on this host, POSTs `{code, user_pub_key}` to the
+    /// orchestrator's `/redeem-agent`, writes both `.creds` and
+    /// `.seed` to disk (mode 0600 on Unix), and prints a summary.
+    Redeem {
+        /// The invite code provided by the admin (a JWT string,
+        /// `eyJhbGc...`). Pass as a single positional argument.
+        code: String,
+
+        /// Orchestrator base URL.
+        ///
+        /// Resolution order: `--url` > `$ORCH_URL` env > built-in
+        /// default. The default is `https://api.peeramid.xyz`;
+        /// setting `NSED_ENV=local` (or `dev` / `development`)
+        /// flips it to `http://localhost:8080` so working against
+        /// a locally-running orchestrator doesn't need the flag.
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Path to write the `.seed` file to. Defaults to
+        /// `~/.nsed/agent.seed`.
+        #[arg(long, value_name = "PATH")]
+        seed_out: Option<PathBuf>,
+
+        /// Path to write the `.creds` file to. Defaults to
+        /// `~/.nsed/agent.creds`.
+        #[arg(long, value_name = "PATH")]
+        creds_out: Option<PathBuf>,
+
+        /// Overwrite existing creds / seed files.
+        #[arg(long)]
+        force: bool,
+
+        /// Optional path to an existing NKey seed file (the `.seed`
+        /// from a prior `quorum redeem`, or any `SU…` seed produced
+        /// elsewhere). When set, the seed is loaded and reused
+        /// instead of generating a fresh keypair. Lets an operator
+        /// keep the same NATS identity across re-runs (e.g. when a
+        /// transient redeem failed AFTER the orchestrator marked
+        /// the JTI consumed — pre-stage the seed once, then redeem
+        /// fresh invites with `--seed-in agent.seed` to keep the
+        /// same pubkey). When absent, a fresh NKey is generated.
+        #[arg(long, value_name = "PATH")]
+        seed_in: Option<PathBuf>,
+
+        /// Maximum retry attempts on transient failures
+        /// (5xx, `kv_unavailable`, network blips).
+        #[arg(long, default_value_t = 5)]
+        max_attempts: u32,
+    },
 }
 
 impl Cli {
@@ -191,6 +242,48 @@ async fn main() -> ExitCode {
             verbose,
         } => {
             commands::trace::run(cli.config_path(), job_id, orchestrator.as_deref(), verbose).await
+        }
+        Commands::Redeem {
+            ref code,
+            ref url,
+            ref seed_out,
+            ref creds_out,
+            force,
+            ref seed_in,
+            max_attempts,
+        } => {
+            // Trim whitespace and ignore empty strings from `--url` /
+            // `$ORCH_URL` so a stray blank doesn't beat the production
+            // default and silently redeem against an unparseable URL.
+            let resolved_url = url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    std::env::var("ORCH_URL")
+                        .ok()
+                        .map(|s| s.trim().to_owned())
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or_else(commands::redeem::default_orchestrator_url);
+            match commands::redeem::run(
+                code,
+                &resolved_url,
+                seed_out.as_deref(),
+                creds_out.as_deref(),
+                force,
+                seed_in.as_deref(),
+                max_attempts,
+            )
+            .await
+            {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    ExitCode::FAILURE
+                }
+            }
         }
         Commands::Init {
             ref orchestrator_url,

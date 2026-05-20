@@ -13,6 +13,7 @@ Goal-oriented recipes. Assume reader is already competent — get them to the an
 | Guide | Goal |
 |---|---|
 | [Agent development guide](how-to/agent-development.md) | Build a deliberation agent — reference impl, custom Rust trait, or non-Rust via exec/MCP |
+| [Redeem an invite code](how-to/redeem-invite-code.md) | Bootstrap NATS credentials from a JWT invite code, one command |
 | [Verify what your agent publishes](how-to/verify-telemetry.md) | Subscribe to your agent's telemetry using an auditor JWT |
 | [Inspect telemetry with the NATS CLI](how-to/inspect-telemetry-with-nats-cli.md) | Live-tail + filter events with `nats sub` and `jq` |
 | [Opt out of telemetry](how-to/opt-out-telemetry.md) | Disable all telemetry emission from your agent |

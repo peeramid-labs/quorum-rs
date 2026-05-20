@@ -1257,6 +1257,7 @@ mod tests {
             id: Some("local".to_string()),
             url: "http://localhost:8080".to_string(),
             bearer_token: None,
+            invite_code: None,
         }];
 
         let serialized = serde_json::to_value(&config).expect("serialize");
