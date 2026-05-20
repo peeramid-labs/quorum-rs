@@ -153,6 +153,18 @@ enum Commands {
         #[arg(long)]
         force: bool,
 
+        /// Optional path to an existing NKey seed file (the `.seed`
+        /// from a prior `quorum redeem`, or any `SU…` seed produced
+        /// elsewhere). When set, the seed is loaded and reused
+        /// instead of generating a fresh keypair. Lets an operator
+        /// keep the same NATS identity across re-runs (e.g. when a
+        /// transient redeem failed AFTER the orchestrator marked
+        /// the JTI consumed — pre-stage the seed once, then redeem
+        /// fresh invites with `--seed-in agent.seed` to keep the
+        /// same pubkey). When absent, a fresh NKey is generated.
+        #[arg(long, value_name = "PATH")]
+        seed_in: Option<PathBuf>,
+
         /// Maximum retry attempts on transient failures
         /// (5xx, `kv_unavailable`, network blips).
         #[arg(long, default_value_t = 5)]
@@ -237,6 +249,7 @@ async fn main() -> ExitCode {
             ref seed_out,
             ref creds_out,
             force,
+            ref seed_in,
             max_attempts,
         } => {
             // Trim whitespace and ignore empty strings from `--url` /
@@ -260,6 +273,7 @@ async fn main() -> ExitCode {
                 seed_out.as_deref(),
                 creds_out.as_deref(),
                 force,
+                seed_in.as_deref(),
                 max_attempts,
             )
             .await

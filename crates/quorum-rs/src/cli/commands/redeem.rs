@@ -71,6 +71,7 @@ pub async fn run(
     seed_out: Option<&Path>,
     creds_out: Option<&Path>,
     force: bool,
+    seed_in: Option<&Path>,
     max_attempts: u32,
 ) -> Result<()> {
     let resolved_creds = match creds_out {
@@ -111,12 +112,34 @@ pub async fn run(
         }
     }
 
-    // Generate the NKey here, BEFORE the redeem call, so retries
-    // reuse the same key. Otherwise a 5xx after the orchestrator
-    // already marked the JTI redeemed would consume the invite on
-    // attempt N and the retry on attempt N+1 would present a new
-    // pubkey to a now-consumed code → 409 Replayed and lost invite.
-    let keypair = nkeys::KeyPair::new_user();
+    // Resolve the NKey: caller-supplied `--seed-in` PATH wins (lets
+    // an operator pre-stage a seed and keep the same pubkey across
+    // redemptions). Otherwise generate a fresh keypair. Either way
+    // the key is allocated BEFORE the redeem call so the retry
+    // helper presents the SAME pubkey on every attempt — a 5xx
+    // after the orchestrator marked the JTI redeemed would
+    // otherwise consume the invite on attempt N and present a new
+    // pubkey on attempt N+1 → 409 Replayed and a lost invite.
+    let keypair = match seed_in {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read seed file at {}", path.display()))?;
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!(
+                    "--seed-in file {} is empty. Expected a `SU…`-prefixed NKey seed.",
+                    path.display()
+                );
+            }
+            nkeys::KeyPair::from_seed(trimmed).with_context(|| {
+                format!(
+                    "Failed to parse seed from {} — must be a `SU…`-prefixed NKey user seed",
+                    path.display()
+                )
+            })?
+        }
+        None => nkeys::KeyPair::new_user(),
+    };
     eprintln!("Redeeming invite at {orchestrator_url}…");
     let result = match redeem_invite_with_orchestrator_with_retry(
         orchestrator_url,
@@ -188,6 +211,10 @@ fn redeem_error_message(e: RedeemInviteError) -> anyhow::Error {
             anyhow::anyhow!("Unexpected response from orchestrator: HTTP {status} body={body:?}")
         }
         RedeemInviteError::Transport(inner) => inner.context("Failed to reach orchestrator"),
+        RedeemInviteError::Decode(inner) => inner.context(
+            "Orchestrator accepted the invite but the SDK couldn't process the response. \
+             The invite is now consumed — ask the admin for a fresh code",
+        ),
     }
 }
 
@@ -195,7 +222,7 @@ fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -206,6 +233,12 @@ fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
         if !content.ends_with('\n') {
             writeln!(f)?;
         }
+        drop(f);
+        // `OpenOptionsExt::mode` only applies when the file is newly
+        // created — if the caller passed `--force` and the target
+        // already existed with looser perms, the truncate kept those
+        // perms. Re-stamp explicitly to close that window.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         Ok(())
     }
     #[cfg(not(unix))]
@@ -339,6 +372,7 @@ mod tests {
             Some(&seed_path),
             Some(&creds_path),
             false,
+            None,
             1,
         )
         .await
@@ -384,6 +418,7 @@ mod tests {
             Some(&seed_path),
             Some(&creds_path),
             false,
+            None,
             1,
         )
         .await
@@ -426,6 +461,7 @@ mod tests {
             Some(&seed_path),
             Some(&creds_path),
             false,
+            None,
             1,
         )
         .await
@@ -433,6 +469,65 @@ mod tests {
         assert!(err.to_string().contains("expired"), "got: {err}");
         assert!(!creds_path.exists());
         assert!(!seed_path.exists());
+    }
+
+    /// Coderabbit (RUSTSEC-style nit): `--force` overwriting a
+    /// pre-existing file with broader perms would previously leave
+    /// the file at the OLD perms (e.g. 0644) because
+    /// `OpenOptionsExt::mode` only applies on file creation. The
+    /// post-write `set_permissions` call must clamp every successful
+    /// write to 0600 regardless of prior state. Test sets up a
+    /// world-readable creds file, runs `--force` redeem, asserts the
+    /// mode is exactly 0600 after.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn redeem_force_overwrites_to_0600_even_from_looser_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/redeem-agent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user_jwt": "eyJ.x.y",
+                "nats_url": "nats://localhost:4222",
+                "agent_id": "bot-1",
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let seed_path = tmp.path().join("agent.seed");
+        let creds_path = tmp.path().join("agent.creds");
+        // Seed both files at world-readable perms — what a
+        // misconfigured editor / earlier broken redeem might leave.
+        std::fs::write(&creds_path, "stale-creds").unwrap();
+        std::fs::write(&seed_path, "stale-seed").unwrap();
+        std::fs::set_permissions(&creds_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        run(
+            "code",
+            &mock_server.uri(),
+            Some(&seed_path),
+            Some(&creds_path),
+            /* force = */ true,
+            None,
+            1,
+        )
+        .await
+        .expect("force redeem against 200 mock must succeed");
+
+        for path in [&creds_path, &seed_path] {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o600,
+                "{} must end at 0600 after --force overwrite; got {mode:o}",
+                path.display()
+            );
+        }
     }
 
     /// Coderabbit: a typo passing the SAME path to `--seed-out` and
@@ -449,6 +544,7 @@ mod tests {
             Some(&same),
             Some(&same),
             false,
+            None,
             1,
         )
         .await
@@ -460,5 +556,112 @@ mod tests {
         );
         // Neither file must have been touched.
         assert!(!same.exists());
+    }
+
+    /// `--seed-in` lets the operator pre-stage a seed and reuse the
+    /// same pubkey across redemptions. The CLI must load that seed,
+    /// pass it to the SDK helper, and end up with a creds file whose
+    /// embedded seed matches the supplied one verbatim.
+    #[tokio::test]
+    async fn redeem_loads_seed_from_seed_in_when_supplied() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/redeem-agent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user_jwt": "eyJ.fake.jwt",
+                "nats_url": "nats://localhost:4222",
+                "agent_id": "bot-1",
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let staged = tmp.path().join("staged.seed");
+        let expected_kp = nkeys::KeyPair::new_user();
+        let expected_seed = expected_kp.seed().unwrap();
+        let expected_pub = expected_kp.public_key();
+        std::fs::write(&staged, &expected_seed).unwrap();
+
+        let seed_path = tmp.path().join("agent.seed");
+        let creds_path = tmp.path().join("agent.creds");
+        run(
+            "code",
+            &mock_server.uri(),
+            Some(&seed_path),
+            Some(&creds_path),
+            false,
+            Some(&staged),
+            1,
+        )
+        .await
+        .expect("redeem with --seed-in must succeed");
+
+        // The written seed file must contain the SUPPLIED seed
+        // verbatim — proves `--seed-in` was honoured end-to-end
+        // and not silently overridden by a fresh keypair.
+        let written = std::fs::read_to_string(&seed_path).unwrap();
+        assert_eq!(
+            written.trim(),
+            expected_seed,
+            "written seed must match the supplied --seed-in seed"
+        );
+        // The body posted to the orchestrator must carry the
+        // matching pubkey.
+        let reqs = mock_server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(body["user_pub_key"].as_str(), Some(expected_pub.as_str()));
+    }
+
+    /// `--seed-in` pointing at an empty file is a foot-gun. Reject
+    /// before any orchestrator round-trip.
+    #[tokio::test]
+    async fn redeem_rejects_empty_seed_in_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let empty = tmp.path().join("empty.seed");
+        std::fs::write(&empty, "").unwrap();
+        let err = run(
+            "code",
+            "http://orchestrator.invalid",
+            Some(&tmp.path().join("agent.seed")),
+            Some(&tmp.path().join("agent.creds")),
+            false,
+            Some(&empty),
+            1,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("empty"),
+            "must mention emptiness: {err}"
+        );
+    }
+
+    /// Garbage in the seed file (anything that isn't an `SU…` NKey
+    /// seed) must produce a clear error before the redeem call,
+    /// not after — otherwise the JTI would be consumed on a
+    /// nonsense pubkey.
+    #[tokio::test]
+    async fn redeem_rejects_malformed_seed_in_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bad = tmp.path().join("bad.seed");
+        std::fs::write(&bad, "not-a-real-nkey-seed").unwrap();
+        let err = run(
+            "code",
+            "http://orchestrator.invalid",
+            Some(&tmp.path().join("agent.seed")),
+            Some(&tmp.path().join("agent.creds")),
+            false,
+            Some(&bad),
+            1,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("parse seed") || err.to_string().contains("NKey"),
+            "must mention seed-parse failure: {err}"
+        );
     }
 }

@@ -527,22 +527,35 @@ pub enum RedeemInviteError {
         status: reqwest::StatusCode,
         body: String,
     },
-    /// Network / transport / serde failure — the request never produced
-    /// a structured response. Wraps the underlying error.
+    /// Pre-response transport failure — the request never reached the
+    /// orchestrator OR the orchestrator's response never reached us
+    /// (TCP reset, DNS, handshake, request build). Retryable: a
+    /// transient blip can self-heal and the JTI is not yet consumed.
     Transport(anyhow::Error),
+    /// Post-response local failure — the orchestrator returned a
+    /// success status BUT the SDK couldn't decode the body or
+    /// extract the user seed from the caller's keypair. NOT
+    /// retryable: the orchestrator already marked the JTI redeemed,
+    /// so a retry would just earn a `Replayed`. Caller should
+    /// surface the underlying error to the operator and abandon
+    /// this invite.
+    Decode(anyhow::Error),
 }
 
 impl RedeemInviteError {
     /// `true` when retrying could plausibly succeed. Matches the
     /// orchestrator's documented retry semantics:
     ///
-    /// - Retryable: transport errors, `KvUnavailable` (503), and
-    ///   `Unexpected` whose status is 5xx (a future server-side bug or
+    /// - Retryable: `Transport` (request never produced a structured
+    ///   response → JTI still available), `KvUnavailable` (503), and
+    ///   `Unexpected` whose status is 5xx (future server-side bug or
     ///   a not-yet-classified backend issue).
     /// - Non-retryable: `InvalidCode`, `Expired`, `Revoked`,
     ///   `Replayed` (4xx — won't self-heal), `NotConfigured` (admin
-    ///   action required, no point retrying), and `Unexpected` whose
-    ///   status is 4xx (probable caller bug, not transient).
+    ///   action required, no point retrying), `Unexpected` whose
+    ///   status is 4xx, and `Decode` (we received a successful
+    ///   response so the JTI is already consumed — retrying would
+    ///   only earn `Replayed`).
     pub fn is_retryable(&self) -> bool {
         match self {
             RedeemInviteError::Transport(_) | RedeemInviteError::KvUnavailable => true,
@@ -551,7 +564,8 @@ impl RedeemInviteError {
             | RedeemInviteError::Expired
             | RedeemInviteError::Revoked
             | RedeemInviteError::Replayed
-            | RedeemInviteError::NotConfigured => false,
+            | RedeemInviteError::NotConfigured
+            | RedeemInviteError::Decode(_) => false,
         }
     }
 }
@@ -573,6 +587,9 @@ impl std::fmt::Display for RedeemInviteError {
                 write!(f, "unexpected redeem response: {status} body={body:?}")
             }
             RedeemInviteError::Transport(e) => write!(f, "transport error: {e:#}"),
+            RedeemInviteError::Decode(e) => {
+                write!(f, "redeem response decode error (JTI consumed): {e:#}")
+            }
         }
     }
 }
@@ -580,7 +597,7 @@ impl std::fmt::Display for RedeemInviteError {
 impl std::error::Error for RedeemInviteError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            RedeemInviteError::Transport(e) => Some(e.as_ref()),
+            RedeemInviteError::Transport(e) | RedeemInviteError::Decode(e) => Some(e.as_ref()),
             _ => None,
         }
     }
@@ -661,9 +678,15 @@ pub struct RedeemAgentInviteResponse {
 /// ```ignore
 /// use quorum_rs::nats_utils::{redeem_invite_with_orchestrator, RedeemInviteError, NatsAuth, connect_nats};
 ///
+/// // Caller owns the keypair. Generate fresh (typical) or load
+/// // from disk (re-runnable bootstrap). The SAME pubkey is sent
+/// // on every retry attempt — see the helper's `_with_retry`
+/// // variant for why that matters.
+/// let keypair = nkeys::KeyPair::new_user();
 /// let result = match redeem_invite_with_orchestrator(
 ///     "http://localhost:8080",
 ///     &invite_code,
+///     &keypair,
 /// ).await {
 ///     Ok(r) => r,
 ///     Err(RedeemInviteError::Expired) => {
@@ -687,9 +710,9 @@ pub struct RedeemAgentInviteResponse {
 ///
 /// // result.creds is a complete `.creds` blob ready for
 /// // NatsAuth::inline_creds; result.nats_url is the orchestrator-
-/// // advertised NATS URL; result.keypair is the freshly-generated
-/// // NKey (private — persist alongside `.creds` only if the caller
-/// // wants to reform the credential later).
+/// // advertised NATS URL; result.keypair is owned (cloned from
+/// // the caller's seed) — persist alongside `.creds` only if the
+/// // caller wants to reform the credential later.
 /// let auth = NatsAuth { inline_creds: Some(result.creds), ..Default::default() };
 /// let nats = connect_nats(&result.nats_url, Some(&auth)).await?;
 /// ```
@@ -733,14 +756,15 @@ pub async fn redeem_invite_with_orchestrator(
         return Err(classify_redeem_error(response).await);
     }
 
+    // Post-success local failures must NOT retry — JTI is consumed.
     let resp: RedeemAgentInviteResponse = response.json().await.map_err(|e| {
-        RedeemInviteError::Transport(
+        RedeemInviteError::Decode(
             anyhow::Error::new(e).context("Failed to parse /redeem-agent response"),
         )
     })?;
 
     let seed_str = keypair.seed().map_err(|e| {
-        RedeemInviteError::Transport(anyhow::anyhow!("Failed to extract user seed: {e}"))
+        RedeemInviteError::Decode(anyhow::anyhow!("Failed to extract user seed: {e}"))
     })?;
     let creds = format_nats_creds(&resp.user_jwt, &seed_str);
 
@@ -749,7 +773,7 @@ pub async fn redeem_invite_with_orchestrator(
     // to thread it themselves. NKey cloning copies the 32-byte seed
     // material.
     let owned_kp = nkeys::KeyPair::from_seed(&seed_str).map_err(|e| {
-        RedeemInviteError::Transport(anyhow::anyhow!("Failed to clone keypair from seed: {e}"))
+        RedeemInviteError::Decode(anyhow::anyhow!("Failed to clone keypair from seed: {e}"))
     })?;
     Ok(RegistrationResult {
         creds,
@@ -892,11 +916,13 @@ pub async fn redeem_operator_invite_with_orchestrator(
         return Err(classify_redeem_error(response).await);
     }
 
+    // Post-success local failure: orchestrator already marked JTI
+    // consumed before responding. NOT retryable — see `Decode` docs.
     response
         .json::<RedeemOperatorInviteResponse>()
         .await
         .map_err(|e| {
-            RedeemInviteError::Transport(
+            RedeemInviteError::Decode(
                 anyhow::Error::new(e).context("Failed to parse /redeem response"),
             )
         })
@@ -1811,6 +1837,58 @@ mod tests {
                 i + 1
             );
         }
+    }
+
+    /// `Decode` carries post-response local failures (JSON parse,
+    /// seed extraction). The retry helper must NOT retry these —
+    /// the JTI is already consumed, so retrying would just earn a
+    /// `Replayed` and bury the actual root cause. Test serves a
+    /// 200 OK with a body that fails to deserialise into
+    /// `RedeemAgentInviteResponse`, then asserts the helper makes
+    /// exactly ONE request and surfaces `Decode`.
+    #[tokio::test]
+    async fn redeem_invite_decode_failure_does_not_retry() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // 200 but body is missing the required `user_jwt` field →
+        // serde fails. `expect(1)` enforces no retry.
+        Mock::given(method("POST"))
+            .and(path("/redeem-agent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "nats_url": "nats://localhost:4222",
+                "agent_id": "bot-1",
+                // user_jwt deliberately missing
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let err = redeem_invite_with_orchestrator_with_retry(
+            &mock_server.uri(),
+            "code",
+            &nkeys::KeyPair::new_user(),
+            5,
+        )
+        .await
+        .unwrap_err();
+        match err {
+            RedeemInviteError::Decode(_) => {}
+            other => panic!("expected Decode, got {other:?}"),
+        }
+    }
+
+    /// And just to pin the classifier contract from the other side:
+    /// `Decode::is_retryable()` must return `false`. Pure unit
+    /// check — no HTTP round-trip — guards against a future refactor
+    /// that lumps Decode back in with Transport.
+    #[test]
+    fn redeem_invite_decode_is_not_retryable() {
+        let e = RedeemInviteError::Decode(anyhow::anyhow!("synthetic"));
+        assert!(!e.is_retryable());
+        let e = RedeemInviteError::Transport(anyhow::anyhow!("synthetic"));
+        assert!(e.is_retryable());
     }
 
     // ── /redeem (operator) — invite-code redemption (nsed #307) ────
