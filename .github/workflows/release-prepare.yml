@@ -82,6 +82,23 @@ jobs:
           CURRENT=$(grep -m1 '^version' "$CRATE_DIR/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
           echo "Current $CRATE_DIR version: $CURRENT"
 
+          # When CRATE="all", verify ALL releasable crates carry the
+          # same version BEFORE we run `cargo set-version --workspace`.
+          # Otherwise a sibling already at a higher version (e.g.
+          # llm-repair@1.0.0 with quorum-rs@0.6.0) would be silently
+          # downgraded to the new "all" version computed from quorum-rs.
+          # Operators who want independent streams must use the per-
+          # crate dispatch input, not "all".
+          if [ "$CRATE" = "all" ]; then
+            for c in llm-repair quorum-crypto-core quorum-rs; do
+              ver=$(grep -m1 '^version' "crates/${c}/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
+              if [ "$ver" != "$CURRENT" ]; then
+                echo "::error::crates/${c}/Cargo.toml is at $ver but quorum-rs is at $CURRENT — \`all\` requires every workspace crate to be on the same version. Bump them individually first, or pick a single crate from the dispatch input."
+                exit 1
+              fi
+            done
+          fi
+
           # Resolve the previous tag for THIS crate (or workspace).
           # Per-crate releases use the `<crate>-vX.Y.Z` tag scheme
           # (introduced to avoid cross-crate `vX.Y.Z` collisions);
@@ -92,11 +109,6 @@ jobs:
             TAG_PATTERN="${CRATE}-v[0-9]*"
           fi
           PREV_TAG=$(git tag --list --sort=-version:refname "$TAG_PATTERN" | head -1)
-          if [ -z "$PREV_TAG" ]; then
-            PREV_REF=$(git rev-list --max-parents=0 HEAD)
-          else
-            PREV_REF="$PREV_TAG"
-          fi
 
           # `%B` captures the full commit message (subject + body +
           # footers) so `BREAKING CHANGE:` footers — which only appear
@@ -107,10 +119,27 @@ jobs:
           # Commit messages are newline-separated; the trailing
           # %x00 sentinel keeps multi-line bodies from being lost in
           # the grep filtering below.
-          COMMITS=$(git log "${PREV_REF}..HEAD" --format="%B%x00" 2>/dev/null \
-            | grep -v "^chore(release):" \
-            | grep -v "^Merge pull request.*release/" \
-            || true)
+          #
+          # When PREV_TAG is empty (first release) `git log HEAD`
+          # walks the entire history INCLUDING the root commit —
+          # `git log root..HEAD` would have excluded it (`..` is an
+          # exclusive range). Two branches in the command instead of
+          # a single ref so the root commit's conventional-commit
+          # markers (if any) actually count toward the bump
+          # classification.
+          if [ -z "$PREV_TAG" ]; then
+            COMMITS=$(git log HEAD --format="%B%x00" 2>/dev/null \
+              | grep -v "^chore(release):" \
+              | grep -v "^Merge pull request.*release/" \
+              || true)
+            PREV_REF="<first commit>"
+          else
+            PREV_REF="$PREV_TAG"
+            COMMITS=$(git log "${PREV_REF}..HEAD" --format="%B%x00" 2>/dev/null \
+              | grep -v "^chore(release):" \
+              | grep -v "^Merge pull request.*release/" \
+              || true)
+          fi
           if [ -z "$(echo "$COMMITS" | tr -d '[:space:]\0')" ]; then
             echo "No new commits since $PREV_REF (only release machinery) — skipping"
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -178,6 +207,17 @@ jobs:
         run: |
           BRANCH="release/${CRATE}/v${VERSION}"
 
+          # The CHANGELOG section header (and the release tag) are
+          # crate-scoped so two crates can ship version X.Y.Z without
+          # colliding in either git refs or CHANGELOG.md. Workspace-
+          # wide releases keep the bare `vX.Y.Z` shape since by
+          # construction every crate is on the same version.
+          if [ "$CRATE" = "all" ]; then
+            TAG="v${VERSION}"
+          else
+            TAG="${CRATE}-v${VERSION}"
+          fi
+
           git checkout -b "$BRANCH"
 
           # Bump version(s)
@@ -193,7 +233,13 @@ jobs:
           # workflow stays useful even before a CHANGELOG.md is committed —
           # the section just gets dropped on the floor in that case and
           # contributors can adopt CHANGELOG.md later.
-          NEW_SECTION=$(git-cliff --tag "v${VERSION}" --unreleased --strip header 2>/dev/null || true)
+          #
+          # Use `--tag $TAG` (crate-scoped) so the section header lands
+          # as `## [<crate>-vX.Y.Z]` for per-crate releases — that
+          # disambiguates entries when multiple crates eventually
+          # ship the same numeric version. release-publish.yml's
+          # release-notes lookup also keys on $TAG, so both sides match.
+          NEW_SECTION=$(git-cliff --tag "$TAG" --unreleased --strip header 2>/dev/null || true)
           if [ -n "$NEW_SECTION" ] && [ -f CHANGELOG.md ]; then
             HEADER_END=$(grep -n "^## " CHANGELOG.md | head -1 | cut -d: -f1)
             if [ -n "$HEADER_END" ]; then
@@ -224,7 +270,7 @@ jobs:
           fi
           git push origin "$BRANCH"
 
-          CHANGELOG_BODY=$(git-cliff --tag "v${VERSION}" --unreleased --strip header 2>/dev/null || echo "Release v${VERSION}")
+          CHANGELOG_BODY=$(git-cliff --tag "$TAG" --unreleased --strip header 2>/dev/null || echo "Release ${TAG}")
           {
             echo "## Release v${VERSION}"
             echo ""

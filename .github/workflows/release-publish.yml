@@ -108,6 +108,22 @@ jobs:
           echo "crate=$CRATE"  >> "$GITHUB_OUTPUT"
           echo "Release: $TAG (crate=$CRATE, version=$VERSION)"
 
+      # Fail fast before tagging if `CARGO_REGISTRY_TOKEN` isn't set
+      # — otherwise we'd leave a tag with no published crate behind,
+      # and the next release-prepare run would key off a phantom tag.
+      # The token doesn't need to flow into this step's env; we only
+      # need to know whether the secret exists. `secrets.<name>` is
+      # `''` when the secret is absent, which is how the check works.
+      - name: Preflight — CARGO_REGISTRY_TOKEN must be configured
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        env:
+          HAS_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+        run: |
+          if [ "$HAS_TOKEN" != "true" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN repository secret is missing or empty. Refusing to create a release tag with no path to crates.io. Configure the secret in Settings → Secrets → Actions, then re-run."
+            exit 1
+          fi
+
       - name: Create and push tag
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         env:
@@ -134,7 +150,10 @@ jobs:
     name: Publish to crates.io
     needs: tag
     runs-on: ubuntu-latest
-    if: needs.tag.outputs.tag != ''
+    # Skip on dry-run: there's no tag to check out, and the dry-run
+    # job below covers `cargo publish --dry-run` against the current
+    # default branch instead.
+    if: ${{ needs.tag.outputs.tag != '' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
@@ -273,8 +292,22 @@ jobs:
           fi
           exit "$rc"
 
-      - name: Dry-run (no publish)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+  publish-dry-run:
+    name: Publish dry-run (no side effects)
+    # Sibling of publish-crates: lives in its own job because it
+    # needs to check out HEAD of the default branch (the tag the
+    # main publish job uses has not been pushed in dry-run mode,
+    # so `ref: tag` would fail at checkout).
+    needs: tag
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Dry-run cargo publish
         run: |
           # `cargo publish --dry-run -p quorum-rs` fails until its
           # sibling deps are on the registry, so we skip it.
@@ -305,10 +338,21 @@ jobs:
         run: |
           BODY=""
           # Prefer the CHANGELOG.md section when present (allows hand
-          # edits to land in the GitHub release notes).
+          # edits to land in the GitHub release notes). Section
+          # headers are crate-scoped now — try the full crate-scoped
+          # header first (matches what release-prepare.yml writes for
+          # per-crate releases), fall back to the legacy bare version
+          # for workspace-wide releases or older entries.
+          extract_section() {
+            local key="$1"
+            sed -n "/^## \[${key}\]/,/^## \[/{ /^## \[${key}\]/d; /^## \[/d; p; }" CHANGELOG.md 2>/dev/null || true
+          }
           if [ -f CHANGELOG.md ]; then
-            SECTION=$(sed -n "/^## \[${VERSION}\]/,/^## \[/{ /^## \[${VERSION}\]/d; /^## \[/d; p; }" CHANGELOG.md 2>/dev/null || true)
-            [ -n "$SECTION" ] && BODY="$SECTION"
+            # Try the crate-scoped header first (e.g. "llm-repair-v0.7.0"),
+            # then fall back to the bare version (legacy / "all"
+            # releases that wrote "## [0.7.0]").
+            BODY=$(extract_section "${TAG#v}")
+            [ -z "$BODY" ] && BODY=$(extract_section "$VERSION")
           fi
           [ -z "$(echo "$BODY" | tr -d '[:space:]')" ] && BODY="Release ${TAG}"
           {
