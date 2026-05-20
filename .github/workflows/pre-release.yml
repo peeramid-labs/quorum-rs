@@ -293,8 +293,22 @@ jobs:
           # Resolve the tag's actual commit so the release notes
           # point at the artifact we just shipped.
           TAG_COMMIT=$(git rev-parse "${TAG}^{commit}")
-          NOTES=$(printf 'Pre-release of `%s` at \`%s\`.\n\n⚠️ **This is a pre-release** — not recommended for production use.\n\nInstall: `cargo add %s@%s` (semver opt-in required for pre-releases).\n\nCommit: %s' \
-            "$CRATE" "$VERSION" "$CRATE" "$VERSION" "$TAG_COMMIT")
+
+          # Install hint must reflect what actually got published.
+          # `CRATE=all` ships the whole workspace at $VERSION, so
+          # the hint enumerates each crate; otherwise it's a single
+          # `cargo add` for the targeted crate.
+          if [ "$CRATE" = "all" ]; then
+            HEADER="Workspace-wide pre-release at \`${VERSION}\`."
+            INSTALL_LINES=$(printf 'cargo add llm-repair@%s\ncargo add quorum-crypto-core@%s\ncargo add quorum-rs@%s' \
+              "$VERSION" "$VERSION" "$VERSION")
+          else
+            HEADER=$(printf 'Pre-release of \`%s\` at \`%s\`.' "$CRATE" "$VERSION")
+            INSTALL_LINES=$(printf 'cargo add %s@%s' "$CRATE" "$VERSION")
+          fi
+
+          NOTES=$(printf '%s\n\n⚠️ **This is a pre-release** — not recommended for production use.\n\nInstall (semver opt-in required for pre-releases):\n\n```\n%s\n```\n\nCommit: %s' \
+            "$HEADER" "$INSTALL_LINES" "$TAG_COMMIT")
           gh release create "$TAG" \
             --prerelease \
             --title "$TAG" \
