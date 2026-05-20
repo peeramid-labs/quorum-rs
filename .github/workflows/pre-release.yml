@@ -303,7 +303,7 @@ jobs:
             INSTALL_LINES=$(printf 'cargo add llm-repair@%s\ncargo add quorum-crypto-core@%s\ncargo add quorum-rs@%s' \
               "$VERSION" "$VERSION" "$VERSION")
           else
-            HEADER=$(printf 'Pre-release of \`%s\` at \`%s\`.' "$CRATE" "$VERSION")
+            HEADER=$(printf 'Pre-release of `%s` at `%s`.' "$CRATE" "$VERSION")
             INSTALL_LINES=$(printf 'cargo add %s@%s' "$CRATE" "$VERSION")
           fi
 
