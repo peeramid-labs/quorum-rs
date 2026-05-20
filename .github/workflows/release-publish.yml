@@ -58,25 +58,50 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Tag scheme is crate-scoped to support independent release
+      # streams: a `release/llm-repair/v0.7.0` PR creates the
+      # `llm-repair-v0.7.0` tag, while a `release/all/v0.7.0`
+      # workspace-wide release keeps the bare `v0.7.0` name. Without
+      # this scoping the bot's L61-79 finding holds: the second crate
+      # to ship version X.Y.Z would collide with the first one's tag.
       - name: Extract version + crate from branch (or input)
         id: extract
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-            VERSION="${TAG#v}"
-            CRATE="all"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$DISPATCH_TAG"
+            # Dispatch tag may already be crate-scoped (e.g.
+            # `llm-repair-v0.7.0`) or plain (`v0.7.0`). Parse both.
+            case "$TAG" in
+              llm-repair-v*|quorum-crypto-core-v*|quorum-rs-v*)
+                CRATE="${TAG%-v*}"
+                VERSION="${TAG##*-v}"
+                ;;
+              v*)
+                CRATE="all"
+                VERSION="${TAG#v}"
+                ;;
+              *)
+                echo "::error::Unrecognised tag shape: $TAG"; exit 1 ;;
+            esac
           else
-            BRANCH="${{ github.event.pull_request.head.ref }}"
+            BRANCH="$PR_HEAD_REF"
             # release/<crate>/v<X.Y.Z>  OR  legacy release/v<X.Y.Z>
             SUFFIX="${BRANCH#release/}"
-            # If there's a slash, the segment before "/v" is the crate name.
             case "$SUFFIX" in
               */v*) CRATE="${SUFFIX%%/*}" ;;
               *)    CRATE="all" ;;
             esac
             VERSION="${SUFFIX##*/v}"
             VERSION="${VERSION#v}"
-            TAG="v${VERSION}"
+            if [ "$CRATE" = "all" ]; then
+              TAG="v${VERSION}"
+            else
+              TAG="${CRATE}-v${VERSION}"
+            fi
           fi
           echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -85,8 +110,9 @@ jobs:
 
       - name: Create and push tag
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        env:
+          TAG: ${{ steps.extract.outputs.tag }}
         run: |
-          TAG="${{ steps.extract.outputs.tag }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           if git rev-parse "$TAG" >/dev/null 2>&1; then
@@ -100,8 +126,9 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
-          git push origin --delete "${{ github.event.pull_request.head.ref }}" || true
+          git push origin --delete "$PR_HEAD_REF" || true
 
   publish-crates:
     name: Publish to crates.io
@@ -157,15 +184,37 @@ jobs:
       # `release/llm-repair/...` PR doesn't try to re-publish the others,
       # and on the dispatch-only `dry_run` flag so a preview never
       # accidentally publishes.
+      #
+      # Failure handling: `cargo publish` is treated as idempotent only
+      # for the specific "already uploaded" outcome (re-running a
+      # release-publish that previously partially succeeded). ANY other
+      # failure mode (auth, network, validation) must hard-fail the
+      # workflow — `cmd || true` would silently mask a broken release.
       - name: Publish llm-repair
         if: ${{ env.CARGO_REGISTRY_TOKEN != '' && (needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'llm-repair') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        run: cargo publish -p llm-repair || echo "llm-repair already published at this version"
+        run: |
+          set -o pipefail
+          out=$(cargo publish -p llm-repair 2>&1) && rc=0 || rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -eq 0 ]; then exit 0; fi
+          # Cargo's exact wording for "this version already on the
+          # registry" — anything else is a real failure we must
+          # surface, not swallow.
+          if printf '%s' "$out" | grep -qE 'crate version `[^`]+` is already uploaded'; then
+            echo "::notice::llm-repair already published at this version — treating as no-op"
+            exit 0
+          fi
+          exit "$rc"
 
       # Poll for the SPECIFIC version we just published — checking only
       # that the crate exists would return immediately (it already does)
       # and the next publish would then fail with "could not find
       # `llm-repair = x.y.z`". The `versions[].num` field is the
       # authoritative list; jq makes the exact-match check trivial.
+      #
+      # On timeout: hard-fail. If the version never indexes the
+      # downstream publish will fail anyway with a confusing error
+      # — better to fail HERE with an obvious "index timeout" signal.
       - name: Wait for crates.io index refresh (llm-repair)
         if: ${{ env.CARGO_REGISTRY_TOKEN != '' && (needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'llm-repair') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         env:
@@ -174,14 +223,26 @@ jobs:
           for i in $(seq 1 30); do
             if curl -sf "https://crates.io/api/v1/crates/llm-repair" \
                 | jq -e --arg v "$WANT_VERSION" '.versions[]?.num | select(. == $v)' >/dev/null; then
-              echo "llm-repair@${WANT_VERSION} visible after ~${i}0s"; break
+              echo "llm-repair@${WANT_VERSION} visible after ~${i}0s"
+              exit 0
             fi
             sleep 10
           done
+          echo "::error::llm-repair@${WANT_VERSION} not visible on crates.io after 5 minutes"
+          exit 1
 
       - name: Publish quorum-crypto-core
         if: ${{ env.CARGO_REGISTRY_TOKEN != '' && (needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'quorum-crypto-core') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        run: cargo publish -p quorum-crypto-core || echo "quorum-crypto-core already published at this version"
+        run: |
+          set -o pipefail
+          out=$(cargo publish -p quorum-crypto-core 2>&1) && rc=0 || rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -eq 0 ]; then exit 0; fi
+          if printf '%s' "$out" | grep -qE 'crate version `[^`]+` is already uploaded'; then
+            echo "::notice::quorum-crypto-core already published at this version — treating as no-op"
+            exit 0
+          fi
+          exit "$rc"
 
       - name: Wait for crates.io index refresh (quorum-crypto-core)
         if: ${{ env.CARGO_REGISTRY_TOKEN != '' && (needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'quorum-crypto-core') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
@@ -191,14 +252,26 @@ jobs:
           for i in $(seq 1 30); do
             if curl -sf "https://crates.io/api/v1/crates/quorum-crypto-core" \
                 | jq -e --arg v "$WANT_VERSION" '.versions[]?.num | select(. == $v)' >/dev/null; then
-              echo "quorum-crypto-core@${WANT_VERSION} visible after ~${i}0s"; break
+              echo "quorum-crypto-core@${WANT_VERSION} visible after ~${i}0s"
+              exit 0
             fi
             sleep 10
           done
+          echo "::error::quorum-crypto-core@${WANT_VERSION} not visible on crates.io after 5 minutes"
+          exit 1
 
       - name: Publish quorum-rs (lib + `quorum` binary)
         if: ${{ env.CARGO_REGISTRY_TOKEN != '' && (needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'quorum-rs') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        run: cargo publish -p quorum-rs || echo "quorum-rs already published at this version"
+        run: |
+          set -o pipefail
+          out=$(cargo publish -p quorum-rs 2>&1) && rc=0 || rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -eq 0 ]; then exit 0; fi
+          if printf '%s' "$out" | grep -qE 'crate version `[^`]+` is already uploaded'; then
+            echo "::notice::quorum-rs already published at this version — treating as no-op"
+            exit 0
+          fi
+          exit "$rc"
 
       - name: Dry-run (no publish)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
@@ -226,9 +299,10 @@ jobs:
 
       - name: Generate release notes
         id: notes
+        env:
+          VERSION: ${{ needs.tag.outputs.version }}
+          TAG: ${{ needs.tag.outputs.tag }}
         run: |
-          VERSION="${{ needs.tag.outputs.version }}"
-          TAG="${{ needs.tag.outputs.tag }}"
           BODY=""
           # Prefer the CHANGELOG.md section when present (allows hand
           # edits to land in the GitHub release notes).
@@ -246,8 +320,9 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.tag.outputs.tag }}
+          NOTES: ${{ steps.notes.outputs.body }}
         run: |
-          TAG="${{ needs.tag.outputs.tag }}"
           # Idempotent: skip if a release already exists for this tag.
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists — skipping"
@@ -255,4 +330,4 @@ jobs:
           fi
           gh release create "$TAG" \
             --title "$TAG" \
-            --notes "${{ steps.notes.outputs.body }}"
+            --notes "$NOTES"

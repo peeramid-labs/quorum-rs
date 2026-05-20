@@ -54,10 +54,15 @@ jobs:
       - name: Install cargo-edit and git-cliff
         run: cargo binstall --no-confirm cargo-edit git-cliff
 
+      # Inputs flow through `env:` so the shell never sees raw
+      # ${{ … }} interpolation — that closes the command-injection
+      # vector where a (hypothetical) malicious dispatch input could
+      # smuggle shell metacharacters into the script.
       - name: Resolve target crate dir
         id: dir
+        env:
+          CRATE: ${{ github.event.inputs.crate }}
         run: |
-          CRATE="${{ github.event.inputs.crate }}"
           case "$CRATE" in
             llm-repair)         CRATE_DIR="crates/llm-repair" ;;
             quorum-crypto-core) CRATE_DIR="crates/quorum-crypto-core" ;;
@@ -71,34 +76,49 @@ jobs:
         id: bump
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CRATE: ${{ github.event.inputs.crate }}
+          CRATE_DIR: ${{ steps.dir.outputs.crate_dir }}
         run: |
-          CRATE="${{ github.event.inputs.crate }}"
-          CRATE_DIR="${{ steps.dir.outputs.crate_dir }}"
-
           CURRENT=$(grep -m1 '^version' "$CRATE_DIR/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
           echo "Current $CRATE_DIR version: $CURRENT"
 
-          # Find previous tag to determine commit range
-          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          # Resolve the previous tag for THIS crate (or workspace).
+          # Per-crate releases use the `<crate>-vX.Y.Z` tag scheme
+          # (introduced to avoid cross-crate `vX.Y.Z` collisions);
+          # workspace-wide releases keep the legacy `vX.Y.Z` name.
+          if [ "$CRATE" = "all" ]; then
+            TAG_PATTERN='v[0-9]*'
+          else
+            TAG_PATTERN="${CRATE}-v[0-9]*"
+          fi
+          PREV_TAG=$(git tag --list --sort=-version:refname "$TAG_PATTERN" | head -1)
           if [ -z "$PREV_TAG" ]; then
             PREV_REF=$(git rev-list --max-parents=0 HEAD)
           else
             PREV_REF="$PREV_TAG"
           fi
 
-          # Commits since the last tag/release, excluding release machinery
-          COMMITS=$(git log "${PREV_REF}..HEAD" --format="%s" 2>/dev/null \
+          # `%B` captures the full commit message (subject + body +
+          # footers) so `BREAKING CHANGE:` footers — which only appear
+          # in commit bodies — actually influence the bump
+          # classification. `%s` alone would silently downgrade a
+          # major-bump-deserving release to a minor/patch.
+          #
+          # Commit messages are newline-separated; the trailing
+          # %x00 sentinel keeps multi-line bodies from being lost in
+          # the grep filtering below.
+          COMMITS=$(git log "${PREV_REF}..HEAD" --format="%B%x00" 2>/dev/null \
             | grep -v "^chore(release):" \
             | grep -v "^Merge pull request.*release/" \
             || true)
-          if [ -z "$(echo "$COMMITS" | tr -d '[:space:]')" ]; then
+          if [ -z "$(echo "$COMMITS" | tr -d '[:space:]\0')" ]; then
             echo "No new commits since $PREV_REF (only release machinery) — skipping"
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           echo "--- Commits since $PREV_REF ---"
-          echo "$COMMITS" | head -30
+          echo "$COMMITS" | head -50
           echo "---"
 
           # Conventional-commit → bump-type
@@ -106,6 +126,9 @@ jobs:
           if echo "$COMMITS" | grep -qiE "^feat(\(|!|:)"; then
             BUMP="minor"
           fi
+          # Two breaking-change forms: `<type>!:` shorthand on the
+          # subject, OR a `BREAKING CHANGE:` footer in the body
+          # (per Conventional Commits §footer).
           if echo "$COMMITS" | grep -qiE "(^[a-z]+(\(.*\))?!:)|BREAKING CHANGE"; then
             BUMP="major"
           fi
@@ -134,9 +157,9 @@ jobs:
         id: existing
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CRATE: ${{ github.event.inputs.crate }}
+          VERSION: ${{ steps.bump.outputs.new_version }}
         run: |
-          VERSION="${{ steps.bump.outputs.new_version }}"
-          CRATE="${{ github.event.inputs.crate }}"
           BRANCH="release/${CRATE}/v${VERSION}"
           EXISTING=$(gh pr list --head "$BRANCH" --state open --json number -q '.[0].number' || echo "")
           if [ -n "$EXISTING" ]; then
@@ -150,9 +173,9 @@ jobs:
         if: steps.bump.outputs.skip != 'true' && steps.existing.outputs.exists != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CRATE: ${{ github.event.inputs.crate }}
+          VERSION: ${{ steps.bump.outputs.new_version }}
         run: |
-          VERSION="${{ steps.bump.outputs.new_version }}"
-          CRATE="${{ github.event.inputs.crate }}"
           BRANCH="release/${CRATE}/v${VERSION}"
 
           git checkout -b "$BRANCH"

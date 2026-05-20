@@ -48,10 +48,13 @@ jobs:
       - name: Install git-cliff
         run: cargo binstall --no-confirm git-cliff
 
+      # Inputs flow via env: to close the command-injection vector
+      # — same pattern as release-prepare.yml.
       - name: Resolve target crate dir
         id: dir
+        env:
+          CRATE: ${{ github.event.inputs.crate }}
         run: |
-          CRATE="${{ github.event.inputs.crate }}"
           case "$CRATE" in
             llm-repair)         CRATE_DIR="crates/llm-repair" ;;
             quorum-crypto-core) CRATE_DIR="crates/quorum-crypto-core" ;;
@@ -63,12 +66,21 @@ jobs:
 
       - name: Compute next version (dry-run)
         id: bump
+        env:
+          CRATE: ${{ github.event.inputs.crate }}
+          CRATE_DIR: ${{ steps.dir.outputs.crate_dir }}
         run: |
-          CRATE="${{ github.event.inputs.crate }}"
-          CRATE_DIR="${{ steps.dir.outputs.crate_dir }}"
-
           CURRENT=$(grep -m1 '^version' "$CRATE_DIR/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
-          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+          # Resolve the previous tag for THIS crate (or workspace).
+          # Crate-scoped tag scheme matches release-publish.yml:
+          # `<crate>-vX.Y.Z` for per-crate, plain `vX.Y.Z` for `all`.
+          if [ "$CRATE" = "all" ]; then
+            TAG_PATTERN='v[0-9]*'
+          else
+            TAG_PATTERN="${CRATE}-v[0-9]*"
+          fi
+          PREV_TAG=$(git tag --list --sort=-version:refname "$TAG_PATTERN" | head -1)
           if [ -z "$PREV_TAG" ]; then
             PREV_REF=$(git rev-list --max-parents=0 HEAD)
             PREV_LABEL="<first commit>"
@@ -77,7 +89,10 @@ jobs:
             PREV_LABEL="$PREV_TAG"
           fi
 
-          COMMITS=$(git log "${PREV_REF}..HEAD" --format="%s" 2>/dev/null \
+          # `%B` captures full commit message so `BREAKING CHANGE:`
+          # footers in the body trigger the major-bump path. `%s`
+          # alone would silently miss them.
+          COMMITS=$(git log "${PREV_REF}..HEAD" --format="%B%x00" 2>/dev/null \
             | grep -v "^chore(release):" \
             | grep -v "^Merge pull request.*release/" \
             || true)
@@ -118,8 +133,9 @@ jobs:
           echo "next_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Changelog dry-run
+        env:
+          VERSION: ${{ steps.bump.outputs.next_version }}
         run: |
-          VERSION="${{ steps.bump.outputs.next_version }}"
           {
             echo ""
             echo "### Changelog dry-run (v${VERSION})"
