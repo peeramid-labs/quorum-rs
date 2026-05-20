@@ -49,9 +49,14 @@ jobs:
       version: ${{ steps.extract.outputs.version }}
       crate: ${{ steps.extract.outputs.crate }}
     steps:
+      # PR-merge path checks out the merge commit. Dispatch path
+      # uses the repo's DEFAULT BRANCH, not `github.sha`: the
+      # latter resolves to whichever ref the operator was looking
+      # at when firing the workflow, which would let a manual
+      # dispatch tag and publish from an unintended branch.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.event.repository.default_branch }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -303,17 +308,28 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Dry-run cargo publish
-        run: |
-          # `cargo publish --dry-run -p quorum-rs` fails until its
-          # sibling deps are on the registry, so we skip it.
-          cargo publish --dry-run -p llm-repair
-          cargo publish --dry-run -p quorum-crypto-core
-          echo "ℹ️ quorum-rs dry-run skipped (path-dep on siblings not yet on crates.io)"
+      # Dry-runs are crate-gated to mirror the real publish steps:
+      # an `llm-repair-v...` dispatch shouldn't fail because of an
+      # unrelated quorum-crypto-core packaging issue. quorum-rs
+      # dry-run is intentionally skipped — it path-deps on the
+      # other two and would fail until they're on crates.io.
+      - name: Dry-run cargo publish (llm-repair)
+        if: ${{ needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'llm-repair' }}
+        run: cargo publish --dry-run -p llm-repair
+
+      - name: Dry-run cargo publish (quorum-crypto-core)
+        if: ${{ needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'quorum-crypto-core' }}
+        run: cargo publish --dry-run -p quorum-crypto-core
+
+      - name: Dry-run note for quorum-rs
+        if: ${{ needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'quorum-rs' }}
+        run: echo "ℹ️ quorum-rs dry-run skipped (path-dep on siblings not yet on crates.io)"
 
   release:
     name: Create GitHub Release

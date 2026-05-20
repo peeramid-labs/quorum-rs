@@ -72,6 +72,21 @@ jobs:
         run: |
           CURRENT=$(grep -m1 '^version' "$CRATE_DIR/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
 
+          # Mirror release-prepare.yml's `all`-divergence guard so
+          # the preview reports what release-prepare would actually
+          # do. Without this, a dispatch with `crate=all` could
+          # show a clean preview that release-prepare immediately
+          # rejects once the operator tries to ship it.
+          if [ "$CRATE" = "all" ]; then
+            for c in llm-repair quorum-crypto-core quorum-rs; do
+              ver=$(grep -m1 '^version' "crates/${c}/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
+              if [ "$ver" != "$CURRENT" ]; then
+                echo "::error::crates/${c}/Cargo.toml is at $ver but quorum-rs is at $CURRENT — \`all\` requires every workspace crate on the same version. Bump them individually first, or pick a single crate."
+                exit 1
+              fi
+            done
+          fi
+
           # Resolve the previous tag for THIS crate (or workspace).
           # Crate-scoped tag scheme matches release-publish.yml:
           # `<crate>-vX.Y.Z` for per-crate, plain `vX.Y.Z` for `all`.
@@ -141,13 +156,23 @@ jobs:
       - name: Changelog dry-run
         env:
           VERSION: ${{ steps.bump.outputs.next_version }}
+          CRATE: ${{ github.event.inputs.crate }}
         run: |
+          # Crate-scoped tag matches what release-prepare passes to
+          # git-cliff. Without this, the preview's section header
+          # would diverge from the real PR / GitHub Release for any
+          # non-`all` dispatch.
+          if [ "$CRATE" = "all" ]; then
+            TAG="v${VERSION}"
+          else
+            TAG="${CRATE}-v${VERSION}"
+          fi
           {
             echo ""
-            echo "### Changelog dry-run (v${VERSION})"
+            echo "### Changelog dry-run (${TAG})"
             echo ""
             echo '```markdown'
-            git-cliff --tag "v${VERSION}" --unreleased --strip header 2>/dev/null \
+            git-cliff --tag "$TAG" --unreleased --strip header 2>/dev/null \
               || echo "(git-cliff produced no output — no conventional commits since last tag?)"
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"

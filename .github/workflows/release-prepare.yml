@@ -40,8 +40,16 @@ jobs:
     name: Prepare Release PR
     runs-on: ubuntu-latest
     steps:
+      # `workflow_dispatch` can be fired from any ref via the
+      # GitHub UI. Without an explicit `ref:` the checkout uses
+      # whatever the operator was looking at, which means the
+      # release branch could be cut from an unrelated feature
+      # branch — and since the PR is hardcoded `--base dev`, the
+      # release PR would then carry every commit from that branch.
+      # Pinning to `dev` makes the release base unambiguous.
       - uses: actions/checkout@v4
         with:
+          ref: dev
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
