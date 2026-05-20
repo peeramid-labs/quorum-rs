@@ -2908,6 +2908,7 @@ dependencies = [
  "async-openai",
  "async-trait",
  "axum",
+ "base64",
  "bytes",
  "chrono",
  "clap",

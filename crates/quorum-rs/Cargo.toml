@@ -31,6 +31,10 @@ anyhow = "1.0.99"
 async-trait = "0.1.80"
 async-openai = "0.29.1"
 async-nats = "0.47.0"
+# Decodes the `aud` claim from JWT-shaped invite codes so the CLI
+# can route to /redeem vs /redeem-agent. No signature verification
+# happens client-side — the orchestrator re-verifies at redeem time.
+base64 = "0.22.1"
 bytes = "1.11.1"
 chrono = { version = "0.4.38", features = ["serde"] }
 dyn-clone = "1.0.20"
