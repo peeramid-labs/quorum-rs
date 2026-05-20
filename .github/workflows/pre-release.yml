@@ -285,10 +285,16 @@ jobs:
           TAG: ${{ needs.validate.outputs.tag }}
           CRATE: ${{ needs.validate.outputs.crate }}
           VERSION: ${{ needs.validate.outputs.version }}
-          COMMIT_SHA: ${{ github.sha }}
         run: |
+          # `github.sha` is the workflow-dispatch SHA (default-branch
+          # HEAD when the dispatch fired), NOT the tagged commit. The
+          # publish job pushes the tag at a transient bump commit
+          # ON TOP of dev, so the two diverge by exactly that bump.
+          # Resolve the tag's actual commit so the release notes
+          # point at the artifact we just shipped.
+          TAG_COMMIT=$(git rev-parse "${TAG}^{commit}")
           NOTES=$(printf 'Pre-release of `%s` at \`%s\`.\n\n⚠️ **This is a pre-release** — not recommended for production use.\n\nInstall: `cargo add %s@%s` (semver opt-in required for pre-releases).\n\nCommit: %s' \
-            "$CRATE" "$VERSION" "$CRATE" "$VERSION" "$COMMIT_SHA")
+            "$CRATE" "$VERSION" "$CRATE" "$VERSION" "$TAG_COMMIT")
           gh release create "$TAG" \
             --prerelease \
             --title "$TAG" \
