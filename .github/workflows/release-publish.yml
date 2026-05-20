@@ -1,0 +1,393 @@
+name: Publish Release
+
+# Fires when a release/* PR is merged into the default branch. Creates
+# the git tag from the branch name, then publishes the affected crates
+# to crates.io in topological order. Out of scope vs. the nsed parent:
+# Homebrew tap / apt repo / Docker images / binary tarballs — those
+# pipelines live in the proprietary nsed repo, not the SDK.
+#
+# Manual `workflow_dispatch` is also wired for the rare case where the
+# PR-merge trigger didn't fire (mirror-merge from another tool, etc.).
+
+on:
+  pull_request:
+    branches: [dev]
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.6.1). Must already exist or will be created from the current default branch."
+        required: true
+        type: string
+      dry_run:
+        description: "Dry-run packaging only (skips `cargo publish`)."
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tag:
+    name: Create Tag & Sync
+    runs-on: ubuntu-latest
+    # PR-merge path: only fire when the release branch was actually
+    # merged (not just closed). Dispatch path: always run.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
+       startsWith(github.event.pull_request.head.ref, 'release/'))
+    outputs:
+      tag: ${{ steps.extract.outputs.tag }}
+      version: ${{ steps.extract.outputs.version }}
+      crate: ${{ steps.extract.outputs.crate }}
+    steps:
+      # PR-merge path checks out the merge commit. Dispatch path
+      # uses the repo's DEFAULT BRANCH, not `github.sha`: the
+      # latter resolves to whichever ref the operator was looking
+      # at when firing the workflow, which would let a manual
+      # dispatch tag and publish from an unintended branch.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.event.repository.default_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Tag scheme is crate-scoped to support independent release
+      # streams: a `release/llm-repair/v0.7.0` PR creates the
+      # `llm-repair-v0.7.0` tag, while a `release/all/v0.7.0`
+      # workspace-wide release keeps the bare `v0.7.0` name. Without
+      # this scoping the bot's L61-79 finding holds: the second crate
+      # to ship version X.Y.Z would collide with the first one's tag.
+      - name: Extract version + crate from branch (or input)
+        id: extract
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$DISPATCH_TAG"
+            # Dispatch tag may already be crate-scoped (e.g.
+            # `llm-repair-v0.7.0`) or plain (`v0.7.0`). Parse both.
+            case "$TAG" in
+              llm-repair-v*|quorum-crypto-core-v*|quorum-rs-v*)
+                CRATE="${TAG%-v*}"
+                VERSION="${TAG##*-v}"
+                ;;
+              v*)
+                CRATE="all"
+                VERSION="${TAG#v}"
+                ;;
+              *)
+                echo "::error::Unrecognised tag shape: $TAG"; exit 1 ;;
+            esac
+          else
+            BRANCH="$PR_HEAD_REF"
+            # release/<crate>/v<X.Y.Z>  OR  legacy release/v<X.Y.Z>
+            SUFFIX="${BRANCH#release/}"
+            case "$SUFFIX" in
+              */v*) CRATE="${SUFFIX%%/*}" ;;
+              *)    CRATE="all" ;;
+            esac
+            VERSION="${SUFFIX##*/v}"
+            VERSION="${VERSION#v}"
+            if [ "$CRATE" = "all" ]; then
+              TAG="v${VERSION}"
+            else
+              TAG="${CRATE}-v${VERSION}"
+            fi
+          fi
+          echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "crate=$CRATE"  >> "$GITHUB_OUTPUT"
+          echo "Release: $TAG (crate=$CRATE, version=$VERSION)"
+
+      # Fail fast before tagging if `CARGO_REGISTRY_TOKEN` isn't set
+      # — otherwise we'd leave a tag with no published crate behind,
+      # and the next release-prepare run would key off a phantom tag.
+      # The token doesn't need to flow into this step's env; we only
+      # need to know whether the secret exists. `secrets.<name>` is
+      # `''` when the secret is absent, which is how the check works.
+      - name: Preflight — CARGO_REGISTRY_TOKEN must be configured
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        env:
+          HAS_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+        run: |
+          if [ "$HAS_TOKEN" != "true" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN repository secret is missing or empty. Refusing to create a release tag with no path to crates.io. Configure the secret in Settings → Secrets → Actions, then re-run."
+            exit 1
+          fi
+
+      - name: Create and push tag
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        env:
+          TAG: ${{ steps.extract.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists locally — pushing as-is."
+          else
+            git tag "$TAG"
+          fi
+          git push origin "$TAG"
+
+      - name: Delete release branch
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          git push origin --delete "$PR_HEAD_REF" || true
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: tag
+    runs-on: ubuntu-latest
+    # Skip on dry-run: there's no tag to check out, and the dry-run
+    # job below covers `cargo publish --dry-run` against the current
+    # default branch instead.
+    if: ${{ needs.tag.outputs.tag != '' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.tag.outputs.tag }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-publish-${{ needs.tag.outputs.tag }}
+
+      - name: Verify tag versions match the crates being published
+        run: |
+          set -euo pipefail
+          # The tag is the source of truth. Whichever crates we publish
+          # below must carry exactly that version in their Cargo.toml.
+          # Independent release cycles are supported: `release/<crate>/v…`
+          # only bumps that one crate, so a sibling crate at an older
+          # version is fine — we only assert on the crate(s) we publish.
+          TAG="${{ needs.tag.outputs.version }}"
+          CRATE="${{ needs.tag.outputs.crate }}"
+          check_one() {
+            local c="$1"
+            local ver
+            ver=$(grep -m1 '^version' "crates/${c}/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')
+            if [ "$ver" != "$TAG" ]; then
+              echo "::error::crates/${c}/Cargo.toml has version ${ver} but tag is ${TAG}"
+              exit 1
+            fi
+            echo "  ${c}: ${ver} ✓"
+          }
+          case "$CRATE" in
+            all)
+              for c in llm-repair quorum-crypto-core quorum-rs; do check_one "$c"; done ;;
+            llm-repair|quorum-crypto-core|quorum-rs)
+              check_one "$CRATE" ;;
+            *)
+              echo "::error::Unknown crate slug: $CRATE"; exit 1 ;;
+          esac
+
+      # Topological publish order: llm-repair → quorum-crypto-core →
+      # quorum-rs. Each step is gated on the workflow's crate slug so a
+      # `release/llm-repair/...` PR doesn't try to re-publish the others,
+      # and on the dispatch-only `dry_run` flag so a preview never
+      # accidentally publishes.
+      #
+      # Failure handling: `cargo publish` is treated as idempotent only
+      # for the specific "already uploaded" outcome (re-running a
+      # release-publish that previously partially succeeded). ANY other
+      # failure mode (auth, network, validation) must hard-fail the
+      # workflow — `cmd || true` would silently mask a broken release.
+      - name: Publish llm-repair
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && (needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'llm-repair') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        run: |
+          set -o pipefail
+          out=$(cargo publish -p llm-repair 2>&1) && rc=0 || rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -eq 0 ]; then exit 0; fi
+          # Cargo's exact wording for "this version already on the
+          # registry" — anything else is a real failure we must
+          # surface, not swallow.
+          if printf '%s' "$out" | grep -qE 'crate version `[^`]+` is already uploaded'; then
+            echo "::notice::llm-repair already published at this version — treating as no-op"
+            exit 0
+          fi
+          exit "$rc"
+
+      # Poll for the SPECIFIC version we just published — checking only
+      # that the crate exists would return immediately (it already does)
+      # and the next publish would then fail with "could not find
+      # `llm-repair = x.y.z`". The `versions[].num` field is the
+      # authoritative list; jq makes the exact-match check trivial.
+      #
+      # On timeout: hard-fail. If the version never indexes the
+      # downstream publish will fail anyway with a confusing error
+      # — better to fail HERE with an obvious "index timeout" signal.
+      - name: Wait for crates.io index refresh (llm-repair)
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && (needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'llm-repair') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        env:
+          WANT_VERSION: ${{ needs.tag.outputs.version }}
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf "https://crates.io/api/v1/crates/llm-repair" \
+                | jq -e --arg v "$WANT_VERSION" '.versions[]?.num | select(. == $v)' >/dev/null; then
+              echo "llm-repair@${WANT_VERSION} visible after ~${i}0s"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::llm-repair@${WANT_VERSION} not visible on crates.io after 5 minutes"
+          exit 1
+
+      - name: Publish quorum-crypto-core
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && (needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'quorum-crypto-core') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        run: |
+          set -o pipefail
+          out=$(cargo publish -p quorum-crypto-core 2>&1) && rc=0 || rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -eq 0 ]; then exit 0; fi
+          if printf '%s' "$out" | grep -qE 'crate version `[^`]+` is already uploaded'; then
+            echo "::notice::quorum-crypto-core already published at this version — treating as no-op"
+            exit 0
+          fi
+          exit "$rc"
+
+      - name: Wait for crates.io index refresh (quorum-crypto-core)
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && (needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'quorum-crypto-core') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        env:
+          WANT_VERSION: ${{ needs.tag.outputs.version }}
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf "https://crates.io/api/v1/crates/quorum-crypto-core" \
+                | jq -e --arg v "$WANT_VERSION" '.versions[]?.num | select(. == $v)' >/dev/null; then
+              echo "quorum-crypto-core@${WANT_VERSION} visible after ~${i}0s"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::quorum-crypto-core@${WANT_VERSION} not visible on crates.io after 5 minutes"
+          exit 1
+
+      - name: Publish quorum-rs (lib + `quorum` binary)
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && (needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'quorum-rs') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        run: |
+          set -o pipefail
+          out=$(cargo publish -p quorum-rs 2>&1) && rc=0 || rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -eq 0 ]; then exit 0; fi
+          if printf '%s' "$out" | grep -qE 'crate version `[^`]+` is already uploaded'; then
+            echo "::notice::quorum-rs already published at this version — treating as no-op"
+            exit 0
+          fi
+          exit "$rc"
+
+  publish-dry-run:
+    name: Publish dry-run (no side effects)
+    # Sibling of publish-crates: lives in its own job because it
+    # needs to check out HEAD of the default branch (the tag the
+    # main publish job uses has not been pushed in dry-run mode,
+    # so `ref: tag` would fail at checkout).
+    needs: tag
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Dry-runs are crate-gated to mirror the real publish steps:
+      # an `llm-repair-v...` dispatch shouldn't fail because of an
+      # unrelated quorum-crypto-core packaging issue. quorum-rs
+      # dry-run is intentionally skipped — it path-deps on the
+      # other two and would fail until they're on crates.io.
+      - name: Dry-run cargo publish (llm-repair)
+        if: ${{ needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'llm-repair' }}
+        run: cargo publish --dry-run -p llm-repair
+
+      - name: Dry-run cargo publish (quorum-crypto-core)
+        if: ${{ needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'quorum-crypto-core' }}
+        run: cargo publish --dry-run -p quorum-crypto-core
+
+      - name: Dry-run note for quorum-rs
+        if: ${{ needs.tag.outputs.crate == 'all' || needs.tag.outputs.crate == 'quorum-rs' }}
+        run: echo "ℹ️ quorum-rs dry-run skipped (path-dep on siblings not yet on crates.io)"
+
+  release:
+    name: Create GitHub Release
+    needs: [tag, publish-crates]
+    runs-on: ubuntu-latest
+    # Skip on dry-run: no tag was pushed, so a GH Release would point
+    # at nothing.
+    if: ${{ needs.tag.outputs.tag != '' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.tag.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Generate release notes
+        id: notes
+        env:
+          VERSION: ${{ needs.tag.outputs.version }}
+          TAG: ${{ needs.tag.outputs.tag }}
+        run: |
+          BODY=""
+          # Prefer the CHANGELOG.md section when present (allows hand
+          # edits to land in the GitHub release notes). Section
+          # headers are crate-scoped now — try the full crate-scoped
+          # header first (matches what release-prepare.yml writes for
+          # per-crate releases), fall back to the legacy bare version
+          # for workspace-wide releases or older entries.
+          extract_section() {
+            local key="$1"
+            sed -n "/^## \[${key}\]/,/^## \[/{ /^## \[${key}\]/d; /^## \[/d; p; }" CHANGELOG.md 2>/dev/null || true
+          }
+          if [ -f CHANGELOG.md ]; then
+            # Try the crate-scoped header first (e.g. "llm-repair-v0.7.0"),
+            # then fall back to the bare version (legacy / "all"
+            # releases that wrote "## [0.7.0]").
+            BODY=$(extract_section "${TAG#v}")
+            [ -z "$BODY" ] && BODY=$(extract_section "$VERSION")
+          fi
+          [ -z "$(echo "$BODY" | tr -d '[:space:]')" ] && BODY="Release ${TAG}"
+          {
+            echo "body<<RELEASE_EOF"
+            echo "$BODY"
+            echo "RELEASE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.tag.outputs.tag }}
+          NOTES: ${{ steps.notes.outputs.body }}
+        run: |
+          # Idempotent: skip if a release already exists for this tag.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — skipping"
+            exit 0
+          fi
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes "$NOTES"

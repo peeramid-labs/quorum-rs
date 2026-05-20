@@ -1,0 +1,178 @@
+name: Pre-Release Preview
+
+# Dry-run preview pipeline. Authors can sanity-check what
+# `release-prepare.yml` would produce — version bump + changelog —
+# without touching Cargo.toml or opening a PR.
+#
+# Scope note: the nsed parent's `pre-release.yml` also builds release
+# binaries and pushes pre-release Docker images. Those are out of
+# scope for the SDK (issue #4) — the dry-run here is just changelog +
+# version-bump computation. Adopting the binary-build side later is a
+# separate change.
+
+on:
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: 'Crate to preview (or "all" for workspace-wide bump)'
+        type: choice
+        options:
+          - all
+          - llm-repair
+          - quorum-crypto-core
+          - quorum-rs
+        default: quorum-rs
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pre-release
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preview:
+    name: Preview Next Version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@v1.17.9
+
+      - name: Install git-cliff
+        run: cargo binstall --no-confirm git-cliff
+
+      # Inputs flow via env: to close the command-injection vector
+      # — same pattern as release-prepare.yml.
+      - name: Resolve target crate dir
+        id: dir
+        env:
+          CRATE: ${{ github.event.inputs.crate }}
+        run: |
+          case "$CRATE" in
+            llm-repair)         CRATE_DIR="crates/llm-repair" ;;
+            quorum-crypto-core) CRATE_DIR="crates/quorum-crypto-core" ;;
+            quorum-rs)          CRATE_DIR="crates/quorum-rs" ;;
+            all)                CRATE_DIR="crates/quorum-rs" ;;
+            *) echo "::error::Unknown crate: $CRATE"; exit 1 ;;
+          esac
+          echo "crate_dir=$CRATE_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Compute next version (dry-run)
+        id: bump
+        env:
+          CRATE: ${{ github.event.inputs.crate }}
+          CRATE_DIR: ${{ steps.dir.outputs.crate_dir }}
+        run: |
+          CURRENT=$(grep -m1 '^version' "$CRATE_DIR/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
+
+          # Mirror release-prepare.yml's `all`-divergence guard so
+          # the preview reports what release-prepare would actually
+          # do. Without this, a dispatch with `crate=all` could
+          # show a clean preview that release-prepare immediately
+          # rejects once the operator tries to ship it.
+          if [ "$CRATE" = "all" ]; then
+            for c in llm-repair quorum-crypto-core quorum-rs; do
+              ver=$(grep -m1 '^version' "crates/${c}/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
+              if [ "$ver" != "$CURRENT" ]; then
+                echo "::error::crates/${c}/Cargo.toml is at $ver but quorum-rs is at $CURRENT — \`all\` requires every workspace crate on the same version. Bump them individually first, or pick a single crate."
+                exit 1
+              fi
+            done
+          fi
+
+          # Resolve the previous tag for THIS crate (or workspace).
+          # Crate-scoped tag scheme matches release-publish.yml:
+          # `<crate>-vX.Y.Z` for per-crate, plain `vX.Y.Z` for `all`.
+          if [ "$CRATE" = "all" ]; then
+            TAG_PATTERN='v[0-9]*'
+          else
+            TAG_PATTERN="${CRATE}-v[0-9]*"
+          fi
+          PREV_TAG=$(git tag --list --sort=-version:refname "$TAG_PATTERN" | head -1)
+
+          # `%B` captures full commit message so `BREAKING CHANGE:`
+          # footers in the body trigger the major-bump path. `%s`
+          # alone would silently miss them.
+          #
+          # `git log root..HEAD` excludes the root commit (exclusive
+          # range), so the first-release path uses `git log HEAD` to
+          # walk the entire history including root.
+          if [ -z "$PREV_TAG" ]; then
+            PREV_LABEL="<first commit>"
+            COMMITS=$(git log HEAD --format="%B%x00" 2>/dev/null \
+              | grep -v "^chore(release):" \
+              | grep -v "^Merge pull request.*release/" \
+              || true)
+          else
+            PREV_LABEL="$PREV_TAG"
+            COMMITS=$(git log "${PREV_TAG}..HEAD" --format="%B%x00" 2>/dev/null \
+              | grep -v "^chore(release):" \
+              | grep -v "^Merge pull request.*release/" \
+              || true)
+          fi
+
+          BUMP="patch"
+          if echo "$COMMITS" | grep -qiE "^feat(\(|!|:)"; then
+            BUMP="minor"
+          fi
+          if echo "$COMMITS" | grep -qiE "(^[a-z]+(\(.*\))?!:)|BREAKING CHANGE"; then
+            BUMP="major"
+          fi
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+
+          {
+            echo "## Pre-release preview: ${CRATE}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Current version | \`${CURRENT}\` |"
+            echo "| Previous tag    | \`${PREV_LABEL}\` |"
+            echo "| Bump type       | \`${BUMP}\` |"
+            echo "| **Next version**    | **\`${NEW_VERSION}\`** |"
+            echo ""
+            echo "### Commits since ${PREV_LABEL}"
+            echo ""
+            echo '```'
+            echo "$COMMITS" | head -50
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+          echo "next_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Changelog dry-run
+        env:
+          VERSION: ${{ steps.bump.outputs.next_version }}
+          CRATE: ${{ github.event.inputs.crate }}
+        run: |
+          # Crate-scoped tag matches what release-prepare passes to
+          # git-cliff. Without this, the preview's section header
+          # would diverge from the real PR / GitHub Release for any
+          # non-`all` dispatch.
+          if [ "$CRATE" = "all" ]; then
+            TAG="v${VERSION}"
+          else
+            TAG="${CRATE}-v${VERSION}"
+          fi
+          {
+            echo ""
+            echo "### Changelog dry-run (${TAG})"
+            echo ""
+            echo '```markdown'
+            git-cliff --tag "$TAG" --unreleased --strip header 2>/dev/null \
+              || echo "(git-cliff produced no output — no conventional commits since last tag?)"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,311 @@
+name: Prepare Release
+
+# Manually-triggered version-bump workflow. Picks a crate, computes
+# the next semver from conventional commits, bumps Cargo.toml + the
+# CHANGELOG, and opens a release/<crate>/v<X.Y.Z> PR against the
+# default branch. Merging that PR is what fires `release-publish.yml`.
+#
+# Ported from peeramid-labs/nsed/.github/workflows/release-prepare.yml
+# (issue #4) — crate set is the quorum-rs workspace
+# (llm-repair, quorum-crypto-core, quorum-rs) instead of the
+# nsed-orchestrator family.
+
+on:
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: 'Crate to release (or "all" for workspace-wide bump)'
+        type: choice
+        options:
+          - all
+          - llm-repair
+          - quorum-crypto-core
+          - quorum-rs
+        default: quorum-rs
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: release-prepare
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Prepare Release PR
+    runs-on: ubuntu-latest
+    steps:
+      # `workflow_dispatch` can be fired from any ref via the
+      # GitHub UI. Without an explicit `ref:` the checkout uses
+      # whatever the operator was looking at, which means the
+      # release branch could be cut from an unrelated feature
+      # branch — and since the PR is hardcoded `--base dev`, the
+      # release PR would then carry every commit from that branch.
+      # Pinning to `dev` makes the release base unambiguous.
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@v1.17.9
+
+      - name: Install cargo-edit and git-cliff
+        run: cargo binstall --no-confirm cargo-edit git-cliff
+
+      # Inputs flow through `env:` so the shell never sees raw
+      # ${{ … }} interpolation — that closes the command-injection
+      # vector where a (hypothetical) malicious dispatch input could
+      # smuggle shell metacharacters into the script.
+      - name: Resolve target crate dir
+        id: dir
+        env:
+          CRATE: ${{ github.event.inputs.crate }}
+        run: |
+          case "$CRATE" in
+            llm-repair)         CRATE_DIR="crates/llm-repair" ;;
+            quorum-crypto-core) CRATE_DIR="crates/quorum-crypto-core" ;;
+            quorum-rs)          CRATE_DIR="crates/quorum-rs" ;;
+            all)                CRATE_DIR="crates/quorum-rs" ;;
+            *) echo "::error::Unknown crate: $CRATE"; exit 1 ;;
+          esac
+          echo "crate_dir=$CRATE_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Calculate version bump
+        id: bump
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CRATE: ${{ github.event.inputs.crate }}
+          CRATE_DIR: ${{ steps.dir.outputs.crate_dir }}
+        run: |
+          CURRENT=$(grep -m1 '^version' "$CRATE_DIR/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
+          echo "Current $CRATE_DIR version: $CURRENT"
+
+          # When CRATE="all", verify ALL releasable crates carry the
+          # same version BEFORE we run `cargo set-version --workspace`.
+          # Otherwise a sibling already at a higher version (e.g.
+          # llm-repair@1.0.0 with quorum-rs@0.6.0) would be silently
+          # downgraded to the new "all" version computed from quorum-rs.
+          # Operators who want independent streams must use the per-
+          # crate dispatch input, not "all".
+          if [ "$CRATE" = "all" ]; then
+            for c in llm-repair quorum-crypto-core quorum-rs; do
+              ver=$(grep -m1 '^version' "crates/${c}/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
+              if [ "$ver" != "$CURRENT" ]; then
+                echo "::error::crates/${c}/Cargo.toml is at $ver but quorum-rs is at $CURRENT — \`all\` requires every workspace crate to be on the same version. Bump them individually first, or pick a single crate from the dispatch input."
+                exit 1
+              fi
+            done
+          fi
+
+          # Resolve the previous tag for THIS crate (or workspace).
+          # Per-crate releases use the `<crate>-vX.Y.Z` tag scheme
+          # (introduced to avoid cross-crate `vX.Y.Z` collisions);
+          # workspace-wide releases keep the legacy `vX.Y.Z` name.
+          if [ "$CRATE" = "all" ]; then
+            TAG_PATTERN='v[0-9]*'
+          else
+            TAG_PATTERN="${CRATE}-v[0-9]*"
+          fi
+          PREV_TAG=$(git tag --list --sort=-version:refname "$TAG_PATTERN" | head -1)
+
+          # `%B` captures the full commit message (subject + body +
+          # footers) so `BREAKING CHANGE:` footers — which only appear
+          # in commit bodies — actually influence the bump
+          # classification. `%s` alone would silently downgrade a
+          # major-bump-deserving release to a minor/patch.
+          #
+          # Commit messages are newline-separated; the trailing
+          # %x00 sentinel keeps multi-line bodies from being lost in
+          # the grep filtering below.
+          #
+          # When PREV_TAG is empty (first release) `git log HEAD`
+          # walks the entire history INCLUDING the root commit —
+          # `git log root..HEAD` would have excluded it (`..` is an
+          # exclusive range). Two branches in the command instead of
+          # a single ref so the root commit's conventional-commit
+          # markers (if any) actually count toward the bump
+          # classification.
+          if [ -z "$PREV_TAG" ]; then
+            COMMITS=$(git log HEAD --format="%B%x00" 2>/dev/null \
+              | grep -v "^chore(release):" \
+              | grep -v "^Merge pull request.*release/" \
+              || true)
+            PREV_REF="<first commit>"
+          else
+            PREV_REF="$PREV_TAG"
+            COMMITS=$(git log "${PREV_REF}..HEAD" --format="%B%x00" 2>/dev/null \
+              | grep -v "^chore(release):" \
+              | grep -v "^Merge pull request.*release/" \
+              || true)
+          fi
+          if [ -z "$(echo "$COMMITS" | tr -d '[:space:]\0')" ]; then
+            echo "No new commits since $PREV_REF (only release machinery) — skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "--- Commits since $PREV_REF ---"
+          echo "$COMMITS" | head -50
+          echo "---"
+
+          # Conventional-commit → bump-type
+          BUMP="patch"
+          if echo "$COMMITS" | grep -qiE "^feat(\(|!|:)"; then
+            BUMP="minor"
+          fi
+          # Two breaking-change forms: `<type>!:` shorthand on the
+          # subject, OR a `BREAKING CHANGE:` footer in the body
+          # (per Conventional Commits §footer).
+          if echo "$COMMITS" | grep -qiE "(^[a-z]+(\(.*\))?!:)|BREAKING CHANGE"; then
+            BUMP="major"
+          fi
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "Bump: $BUMP ($CURRENT -> $NEW_VERSION)"
+
+          # Skip if the release branch already exists
+          BRANCH="release/${CRATE}/v${NEW_VERSION}"
+          if [ "$(git ls-remote --heads origin "$BRANCH" 2>/dev/null | wc -l)" -gt 0 ]; then
+            echo "Release branch $BRANCH already exists — skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check for existing open release PR
+        if: steps.bump.outputs.skip != 'true'
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CRATE: ${{ github.event.inputs.crate }}
+          VERSION: ${{ steps.bump.outputs.new_version }}
+        run: |
+          BRANCH="release/${CRATE}/v${VERSION}"
+          EXISTING=$(gh pr list --head "$BRANCH" --state open --json number -q '.[0].number' || echo "")
+          if [ -n "$EXISTING" ]; then
+            echo "Release PR #${EXISTING} already exists for ${BRANCH}"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release branch and PR
+        if: steps.bump.outputs.skip != 'true' && steps.existing.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CRATE: ${{ github.event.inputs.crate }}
+          VERSION: ${{ steps.bump.outputs.new_version }}
+        run: |
+          BRANCH="release/${CRATE}/v${VERSION}"
+
+          # The CHANGELOG section header (and the release tag) are
+          # crate-scoped so two crates can ship version X.Y.Z without
+          # colliding in either git refs or CHANGELOG.md. Workspace-
+          # wide releases keep the bare `vX.Y.Z` shape since by
+          # construction every crate is on the same version.
+          if [ "$CRATE" = "all" ]; then
+            TAG="v${VERSION}"
+          else
+            TAG="${CRATE}-v${VERSION}"
+          fi
+
+          git checkout -b "$BRANCH"
+
+          # Bump version(s)
+          case "$CRATE" in
+            llm-repair)         cargo set-version -p llm-repair "$VERSION" ;;
+            quorum-crypto-core) cargo set-version -p quorum-crypto-core "$VERSION" ;;
+            quorum-rs)          cargo set-version -p quorum-rs "$VERSION" ;;
+            all)                cargo set-version --workspace "$VERSION" ;;
+          esac
+          cargo generate-lockfile
+
+          # Prepend the new section to CHANGELOG.md (if it exists). The
+          # workflow stays useful even before a CHANGELOG.md is committed —
+          # the section just gets dropped on the floor in that case and
+          # contributors can adopt CHANGELOG.md later.
+          #
+          # Use `--tag $TAG` (crate-scoped) so the section header lands
+          # as `## [<crate>-vX.Y.Z]` for per-crate releases — that
+          # disambiguates entries when multiple crates eventually
+          # ship the same numeric version. release-publish.yml's
+          # release-notes lookup also keys on $TAG, so both sides match.
+          NEW_SECTION=$(git-cliff --tag "$TAG" --unreleased --strip header 2>/dev/null || true)
+          if [ -n "$NEW_SECTION" ] && [ -f CHANGELOG.md ]; then
+            HEADER_END=$(grep -n "^## " CHANGELOG.md | head -1 | cut -d: -f1)
+            if [ -n "$HEADER_END" ]; then
+              {
+                head -n $((HEADER_END - 1)) CHANGELOG.md
+                echo ""
+                echo "$NEW_SECTION"
+                echo ""
+                tail -n +"$HEADER_END" CHANGELOG.md
+              } > CHANGELOG.tmp && mv CHANGELOG.tmp CHANGELOG.md
+            else
+              # CHANGELOG.md has no existing sections — append the new one.
+              printf '\n%s\n' "$NEW_SECTION" >> CHANGELOG.md
+            fi
+          fi
+
+          # Commit (allow empty in case the only effect was a no-op set-version)
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -u Cargo.toml Cargo.lock crates/*/Cargo.toml
+          # CHANGELOG.md may or may not exist; only stage when present.
+          [ -f CHANGELOG.md ] && git add CHANGELOG.md || true
+          if git diff --cached --quiet; then
+            echo "No diff staged — creating empty release commit"
+            git commit --allow-empty -m "chore(release): v${VERSION}"
+          else
+            git commit -m "chore(release): v${VERSION}"
+          fi
+          git push origin "$BRANCH"
+
+          CHANGELOG_BODY=$(git-cliff --tag "$TAG" --unreleased --strip header 2>/dev/null || echo "Release ${TAG}")
+          {
+            echo "## Release v${VERSION}"
+            echo ""
+            echo "This PR was generated by the \`release-prepare\` workflow."
+            echo ""
+            echo "**Review the changelog below** and edit \`CHANGELOG.md\` directly if needed before merging."
+            echo ""
+            echo "---"
+            echo ""
+            echo "${CHANGELOG_BODY}"
+            echo ""
+            echo "---"
+            echo ""
+            echo "> Merging this PR fires \`release-publish.yml\`: tag creation + \`cargo publish\` for the affected crate(s)."
+          } > /tmp/pr-body.md
+
+          # Ensure the "release" label exists (idempotent).
+          if ! gh label create "release" --description "Automated release PR" --color "0e8a16" 2>&1; then
+            if ! gh label list --search "release" --json name -q '.[].name' | grep -qx "release"; then
+              echo "::error::Failed to create or find 'release' label"
+              exit 1
+            fi
+          fi
+
+          gh pr create \
+            --base dev \
+            --head "$BRANCH" \
+            --title "chore(release): v${VERSION}" \
+            --body-file /tmp/pr-body.md \
+            --label "release"
