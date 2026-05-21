@@ -149,6 +149,21 @@ impl MultiAgentRunner {
         self.workers.iter().map(|(name, _)| name.as_str()).collect()
     }
 
+    /// Number of workers currently registered.
+    pub fn len(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// `true` when no workers have been added — `serve_fleet` uses
+    /// this to bail before calling `.run()` if every fleet entry
+    /// was skipped (e.g. all `exec` agents missing their config
+    /// sections). Calling `.run()` on an empty runner already
+    /// errors, but checking here lets callers surface a more
+    /// specific "fleet had N entries, 0 buildable" message.
+    pub fn is_empty(&self) -> bool {
+        self.workers.is_empty()
+    }
+
     /// Run all agents concurrently.
     ///
     /// Spawns each worker in its own tokio task and waits for **all** tasks to

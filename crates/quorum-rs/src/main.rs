@@ -181,6 +181,53 @@ enum Commands {
         #[arg(long, default_value_t = 5)]
         max_attempts: u32,
     },
+
+    /// Run a fleet of agents from a YAML config. The SDK analog of
+    /// the proprietary `nsed serve` binary — boots one
+    /// `NatsNsedWorker` per agent, wires them into a
+    /// `MultiAgentRunner`, and runs until SIGTERM.
+    ///
+    /// Operator pre-flight: `quorum redeem <invite>` to write
+    /// `~/.nsed/agent.creds`, then point this command at your
+    /// `agent.yml` and the orchestrator's NATS URL.
+    Serve {
+        /// Path to the fleet config (`agent.yml`). When omitted,
+        /// searches `./agent.yml` then `./config/default.yml`.
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+
+        /// NATS server URL. Falls back to `$NATS_URL`, then
+        /// `nats://localhost:4222`. Production deployments should
+        /// always pass this explicitly — the orchestrator returns
+        /// the right URL in the `/redeem` response.
+        #[arg(long, value_name = "URL")]
+        nats_url: Option<String>,
+
+        /// Path to a `.creds` file (NKey User JWT) the agents
+        /// authenticate with. Defaults to `~/.nsed/agent.creds`
+        /// (where `quorum redeem` writes). Omit for unauthenticated
+        /// dev orchestrators.
+        #[arg(long, value_name = "PATH")]
+        nats_creds: Option<PathBuf>,
+
+        /// Restrict to a subset of agent names from the fleet
+        /// config. Repeatable; matches case-insensitively. Omit
+        /// (or pass `--agent ALL`) to run every configured agent.
+        #[arg(long = "agent", value_name = "NAME")]
+        agents: Vec<String>,
+
+        /// JetStream stream name the orchestrator publishes work
+        /// on. Override only if the orchestrator was deployed with
+        /// `$NSED_STREAM` set to a non-default value.
+        #[arg(long, value_name = "NAME")]
+        stream_name: Option<String>,
+
+        /// API subject prefix the orchestrator uses. Override only
+        /// if the orchestrator was deployed with `$NSED_API_PREFIX`
+        /// set to a non-default value.
+        #[arg(long, value_name = "PREFIX")]
+        api_prefix: Option<String>,
+    },
 }
 
 impl Cli {
@@ -312,5 +359,36 @@ async fn main() -> ExitCode {
             agents,
             force,
         ),
+
+        Commands::Serve {
+            ref config,
+            ref nats_url,
+            ref nats_creds,
+            ref agents,
+            ref stream_name,
+            ref api_prefix,
+        } => {
+            let agents_filter: Option<&[String]> = if agents.is_empty() {
+                None
+            } else {
+                Some(agents.as_slice())
+            };
+            match commands::serve::run(
+                config.as_deref(),
+                nats_url.as_deref(),
+                nats_creds.as_deref(),
+                agents_filter,
+                stream_name.as_deref(),
+                api_prefix.as_deref(),
+            )
+            .await
+            {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
 }
