@@ -43,20 +43,28 @@ Before starting, have these ready:
   ```
 - **An invite code** from your admin. Looks like a long
   JWT (`eyJhbGc...`).
-- **An OpenAI API key** with credit on it. Set it in your
-  shell:
-  ```bash
-  export OPENAI_API_KEY=sk-...
-  ```
-  Don't have one? Skip ahead to [Step 6 (alternative LLMs)](#step-6-alternative-llms);
-  Claude CLI works without needing an API key here.
-- **About $0.50 of LLM credit** to comfortably complete a few
-  deliberations. The default model (`gpt-4o-mini`) is cheap.
+- **An LLM endpoint to drive the agent.** Any of:
+  - An OpenAI-compatible API key (OpenAI itself, Groq, DeepSeek,
+    Together, local llama.cpp, …),
+  - The `claude` CLI on your `$PATH` (no key needed — Claude CLI
+    handles its own auth),
+  - A local Ollama instance,
+  - Or your own subprocess-based agent driven via the exec / MCP
+    protocols.
+
+  We default to an OpenAI-compatible setup below. To pick a
+  different runtime, jump to [Step 6 (alternative LLMs)](#step-6-alternative-llms)
+  before you start the agent. The bootstrap command in Step 3
+  scaffolds **all** of these in one file so you only have to
+  uncomment the block you want.
+- **About $0.50 of LLM credit** if you're going with a hosted
+  OpenAI-compatible provider. The default model (`gpt-4o-mini`)
+  is cheap.
 
 ## Step 1 — install the `quorum` CLI
 
 ```bash
-cargo install quorum-rs --version 0.7.0-rc.2
+cargo install quorum-rs
 ```
 
 This takes 1-3 minutes the first time (Rust crates compile from
@@ -66,14 +74,16 @@ source). Verify the binary is on your `$PATH`:
 quorum --version
 ```
 
-Expected output: something like `quorum 0.7.0-rc.2`. If you get
-"command not found", your `~/.cargo/bin` isn't in `$PATH` — add
-it to your shell profile:
+Expected output: a version line starting with `quorum `. If you
+get "command not found", your `~/.cargo/bin` isn't in `$PATH`
+— add it to your shell profile:
 
 ```bash
 echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.zshrc   # or ~/.bashrc
 source ~/.zshrc
 ```
+
+If `cargo install` says `could not find quorum-rs in registry with version *`, only pre-release versions are on crates.io right now — check <https://crates.io/crates/quorum-rs> for the latest and pass it explicitly, e.g. `cargo install quorum-rs --version "<latest-shown-on-crates-io>"`. Once a stable `0.x` ships the bare command above will just work.
 
 ✅ **Checkpoint:** `quorum --version` prints a version.
 
@@ -98,19 +108,40 @@ Redeeming invite at https://api.peeramid.xyz…
   Seed file    : /home/you/.nsed/agent.seed
 ```
 
-The interesting bits:
+The three files are your operator identity, split by transport:
 
-- `~/.nsed/operator.token` — your HTTP bearer for `quorum run`
-  later when you submit tasks AS A CLIENT.
-- `~/.nsed/agent.creds` — your NATS credentials. `quorum serve`
-  picks these up automatically when starting your agent.
-- `~/.nsed/agent.seed` — the private half of your NATS identity.
-  Don't share this anywhere. The file is mode 0600.
+- `~/.nsed/operator.token` — bearer token. Authenticates you to
+  the orchestrator's **HTTP API**. `quorum run`, `quorum status`,
+  `quorum trace`, and `quorum tui` use it.
+- `~/.nsed/agent.creds` — NATS User JWT + seed bundle.
+  Authenticates you to the orchestrator's **NATS bus**. `quorum
+  serve` reads it to start agents.
+- `~/.nsed/agent.seed` — the raw NKey seed (mode 0600, never
+  share). The `.creds` blob embeds a copy; the standalone file
+  is for tooling that needs the seed in isolation.
+
+Both `operator.token` and `agent.creds` represent the SAME
+operator identity. The orchestrator pins the same `username`
+(`alice` in the example) to both during redemption.
+
+> **Picking a different directory?** Pass explicit paths to
+> `quorum redeem`:
+>
+> ```bash
+> quorum redeem eyJhbGc... \
+>   --token-out  ./creds/api.token \
+>   --creds-out  ./creds/nats.creds \
+>   --seed-out   ./creds/nats.seed
+> ```
+>
+> You'll then need to point `quorum serve` at the same files
+> with `--nats-creds ./creds/nats.creds` (Step 4) and export
+> the bearer manually when running client commands.
 
 > **What if the admin gave you a chat-only code?** You'll see "Redeemed
 > operator invite (chat-only)" instead, and `agent.creds` won't
-> be written. You can chat against the orchestrator with the
-> bearer token but you can't run an agent. Ask the admin to mint
+> be written. The bearer alone lets you submit tasks from the
+> client side but you can't run an agent. Ask the admin to mint
 > a unified code (`capabilities: ["chat", "agent"]`) and rerun.
 
 Save the NATS URL — you'll need it in Step 4:
@@ -121,7 +152,7 @@ export NATS_URL=nats://api.peeramid.xyz:4222    # use what was printed above
 
 ✅ **Checkpoint:** `ls -la ~/.nsed/agent.creds` shows the file with mode 0600.
 
-## Step 3 — create your `agent.yml`
+## Step 3 — scaffold your `agent.yml`
 
 In a fresh directory of your choice:
 
@@ -129,32 +160,44 @@ In a fresh directory of your choice:
 mkdir ~/my-first-agent && cd ~/my-first-agent
 ```
 
-Create `agent.yml` with this content:
+Generate a starter `agent.yml`:
 
-```yaml
-providers:
-  openai:
-    type: openai
-    base_url: "https://api.openai.com/v1"
-    api_key: "${OPENAI_API_KEY}"
-
-agents:
-  - name: cortex-a
-    provider_id: openai
-    model_name: gpt-4o-mini
+```bash
+quorum init --agent-fleet --agents cortex-a
 ```
 
-Three things to note:
+The flag is the important bit — without `--agent-fleet`, `quorum
+init` writes the *client-side* `nsed.yaml` instead (Step 5 uses
+that one). With `--agent-fleet` it writes an `agent.yml` with:
 
-- The `${OPENAI_API_KEY}` placeholder is resolved from your
-  shell environment at agent-build time. No secrets in the YAML.
-- `cortex-a` is the agent's NATS identity in the orchestrator's
-  logs. Pick whatever you like; case-insensitive alphanumeric +
-  `-` / `_`.
-- `gpt-4o-mini` is the model — anything OpenAI offers works
-  here.
+- An active **OpenAI-compatible** provider block (works for
+  OpenAI, Groq, DeepSeek, Together, local llama.cpp — just change
+  `base_url`).
+- Commented stanzas for **Claude CLI**, **exec** (subprocess
+  agent), and **MCP** — uncomment the one you want.
+- One agent entry per name passed to `--agents` (default
+  `cortex-a` if you omit it). `cortex-a` is the agent's NATS
+  identity in the orchestrator's logs.
 
-✅ **Checkpoint:** `cat agent.yml` prints the file contents.
+Open the file, pick your provider, then set the env var the
+template references. For the default OpenAI block:
+
+```bash
+export OPENAI_API_KEY=sk-...
+```
+
+The `${OPENAI_API_KEY}` placeholder is resolved at runtime when
+`quorum serve` loads the config, so no secrets live in the YAML.
+If you uncomment a different block (Claude / exec / MCP), Step 6
+has the per-provider notes.
+
+> **Picking a different filename / location?** Pass `--config
+> ./fleet/agent.yml` to `quorum init` to write there instead.
+> You'll then need to point `quorum serve --config
+> ./fleet/agent.yml` in Step 4.
+
+✅ **Checkpoint:** `cat agent.yml` prints a `providers:` block
+with `openai:` active and the env var you exported is set.
 
 ## Step 4 — start your agent
 
@@ -162,6 +205,16 @@ From the same directory:
 
 ```bash
 quorum serve --nats-url $NATS_URL
+```
+
+`serve` reads `./agent.yml` and `~/.nsed/agent.creds` by default.
+To point at different paths:
+
+```bash
+quorum serve \
+  --config       ./fleet/agent.yml \
+  --nats-url     $NATS_URL \
+  --nats-creds   ./creds/nats.creds
 ```
 
 You'll see startup logs like:
@@ -192,14 +245,16 @@ this terminal open and open a new one for Step 5.
 In a fresh terminal (leave Step 4 running), submit a task to
 the orchestrator and watch your agent pick it up.
 
-First, set the bearer token from Step 2:
+First, export the bearer token from Step 2 — `quorum run` reads
+it from `$QUORUM_DEMO_TOKEN`:
 
 ```bash
 export QUORUM_DEMO_TOKEN=$(cat ~/.nsed/operator.token)
 ```
 
-Bootstrap a client config (this is the OTHER `init` — for the
-client side, not the agent side):
+`quorum run` needs a small config (`nsed.yaml`) telling it which
+orchestrator to talk to and which agents make up the room.
+`quorum init` writes that file:
 
 ```bash
 cd ~/my-first-agent
@@ -208,8 +263,11 @@ quorum init --orchestrator-url https://api.peeramid.xyz \
             --room demo
 ```
 
-This writes `nsed.yaml` next to your `agent.yml`. Now submit a
-task:
+This writes `nsed.yaml` next to your `agent.yml`. (Two yamls
+for two distinct concerns: `agent.yml` configures the AGENT
+PROCESS — `quorum serve` reads it — while `nsed.yaml`
+configures task SUBMISSION — `quorum run` / `quorum tui` /
+`quorum status` read it.) Now submit a task:
 
 ```bash
 quorum run --room demo "What is the most efficient way to boil water?"

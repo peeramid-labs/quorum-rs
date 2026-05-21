@@ -30,9 +30,15 @@ repo for these):
 
 ## Prerequisites
 
-- `quorum` binary installed: `cargo install quorum-rs --version 0.7.0-rc.2`.
+- `quorum` binary installed: `cargo install quorum-rs`. While
+  only pre-release crates are on crates.io, the bare command
+  errors with `could not find quorum-rs ... with version *`;
+  pass `--version "<latest>"` referring to the version on
+  <https://crates.io/crates/quorum-rs>.
 - An invite code from your admin AND NATS credentials for the
-  orchestrator. `quorum redeem <code>` writes both to `~/.nsed/`.
+  orchestrator. `quorum redeem <code>` writes both to `~/.nsed/`
+  by default; pass `--token-out`, `--creds-out`, `--seed-out`
+  to put them elsewhere.
 - An OpenAI-compatible LLM endpoint with an API key OR the
   `claude` CLI on `$PATH`.
 
@@ -52,9 +58,19 @@ For chat-only codes only the `.token` is written; you can't run
 agents off a chat-only invite. Ask the admin for a unified code
 (`capabilities: ["chat", "agent"]`).
 
-## Step 2 — write `agent.yml`
+## Step 2 — scaffold `agent.yml`
 
-The minimal shape:
+```bash
+quorum init --agent-fleet --agents cortex-a
+```
+
+Writes an `agent.yml` next to you with an active OpenAI-compatible
+provider, commented stanzas for Claude CLI / exec / MCP, and one
+agent entry per name passed to `--agents` (default `cortex-a`).
+Pass `--config PATH` to write elsewhere; `--force` overwrites an
+existing file.
+
+The minimal shape it generates:
 
 ```yaml
 providers:
@@ -66,11 +82,19 @@ providers:
 agents:
   - name: cortex-a
     provider_id: openai
-    model_name: gpt-4o
+    model_name: gpt-4o-mini
 ```
 
-The `${OPENAI_API_KEY}` env reference is resolved at agent-build
-time — keep the key out of the YAML.
+`${OPENAI_API_KEY}` is resolved at runtime when `quorum serve` loads the config — keep the
+key out of the YAML, set it in the shell that runs `quorum serve`.
+Bump `model_name` to `gpt-4o` (or whatever your provider exposes)
+when you're ready to spend more.
+
+### Layering customisations on top of the scaffold
+
+Everything below assumes you started from `quorum init
+--agent-fleet`. The patterns differ only in which provider block
+you uncomment and what `model_name`s you list under `agents:`.
 
 ### Multiple agents on the same LLM
 

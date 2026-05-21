@@ -93,25 +93,45 @@ enum Commands {
     /// remote orchestrator + room. Non-interactive: pass flags or
     /// take defaults; no prompts.
     Init {
-        /// Orchestrator base URL.
+        /// Write an `agent.yml` fleet config (consumed by `quorum
+        /// serve`) instead of the client-side `nsed.yaml` (consumed
+        /// by `quorum run`/`status`/`trace`/`tui`). The two YAMLs
+        /// configure distinct concerns:
+        ///
+        /// - Without this flag → `nsed.yaml`: which orchestrator to
+        ///   talk to, which room, which agents make up the room's
+        ///   policy. Read when SUBMITTING tasks.
+        /// - With this flag → `agent.yml`: providers (LLM endpoints
+        ///   / Claude CLI / exec subprocess), agents (the
+        ///   per-worker config that `quorum serve` instantiates).
+        ///   Read when RUNNING agents.
+        #[arg(long)]
+        agent_fleet: bool,
+
+        /// Orchestrator base URL. Only embedded in `nsed.yaml`
+        /// (client config); ignored when `--agent-fleet` is set
+        /// because `quorum serve` learns the NATS URL from
+        /// `--nats-url` at runtime.
         #[arg(long, default_value = commands::init::DEFAULT_ORCHESTRATOR_URL)]
         orchestrator_url: String,
 
         /// Room name (becomes both the room key + `default_room`).
+        /// Only used by the `nsed.yaml` template.
         #[arg(short, long, default_value = commands::init::DEFAULT_ROOM)]
         room: String,
 
         /// Env-var name the generated YAML interpolates for the
         /// bearer token. The value of this variable is NOT read by
         /// `init` itself — only its name is embedded in the config.
+        /// Only used by the `nsed.yaml` template.
         #[arg(long, default_value = commands::init::DEFAULT_TOKEN_ENV)]
         token_env: String,
 
-        /// Agent names the default policy dispatches to. Repeat or
-        /// comma-separate (e.g. `--agents CortexA,CortexB,CortexC`).
-        /// When omitted, the generated file has `agents: []` and a
-        /// commented edit hint — `quorum run` will refuse cleanly
-        /// until the user populates this list.
+        /// Agent names. For `nsed.yaml` (no `--agent-fleet`):
+        /// listed under the room's policy. For `agent.yml`
+        /// (`--agent-fleet`): each becomes an agent entry the
+        /// runner instantiates. Repeat or comma-separate
+        /// (`--agents cortex-a,cortex-b`).
         #[arg(long, value_delimiter = ',', num_args = 0..)]
         agents: Vec<String>,
 
@@ -346,19 +366,37 @@ async fn main() -> ExitCode {
             }
         }
         Commands::Init {
+            agent_fleet,
             ref orchestrator_url,
             ref room,
             ref token_env,
             ref agents,
             force,
-        } => commands::init::run(
-            cli.config_path(),
-            orchestrator_url,
-            room,
-            token_env,
-            agents,
-            force,
-        ),
+        } => {
+            if agent_fleet {
+                // `agent.yml` is the conventional name `quorum
+                // serve` looks for; fall back to it when --config
+                // wasn't passed. Reusing `cli.config_path()` would
+                // emit `nsed.yaml` here which is the wrong file
+                // for the agent runner to read.
+                let default_path = std::path::Path::new("agent.yml");
+                let target = if cli.config.is_some() {
+                    cli.config_path()
+                } else {
+                    default_path
+                };
+                commands::init::run_agent_fleet(target, agents, force)
+            } else {
+                commands::init::run(
+                    cli.config_path(),
+                    orchestrator_url,
+                    room,
+                    token_env,
+                    agents,
+                    force,
+                )
+            }
+        }
 
         Commands::Serve {
             ref config,
