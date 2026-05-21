@@ -181,12 +181,29 @@ impl MultiAgentRunner {
     /// workers. Returns `Ok(())` when every worker succeeds, or an aggregated
     /// error listing all failures when one or more workers crash or panic.
     ///
-    /// When `cancel.cancelled()` fires, every worker task is
-    /// aborted via [`tokio::task::JoinHandle::abort`] and the
-    /// runner returns `Ok(())`. Without this, a SIGTERM-driven
-    /// drop of the runner future would only stop polling — the
-    /// inner `tokio::spawn`'d tasks are detached and would keep
-    /// running (and reconnecting), the bug the CR review flagged.
+    /// Shutdown happens on two layers:
+    ///
+    /// 1. **Cooperative.** Each worker's reconnect loop checks
+    ///    `cancel.is_cancelled()` at the top of the loop and
+    ///    returns cleanly when set — gives the worker a chance to
+    ///    drop its NATS connection between message-handling
+    ///    iterations.
+    /// 2. **Forceful (abort).** A watchdog task captures
+    ///    [`tokio::task::AbortHandle`]s for every worker BEFORE
+    ///    the runner's join loop consumes the [`JoinHandle`]s.
+    ///    When `cancel.cancelled()` fires the watchdog calls
+    ///    `.abort()` on each handle, which stops a worker even
+    ///    if it's blocked deep inside `worker.run().await` past
+    ///    the cooperative check. Resulting JoinErrors with
+    ///    `is_cancelled() == true` are treated as clean
+    ///    shutdown, not failure.
+    ///
+    /// Layer 1 alone would leak workers blocked inside
+    /// `worker.run()` past the CLI's shutdown grace window —
+    /// that's why both layers exist (CR finding on PR #13).
+    /// Without either, a SIGTERM-driven drop of the runner future
+    /// would only stop polling and the inner `tokio::spawn`'d
+    /// tasks would detach and keep running / reconnecting.
     ///
     /// If a dashboard port is configured and the `status-server` feature is
     /// enabled, the unified dashboard server is started before the workers.
@@ -303,54 +320,67 @@ impl MultiAgentRunner {
             handles.push((name, handle));
         }
 
-        // Wait for all workers OR an external shutdown signal —
-        // whichever fires first. On cancel, abort every handle so
-        // the tasks stop and we then drain JoinErrors below.
-        // Without the abort, dropping the handles would just
-        // detach the spawned tasks (see CR review on PR #13).
-        let join_all = async {
-            let mut errors = Vec::new();
-            for (name, handle) in handles {
-                match handle.await {
-                    Ok(Ok(())) => info!("Agent '{}' completed normally", name),
-                    Ok(Err(e)) => {
-                        error!("Agent '{}' failed: {:?}", name, e);
-                        errors.push(e);
-                    }
-                    Err(e) if e.is_cancelled() => {
-                        info!("Agent '{}' cancelled cleanly", name);
-                    }
-                    Err(e) => {
-                        error!("Agent '{}' panicked: {:?}", name, e);
-                        errors.push(anyhow::anyhow!("Agent '{}' panicked: {:?}", name, e));
-                    }
+        // Snapshot abort-handles before we consume the JoinHandles
+        // into `join_all`. The abort-handles are cheap clones that
+        // let an out-of-band task fire `.abort()` on each worker
+        // when the cancellation token signals shutdown. Without
+        // these, only the cooperative `task_cancel.is_cancelled()`
+        // check inside each worker's reconnect loop can stop
+        // workers — and a worker blocked deep inside
+        // `worker.run().await` would miss it until the inner
+        // call returns. CR finding on PR #13.
+        let abort_handles: Vec<(String, tokio::task::AbortHandle)> = handles
+            .iter()
+            .map(|(n, h)| (n.clone(), h.abort_handle()))
+            .collect();
+        let watchdog_cancel = cancel.clone();
+        let watchdog = tokio::spawn(async move {
+            watchdog_cancel.cancelled().await;
+            info!(
+                "shutdown signal received; aborting {} worker(s)",
+                abort_handles.len()
+            );
+            for (name, h) in &abort_handles {
+                if !h.is_finished() {
+                    info!("aborting worker '{}'", name);
+                    h.abort();
                 }
             }
-            errors
-        };
+        });
 
-        let errors = {
-            // Local pin so we can re-await on the join future after
-            // the cancel-arm has fired without dropping it (which
-            // would detach the worker tasks).
-            tokio::pin!(join_all);
-            tokio::select! {
-                e = &mut join_all => e,
-                _ = cancel.cancelled() => {
-                    info!("shutdown signal received; aborting all workers");
-                    // Aborting after pinning means `join_all` is
-                    // still being polled — the JoinErrors from the
-                    // aborted tasks flow through the existing
-                    // is_cancelled() branch above.
-                    //
-                    // We don't have a handle list here (consumed by
-                    // join_all) so cancellation propagates via the
-                    // cooperative `task_cancel.is_cancelled()`
-                    // check inside each worker's reconnect loop.
-                    join_all.await
+        // Wait for all workers — completed normally, returned an
+        // error, panicked, or cancelled-via-abort. The watchdog
+        // above fires `.abort()` when the cancel token signals,
+        // so a JoinError with `is_cancelled() == true` is the
+        // clean-shutdown path (treated as success, not added to
+        // the error list).
+        let mut errors = Vec::new();
+        for (name, handle) in handles {
+            match handle.await {
+                Ok(Ok(())) => info!("Agent '{}' completed normally", name),
+                Ok(Err(e)) => {
+                    error!("Agent '{}' failed: {:?}", name, e);
+                    errors.push(e);
+                }
+                Err(e) if e.is_cancelled() => {
+                    info!("Agent '{}' aborted cleanly via shutdown signal", name);
+                }
+                Err(e) => {
+                    error!("Agent '{}' panicked: {:?}", name, e);
+                    errors.push(anyhow::anyhow!("Agent '{}' panicked: {:?}", name, e));
                 }
             }
-        };
+        }
+        // Abort the watchdog so it doesn't outlive the runner.
+        // If cancel fired, the watchdog's `.abort()` loop has
+        // already run by the time we got here (every worker
+        // completed above), so the watchdog itself is just
+        // sitting at `watchdog_cancel.cancelled().await` having
+        // returned — `.abort()` on a finished task is a no-op.
+        // If cancel never fired (workers completed naturally),
+        // the watchdog is still awaiting cancellation and
+        // `.abort()` stops it cleanly.
+        watchdog.abort();
 
         if !errors.is_empty() {
             anyhow::bail!(
