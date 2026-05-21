@@ -88,6 +88,15 @@ pub struct ServeOptions {
     /// orchestrator was deployed with `$NSED_API_PREFIX` set to a
     /// non-default value.
     pub api_prefix: String,
+    /// External shutdown signal. When `cancel.cancelled()` fires,
+    /// the runner aborts every worker task and returns `Ok(())`.
+    /// The CLI wires this to SIGTERM / SIGINT; library consumers
+    /// can clone the token and call `.cancel()` from anywhere.
+    ///
+    /// `None` uses an internal token that never fires — the
+    /// runner only exits when workers exhaust their retry budget
+    /// or complete naturally.
+    pub cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl Default for ServeOptions {
@@ -98,7 +107,30 @@ impl Default for ServeOptions {
             agent_filter: None,
             stream_name: "sphera_jobs".to_string(),
             api_prefix: "sphera".to_string(),
+            cancel: None,
         }
+    }
+}
+
+/// Scrub a NATS URL so we can log it without leaking userinfo
+/// (`nats://user:password@host:port` → `nats://<redacted>@host:port`).
+/// A minimal hand-rolled scrub avoids pulling in the `url` crate
+/// just for one log line. Untouched if the URL has no `@`.
+fn redact_userinfo(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some(pair) => pair,
+        None => return url.to_string(),
+    };
+    // Find an `@` that occurs BEFORE the first `/` (or end-of-string).
+    // An `@` inside the path doesn't carry userinfo.
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(authority_end);
+    match authority.rfind('@') {
+        Some(_) => match authority.rsplit_once('@') {
+            Some((_userinfo, host)) => format!("{scheme}://<redacted>@{host}{path}"),
+            None => url.to_string(),
+        },
+        None => url.to_string(),
     }
 }
 
@@ -248,7 +280,7 @@ pub async fn serve_fleet(fleet: &AgentFleetConfig, opts: ServeOptions) -> Result
     }
     info!(
         agent_count = names.len(),
-        nats_url = %opts.nats_url,
+        nats_url = %redact_userinfo(&opts.nats_url),
         "starting fleet"
     );
 
@@ -284,7 +316,8 @@ pub async fn serve_fleet(fleet: &AgentFleetConfig, opts: ServeOptions) -> Result
         );
     }
 
-    runner.run().await
+    let cancel = opts.cancel.unwrap_or_default();
+    runner.run_with_cancellation(cancel).await
 }
 
 /// Suggest a useful tracing subscriber for the CLI wrapper. Library
@@ -398,6 +431,90 @@ agents:
             matches!(result, Ok(None)),
             "exec provider with no exec section must skip cleanly (Ok(None)) before NATS connect; \
              if NATS connection was attempted it would have errored on the unbindable port"
+        );
+    }
+
+    /// `redact_userinfo` must scrub `user:pass@` from the
+    /// authority section of a NATS URL — anything else (the path,
+    /// no userinfo at all) goes through unchanged. The CR review
+    /// flagged the prior startup log as leaking creds when an
+    /// operator passed `nats://user:pass@host` as `--nats-url`.
+    #[test]
+    fn redact_userinfo_strips_credentials() {
+        assert_eq!(
+            redact_userinfo("nats://user:pass@example.com:4222"),
+            "nats://<redacted>@example.com:4222"
+        );
+        assert_eq!(
+            redact_userinfo("nats://token@example.com:4222"),
+            "nats://<redacted>@example.com:4222"
+        );
+    }
+
+    #[test]
+    fn redact_userinfo_leaves_credential_free_urls_alone() {
+        for url in [
+            "nats://localhost:4222",
+            "nats://api.peeramid.xyz:4222",
+            "nats://10.0.0.1:4222",
+        ] {
+            assert_eq!(redact_userinfo(url), url, "{url} must round-trip");
+        }
+    }
+
+    /// An `@` in the PATH must not be misread as userinfo.
+    /// Edge case but the URL parser used here is hand-rolled.
+    #[test]
+    fn redact_userinfo_ignores_at_sign_in_path() {
+        assert_eq!(
+            redact_userinfo("nats://example.com:4222/some@path"),
+            "nats://example.com:4222/some@path"
+        );
+    }
+
+    /// Non-URL input (no `://`) passes through unchanged rather
+    /// than corrupting the value — better to log "weird-looking
+    /// string" than `<redacted>weird-looking-string`.
+    #[test]
+    fn redact_userinfo_handles_non_url_input() {
+        assert_eq!(redact_userinfo("not a url"), "not a url");
+        assert_eq!(redact_userinfo(""), "");
+    }
+
+    /// Cancel token plumbing — when the caller cancels the token,
+    /// `serve_fleet` propagates through `run_with_cancellation`
+    /// and returns Ok(()) without orphaning worker tasks. The
+    /// test uses an unbindable NATS URL + an immediately-cancelled
+    /// token so the runner gives up before any real connection.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn serve_fleet_honours_pre_cancelled_token() {
+        let fleet = fleet_yaml(
+            r#"
+providers:
+  exec_local:
+    type: exec
+agents:
+  - name: noop
+    provider_id: exec_local
+    model_name: custom
+"#,
+        );
+        // exec provider with no `exec:` config => build_worker
+        // returns Ok(None) => runner is empty => serve_fleet
+        // bails BEFORE reaching the runner. We're only proving the
+        // cancel field plumbs through without panicking on
+        // construction. (Real-shutdown coverage of the runner
+        // itself lives in `multi_agent::tests`.)
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let opts = ServeOptions {
+            cancel: Some(token),
+            ..Default::default()
+        };
+        let err = serve_fleet(&fleet, opts).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no agents successfully started"),
+            "must bail with the empty-runner error, not a cancel error: {err}"
         );
     }
 

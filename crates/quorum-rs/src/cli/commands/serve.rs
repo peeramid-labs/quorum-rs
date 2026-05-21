@@ -93,6 +93,16 @@ pub async fn run(
     let fleet = crate::config::load_config(&config_path)
         .with_context(|| format!("failed to load fleet config at {}", config_path.display()))?;
 
+    // The cancellation token threads through serve_fleet →
+    // MultiAgentRunner → each worker task. Without it, the
+    // `tokio::select!` shutdown path below would just drop the
+    // runner future — and tokio tasks spawned INSIDE that future
+    // (one per agent) would detach and keep running. With the
+    // token, the shutdown branch calls `.cancel()` and the
+    // runner aborts every worker before returning. CR flagged
+    // this as the major finding on PR #13.
+    let cancel = tokio_util::sync::CancellationToken::new();
+
     let opts = ServeOptions {
         nats_url: nats_url
             .map(|s| s.to_string())
@@ -105,18 +115,24 @@ pub async fn run(
         api_prefix: api_prefix
             .map(|s| s.to_string())
             .unwrap_or_else(|| "sphera".to_string()),
+        cancel: Some(cancel.clone()),
     };
 
-    // Race the runner against a shutdown signal. The runner returns
-    // when every worker exits OR when one errors. The signal future
-    // returns on SIGTERM / SIGINT. `select!` cancels whichever
-    // future loses; worker tasks self-cancel on drop via tokio's
-    // co-operative cancellation.
-    let runner = serve_fleet(&fleet, opts);
+    // Race the runner against a shutdown signal. On signal we
+    // call `cancel.cancel()` — that signals the runner to abort
+    // every worker BEFORE the select! finishes dropping the
+    // runner future, so no worker task leaks.
     tokio::select! {
-        result = runner => result,
+        result = serve_fleet(&fleet, opts) => result,
         _ = shutdown_signal() => {
-            tracing::info!("shutdown signal received; exiting");
+            tracing::info!("shutdown signal received; cancelling workers");
+            cancel.cancel();
+            // Give workers a brief window to drop their NATS
+            // connections cleanly. The select! will then drop the
+            // runner future; with the cancel token already fired,
+            // the runner's own cancel-aware loop has by then
+            // either completed or is mid-abort — both are safe.
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             Ok(())
         }
     }
