@@ -1,17 +1,33 @@
 //! `quorum redeem <code>` — redeem a JWT invite code, generate a
-//! fresh NKey locally, persist `.creds` + `.seed`, and print a
-//! summary to the terminal.
+//! fresh NKey locally, persist `.creds` + `.seed` (when the code
+//! grants NATS credentials) and/or `.token` (when the code grants
+//! an HTTP bearer), and print a summary to the terminal.
 //!
-//! This is the one-step bootstrap path for 3rd-party agent
-//! operators. The operator never has to share a pubkey with the
-//! admin in advance — `quorum redeem` generates the NKey on the
-//! redeeming host and presents the public half to the orchestrator
-//! at redeem time. The seed never crosses the network.
+//! The CLI dispatches on the code's `aud` claim:
+//!
+//!   * `aud = "nsed-operator-redeem"` → POST `/redeem` (the
+//!     `/admin/api/invites` family — chat users + operators).
+//!     With `capabilities: ["agent"]` on the code, this path also
+//!     mints NATS creds and writes them to disk; with chat-only
+//!     codes it just writes the bearer token.
+//!   * `aud = "nsed-agent-redeem"` → POST `/redeem-agent` (the
+//!     `/admin/api/agent-invites` family — pure NATS agent
+//!     workers). Always mints creds; never mints an HTTP bearer.
+//!   * no `aud` (legacy pre-#444 codes) → falls through to the
+//!     operator path; pre-#444 the only mint endpoint was
+//!     `/admin/api/invites`.
+//!
+//! The operator never has to share a pubkey with the admin in
+//! advance — `quorum redeem` generates the NKey on the redeeming
+//! host and presents the public half to the orchestrator at redeem
+//! time. The seed never crosses the network.
 //!
 //! UX defaults:
 //!
 //! - Seed at `~/.nsed/agent.seed` (override with `--seed-out PATH`).
 //! - Creds at `~/.nsed/agent.creds` (override with `--creds-out PATH`).
+//! - Bearer token at `~/.nsed/operator.token` (override with
+//!   `--token-out PATH`).
 //! - Orchestrator URL defaults to `https://api.peeramid.xyz`; setting
 //!   `NSED_ENV=local` (or `dev`/`development`) flips it to
 //!   `http://localhost:8080`. `--url` or `$ORCH_URL` override.
@@ -19,7 +35,11 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-use crate::nats_utils::{RedeemInviteError, redeem_invite_with_orchestrator_with_retry};
+use crate::nats_utils::{
+    AUD_AGENT_REDEEM, AUD_OPERATOR_REDEEM, RedeemInviteError, format_nats_creds, invite_audience,
+    redeem_invite_with_orchestrator_with_retry,
+    redeem_operator_invite_with_orchestrator_with_retry,
+};
 
 /// Production orchestrator URL — the default `quorum redeem`
 /// points at when the operator hasn't passed `--url` or
@@ -56,6 +76,17 @@ fn default_seed_path() -> Option<PathBuf> {
     Some(p)
 }
 
+/// Default operator bearer-token file location. `~/.nsed/operator.token`.
+/// Mode 0600 on Unix; one-line, no trailing whitespace, suitable for
+/// `Authorization: Bearer $(cat ~/.nsed/operator.token)`.
+fn default_token_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let mut p = PathBuf::from(home);
+    p.push(".nsed");
+    p.push("operator.token");
+    Some(p)
+}
+
 /// Default creds file location. `~/.nsed/agent.creds`.
 pub fn default_creds_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
@@ -65,13 +96,237 @@ pub fn default_creds_path() -> Option<PathBuf> {
     Some(p)
 }
 
+// Each argument maps to a distinct CLI flag (`--seed-out`,
+// `--creds-out`, `--token-out`, `--force`, `--seed-in`,
+// `--max-attempts`) — collapsing them into a struct would just
+// move the same arity into a builder.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     code: &str,
     orchestrator_url: &str,
     seed_out: Option<&Path>,
     creds_out: Option<&Path>,
+    token_out: Option<&Path>,
     force: bool,
     seed_in: Option<&Path>,
+    max_attempts: u32,
+) -> Result<()> {
+    // Resolve the NKey FIRST — surfaces `--seed-in` errors before
+    // any orchestrator round-trip and before audience decode, so a
+    // malformed seed file fails cleanly regardless of what the
+    // invite code looks like.
+    let keypair = load_or_generate_keypair(seed_in)?;
+
+    // Pick the right endpoint by looking at the code's audience pin.
+    // Pre-#444 codes don't carry an `aud` — those went to
+    // /admin/api/invites only, so fall through to the operator path.
+    // Anything else (malformed JWT, unrecognised audience) bails
+    // before any side effect with the same UX as the orchestrator's
+    // own `invalid_code` 401.
+    let aud = invite_audience(code).context("invite code is not in JWT shape")?;
+    match aud.as_deref() {
+        Some(AUD_AGENT_REDEEM) => {
+            run_agent_redeem(
+                code,
+                orchestrator_url,
+                seed_out,
+                creds_out,
+                force,
+                keypair,
+                max_attempts,
+            )
+            .await
+        }
+        Some(AUD_OPERATOR_REDEEM) | None => {
+            run_operator_redeem(
+                code,
+                orchestrator_url,
+                seed_out,
+                creds_out,
+                token_out,
+                force,
+                keypair,
+                max_attempts,
+            )
+            .await
+        }
+        Some(other) => {
+            anyhow::bail!(
+                "invite code carries unknown audience {other:?}. \
+                 Expected {AUD_OPERATOR_REDEEM:?} or {AUD_AGENT_REDEEM:?}."
+            )
+        }
+    }
+}
+
+/// Operator-code path: POSTs `/redeem`, gets back an HTTP bearer
+/// token and (for unified codes carrying the `agent` capability)
+/// a scoped NATS User JWT + creds. Used for invites minted via
+/// `/admin/api/invites` — the `/invite` admin page's output.
+#[allow(clippy::too_many_arguments)]
+async fn run_operator_redeem(
+    code: &str,
+    orchestrator_url: &str,
+    seed_out: Option<&Path>,
+    creds_out: Option<&Path>,
+    token_out: Option<&Path>,
+    force: bool,
+    keypair: nkeys::KeyPair,
+    max_attempts: u32,
+) -> Result<()> {
+    // Resolve all three output paths upfront and validate uniqueness
+    // BEFORE the orchestrator round-trip OR any file write. A typo
+    // like `--token-out=~/.nsed/agent.creds` would otherwise have
+    // the bearer-write clobber the NATS creds file (or vice versa)
+    // after a successful redeem — same foot-gun the existing
+    // `--seed-out`/`--creds-out` collision check guards against.
+    //
+    // Creds + seed paths are resolved even for chat-only redeems so
+    // the collision check runs regardless. They're only WRITTEN
+    // when the response carries `user_jwt` + `nats_url`.
+    let resolved_token = match token_out {
+        Some(p) => p.to_path_buf(),
+        None => default_token_path().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot determine default token path — pass --token-out PATH explicitly."
+            )
+        })?,
+    };
+    let resolved_creds = match creds_out {
+        Some(p) => p.to_path_buf(),
+        None => default_creds_path().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot determine default creds path — pass --creds-out PATH explicitly."
+            )
+        })?,
+    };
+    let resolved_seed = match seed_out {
+        Some(p) => p.to_path_buf(),
+        None => default_seed_path().ok_or_else(|| {
+            anyhow::anyhow!("Cannot determine default seed path — pass --seed-out PATH explicitly.")
+        })?,
+    };
+    for (a_label, a_path, b_label, b_path) in [
+        (
+            "--token-out",
+            &resolved_token,
+            "--creds-out",
+            &resolved_creds,
+        ),
+        ("--token-out", &resolved_token, "--seed-out", &resolved_seed),
+        ("--creds-out", &resolved_creds, "--seed-out", &resolved_seed),
+    ] {
+        if a_path == b_path {
+            anyhow::bail!(
+                "{a_label} and {b_label} resolve to the same path ({}). \
+                 Each file format is distinct; one would overwrite the other.",
+                a_path.display()
+            );
+        }
+    }
+    if resolved_token.exists() && !force {
+        anyhow::bail!(
+            "token file already exists at {}. Pass --force to overwrite (only do this \
+             if you're sure the existing file is no longer needed).",
+            resolved_token.display()
+        );
+    }
+
+    // Pubkey is presented to the orchestrator. The orchestrator
+    // silently ignores it for chat-only codes (`capabilities: ["chat"]`).
+    let pub_key = keypair.public_key();
+
+    eprintln!("Redeeming invite at {orchestrator_url}…");
+    let resp = match redeem_operator_invite_with_orchestrator_with_retry(
+        orchestrator_url,
+        code,
+        Some(&pub_key),
+        Some("quorum-cli"),
+        max_attempts,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return Err(redeem_error_message(e)),
+    };
+
+    // Always write the bearer.
+    if let Some(parent) = resolved_token.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+    }
+    write_secret_file(&resolved_token, &resp.token)
+        .with_context(|| format!("Failed to write token file at {}", resolved_token.display()))?;
+
+    // For unified codes we also got NATS creds back — write them in
+    // the same `.creds` + `.seed` layout the agent path uses, so
+    // downstream tooling (yaml `nats.auth.creds_file`, etc.) doesn't
+    // need to know which redeem path the operator went through.
+    let unified = match (&resp.user_jwt, &resp.nats_url) {
+        (Some(jwt), Some(url)) => Some((jwt.clone(), url.clone())),
+        _ => None,
+    };
+
+    if let Some((user_jwt, nats_url)) = unified.as_ref() {
+        for (label, path) in [("creds", &resolved_creds), ("seed", &resolved_seed)] {
+            if path.exists() && !force {
+                anyhow::bail!(
+                    "{label} file already exists at {}. Pass --force to overwrite.",
+                    path.display()
+                );
+            }
+        }
+        let seed = keypair
+            .seed()
+            .map_err(|e| anyhow::anyhow!("Failed to extract NKey seed: {e}"))?;
+        let creds = format_nats_creds(user_jwt, &seed);
+        for (label, path, content) in [
+            ("creds", &resolved_creds, creds.as_str()),
+            ("seed", &resolved_seed, seed.as_str()),
+        ] {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+            }
+            write_secret_file(path, content)
+                .with_context(|| format!("Failed to write {label} file at {}", path.display()))?;
+        }
+
+        println!();
+        println!("✓ Redeemed unified invite (operator + agent).");
+        println!();
+        println!("  Operator     : {}", resp.name);
+        println!("  Token file   : {}", resolved_token.display());
+        println!("  Connect URL  : {nats_url}");
+        println!("  Agent pubkey : {pub_key}");
+        println!("  Creds file   : {}", resolved_creds.display());
+        println!("  Seed file    : {}", resolved_seed.display());
+    } else {
+        println!();
+        println!("✓ Redeemed operator invite (chat-only).");
+        println!();
+        println!("  Operator    : {}", resp.name);
+        println!("  Token file  : {}", resolved_token.display());
+        if let Some(budget) = resp.budget {
+            println!("  Budget cap  : {budget} credits");
+        }
+    }
+    println!();
+    println!("Files are written mode 0600 on Unix. Keep them private —");
+    println!("the bearer is the only way to authenticate as this operator.");
+    Ok(())
+}
+
+/// Agent-code path: POSTs `/redeem-agent`, mints NATS creds only.
+/// Used for invites minted via `/admin/api/agent-invites`.
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_redeem(
+    code: &str,
+    orchestrator_url: &str,
+    seed_out: Option<&Path>,
+    creds_out: Option<&Path>,
+    force: bool,
+    keypair: nkeys::KeyPair,
     max_attempts: u32,
 ) -> Result<()> {
     let resolved_creds = match creds_out {
@@ -91,10 +346,7 @@ pub async fn run(
     // Catch the foot-gun where a typo sets `--seed-out` and
     // `--creds-out` to the same path: the second write would
     // overwrite the first and the operator would silently lose
-    // either the seed or the creds depending on order. Reject
-    // upfront. Identity is checked on canonical-ish bytes; we
-    // don't resolve symlinks because the files don't exist yet at
-    // this point (and `--force` would have stripped them).
+    // either the seed or the creds depending on order.
     if resolved_creds == resolved_seed {
         anyhow::bail!(
             "--seed-out and --creds-out resolve to the same path ({}). The creds blob and \
@@ -112,34 +364,6 @@ pub async fn run(
         }
     }
 
-    // Resolve the NKey: caller-supplied `--seed-in` PATH wins (lets
-    // an operator pre-stage a seed and keep the same pubkey across
-    // redemptions). Otherwise generate a fresh keypair. Either way
-    // the key is allocated BEFORE the redeem call so the retry
-    // helper presents the SAME pubkey on every attempt — a 5xx
-    // after the orchestrator marked the JTI redeemed would
-    // otherwise consume the invite on attempt N and present a new
-    // pubkey on attempt N+1 → 409 Replayed and a lost invite.
-    let keypair = match seed_in {
-        Some(path) => {
-            let raw = std::fs::read_to_string(path)
-                .with_context(|| format!("Failed to read seed file at {}", path.display()))?;
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                anyhow::bail!(
-                    "--seed-in file {} is empty. Expected a `SU…`-prefixed NKey seed.",
-                    path.display()
-                );
-            }
-            nkeys::KeyPair::from_seed(trimmed).with_context(|| {
-                format!(
-                    "Failed to parse seed from {} — must be a `SU…`-prefixed NKey user seed",
-                    path.display()
-                )
-            })?
-        }
-        None => nkeys::KeyPair::new_user(),
-    };
     eprintln!("Redeeming invite at {orchestrator_url}…");
     let result = match redeem_invite_with_orchestrator_with_retry(
         orchestrator_url,
@@ -181,6 +405,37 @@ pub async fn run(
     println!("Both files are written mode 0600 on Unix. Keep the seed");
     println!("private — it's the long-lived half of your NATS identity.");
     Ok(())
+}
+
+/// Resolve the NKey: caller-supplied `--seed-in` PATH wins (lets an
+/// operator pre-stage a seed and keep the same pubkey across
+/// redemptions). Otherwise generate a fresh keypair. Either way the
+/// key is allocated BEFORE the redeem call so the retry helper
+/// presents the SAME pubkey on every attempt — a 5xx after the
+/// orchestrator marked the JTI redeemed would otherwise consume the
+/// invite on attempt N and present a new pubkey on attempt N+1 →
+/// 409 Replayed and a lost invite.
+fn load_or_generate_keypair(seed_in: Option<&Path>) -> Result<nkeys::KeyPair> {
+    match seed_in {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read seed file at {}", path.display()))?;
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!(
+                    "--seed-in file {} is empty. Expected a `SU…`-prefixed NKey seed.",
+                    path.display()
+                );
+            }
+            nkeys::KeyPair::from_seed(trimmed).with_context(|| {
+                format!(
+                    "Failed to parse seed from {} — must be a `SU…`-prefixed NKey user seed",
+                    path.display()
+                )
+            })
+        }
+        None => Ok(nkeys::KeyPair::new_user()),
+    }
 }
 
 /// Map a typed [`RedeemInviteError`] to an actionable
@@ -254,6 +509,23 @@ fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── JWT-shaped code helpers ───────────────────────────────────────
+    //
+    // The aud-dispatch in `run()` decodes the JWT payload to pick an
+    // endpoint, so test inputs need to be JWT-shaped even though the
+    // mock server never verifies signatures. Both helpers produce a
+    // 3-segment dot-separated string with a base64url payload that
+    // parses as `{"sub": ..., "exp": ..., "aud": ...}`.
+
+    fn agent_invite_code() -> String {
+        use base64::Engine;
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"sub":"bot-1","exp":9999999999,"aud":"nsed-agent-redeem"}"#);
+        format!("{header}.{payload}.AAAA")
+    }
 
     // ── default_orchestrator_url ─────────────────────────────────────
 
@@ -367,10 +639,11 @@ mod tests {
         let creds_path = tmp.path().join("agent.creds");
 
         run(
-            "fake.invite.code",
+            &agent_invite_code(),
             &mock_server.uri(),
             Some(&seed_path),
             Some(&creds_path),
+            None, // token_out
             false,
             None,
             1,
@@ -413,10 +686,11 @@ mod tests {
         std::fs::write(&creds_path, "pre-existing").unwrap();
 
         let err = run(
-            "code",
+            &agent_invite_code(),
             &mock_server.uri(),
             Some(&seed_path),
             Some(&creds_path),
+            None, // token_out
             false,
             None,
             1,
@@ -456,10 +730,11 @@ mod tests {
         let creds_path = tmp.path().join("agent.creds");
 
         let err = run(
-            "stale.code",
+            &agent_invite_code(),
             &mock_server.uri(),
             Some(&seed_path),
             Some(&creds_path),
+            None, // token_out
             false,
             None,
             1,
@@ -508,10 +783,11 @@ mod tests {
         std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         run(
-            "code",
+            &agent_invite_code(),
             &mock_server.uri(),
             Some(&seed_path),
             Some(&creds_path),
+            None, // token_out
             /* force = */ true,
             None,
             1,
@@ -539,10 +815,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let same = tmp.path().join("agent.both");
         let err = run(
-            "any.code",
+            &agent_invite_code(),
             "http://orchestrator.invalid",
             Some(&same),
             Some(&same),
+            None, // token_out
             false,
             None,
             1,
@@ -556,6 +833,65 @@ mod tests {
         );
         // Neither file must have been touched.
         assert!(!same.exists());
+    }
+
+    /// Operator-redeem path has a third secret file (`--token-out`).
+    /// All three pairs must be checked for collision — token vs
+    /// creds, token vs seed, creds vs seed — before any write hits
+    /// the disk. Failure mode this guards against: a typo like
+    /// `--token-out=~/.nsed/agent.creds` would have the bearer
+    /// write clobber the NATS creds after a successful redeem,
+    /// silently losing one secret to recover the other.
+    #[tokio::test]
+    async fn redeem_operator_rejects_token_creds_path_collision() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let same = tmp.path().join("collide");
+        // Use a JWT-shaped operator code so dispatch routes to the
+        // operator path and the collision check fires. No HTTP
+        // mock needed — the collision check is upstream of the
+        // network call.
+        let err = run(
+            &operator_invite_code(),
+            "http://orchestrator.invalid",
+            Some(&tmp.path().join("agent.seed")),
+            Some(&same), // creds
+            Some(&same), // token — collides with creds
+            false,
+            None,
+            1,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--token-out") && msg.contains("--creds-out"),
+            "error must name both colliding flags; got: {msg}"
+        );
+        assert!(!same.exists(), "no file may have been written");
+    }
+
+    #[tokio::test]
+    async fn redeem_operator_rejects_token_seed_path_collision() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let same = tmp.path().join("collide");
+        let err = run(
+            &operator_invite_code(),
+            "http://orchestrator.invalid",
+            Some(&same), // seed
+            Some(&tmp.path().join("agent.creds")),
+            Some(&same), // token — collides with seed
+            false,
+            None,
+            1,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--token-out") && msg.contains("--seed-out"),
+            "error must name both colliding flags; got: {msg}"
+        );
+        assert!(!same.exists(), "no file may have been written");
     }
 
     /// `--seed-in` lets the operator pre-stage a seed and reuse the
@@ -588,10 +924,11 @@ mod tests {
         let seed_path = tmp.path().join("agent.seed");
         let creds_path = tmp.path().join("agent.creds");
         run(
-            "code",
+            &agent_invite_code(),
             &mock_server.uri(),
             Some(&seed_path),
             Some(&creds_path),
+            None, // token_out
             false,
             Some(&staged),
             1,
@@ -627,6 +964,7 @@ mod tests {
             "http://orchestrator.invalid",
             Some(&tmp.path().join("agent.seed")),
             Some(&tmp.path().join("agent.creds")),
+            None, // token_out
             false,
             Some(&empty),
             1,
@@ -653,6 +991,7 @@ mod tests {
             "http://orchestrator.invalid",
             Some(&tmp.path().join("agent.seed")),
             Some(&tmp.path().join("agent.creds")),
+            None, // token_out
             false,
             Some(&bad),
             1,
@@ -662,6 +1001,213 @@ mod tests {
         assert!(
             err.to_string().contains("parse seed") || err.to_string().contains("NKey"),
             "must mention seed-parse failure: {err}"
+        );
+    }
+
+    // ── aud-dispatch (operator-token vs agent-credential routing) ──
+
+    /// Build a JWT-shaped invite code with `aud=nsed-operator-redeem`.
+    /// Same construction as the orchestrator's `sign_invite`, minus
+    /// the HMAC (the test mock doesn't verify signatures — the real
+    /// orchestrator does, that's its concern).
+    fn operator_invite_code() -> String {
+        use base64::Engine;
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"sub":"alice","exp":9999999999,"aud":"nsed-operator-redeem"}"#);
+        format!("{header}.{payload}.AAAA")
+    }
+
+    /// Regression for the user-reported bug: `quorum redeem` against
+    /// an operator-token code (from `/admin/api/invites`, e.g. the
+    /// `/invite` admin page) used to always POST `/redeem-agent` and
+    /// get back `invalid_code` because of the audience-pin mismatch.
+    /// The new dispatch must route to `/redeem` for operator codes
+    /// and write the bearer to `--token-out`.
+    #[tokio::test]
+    async fn redeem_dispatches_operator_code_to_redeem_endpoint() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // /redeem is the only endpoint that should fire. /redeem-agent
+        // has `.expect(0)` so the test hard-fails if the CLI ever
+        // misroutes again.
+        Mock::given(method("POST"))
+            .and(path("/redeem"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "op-abc-123",
+                "name": "alice",
+                "budget": 5.0,
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/redeem-agent"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let token_path = tmp.path().join("operator.token");
+
+        run(
+            &operator_invite_code(),
+            &mock_server.uri(),
+            Some(&tmp.path().join("agent.seed")),
+            Some(&tmp.path().join("agent.creds")),
+            Some(&token_path),
+            false,
+            None,
+            1,
+        )
+        .await
+        .expect("operator redeem must succeed via /redeem");
+
+        let token = std::fs::read_to_string(&token_path).unwrap();
+        assert_eq!(token.trim(), "op-abc-123");
+        // chat-only response → no .creds or .seed written
+        assert!(!tmp.path().join("agent.creds").exists());
+        assert!(!tmp.path().join("agent.seed").exists());
+    }
+
+    /// Unified-code path: operator code with `capabilities=[chat,agent]`
+    /// means the `/redeem` response carries `user_jwt` + `nats_url`.
+    /// The CLI must write BOTH the bearer AND the `.creds`/`.seed`
+    /// in that case so the operator can chat AND run an agent
+    /// without a second tool.
+    #[tokio::test]
+    async fn redeem_dispatches_unified_code_writes_token_and_creds() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/redeem"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "op-unified-xyz",
+                "name": "alice",
+                "user_jwt": "eyJ.unified.jwt",
+                "nats_url": "nats://localhost:4222",
+                "agent_id": "alice",
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let token_path = tmp.path().join("operator.token");
+        let creds_path = tmp.path().join("agent.creds");
+        let seed_path = tmp.path().join("agent.seed");
+
+        run(
+            &operator_invite_code(),
+            &mock_server.uri(),
+            Some(&seed_path),
+            Some(&creds_path),
+            Some(&token_path),
+            false,
+            None,
+            1,
+        )
+        .await
+        .expect("unified redeem must succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(&token_path).unwrap().trim(),
+            "op-unified-xyz"
+        );
+        let creds = std::fs::read_to_string(&creds_path).unwrap();
+        assert!(
+            creds.contains("eyJ.unified.jwt"),
+            "creds blob must embed user_jwt"
+        );
+        let seed = std::fs::read_to_string(&seed_path).unwrap();
+        assert!(
+            seed.trim().starts_with("SU"),
+            "seed file must contain SU-prefixed nkey: {seed}"
+        );
+    }
+
+    /// Agent-code path (`aud=nsed-agent-redeem`) must keep using
+    /// `/redeem-agent`. Regression guard so future refactors don't
+    /// accidentally collapse the dispatch.
+    #[tokio::test]
+    async fn redeem_dispatches_agent_code_to_redeem_agent_endpoint() {
+        use base64::Engine;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"sub":"bot-1","exp":9999999999,"aud":"nsed-agent-redeem"}"#);
+        let agent_code = format!("{header}.{payload}.AAAA");
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/redeem-agent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user_jwt": "eyJ.agent.jwt",
+                "nats_url": "nats://localhost:4222",
+                "agent_id": "bot-1",
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/redeem"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        run(
+            &agent_code,
+            &mock_server.uri(),
+            Some(&tmp.path().join("agent.seed")),
+            Some(&tmp.path().join("agent.creds")),
+            Some(&tmp.path().join("operator.token")),
+            false,
+            None,
+            1,
+        )
+        .await
+        .expect("agent redeem must succeed via /redeem-agent");
+        // Agent path doesn't issue a bearer.
+        assert!(!tmp.path().join("operator.token").exists());
+    }
+
+    /// Unknown audience must bail before any network call.
+    #[tokio::test]
+    async fn redeem_rejects_unknown_audience_without_network() {
+        use base64::Engine;
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"sub":"x","exp":9,"aud":"nsed-mystery-redeem"}"#);
+        let unknown = format!("{header}.{payload}.AAAA");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = run(
+            &unknown,
+            "http://orchestrator.invalid",
+            Some(&tmp.path().join("agent.seed")),
+            Some(&tmp.path().join("agent.creds")),
+            Some(&tmp.path().join("operator.token")),
+            false,
+            None,
+            1,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown audience"),
+            "must mention unknown audience: {err}"
         );
     }
 }

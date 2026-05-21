@@ -145,11 +145,22 @@ enum Commands {
         seed_out: Option<PathBuf>,
 
         /// Path to write the `.creds` file to. Defaults to
-        /// `~/.nsed/agent.creds`.
+        /// `~/.nsed/agent.creds`. Only written when the code grants
+        /// NATS credentials (any code minted via
+        /// `/admin/api/agent-invites`, or operator codes with the
+        /// `agent` capability in `capabilities`).
         #[arg(long, value_name = "PATH")]
         creds_out: Option<PathBuf>,
 
-        /// Overwrite existing creds / seed files.
+        /// Path to write the HTTP bearer token to. Defaults to
+        /// `~/.nsed/operator.token`. Only written for operator
+        /// codes (those minted via `/admin/api/invites` — chat
+        /// users + operators). Agent-only codes don't carry a
+        /// bearer token.
+        #[arg(long, value_name = "PATH")]
+        token_out: Option<PathBuf>,
+
+        /// Overwrite existing creds / seed / token files.
         #[arg(long)]
         force: bool,
 
@@ -248,6 +259,7 @@ async fn main() -> ExitCode {
             ref url,
             ref seed_out,
             ref creds_out,
+            ref token_out,
             force,
             ref seed_in,
             max_attempts,
@@ -272,6 +284,7 @@ async fn main() -> ExitCode {
                 &resolved_url,
                 seed_out.as_deref(),
                 creds_out.as_deref(),
+                token_out.as_deref(),
                 force,
                 seed_in.as_deref(),
                 max_attempts,

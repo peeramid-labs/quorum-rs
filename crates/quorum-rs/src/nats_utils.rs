@@ -492,6 +492,57 @@ pub async fn register_with_orchestrator_with_retry(
 // Invite-code redemption (companion to nsed#444)
 // ---------------------------------------------------------------------------
 
+/// Audience pin for operator HTTP-token invites — emitted by the
+/// orchestrator's `/admin/api/invites` endpoint and required by
+/// `/redeem`. Mirror of `nsed_orchestrator::auth::invites::AUD_OPERATOR_REDEEM`.
+pub const AUD_OPERATOR_REDEEM: &str = "nsed-operator-redeem";
+
+/// Audience pin for agent NATS-credential invites — emitted by the
+/// orchestrator's `/admin/api/agent-invites` endpoint and required by
+/// `/redeem-agent`. Mirror of `nsed_orchestrator::auth::invites::AUD_AGENT_REDEEM`.
+pub const AUD_AGENT_REDEEM: &str = "nsed-agent-redeem";
+
+/// Decode the `aud` claim from an invite code WITHOUT verifying the
+/// signature. The signing secret lives on the orchestrator only —
+/// clients can't (and shouldn't) verify; the orchestrator re-checks
+/// the signature at redeem time anyway. We just need the audience to
+/// pick the right endpoint.
+///
+/// Returns `Ok(Some(aud))` for codes that carry the field (post-#444
+/// orchestrator output), `Ok(None)` for legacy codes minted before
+/// the audience-pin landed, and `Err` only for codes that aren't
+/// shaped like a JWT at all (so the caller can surface the same
+/// "invalid code" UX as the orchestrator would).
+pub fn invite_audience(code: &str) -> Result<Option<String>> {
+    use base64::Engine;
+    // JWTs are EXACTLY three dot-separated segments:
+    // header.payload.signature. Anything else is malformed — reject
+    // before wasting cycles on a base64 decode. The old
+    // `parts.next()` chain accepted 2-segment input (would have
+    // base64-decoded what was actually the header) AND 4+ segments
+    // (silently dropped the trailing junk).
+    let parts: Vec<&str> = code.split('.').collect();
+    if parts.len() != 3 {
+        anyhow::bail!(
+            "invite code is not JWT-shaped (expected 3 dot-separated segments, got {})",
+            parts.len()
+        );
+    }
+    let payload = parts[1];
+    // base64url, no padding — what JWTs use.
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|e| anyhow::anyhow!("invite payload not base64url: {e}"))?;
+    #[derive(serde::Deserialize)]
+    struct AudOnly {
+        #[serde(default)]
+        aud: Option<String>,
+    }
+    let parsed: AudOnly = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("invite payload not JSON: {e}"))?;
+    Ok(parsed.aud)
+}
+
 /// Typed outcome from [`redeem_invite_with_orchestrator`].
 ///
 /// 3rd parties consuming the SDK get a clean `match` over the
@@ -926,6 +977,55 @@ pub async fn redeem_operator_invite_with_orchestrator(
                 anyhow::Error::new(e).context("Failed to parse /redeem response"),
             )
         })
+}
+
+/// Like [`redeem_operator_invite_with_orchestrator`] but retries on
+/// transient failures with exponential backoff. Same policy as the
+/// agent-side [`redeem_invite_with_orchestrator_with_retry`]:
+/// permanent failures (4xx, `Decode`) short-circuit; transports +
+/// 5xx + `KvUnavailable` back off and retry up to `max_attempts`.
+///
+/// The `user_pub_key` is fixed across attempts — unified codes need
+/// the same pubkey to land in the issued NATS User JWT regardless
+/// of which attempt succeeds, just like the agent helper.
+pub async fn redeem_operator_invite_with_orchestrator_with_retry(
+    orchestrator_url: &str,
+    invite_code: &str,
+    user_pub_key: Option<&str>,
+    device_hint: Option<&str>,
+    max_attempts: u32,
+) -> std::result::Result<RedeemOperatorInviteResponse, RedeemInviteError> {
+    let base_delay_ms = 1_000u64;
+    let mut last_err = RedeemInviteError::Transport(anyhow::anyhow!("No attempts made"));
+    for attempt in 1..=max_attempts {
+        match redeem_operator_invite_with_orchestrator(
+            orchestrator_url,
+            invite_code,
+            user_pub_key,
+            device_hint,
+        )
+        .await
+        {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                if !e.is_retryable() || attempt == max_attempts {
+                    return Err(e);
+                }
+                let wait = Duration::from_millis(base_delay_ms * 2u64.pow(attempt.min(6) - 1));
+                tracing::warn!(
+                    orchestrator_url,
+                    attempt,
+                    max_attempts,
+                    wait_ms = wait.as_millis(),
+                    error = %e,
+                    "Orchestrator not yet reachable for operator redeem, retrying..."
+                );
+                tokio::time::sleep(wait).await;
+                last_err = e;
+            }
+        }
+    }
+    Err(last_err)
 }
 
 /// Returns `true` if `e` is a transient error that should be retried.
@@ -1889,6 +1989,107 @@ mod tests {
         assert!(!e.is_retryable());
         let e = RedeemInviteError::Transport(anyhow::anyhow!("synthetic"));
         assert!(e.is_retryable());
+    }
+
+    // ── invite_audience — JWT aud-claim decode (CLI dispatch) ─────
+
+    /// Build a minimally-shaped unsigned JWT with the given audience.
+    /// Signature isn't checked here — `invite_audience` parses the
+    /// payload segment only, the orchestrator re-verifies at redeem.
+    fn jwt_with_aud(aud: Option<&str>) -> String {
+        use base64::Engine;
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload_json = match aud {
+            Some(a) => format!(r#"{{"sub":"alice","exp":1,"aud":"{a}"}}"#),
+            None => r#"{"sub":"alice","exp":1}"#.to_string(),
+        };
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload_json);
+        // Signature is just a placeholder — we never verify it.
+        format!("{header}.{payload}.AAAA")
+    }
+
+    #[test]
+    fn invite_audience_extracts_operator_aud() {
+        let code = jwt_with_aud(Some(AUD_OPERATOR_REDEEM));
+        assert_eq!(
+            invite_audience(&code).unwrap().as_deref(),
+            Some(AUD_OPERATOR_REDEEM)
+        );
+    }
+
+    #[test]
+    fn invite_audience_extracts_agent_aud() {
+        let code = jwt_with_aud(Some(AUD_AGENT_REDEEM));
+        assert_eq!(
+            invite_audience(&code).unwrap().as_deref(),
+            Some(AUD_AGENT_REDEEM)
+        );
+    }
+
+    /// Pre-#444 codes never carried an `aud` claim. The decoder must
+    /// return `Ok(None)` so the caller can route those to the
+    /// historical-default endpoint (operator path) without erroring.
+    #[test]
+    fn invite_audience_handles_legacy_no_aud() {
+        let code = jwt_with_aud(None);
+        assert_eq!(invite_audience(&code).unwrap(), None);
+    }
+
+    /// A string that isn't JWT-shaped (missing `.`-separated segments)
+    /// must Err, not return None — caller wants to surface
+    /// `invalid_code` UX without an HTTP round-trip.
+    #[test]
+    fn invite_audience_rejects_non_jwt() {
+        assert!(invite_audience("not-a-jwt").is_err());
+    }
+
+    /// Payload segment that isn't base64url must Err.
+    #[test]
+    fn invite_audience_rejects_invalid_base64() {
+        assert!(invite_audience("aaa.!!!notbase64!!!.bbb").is_err());
+    }
+
+    /// Base64url-decoded payload that isn't valid JSON must Err.
+    #[test]
+    fn invite_audience_rejects_invalid_json_payload() {
+        use base64::Engine;
+        let bad = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not json");
+        let code = format!("AAAA.{bad}.BBBB");
+        assert!(invite_audience(&code).is_err());
+    }
+
+    /// Two-segment input (header.payload, no signature) is not a
+    /// valid JWT — the old `parts.next()` chain would have happily
+    /// base64-decoded the "payload" as if it were the missing
+    /// signature. Reject strictly on segment count.
+    #[test]
+    fn invite_audience_rejects_two_segments() {
+        let err = invite_audience("aaa.bbb").unwrap_err().to_string();
+        assert!(
+            err.contains("3 dot-separated segments") && err.contains("got 2"),
+            "must surface segment-count mismatch: {err}"
+        );
+    }
+
+    /// Four-or-more segments are also rejected. Some flavours of
+    /// JWS allow this (compact serialization with detached
+    /// payload), but invite codes are plain JWT and we don't want
+    /// to silently pass through unexpected trailers.
+    #[test]
+    fn invite_audience_rejects_four_segments() {
+        let err = invite_audience("aaa.bbb.ccc.ddd").unwrap_err().to_string();
+        assert!(
+            err.contains("3 dot-separated segments") && err.contains("got 4"),
+            "must surface segment-count mismatch: {err}"
+        );
+    }
+
+    /// Empty input — zero segments before split, one (empty) after
+    /// split. Behaviour: rejected via the same segment-count guard.
+    #[test]
+    fn invite_audience_rejects_empty_input() {
+        assert!(invite_audience("").is_err());
     }
 
     // ── /redeem (operator) — invite-code redemption (nsed #307) ────
