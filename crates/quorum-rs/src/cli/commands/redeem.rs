@@ -174,6 +174,16 @@ async fn run_operator_redeem(
     keypair: nkeys::KeyPair,
     max_attempts: u32,
 ) -> Result<()> {
+    // Resolve all three output paths upfront and validate uniqueness
+    // BEFORE the orchestrator round-trip OR any file write. A typo
+    // like `--token-out=~/.nsed/agent.creds` would otherwise have
+    // the bearer-write clobber the NATS creds file (or vice versa)
+    // after a successful redeem — same foot-gun the existing
+    // `--seed-out`/`--creds-out` collision check guards against.
+    //
+    // Creds + seed paths are resolved even for chat-only redeems so
+    // the collision check runs regardless. They're only WRITTEN
+    // when the response carries `user_jwt` + `nats_url`.
     let resolved_token = match token_out {
         Some(p) => p.to_path_buf(),
         None => default_token_path().ok_or_else(|| {
@@ -182,6 +192,38 @@ async fn run_operator_redeem(
             )
         })?,
     };
+    let resolved_creds = match creds_out {
+        Some(p) => p.to_path_buf(),
+        None => default_creds_path().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot determine default creds path — pass --creds-out PATH explicitly."
+            )
+        })?,
+    };
+    let resolved_seed = match seed_out {
+        Some(p) => p.to_path_buf(),
+        None => default_seed_path().ok_or_else(|| {
+            anyhow::anyhow!("Cannot determine default seed path — pass --seed-out PATH explicitly.")
+        })?,
+    };
+    for (a_label, a_path, b_label, b_path) in [
+        (
+            "--token-out",
+            &resolved_token,
+            "--creds-out",
+            &resolved_creds,
+        ),
+        ("--token-out", &resolved_token, "--seed-out", &resolved_seed),
+        ("--creds-out", &resolved_creds, "--seed-out", &resolved_seed),
+    ] {
+        if a_path == b_path {
+            anyhow::bail!(
+                "{a_label} and {b_label} resolve to the same path ({}). \
+                 Each file format is distinct; one would overwrite the other.",
+                a_path.display()
+            );
+        }
+    }
     if resolved_token.exists() && !force {
         anyhow::bail!(
             "token file already exists at {}. Pass --force to overwrite (only do this \
@@ -226,28 +268,6 @@ async fn run_operator_redeem(
     };
 
     if let Some((user_jwt, nats_url)) = unified.as_ref() {
-        let resolved_creds = match creds_out {
-            Some(p) => p.to_path_buf(),
-            None => default_creds_path().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Cannot determine default creds path — pass --creds-out PATH explicitly."
-                )
-            })?,
-        };
-        let resolved_seed = match seed_out {
-            Some(p) => p.to_path_buf(),
-            None => default_seed_path().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Cannot determine default seed path — pass --seed-out PATH explicitly."
-                )
-            })?,
-        };
-        if resolved_creds == resolved_seed {
-            anyhow::bail!(
-                "--seed-out and --creds-out resolve to the same path ({}).",
-                resolved_creds.display()
-            );
-        }
         for (label, path) in [("creds", &resolved_creds), ("seed", &resolved_seed)] {
             if path.exists() && !force {
                 anyhow::bail!(
@@ -813,6 +833,65 @@ mod tests {
         );
         // Neither file must have been touched.
         assert!(!same.exists());
+    }
+
+    /// Operator-redeem path has a third secret file (`--token-out`).
+    /// All three pairs must be checked for collision — token vs
+    /// creds, token vs seed, creds vs seed — before any write hits
+    /// the disk. Failure mode this guards against: a typo like
+    /// `--token-out=~/.nsed/agent.creds` would have the bearer
+    /// write clobber the NATS creds after a successful redeem,
+    /// silently losing one secret to recover the other.
+    #[tokio::test]
+    async fn redeem_operator_rejects_token_creds_path_collision() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let same = tmp.path().join("collide");
+        // Use a JWT-shaped operator code so dispatch routes to the
+        // operator path and the collision check fires. No HTTP
+        // mock needed — the collision check is upstream of the
+        // network call.
+        let err = run(
+            &operator_invite_code(),
+            "http://orchestrator.invalid",
+            Some(&tmp.path().join("agent.seed")),
+            Some(&same), // creds
+            Some(&same), // token — collides with creds
+            false,
+            None,
+            1,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--token-out") && msg.contains("--creds-out"),
+            "error must name both colliding flags; got: {msg}"
+        );
+        assert!(!same.exists(), "no file may have been written");
+    }
+
+    #[tokio::test]
+    async fn redeem_operator_rejects_token_seed_path_collision() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let same = tmp.path().join("collide");
+        let err = run(
+            &operator_invite_code(),
+            "http://orchestrator.invalid",
+            Some(&same), // seed
+            Some(&tmp.path().join("agent.creds")),
+            Some(&same), // token — collides with seed
+            false,
+            None,
+            1,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--token-out") && msg.contains("--seed-out"),
+            "error must name both colliding flags; got: {msg}"
+        );
+        assert!(!same.exists(), "no file may have been written");
     }
 
     /// `--seed-in` lets the operator pre-stage a seed and reuse the

@@ -515,11 +515,20 @@ pub const AUD_AGENT_REDEEM: &str = "nsed-agent-redeem";
 /// "invalid code" UX as the orchestrator would).
 pub fn invite_audience(code: &str) -> Result<Option<String>> {
     use base64::Engine;
-    let mut parts = code.split('.');
-    let _header = parts.next();
-    let payload = parts.next().ok_or_else(|| {
-        anyhow::anyhow!("invite code is not JWT-shaped (missing payload segment)")
-    })?;
+    // JWTs are EXACTLY three dot-separated segments:
+    // header.payload.signature. Anything else is malformed — reject
+    // before wasting cycles on a base64 decode. The old
+    // `parts.next()` chain accepted 2-segment input (would have
+    // base64-decoded what was actually the header) AND 4+ segments
+    // (silently dropped the trailing junk).
+    let parts: Vec<&str> = code.split('.').collect();
+    if parts.len() != 3 {
+        anyhow::bail!(
+            "invite code is not JWT-shaped (expected 3 dot-separated segments, got {})",
+            parts.len()
+        );
+    }
+    let payload = parts[1];
     // base64url, no padding — what JWTs use.
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)
@@ -2048,6 +2057,39 @@ mod tests {
         let bad = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not json");
         let code = format!("AAAA.{bad}.BBBB");
         assert!(invite_audience(&code).is_err());
+    }
+
+    /// Two-segment input (header.payload, no signature) is not a
+    /// valid JWT — the old `parts.next()` chain would have happily
+    /// base64-decoded the "payload" as if it were the missing
+    /// signature. Reject strictly on segment count.
+    #[test]
+    fn invite_audience_rejects_two_segments() {
+        let err = invite_audience("aaa.bbb").unwrap_err().to_string();
+        assert!(
+            err.contains("3 dot-separated segments") && err.contains("got 2"),
+            "must surface segment-count mismatch: {err}"
+        );
+    }
+
+    /// Four-or-more segments are also rejected. Some flavours of
+    /// JWS allow this (compact serialization with detached
+    /// payload), but invite codes are plain JWT and we don't want
+    /// to silently pass through unexpected trailers.
+    #[test]
+    fn invite_audience_rejects_four_segments() {
+        let err = invite_audience("aaa.bbb.ccc.ddd").unwrap_err().to_string();
+        assert!(
+            err.contains("3 dot-separated segments") && err.contains("got 4"),
+            "must surface segment-count mismatch: {err}"
+        );
+    }
+
+    /// Empty input — zero segments before split, one (empty) after
+    /// split. Behaviour: rejected via the same segment-count guard.
+    #[test]
+    fn invite_audience_rejects_empty_input() {
+        assert!(invite_audience("").is_err());
     }
 
     // ── /redeem (operator) — invite-code redemption (nsed #307) ────
