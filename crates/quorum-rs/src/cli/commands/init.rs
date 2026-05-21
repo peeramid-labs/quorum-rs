@@ -133,11 +133,25 @@ pub fn run(
     ExitCode::SUCCESS
 }
 
+/// Reject agent names that would break YAML when interpolated raw
+/// into the fleet template (`:`, `#`, quotes, newlines, …) — and
+/// match the documented constraint operators see in the tutorial
+/// ("alphanumeric + `-` / `_` / `.`"). Empty names also rejected.
+fn is_valid_agent_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
 /// Render an `agent.yml` (fleet config) template. All four
 /// provider types ship commented except the first; an operator
 /// picks one by uncommenting (or by editing the active block).
 /// Mirrors `quorum serve`'s dispatch order so a copy/paste from
 /// the running operator matches what the runner expects.
+///
+/// Caller must pre-validate agent names with
+/// [`is_valid_agent_name`]; this function interpolates them raw.
 fn render_fleet_yaml(agents: &[String]) -> String {
     let agent_names: Vec<String> = if agents.is_empty() {
         vec!["cortex-a".to_string()]
@@ -204,6 +218,15 @@ agents:
 /// Drop an `agent.yml` (fleet config for `quorum serve`) at
 /// `target`. Fails when the file exists unless `force` is set.
 pub fn run_agent_fleet(target: &Path, agents: &[String], force: bool) -> ExitCode {
+    for name in agents {
+        if !is_valid_agent_name(name) {
+            eprintln!(
+                "error: invalid agent name {name:?}. Allowed characters: ASCII letters, digits, `-`, `_`, `.` (and non-empty)."
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
     if target.exists() && !force {
         eprintln!(
             "error: {} already exists. Re-run with --force to overwrite.",
@@ -498,5 +521,44 @@ mod tests {
         let exit = run_agent_fleet(&target, &[], false);
         assert_eq!(exit, ExitCode::SUCCESS);
         assert!(target.exists());
+    }
+
+    #[test]
+    fn is_valid_agent_name_accepts_documented_alphabet() {
+        for ok in ["cortex-a", "Cortex_B", "agent.v1", "a", "0", "A1_b.2-x"] {
+            assert!(is_valid_agent_name(ok), "expected {ok:?} valid");
+        }
+    }
+
+    #[test]
+    fn is_valid_agent_name_rejects_yaml_breakers() {
+        // Empty + every character that could break YAML when
+        // interpolated raw into `  - name: {name}\n`.
+        for bad in [
+            "",
+            "foo: bar",
+            "name#with hash",
+            "has\"quote",
+            "has'quote",
+            "line\nbreak",
+            "tab\there",
+            "back\\slash",
+            "space here",
+            "uni¢ode",
+        ] {
+            assert!(!is_valid_agent_name(bad), "expected {bad:?} invalid");
+        }
+    }
+
+    #[test]
+    fn run_agent_fleet_rejects_invalid_name_and_does_not_write_file() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("agent.yml");
+        let exit = run_agent_fleet(&target, &agents(&["bad: name"]), false);
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert!(
+            !target.exists(),
+            "must not leave a broken agent.yml on disk when validation rejects"
+        );
     }
 }
