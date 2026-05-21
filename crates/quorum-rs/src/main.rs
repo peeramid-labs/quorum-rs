@@ -93,25 +93,45 @@ enum Commands {
     /// remote orchestrator + room. Non-interactive: pass flags or
     /// take defaults; no prompts.
     Init {
-        /// Orchestrator base URL.
+        /// Write an `agent.yml` fleet config (consumed by `quorum
+        /// serve`) instead of the client-side `nsed.yaml` (consumed
+        /// by `quorum run`/`status`/`trace`/`tui`). The two YAMLs
+        /// configure distinct concerns:
+        ///
+        /// - Without this flag → `nsed.yaml`: which orchestrator to
+        ///   talk to, which room, which agents make up the room's
+        ///   policy. Read when SUBMITTING tasks.
+        /// - With this flag → `agent.yml`: providers (LLM endpoints
+        ///   / Claude CLI / exec subprocess), agents (the
+        ///   per-worker config that `quorum serve` instantiates).
+        ///   Read when RUNNING agents.
+        #[arg(long)]
+        agent_fleet: bool,
+
+        /// Orchestrator base URL. Only embedded in `nsed.yaml`
+        /// (client config); ignored when `--agent-fleet` is set
+        /// because `quorum serve` learns the NATS URL from
+        /// `--nats-url` at runtime.
         #[arg(long, default_value = commands::init::DEFAULT_ORCHESTRATOR_URL)]
         orchestrator_url: String,
 
         /// Room name (becomes both the room key + `default_room`).
+        /// Only used by the `nsed.yaml` template.
         #[arg(short, long, default_value = commands::init::DEFAULT_ROOM)]
         room: String,
 
         /// Env-var name the generated YAML interpolates for the
         /// bearer token. The value of this variable is NOT read by
         /// `init` itself — only its name is embedded in the config.
+        /// Only used by the `nsed.yaml` template.
         #[arg(long, default_value = commands::init::DEFAULT_TOKEN_ENV)]
         token_env: String,
 
-        /// Agent names the default policy dispatches to. Repeat or
-        /// comma-separate (e.g. `--agents CortexA,CortexB,CortexC`).
-        /// When omitted, the generated file has `agents: []` and a
-        /// commented edit hint — `quorum run` will refuse cleanly
-        /// until the user populates this list.
+        /// Agent names. For `nsed.yaml` (no `--agent-fleet`):
+        /// listed under the room's policy. For `agent.yml`
+        /// (`--agent-fleet`): each becomes an agent entry the
+        /// runner instantiates. Repeat or comma-separate
+        /// (`--agents cortex-a,cortex-b`).
         #[arg(long, value_delimiter = ',', num_args = 0..)]
         agents: Vec<String>,
 
@@ -180,6 +200,53 @@ enum Commands {
         /// (5xx, `kv_unavailable`, network blips).
         #[arg(long, default_value_t = 5)]
         max_attempts: u32,
+    },
+
+    /// Run a fleet of agents from a YAML config. The SDK analog of
+    /// the proprietary `nsed serve` binary — boots one
+    /// `NatsNsedWorker` per agent, wires them into a
+    /// `MultiAgentRunner`, and runs until SIGTERM.
+    ///
+    /// Operator pre-flight: `quorum redeem <invite>` to write
+    /// `~/.nsed/agent.creds`, then point this command at your
+    /// `agent.yml` and the orchestrator's NATS URL.
+    Serve {
+        /// Path to the fleet config (`agent.yml`). When omitted,
+        /// searches `./agent.yml` then `./config/default.yml`.
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+
+        /// NATS server URL. Falls back to `$NATS_URL`, then
+        /// `nats://localhost:4222`. Production deployments should
+        /// always pass this explicitly — the orchestrator returns
+        /// the right URL in the `/redeem` response.
+        #[arg(long, value_name = "URL")]
+        nats_url: Option<String>,
+
+        /// Path to a `.creds` file (NKey User JWT) the agents
+        /// authenticate with. Defaults to `~/.nsed/agent.creds`
+        /// (where `quorum redeem` writes). Omit for unauthenticated
+        /// dev orchestrators.
+        #[arg(long, value_name = "PATH")]
+        nats_creds: Option<PathBuf>,
+
+        /// Restrict to a subset of agent names from the fleet
+        /// config. Repeatable; matches case-insensitively. Omit
+        /// (or pass `--agent ALL`) to run every configured agent.
+        #[arg(long = "agent", value_name = "NAME")]
+        agents: Vec<String>,
+
+        /// JetStream stream name the orchestrator publishes work
+        /// on. Override only if the orchestrator was deployed with
+        /// `$NSED_STREAM` set to a non-default value.
+        #[arg(long, value_name = "NAME")]
+        stream_name: Option<String>,
+
+        /// API subject prefix the orchestrator uses. Override only
+        /// if the orchestrator was deployed with `$NSED_API_PREFIX`
+        /// set to a non-default value.
+        #[arg(long, value_name = "PREFIX")]
+        api_prefix: Option<String>,
     },
 }
 
@@ -299,18 +366,67 @@ async fn main() -> ExitCode {
             }
         }
         Commands::Init {
+            agent_fleet,
             ref orchestrator_url,
             ref room,
             ref token_env,
             ref agents,
             force,
-        } => commands::init::run(
-            cli.config_path(),
-            orchestrator_url,
-            room,
-            token_env,
-            agents,
-            force,
-        ),
+        } => {
+            if agent_fleet {
+                // `agent.yml` is the conventional name `quorum
+                // serve` looks for; fall back to it when --config
+                // wasn't passed. Reusing `cli.config_path()` would
+                // emit `nsed.yaml` here which is the wrong file
+                // for the agent runner to read.
+                let default_path = std::path::Path::new("agent.yml");
+                let target = if cli.config.is_some() {
+                    cli.config_path()
+                } else {
+                    default_path
+                };
+                commands::init::run_agent_fleet(target, agents, force)
+            } else {
+                commands::init::run(
+                    cli.config_path(),
+                    orchestrator_url,
+                    room,
+                    token_env,
+                    agents,
+                    force,
+                )
+            }
+        }
+
+        Commands::Serve {
+            ref config,
+            ref nats_url,
+            ref nats_creds,
+            ref agents,
+            ref stream_name,
+            ref api_prefix,
+        } => {
+            let agents_filter: Option<&[String]> = if agents.is_empty() {
+                None
+            } else {
+                Some(agents.as_slice())
+            };
+            match commands::serve::run(
+                config.as_deref(),
+                nats_url.as_deref(),
+                nats_creds.as_deref(),
+                agents_filter,
+                stream_name.as_deref(),
+                api_prefix.as_deref(),
+            )
+            .await
+            {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
 }

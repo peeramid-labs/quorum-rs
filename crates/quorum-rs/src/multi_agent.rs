@@ -149,16 +149,68 @@ impl MultiAgentRunner {
         self.workers.iter().map(|(name, _)| name.as_str()).collect()
     }
 
-    /// Run all agents concurrently.
+    /// Number of workers currently registered.
+    pub fn len(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// `true` when no workers have been added — `serve_fleet` uses
+    /// this to bail before calling `.run()` if every fleet entry
+    /// was skipped (e.g. all `exec` agents missing their config
+    /// sections). Calling `.run()` on an empty runner already
+    /// errors, but checking here lets callers surface a more
+    /// specific "fleet had N entries, 0 buildable" message.
+    pub fn is_empty(&self) -> bool {
+        self.workers.is_empty()
+    }
+
+    /// Run all agents concurrently with no external shutdown signal.
+    /// Convenience wrapper for [`Self::run_with_cancellation`] that
+    /// passes a fresh token the caller doesn't hold a clone of, so
+    /// only natural worker completion or a worker exhausting its
+    /// retry budget ends the runner.
+    pub async fn run(self) -> anyhow::Result<()> {
+        self.run_with_cancellation(tokio_util::sync::CancellationToken::new())
+            .await
+    }
+
+    /// Run all agents concurrently with an external shutdown signal.
     ///
     /// Spawns each worker in its own tokio task and waits for **all** tasks to
     /// complete. Individual failures are logged but do not abort the remaining
     /// workers. Returns `Ok(())` when every worker succeeds, or an aggregated
     /// error listing all failures when one or more workers crash or panic.
     ///
+    /// Shutdown happens on two layers:
+    ///
+    /// 1. **Cooperative.** Each worker's reconnect loop checks
+    ///    `cancel.is_cancelled()` at the top of the loop and
+    ///    returns cleanly when set — gives the worker a chance to
+    ///    drop its NATS connection between message-handling
+    ///    iterations.
+    /// 2. **Forceful (abort).** A watchdog task captures
+    ///    [`tokio::task::AbortHandle`]s for every worker BEFORE
+    ///    the runner's join loop consumes the [`JoinHandle`]s.
+    ///    When `cancel.cancelled()` fires the watchdog calls
+    ///    `.abort()` on each handle, which stops a worker even
+    ///    if it's blocked deep inside `worker.run().await` past
+    ///    the cooperative check. Resulting JoinErrors with
+    ///    `is_cancelled() == true` are treated as clean
+    ///    shutdown, not failure.
+    ///
+    /// Layer 1 alone would leak workers blocked inside
+    /// `worker.run()` past the CLI's shutdown grace window —
+    /// that's why both layers exist (CR finding on PR #13).
+    /// Without either, a SIGTERM-driven drop of the runner future
+    /// would only stop polling and the inner `tokio::spawn`'d
+    /// tasks would detach and keep running / reconnecting.
+    ///
     /// If a dashboard port is configured and the `status-server` feature is
     /// enabled, the unified dashboard server is started before the workers.
-    pub async fn run(self) -> anyhow::Result<()> {
+    pub async fn run_with_cancellation(
+        self,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
         if self.workers.is_empty() {
             anyhow::bail!("No agents configured. Add workers before calling run().");
         }
@@ -197,9 +249,17 @@ impl MultiAgentRunner {
         // Each worker runs in a loop: if `run()` returns Ok (consumers closed,
         // e.g. NATS reconnect), the worker is restarted after a backoff delay.
         // Errors (permanent failures) are retried up to MAX_RECONNECT_ATTEMPTS.
+        //
+        // The outer `cancel` is cloned into each task so a SIGTERM
+        // signaled via `cancel.cancel()` ALSO short-circuits the
+        // worker's reconnect loop instead of just aborting the
+        // task at its next .await — the latter still works but
+        // cooperative shutdown gives the worker a chance to drop
+        // its NATS connection cleanly.
         let mut handles = Vec::new();
         for (name, worker) in self.workers {
             let agent_name = name.clone();
+            let task_cancel = cancel.clone();
             let handle = tokio::spawn(async move {
                 const MAX_RECONNECT_ATTEMPTS: u32 = 10;
                 const BASE_DELAY_MS: u64 = 1000;
@@ -209,6 +269,10 @@ impl MultiAgentRunner {
 
                 info!("🟢 Agent '{}' started", agent_name);
                 loop {
+                    if task_cancel.is_cancelled() {
+                        info!("🛑 Agent '{}' shutting down (cancelled)", agent_name);
+                        return Ok(());
+                    }
                     match worker.run().await {
                         Ok(()) => {
                             // Worker exited cleanly — consumers closed (connection lost).
@@ -256,7 +320,40 @@ impl MultiAgentRunner {
             handles.push((name, handle));
         }
 
-        // Wait for all workers — if any exhausts retry attempts, collect error
+        // Snapshot abort-handles before we consume the JoinHandles
+        // into `join_all`. The abort-handles are cheap clones that
+        // let an out-of-band task fire `.abort()` on each worker
+        // when the cancellation token signals shutdown. Without
+        // these, only the cooperative `task_cancel.is_cancelled()`
+        // check inside each worker's reconnect loop can stop
+        // workers — and a worker blocked deep inside
+        // `worker.run().await` would miss it until the inner
+        // call returns. CR finding on PR #13.
+        let abort_handles: Vec<(String, tokio::task::AbortHandle)> = handles
+            .iter()
+            .map(|(n, h)| (n.clone(), h.abort_handle()))
+            .collect();
+        let watchdog_cancel = cancel.clone();
+        let watchdog = tokio::spawn(async move {
+            watchdog_cancel.cancelled().await;
+            info!(
+                "shutdown signal received; aborting {} worker(s)",
+                abort_handles.len()
+            );
+            for (name, h) in &abort_handles {
+                if !h.is_finished() {
+                    info!("aborting worker '{}'", name);
+                    h.abort();
+                }
+            }
+        });
+
+        // Wait for all workers — completed normally, returned an
+        // error, panicked, or cancelled-via-abort. The watchdog
+        // above fires `.abort()` when the cancel token signals,
+        // so a JoinError with `is_cancelled() == true` is the
+        // clean-shutdown path (treated as success, not added to
+        // the error list).
         let mut errors = Vec::new();
         for (name, handle) in handles {
             match handle.await {
@@ -265,12 +362,25 @@ impl MultiAgentRunner {
                     error!("Agent '{}' failed: {:?}", name, e);
                     errors.push(e);
                 }
+                Err(e) if e.is_cancelled() => {
+                    info!("Agent '{}' aborted cleanly via shutdown signal", name);
+                }
                 Err(e) => {
                     error!("Agent '{}' panicked: {:?}", name, e);
                     errors.push(anyhow::anyhow!("Agent '{}' panicked: {:?}", name, e));
                 }
             }
         }
+        // Abort the watchdog so it doesn't outlive the runner.
+        // If cancel fired, the watchdog's `.abort()` loop has
+        // already run by the time we got here (every worker
+        // completed above), so the watchdog itself is just
+        // sitting at `watchdog_cancel.cancelled().await` having
+        // returned — `.abort()` on a finished task is a no-op.
+        // If cancel never fired (workers completed naturally),
+        // the watchdog is still awaiting cancellation and
+        // `.abort()` stops it cleanly.
+        watchdog.abort();
 
         if !errors.is_empty() {
             anyhow::bail!(
@@ -339,6 +449,34 @@ mod tests {
             err_msg.contains("No agents configured"),
             "Expected 'No agents configured' error, got: {}",
             err_msg
+        );
+    }
+
+    /// `run_with_cancellation` plumbs through to the worker tasks
+    /// via the cooperative `is_cancelled()` check at the top of
+    /// the reconnect loop. Pre-cancelled token + empty runner is
+    /// the simplest end-to-end check that wiring is intact;
+    /// fuller "spawn workers + cancel + assert tasks stopped"
+    /// coverage needs a real NATS test fixture which lives in the
+    /// integration suite.
+    #[tokio::test]
+    async fn run_with_cancellation_takes_token() {
+        let runner = MultiAgentRunner::new();
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        // Empty runner still bails with "No agents configured"
+        // — this test pins the SHAPE of the API (takes a token,
+        // returns a Result) and proves a pre-cancelled token
+        // doesn't trip a panic or hang before the empty-runner
+        // check fires.
+        let result = runner.run_with_cancellation(token).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No agents configured"),
+            "empty runner still errors before honouring cancellation"
         );
     }
 

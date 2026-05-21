@@ -4,7 +4,11 @@ Organized by the [Diátaxis](https://diataxis.fr) framework — four sections se
 
 ## Tutorials
 
-Learning-by-doing material. _Not shipped yet — once added they will live under `docs/tutorials/` and target newcomers building their first agent end-to-end._
+Learning-by-doing material — single-path lessons with verification checkpoints at every step.
+
+| Tutorial | What you'll have at the end |
+|---|---|
+| [Your first agent — from invite code to live deliberation](tutorials/first-agent-from-invite.md) | One agent running on your laptop, joined to a remote orchestrator, contributing to deliberations. ~15 minutes. |
 
 ## How-to
 
@@ -12,6 +16,7 @@ Goal-oriented recipes. Assume reader is already competent — get them to the an
 
 | Guide | Goal |
 |---|---|
+| [Run an agent fleet via `quorum serve`](how-to/run-an-agent-fleet.md) | Load `agent.yml`, dispatch each entry to the right agent implementation, run the lot |
 | [Agent development guide](how-to/agent-development.md) | Build a deliberation agent — reference impl, custom Rust trait, or non-Rust via exec/MCP |
 | [Redeem an invite code](how-to/redeem-invite-code.md) | Bootstrap NATS credentials from a JWT invite code, one command |
 | [Verify what your agent publishes](how-to/verify-telemetry.md) | Subscribe to your agent's telemetry using an auditor JWT |

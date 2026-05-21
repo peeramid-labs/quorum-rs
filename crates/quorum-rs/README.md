@@ -34,13 +34,18 @@ MSRV: Rust 1.85 (uses Edition 2024).
 
 ```text
 quorum init                Bootstrap an `nsed.yaml` workspace config
+quorum redeem <code>       Redeem a JWT invite — writes ~/.nsed/operator.token
+                           and (for unified codes) ~/.nsed/agent.creds + .seed
+quorum serve               Run an agent fleet from agent.yml. Reads creds
+                           from ~/.nsed/agent.creds (default)
 quorum run <task>          Submit a deliberation task to the orchestrator
 quorum status              Health check + agent status
 quorum trace <job_id>      Show a deliberation trace (verdict + evaluations)
 quorum tui                 Interactive terminal UI (live deliberation view)
 ```
 
-All commands read `./nsed.yaml` by default (`--config <path>` to override).
+`run`, `status`, `trace`, `tui` read `./nsed.yaml` by default (`--config <path>` to override).
+`serve` reads `./agent.yml` by default.
 
 ## What's inside
 
