@@ -93,6 +93,14 @@ enum Commands {
     /// remote orchestrator + room. Non-interactive: pass flags or
     /// take defaults; no prompts.
     Init {
+        /// Interactive provider-discovery + preset-selection wizard
+        /// (the same flow as legacy `nsed init`). Resolves a working
+        /// `nsed.yaml` with sensible defaults; ignores every other
+        /// flag on this subcommand. Use without `--wizard` for the
+        /// one-shot non-interactive variants below.
+        #[arg(long, conflicts_with_all = ["agent_fleet"])]
+        wizard: bool,
+
         /// Write an `agent.yml` fleet config (consumed by `quorum
         /// serve`) instead of the client-side `nsed.yaml` (consumed
         /// by `quorum run`/`status`/`trace`/`tui`). The two YAMLs
@@ -371,6 +379,7 @@ async fn main() -> ExitCode {
             }
         }
         Commands::Init {
+            wizard,
             agent_fleet,
             ref orchestrator_url,
             ref room,
@@ -378,7 +387,12 @@ async fn main() -> ExitCode {
             ref agents,
             force,
         } => {
-            if agent_fleet {
+            if wizard {
+                // Interactive provider-discovery flow. Targets
+                // `nsed.yaml` (the client-side workspace config) by
+                // default; respects --config when explicitly passed.
+                commands::init_wizard::run(cli.config_path()).await
+            } else if agent_fleet {
                 // `agent.yml` is the conventional name `quorum
                 // serve` looks for; fall back to it when --config
                 // wasn't passed. Reusing `cli.config_path()` would

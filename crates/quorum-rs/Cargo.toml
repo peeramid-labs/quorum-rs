@@ -20,9 +20,19 @@ required-features = ["cli"]
 default = ["audit", "cli", "tui"]
 audit = ["dep:quorum-crypto-core", "dep:hex"]
 status-server = ["dep:open", "dep:utoipa-swagger-ui"]
-# CLI runtime — pulls in clap/inquire/dotenvy so library-only users
-# don't pay for them. Required to build the `quorum` binary.
-cli = ["dep:clap", "dep:inquire", "dep:dotenvy", "dep:tracing-subscriber"]
+# CLI runtime — pulls in clap/inquire/dotenvy/comfy-table/owo-colors
+# so library-only users don't pay for them. Required to build the
+# `quorum` binary.
+cli = [
+    "dep:clap",
+    "dep:inquire",
+    "dep:dotenvy",
+    "dep:tracing-subscriber",
+    "dep:comfy-table",
+    "dep:owo-colors",
+    "dep:rand",
+    "dep:hex",
+]
 # Interactive terminal UI for `quorum tui` / `quorum run --tui`.
 tui = ["cli", "dep:ratatui", "dep:crossterm"]
 
@@ -73,6 +83,9 @@ dotenvy = { version = "0.15", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }
 crossterm = { version = "0.29", optional = true }
+comfy-table = { version = "7", optional = true }
+owo-colors = { version = "4", optional = true }
+rand = { version = "0.9", optional = true }
 
 [dev-dependencies]
 serial_test = "3"

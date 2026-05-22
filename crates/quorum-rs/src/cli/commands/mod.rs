@@ -1,5 +1,6 @@
 pub mod common;
 pub mod init;
+pub mod init_wizard;
 pub mod redeem;
 pub mod run;
 pub mod serve;
