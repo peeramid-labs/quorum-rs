@@ -248,6 +248,11 @@ enum Commands {
         #[arg(long, value_name = "PREFIX")]
         api_prefix: Option<String>,
     },
+
+    /// Validate a workspace yaml against the `WorkspaceConfig` schema.
+    /// Reports a one-line summary on success, exits non-zero on parse
+    /// failure. Pure CLI helper — no network, no LLM, no mutation.
+    Validate,
 }
 
 impl Cli {
@@ -428,5 +433,7 @@ async fn main() -> ExitCode {
                 }
             }
         }
+
+        Commands::Validate => commands::validate::run(cli.config_path()),
     }
 }
