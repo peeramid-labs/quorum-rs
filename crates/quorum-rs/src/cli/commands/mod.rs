@@ -5,3 +5,4 @@ pub mod run;
 pub mod serve;
 pub mod status;
 pub mod trace;
+pub mod validate;
