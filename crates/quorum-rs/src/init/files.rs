@@ -180,6 +180,13 @@ pub(super) fn ensure_gitignore(output_dir: &Path) -> Result<()> {
 }
 
 /// Extract non-comment key names from generated `.env` content.
+///
+/// Currently only consumed from the test suite — the production
+/// merge path no longer needs to enumerate template keys upfront
+/// because `merge_env` falls back to the template default per-line.
+/// Kept here (under `#[cfg(test)]`) so the test surface that verifies
+/// template-key extraction lives next to the production parser.
+#[cfg(test)]
 pub(super) fn env_keys(env_content: &str) -> std::collections::HashSet<String> {
     env_content
         .lines()
@@ -285,10 +292,6 @@ pub(super) fn write_files(
             .with_context(|| format!("writing {}", env_path.display()))?;
         false
     };
-    // `env_keys` is still useful elsewhere — the import is retained
-    // so a downstream caller adding a key-coverage check has it.
-    let _ = env_keys(env_content);
-
     ensure_gitignore(output_dir).context("updating .gitignore")?;
 
     // Write config/ YAML files

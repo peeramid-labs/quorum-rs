@@ -98,7 +98,13 @@ enum Commands {
         /// `nsed.yaml` with sensible defaults; ignores every other
         /// flag on this subcommand. Use without `--wizard` for the
         /// one-shot non-interactive variants below.
-        #[arg(long, conflicts_with_all = ["agent_fleet"])]
+        ///
+        /// `conflicts_with_all` covers the boolean flags clap can
+        /// reliably detect; the string/list args with `default_value`
+        /// (orchestrator_url, room, token_env, agents) get a runtime
+        /// guard below so an admin who passes `--wizard --room demo`
+        /// sees a clear error rather than silent ignore.
+        #[arg(long, conflicts_with_all = ["agent_fleet", "force"])]
         wizard: bool,
 
         /// Write an `agent.yml` fleet config (consumed by `quorum
@@ -388,6 +394,22 @@ async fn main() -> ExitCode {
             force,
         } => {
             if wizard {
+                // Runtime guard for flags with `default_value` that
+                // clap's `conflicts_with_all` can't reliably gate on.
+                // Compares against the same constants the field
+                // declarations reference, so a future default change
+                // automatically widens the guard.
+                let other_args_set = orchestrator_url != commands::init::DEFAULT_ORCHESTRATOR_URL
+                    || room != commands::init::DEFAULT_ROOM
+                    || token_env != commands::init::DEFAULT_TOKEN_ENV
+                    || !agents.is_empty();
+                if other_args_set {
+                    eprintln!(
+                        "error: --wizard is interactive and ignores --orchestrator-url, --room, --token-env, --agents.\n\
+                         Drop those flags to run the wizard, or drop --wizard to use the non-interactive one-shot."
+                    );
+                    return ExitCode::FAILURE;
+                }
                 // Interactive provider-discovery flow. Targets
                 // `nsed.yaml` (the client-side workspace config) by
                 // default; respects --config when explicitly passed.

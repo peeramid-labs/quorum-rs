@@ -18,7 +18,12 @@ use crate::brand;
 ///
 /// Handles basic quoting (e.g. `python3 "my agent.py"` → `["python3", "my agent.py"]`)
 /// without full shell expansion. Sufficient for exec provider commands.
-fn split_shell_command(cmd: &str) -> Vec<String> {
+///
+/// Returns `Err` when the input has an unterminated quote — previously
+/// the function silently returned partial tokens, which let a typo
+/// like `python3 "agent.py` produce a single-token command of
+/// `["python3", "agent.py"]` with the rest of the line glued on.
+fn split_shell_command(cmd: &str) -> Result<Vec<String>, String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_single = false;
@@ -40,10 +45,16 @@ fn split_shell_command(cmd: &str) -> Vec<String> {
             c => current.push(c),
         }
     }
+    if in_single {
+        return Err(format!("unterminated single quote in command: {cmd}"));
+    }
+    if in_double {
+        return Err(format!("unterminated double quote in command: {cmd}"));
+    }
     if !current.is_empty() {
         tokens.push(current);
     }
-    tokens
+    Ok(tokens)
 }
 
 /// Resolve `${VAR}` references against process environment (which includes
@@ -610,7 +621,13 @@ pub(super) fn wizard_agents(
                 else {
                     return Ok(None);
                 };
-                Some(split_shell_command(&cmd_str))
+                match split_shell_command(&cmd_str) {
+                    Ok(parts) => Some(parts),
+                    Err(e) => {
+                        brand::warn(&format!("Invalid command — {e}"));
+                        return Ok(None);
+                    }
+                }
             } else {
                 // Generic exec provider — prompt for command
                 let default_cmd = if exec_tools.iter().any(|t| t.name == "python3") {
@@ -619,10 +636,9 @@ pub(super) fn wizard_agents(
                     "bash agent.sh"
                 };
                 // Re-prompt locally until the operator supplies a
-                // non-empty command. Previous fallback returned a
-                // phony `["echo", "hello"]` which silently shipped
-                // a useless agent — making the empty-command warn
-                // a no-op in production.
+                // non-empty, properly-quoted command. Previous
+                // fallback returned a phony `["echo", "hello"]`
+                // which silently shipped a useless agent.
                 let parts: Vec<String> = loop {
                     let Some(cmd_str) = ask(Text::new(&format!("Exec command for {name}:"))
                         .with_default(default_cmd)
@@ -634,7 +650,13 @@ pub(super) fn wizard_agents(
                     else {
                         return Ok(None);
                     };
-                    let parts = split_shell_command(&cmd_str);
+                    let parts = match split_shell_command(&cmd_str) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            brand::warn(&format!("Invalid command — {e}"));
+                            continue;
+                        }
+                    };
                     if parts.is_empty() {
                         brand::warn("Command cannot be empty — please enter a runnable command.");
                         continue;
@@ -677,7 +699,7 @@ mod tests {
     #[test]
     fn simple_command() {
         assert_eq!(
-            split_shell_command("python3 agent.py"),
+            split_shell_command("python3 agent.py").unwrap(),
             vec!["python3", "agent.py"]
         );
     }
@@ -685,7 +707,7 @@ mod tests {
     #[test]
     fn double_quoted_arg() {
         assert_eq!(
-            split_shell_command(r#"python3 "my agent.py" --flag"#),
+            split_shell_command(r#"python3 "my agent.py" --flag"#).unwrap(),
             vec!["python3", "my agent.py", "--flag"]
         );
     }
@@ -693,7 +715,7 @@ mod tests {
     #[test]
     fn single_quoted_arg() {
         assert_eq!(
-            split_shell_command("bash -c 'echo hello world'"),
+            split_shell_command("bash -c 'echo hello world'").unwrap(),
             vec!["bash", "-c", "echo hello world"]
         );
     }
@@ -701,7 +723,7 @@ mod tests {
     #[test]
     fn claude_cli_command() {
         assert_eq!(
-            split_shell_command("claude -p --output-format json --model sonnet --verbose"),
+            split_shell_command("claude -p --output-format json --model sonnet --verbose").unwrap(),
             vec![
                 "claude",
                 "-p",
@@ -716,14 +738,32 @@ mod tests {
 
     #[test]
     fn empty_string() {
-        let result: Vec<String> = split_shell_command("");
+        let result: Vec<String> = split_shell_command("").unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn unterminated_double_quote_returns_err() {
+        let err = split_shell_command(r#"python3 "agent.py"#).unwrap_err();
+        assert!(
+            err.contains("unterminated double quote"),
+            "expected unterminated-quote message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn unterminated_single_quote_returns_err() {
+        let err = split_shell_command("bash -c 'echo hello").unwrap_err();
+        assert!(
+            err.contains("unterminated single quote"),
+            "expected unterminated-quote message, got: {err}"
+        );
     }
 
     #[test]
     fn extra_whitespace() {
         assert_eq!(
-            split_shell_command("  python3   agent.py  "),
+            split_shell_command("  python3   agent.py  ").unwrap(),
             vec!["python3", "agent.py"]
         );
     }
