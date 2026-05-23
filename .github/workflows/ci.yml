@@ -148,10 +148,6 @@ jobs:
           docker logs "$NAME"
           exit 1
 
-      - name: Cleanup NATS
-        if: always()
-        run: docker rm -f "${NATS_NAME:-nats-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}}" || true
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -175,7 +171,7 @@ jobs:
           # NATS reachable via DNS alias on per-workflow network
           echo "NATS_URL=nats://nats:4222" >> $GITHUB_ENV
           echo "RUST_LOG=info" >> $GITHUB_ENV
-          echo "CARGO_BUILD_JOBS=4" >> $GITHUB_ENV
+          echo "CARGO_BUILD_JOBS=2" >> $GITHUB_ENV
 
       - name: Run Tests & Coverage
         run: |
@@ -246,6 +242,10 @@ jobs:
           git commit -q -m "ci: coverage ${PERCENT}% (${BRANCH}) [skip ci]"
           git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git push origin gh-pages --force
+
+      - name: Cleanup NATS
+        if: always()
+        run: docker rm -f "${NATS_NAME:-nats-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}}" || true
 
   # ── Conventional-commit PR title gate ──────────────────────────────
   typos:
