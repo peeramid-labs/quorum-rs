@@ -89,28 +89,27 @@ enum Commands {
         verbose: bool,
     },
 
-    /// Bootstrap a workspace config file (nsed.yaml) pointing at a
-    /// remote orchestrator + room. Non-interactive: pass flags or
-    /// take defaults; no prompts.
+    /// Bootstrap a workspace config (nsed.yaml) or agent fleet
+    /// (agent.yml). Default: interactive wizard for provider /
+    /// preset discovery — same flow as legacy `nsed init`. Falls
+    /// through to the one-shot non-interactive renderer when any
+    /// flag is set, when `--non-interactive` is passed, or when
+    /// stdin is not a TTY (piped / CI).
     Init {
-        /// Interactive provider-discovery + preset-selection wizard
-        /// (the same flow as legacy `nsed init`). Resolves a working
-        /// `nsed.yaml` with sensible defaults; ignores every other
-        /// flag on this subcommand. Use without `--wizard` for the
-        /// one-shot non-interactive variants below.
-        ///
-        /// `conflicts_with_all` covers the boolean flags clap can
-        /// reliably detect; the string/list args with `default_value`
-        /// (orchestrator_url, room, token_env, agents) get a runtime
-        /// guard below so an admin who passes `--wizard --room demo`
-        /// sees a clear error rather than silent ignore.
-        #[arg(long, conflicts_with_all = ["agent_fleet", "force"])]
-        wizard: bool,
+        /// Skip the interactive wizard and run the non-interactive
+        /// one-shot template renderer instead. Implied when stdin is
+        /// not a TTY (piped / CI) or when any of `--orchestrator-url`
+        /// / `--room` / `--token-env` / `--agents` are passed. Use
+        /// this flag to force the one-shot from a TTY without
+        /// supplying any other flag (rare; mostly for scripts and
+        /// docker entrypoints).
+        #[arg(long, conflicts_with_all = ["agent_fleet"])]
+        non_interactive: bool,
 
         /// Write an `agent.yml` fleet config (consumed by `quorum
         /// serve`) instead of the client-side `nsed.yaml` (consumed
-        /// by `quorum run`/`status`/`trace`/`tui`). The two YAMLs
-        /// configure distinct concerns:
+        /// by `quorum run`/`status`/`trace`/`tui`). One-shot, never
+        /// interactive. The two YAMLs configure distinct concerns:
         ///
         /// - Without this flag → `nsed.yaml`: which orchestrator to
         ///   talk to, which room, which agents make up the room's
@@ -122,34 +121,33 @@ enum Commands {
         #[arg(long)]
         agent_fleet: bool,
 
-        /// Orchestrator base URL. Only embedded in `nsed.yaml`
-        /// (client config); ignored when `--agent-fleet` is set
-        /// because `quorum serve` learns the NATS URL from
-        /// `--nats-url` at runtime.
-        #[arg(long, default_value = commands::init::DEFAULT_ORCHESTRATOR_URL)]
-        orchestrator_url: String,
+        /// Orchestrator base URL. Only meaningful for the one-shot
+        /// non-interactive path (the wizard prompts for it). Setting
+        /// this auto-selects non-interactive mode.
+        #[arg(long)]
+        orchestrator_url: Option<String>,
 
-        /// Room name (becomes both the room key + `default_room`).
-        /// Only used by the `nsed.yaml` template.
-        #[arg(short, long, default_value = commands::init::DEFAULT_ROOM)]
-        room: String,
+        /// Room name. Setting it auto-selects non-interactive mode.
+        #[arg(short, long)]
+        room: Option<String>,
 
         /// Env-var name the generated YAML interpolates for the
-        /// bearer token. The value of this variable is NOT read by
-        /// `init` itself — only its name is embedded in the config.
-        /// Only used by the `nsed.yaml` template.
-        #[arg(long, default_value = commands::init::DEFAULT_TOKEN_ENV)]
-        token_env: String,
+        /// bearer token. Setting it auto-selects non-interactive
+        /// mode.
+        #[arg(long)]
+        token_env: Option<String>,
 
         /// Agent names. For `nsed.yaml` (no `--agent-fleet`):
         /// listed under the room's policy. For `agent.yml`
         /// (`--agent-fleet`): each becomes an agent entry the
         /// runner instantiates. Repeat or comma-separate
-        /// (`--agents cortex-a,cortex-b`).
+        /// (`--agents cortex-a,cortex-b`). Setting it auto-selects
+        /// non-interactive mode.
         #[arg(long, value_delimiter = ',', num_args = 0..)]
         agents: Vec<String>,
 
-        /// Overwrite an existing workspace file.
+        /// Overwrite an existing workspace file (non-interactive
+        /// modes only). The wizard refuses to clobber and asks first.
         #[arg(long)]
         force: bool,
     },
@@ -385,7 +383,7 @@ async fn main() -> ExitCode {
             }
         }
         Commands::Init {
-            wizard,
+            non_interactive,
             agent_fleet,
             ref orchestrator_url,
             ref room,
@@ -393,28 +391,7 @@ async fn main() -> ExitCode {
             ref agents,
             force,
         } => {
-            if wizard {
-                // Runtime guard for flags with `default_value` that
-                // clap's `conflicts_with_all` can't reliably gate on.
-                // Compares against the same constants the field
-                // declarations reference, so a future default change
-                // automatically widens the guard.
-                let other_args_set = orchestrator_url != commands::init::DEFAULT_ORCHESTRATOR_URL
-                    || room != commands::init::DEFAULT_ROOM
-                    || token_env != commands::init::DEFAULT_TOKEN_ENV
-                    || !agents.is_empty();
-                if other_args_set {
-                    eprintln!(
-                        "error: --wizard is interactive and ignores --orchestrator-url, --room, --token-env, --agents.\n\
-                         Drop those flags to run the wizard, or drop --wizard to use the non-interactive one-shot."
-                    );
-                    return ExitCode::FAILURE;
-                }
-                // Interactive provider-discovery flow. Targets
-                // `nsed.yaml` (the client-side workspace config) by
-                // default; respects --config when explicitly passed.
-                commands::init_wizard::run(cli.config_path()).await
-            } else if agent_fleet {
+            if agent_fleet {
                 // `agent.yml` is the conventional name `quorum
                 // serve` looks for; fall back to it when --config
                 // wasn't passed. Reusing `cli.config_path()` would
@@ -428,14 +405,39 @@ async fn main() -> ExitCode {
                 };
                 commands::init::run_agent_fleet(target, agents, force)
             } else {
-                commands::init::run(
-                    cli.config_path(),
-                    orchestrator_url,
-                    room,
-                    token_env,
-                    agents,
-                    force,
-                )
+                // Wizard is the default. Bail to the one-shot
+                // renderer when EITHER (a) any non-interactive flag
+                // was set, (b) `--non-interactive` was passed
+                // explicitly, or (c) stdin is not a TTY (piped / CI
+                // entrypoint). Otherwise launch the interactive
+                // provider-discovery flow.
+                use std::io::IsTerminal;
+                // `--force` is NOT in this set: it's a confirmation
+                // override that can apply to either path. The wizard
+                // itself can use it to skip the "file exists, overwrite?"
+                // prompt without dropping the rest of the interactive flow.
+                let one_shot_flags_set = orchestrator_url.is_some()
+                    || room.is_some()
+                    || token_env.is_some()
+                    || !agents.is_empty();
+                let stdin_is_tty = std::io::stdin().is_terminal();
+                let use_wizard = !non_interactive && !one_shot_flags_set && stdin_is_tty;
+                if use_wizard {
+                    commands::init_wizard::run(cli.config_path()).await
+                } else {
+                    commands::init::run(
+                        cli.config_path(),
+                        orchestrator_url
+                            .as_deref()
+                            .unwrap_or(commands::init::DEFAULT_ORCHESTRATOR_URL),
+                        room.as_deref().unwrap_or(commands::init::DEFAULT_ROOM),
+                        token_env
+                            .as_deref()
+                            .unwrap_or(commands::init::DEFAULT_TOKEN_ENV),
+                        agents,
+                        force,
+                    )
+                }
             }
         }
 
