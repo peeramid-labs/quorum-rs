@@ -177,10 +177,29 @@ fn render_fleet_yaml(agents: &[String]) -> String {
 # `quorum run`/`status`/`trace`/`tui`).
 #
 # Run:
-#   quorum serve --nats-url <url-from-quorum-redeem>
+#   quorum serve --nats-url <reachable-from-your-network>
 #
 # By default `quorum serve` reads `./agent.yml` + `~/.nsed/agent.creds`
 # from `quorum redeem`. Override with --config / --nats-creds.
+#
+# NATS URL is topology, not identity. The User JWT in agent.creds is
+# scoped to a NATS *account* — connect from whichever URL reaches that
+# account on your network (LAN host, WAN hostname, VPN-internal IP,
+# etc.). `quorum redeem` prints a suggested URL but it's only correct
+# for the network position the orchestrator sits in. If `quorum serve`
+# fails to connect, the URL is wrong, not the credentials.
+#
+# Order of precedence for the URL passed to NATS:
+#   --nats-url > $NATS_URL > telemetry.endpoints[0].nats_url below >
+#   nats://localhost:4222
+# Set it in one of those places to match your network reach.
+
+# Optional — pinned NATS URL for this fleet. Uncomment if you don't
+# want to repeat --nats-url on every `quorum serve` invocation.
+# telemetry:
+#   endpoints:
+#     - name: orchestrator
+#       nats_url: "nats://api.peeramid.xyz:4222"
 
 providers:
   # ── OpenAI-compatible LLMs ───────────────────────────────────────────

@@ -295,12 +295,19 @@ async fn run_operator_redeem(
         println!();
         println!("✓ Redeemed unified invite (operator + agent).");
         println!();
-        println!("  Operator     : {}", resp.name);
-        println!("  Token file   : {}", resolved_token.display());
-        println!("  Connect URL  : {nats_url}");
-        println!("  Agent pubkey : {pub_key}");
-        println!("  Creds file   : {}", resolved_creds.display());
-        println!("  Seed file    : {}", resolved_seed.display());
+        println!("  Operator       : {}", resp.name);
+        println!("  Token file     : {}", resolved_token.display());
+        println!("  Suggested NATS : {nats_url}");
+        println!("  Agent pubkey   : {pub_key}");
+        println!("  Creds file     : {}", resolved_creds.display());
+        println!("  Seed file      : {}", resolved_seed.display());
+        println!();
+        println!(
+            "  The User JWT is account-scoped — connect from any reachable NATS\n  \
+             URL for that account. The suggested URL is the orchestrator's\n  \
+             best guess; override per network in `agent.yml` or via\n  \
+             `quorum serve --nats-url …` (LAN vs VPN vs WAN often differ)."
+        );
     } else {
         println!();
         println!("✓ Redeemed operator invite (chat-only).");
@@ -397,13 +404,20 @@ async fn run_agent_redeem(
     println!();
     println!("✓ Redeemed invite. NATS credentials are ready.");
     println!();
-    println!("  Connect URL : {}", result.nats_url);
-    println!("  Agent pubkey: {}", result.keypair.public_key());
-    println!("  Creds file  : {}", resolved_creds.display());
-    println!("  Seed file   : {}", resolved_seed.display());
+    println!("  Suggested NATS : {}", result.nats_url);
+    println!("  Agent pubkey   : {}", result.keypair.public_key());
+    println!("  Creds file     : {}", resolved_creds.display());
+    println!("  Seed file      : {}", resolved_seed.display());
     println!();
     println!("Both files are written mode 0600 on Unix. Keep the seed");
     println!("private — it's the long-lived half of your NATS identity.");
+    println!();
+    println!(
+        "The User JWT is account-scoped — connect from any reachable NATS\n\
+         URL for that account. The suggested URL is the orchestrator's best\n\
+         guess; override per network in `agent.yml` or via\n\
+         `quorum serve --nats-url …` (LAN vs VPN vs WAN often differ)."
+    );
     Ok(())
 }
 
