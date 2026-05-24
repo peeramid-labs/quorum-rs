@@ -4466,6 +4466,7 @@ mod tests {
         use crate::agents::ChatCapable;
         let (agent, _dir) = make_chat_test_agent(
             r#"#!/bin/sh
+cat > /dev/null
 cat <<'RESP'
 {"type":"result","subtype":"success","result":"Hello from Claude","cost_usd":0.001,"duration_ms":50}
 RESP
@@ -4556,6 +4557,7 @@ echo "Plain text response"
         use crate::agents::ChatCapable;
         let (agent, _dir) = make_chat_test_agent(
             r#"#!/bin/sh
+cat > /dev/null
 cat <<'RESP'
 {"type":"result","subtype":"success","result":"","cost_usd":0.0,"duration_ms":1}
 RESP
@@ -4579,6 +4581,7 @@ RESP
         use crate::agents::ChatCapable;
         let (agent, _dir) = make_chat_test_agent(
             r#"#!/bin/sh
+cat > /dev/null
 cat <<'RESP'
 {"type":"result","subtype":"success","result":"   \n\t  ","cost_usd":0.0,"duration_ms":1}
 RESP
@@ -4601,6 +4604,7 @@ RESP
         use crate::agents::ChatCapable;
         let (agent, _dir) = make_chat_test_agent(
             r#"#!/bin/sh
+cat > /dev/null
 cat <<'RESP'
 {"type":"result","subtype":"success","result":"  hello world  \n","cost_usd":0.0,"duration_ms":1}
 RESP
