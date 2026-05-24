@@ -93,6 +93,30 @@ pub async fn run(
     let fleet = crate::config::load_config(&config_path)
         .with_context(|| format!("failed to load fleet config at {}", config_path.display()))?;
 
+    // Resolution order: --nats-url > $NATS_URL > first
+    // `telemetry.endpoints[].nats_url` in the loaded fleet config >
+    // built-in `nats://localhost:4222`. The telemetry endpoint is
+    // the only place an `agent.yml` carries a NATS URL today (the
+    // `orchestrators[].url` field is HTTP, used for credential
+    // discovery — different transport).
+    let resolved_nats_url = nats_url.map(|s| s.to_string()).unwrap_or_else(|| {
+        if let Ok(v) = std::env::var("NATS_URL")
+            && !v.is_empty()
+        {
+            return v;
+        }
+        if let Some(url) = fleet
+            .telemetry
+            .endpoints
+            .iter()
+            .find_map(|e| e.nats_url.clone())
+            .filter(|u| !u.is_empty())
+        {
+            return url;
+        }
+        default_nats_url()
+    });
+
     // The cancellation token threads through serve_fleet →
     // MultiAgentRunner → each worker task. Without it, the
     // `tokio::select!` shutdown path below would just drop the
@@ -104,9 +128,7 @@ pub async fn run(
     let cancel = tokio_util::sync::CancellationToken::new();
 
     let opts = ServeOptions {
-        nats_url: nats_url
-            .map(|s| s.to_string())
-            .unwrap_or_else(default_nats_url),
+        nats_url: resolved_nats_url,
         nats_auth: resolve_nats_auth(nats_creds),
         agent_filter: agent_filter.map(|v| v.to_vec()),
         stream_name: stream_name
