@@ -841,26 +841,53 @@ async fn wizard_remote_orchestrator() -> Result<Option<(OrchestratorConfig, Vec<
         None => return Ok(None),
     };
 
-    // Branch on how the operator authenticates: a long-lived bearer
-    // token they've been given, OR a single-use invite code we
-    // redeem here-and-now to mint a fresh bearer token. Invite-code
-    // path is the lowest-friction onboarding for "trying the tech"
-    // — operator pastes one string and gets a working workspace.
-    let auth_method = match ask(Select::new(
-        "How do you want to authenticate?",
-        vec![
-            "Bearer token (long-lived, pre-issued)",
-            "Invite code (single-use, redeem now)",
-        ],
-    )
-    .prompt())
-    .map_err(|e| e.to_string())?
+    // Branch on how the operator authenticates. Three sources, in
+    // order of friction:
+    //   - existing token from `~/.nsed/operator.token` (returning
+    //     operator) — surfaced only when the file exists
+    //   - bearer token they've been given out-of-band
+    //   - single-use invite code redeemed here-and-now
+    let existing_token_path = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|h| {
+            std::path::PathBuf::from(h)
+                .join(".nsed")
+                .join("operator.token")
+        })
+        .filter(|p| p.exists());
+
+    let mut auth_opts: Vec<String> = Vec::new();
+    if let Some(ref path) = existing_token_path {
+        auth_opts.push(format!("Use existing token ({})", path.display()));
+    }
+    auth_opts.push("Bearer token (long-lived, pre-issued)".to_string());
+    auth_opts.push("Invite code (single-use, redeem now)".to_string());
+
+    let auth_method = match ask(Select::new("How do you want to authenticate?", auth_opts).prompt())
+        .map_err(|e| e.to_string())?
     {
         Some(m) => m,
         None => return Ok(None),
     };
 
-    let token_raw = if auth_method.starts_with("Invite") {
+    let token_raw = if auth_method.starts_with("Use existing token") {
+        // `existing_token_path` is Some by construction — this branch
+        // only appears in the menu when the file exists.
+        let path = existing_token_path
+            .as_ref()
+            .ok_or_else(|| "existing token path missing".to_string())?;
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            return Err(format!(
+                "{} is empty — re-redeem an invite or delete the file",
+                path.display()
+            ));
+        }
+        eprintln!("  ✓ Loaded token from {}", path.display());
+        trimmed
+    } else if auth_method.starts_with("Invite") {
         match redeem_operator_invite_in_wizard(&address).await? {
             Some(t) => t,
             None => return Ok(None),
