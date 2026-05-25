@@ -377,7 +377,25 @@ pub async fn run(output_path: &Path) -> ExitCode {
                     created_agents = result.agents;
                 }
                 if !result.agent_config_yaml.is_empty() {
-                    agent_config_yaml = Some(result.agent_config_yaml);
+                    // Inject `telemetry.endpoints[].nats_url` from any
+                    // orchestrator that captured one at redeem time —
+                    // otherwise `quorum serve` falls through to its
+                    // localhost default. Operator can still override
+                    // per network via --nats-url or by editing the
+                    // block.
+                    let yaml = result.agent_config_yaml;
+                    let yaml_with_telemetry = match orchestrators
+                        .values()
+                        .find_map(|o| o.nats_url.as_deref())
+                    {
+                        Some(nats_url) if !yaml.contains("telemetry:") => {
+                            format!(
+                                "telemetry:\n  endpoints:\n    - name: orchestrator\n      nats_url: \"{nats_url}\"\n\n{yaml}"
+                            )
+                        }
+                        _ => yaml,
+                    };
+                    agent_config_yaml = Some(yaml_with_telemetry);
                 }
             }
             Ok(None) => {
@@ -876,50 +894,55 @@ async fn wizard_remote_orchestrator() -> Result<Option<(OrchestratorConfig, Vec<
         None => return Ok(None),
     };
 
-    let token_raw = if auth_method.starts_with("Use existing token") {
-        // `existing_token_path` is Some by construction — this branch
-        // only appears in the menu when the file exists.
-        let path = existing_token_path
-            .as_ref()
-            .ok_or_else(|| "existing token path missing".to_string())?;
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-        let trimmed = raw.trim().to_string();
-        if trimmed.is_empty() {
-            return Err(format!(
-                "{} is empty — re-redeem an invite or delete the file",
-                path.display()
-            ));
-        }
-        eprintln!("  ✓ Loaded token from {}", path.display());
-        trimmed
-    } else if auth_method.starts_with("Invite") {
-        match redeem_operator_invite_in_wizard(&address).await? {
-            Some(t) => t,
-            None => return Ok(None),
-        }
-    } else {
-        match ask(Text::new("Bearer token (or ${ENV_VAR}):")
-            .with_default("${NSED_BEARER_TOKEN}")
-            .prompt())
-        .map_err(|e| e.to_string())?
-        {
-            Some(t) => {
-                let trimmed = t.trim().to_string();
-                if trimmed.is_empty() {
-                    return Err("token cannot be empty".into());
-                }
-                trimmed
+    // Token + (optional) suggested NATS URL captured here so
+    // `quorum serve` doesn't fall back to nats://localhost when the
+    // operator simply re-uses this nsed.yaml later.
+    let (token_raw, suggested_nats_url): (String, Option<String>) =
+        if auth_method.starts_with("Use existing token") {
+            // `existing_token_path` is Some by construction — this branch
+            // only appears in the menu when the file exists.
+            let path = existing_token_path
+                .as_ref()
+                .ok_or_else(|| "existing token path missing".to_string())?;
+            let raw = std::fs::read_to_string(path)
+                .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+            let trimmed = raw.trim().to_string();
+            if trimmed.is_empty() {
+                return Err(format!(
+                    "{} is empty — re-redeem an invite or delete the file",
+                    path.display()
+                ));
             }
-            None => return Ok(None),
-        }
-    };
+            eprintln!("  ✓ Loaded token from {}", path.display());
+            (trimmed, None)
+        } else if auth_method.starts_with("Invite") {
+            match redeem_operator_invite_in_wizard(&address).await? {
+                Some(pair) => pair,
+                None => return Ok(None),
+            }
+        } else {
+            let token = match ask(Text::new("Bearer token (or ${ENV_VAR}):")
+                .with_default("${NSED_BEARER_TOKEN}")
+                .prompt())
+            .map_err(|e| e.to_string())?
+            {
+                Some(t) => {
+                    let trimmed = t.trim().to_string();
+                    if trimmed.is_empty() {
+                        return Err("token cannot be empty".into());
+                    }
+                    trimmed
+                }
+                None => return Ok(None),
+            };
+            (token, None)
+        };
 
     let orch = OrchestratorConfig {
         mode: Some(OrchestratorMode::Remote),
         address: Some(address.clone()),
         token: Some(token_raw.clone()),
-        nats_url: None,
+        nats_url: suggested_nats_url.clone(),
         config_file: None,
     };
 
@@ -1190,9 +1213,15 @@ fn wizard_policy() -> Result<Option<(PolicyConfig, bool)>, String> {
 /// `Ok(None)` = operator cancelled / pressed Esc. `Err(_)` =
 /// orchestrator rejected the code or transport failure. In either
 /// case the caller bails out of the wizard cleanly.
+/// Returns `(bearer_token, Option<nats_url>)` on success. The
+/// nats_url is the orchestrator's suggested NATS endpoint for the
+/// minted agent identity — operator persists it so `quorum serve`
+/// doesn't fall back to `nats://localhost:4222`. URL is topology
+/// not identity (see docs/identity-model.md), so the operator can
+/// override per network.
 async fn redeem_operator_invite_in_wizard(
     orchestrator_url: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Option<(String, Option<String>)>, String> {
     use crate::nats_utils::{
         RedeemInviteError, format_nats_creds, redeem_operator_invite_with_orchestrator,
     };
@@ -1245,7 +1274,7 @@ async fn redeem_operator_invite_in_wizard(
                     creds_path.display()
                 );
             }
-            Ok(Some(resp.token))
+            Ok(Some((resp.token, resp.nats_url)))
         }
         Err(RedeemInviteError::Expired) => {
             Err("This invite code has expired. Ask the admin for a fresh code.".into())
