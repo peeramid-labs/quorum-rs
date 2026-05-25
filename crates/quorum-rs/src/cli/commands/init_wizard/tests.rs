@@ -1186,43 +1186,58 @@ fn persist_agent_creds_mode_is_0600_on_unix() {
 
 #[test]
 #[serial_test::serial(home)]
-fn persist_agent_creds_refuses_to_overwrite_existing_creds() {
-    // Wizard has no --force flag — if a stale creds file exists at
-    // `~/.nsed/agent.creds`, refuse to clobber it. Operators with
-    // existing creds are pointed at `quorum redeem --force` in the
-    // error message instead.
+fn persist_agent_creds_rotates_existing_creds_to_backup() {
+    // Regression: previously the wizard REFUSED to overwrite,
+    // which lost the freshly-minted token (orchestrator had
+    // already burned the JTI). Now an existing file is rotated to
+    // a timestamped `.bak-<ts>` sidecar so the new write always
+    // succeeds AND the operator can recover the old identity from
+    // the backup if needed.
     let tmp = tempfile::tempdir().unwrap();
     let nsed_dir = tmp.path().join(".nsed");
     std::fs::create_dir_all(&nsed_dir).unwrap();
     std::fs::write(nsed_dir.join("agent.creds"), b"pre-existing").unwrap();
-    let err = with_home(tmp.path(), || {
-        super::persist_agent_creds("new-cc", "new-ss").unwrap_err()
+    let (creds, seed) = with_home(tmp.path(), || {
+        super::persist_agent_creds("new-cc", "new-ss").unwrap()
     });
-    assert!(
-        err.contains("already exists"),
-        "error must mention existing file; got: {err}"
-    );
-    assert!(
-        err.contains("quorum redeem"),
-        "error must point operator at the --force path; got: {err}"
-    );
-    // The pre-existing creds file must NOT have been overwritten.
-    let body = std::fs::read_to_string(nsed_dir.join("agent.creds")).unwrap();
-    assert_eq!(body, "pre-existing");
-    // Seed file must NOT have been created either.
-    assert!(!nsed_dir.join("agent.seed").exists());
+    // New content written to canonical path. `write_secret_file`
+    // appends a trailing newline if the input lacks one.
+    assert_eq!(std::fs::read_to_string(&creds).unwrap(), "new-cc\n");
+    assert_eq!(std::fs::read_to_string(&seed).unwrap(), "new-ss\n");
+    // Old content preserved under a .bak-<ts> sidecar.
+    let entries: Vec<_> = std::fs::read_dir(&nsed_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().into_string().unwrap())
+        .collect();
+    let backup = entries
+        .iter()
+        .find(|n| n.starts_with("agent.creds.bak-"))
+        .unwrap_or_else(|| panic!("no creds backup found in {entries:?}"));
+    let backup_body = std::fs::read_to_string(nsed_dir.join(backup)).unwrap();
+    assert_eq!(backup_body, "pre-existing");
 }
 
 #[test]
 #[serial_test::serial(home)]
-fn persist_agent_creds_refuses_to_overwrite_existing_seed() {
+fn persist_agent_creds_rotates_existing_seed_to_backup() {
     let tmp = tempfile::tempdir().unwrap();
     let nsed_dir = tmp.path().join(".nsed");
     std::fs::create_dir_all(&nsed_dir).unwrap();
     std::fs::write(nsed_dir.join("agent.seed"), b"pre-existing-seed").unwrap();
-    let err = with_home(tmp.path(), || {
-        super::persist_agent_creds("new-cc", "new-ss").unwrap_err()
+    let (_creds, seed) = with_home(tmp.path(), || {
+        super::persist_agent_creds("new-cc", "new-ss").unwrap()
     });
-    assert!(err.contains("already exists"));
-    assert!(!nsed_dir.join("agent.creds").exists());
+    assert_eq!(std::fs::read_to_string(&seed).unwrap(), "new-ss\n");
+    let entries: Vec<_> = std::fs::read_dir(&nsed_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().into_string().unwrap())
+        .collect();
+    let backup = entries
+        .iter()
+        .find(|n| n.starts_with("agent.seed.bak-"))
+        .unwrap_or_else(|| panic!("no seed backup found in {entries:?}"));
+    let backup_body = std::fs::read_to_string(nsed_dir.join(backup)).unwrap();
+    assert_eq!(backup_body, "pre-existing-seed");
 }

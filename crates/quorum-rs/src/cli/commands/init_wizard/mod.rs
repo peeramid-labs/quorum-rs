@@ -213,59 +213,77 @@ pub async fn run(output_path: &Path) -> ExitCode {
 
     loop {
         let existing_names: Vec<String> = orchestrators.keys().cloned().collect();
-        if !existing_names.is_empty() {
-            eprintln!("Orchestrators: {}", existing_names.join(", "));
-        }
 
-        let add_opts = vec![
-            "Remote  — connect to an existing orchestrator",
-            "Embedded — run orchestrator locally with nsed serve",
-            "Done — no more orchestrators",
-        ];
-        let choice = match ask(Select::new("Add orchestrator:", add_opts).prompt()) {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                eprintln!("Cancelled.");
-                return ExitCode::SUCCESS;
-            }
-            Err(e) => {
-                eprintln!("Prompt failed: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-
-        if choice.starts_with("Done") {
-            if orchestrators.is_empty() {
-                eprintln!("  At least one orchestrator is required.");
-                continue;
-            }
-            break;
-        }
-
-        let is_remote = choice.starts_with("Remote");
-        let default_name = if is_remote {
-            if orchestrators.contains_key("remote") {
-                format!("remote_{}", orchestrators.len() + 1)
-            } else {
-                "remote".into()
-            }
-        } else if orchestrators.contains_key("local") {
-            format!("local_{}", orchestrators.len() + 1)
+        // Happy-path shortcut: first iteration auto-picks Remote
+        // (the overwhelmingly common case) and auto-names it
+        // `remote`. After the first orchestrator is registered the
+        // loop asks a single Y/N "add another?" (default N) instead
+        // of forcing operators through a Remote/Local/Done menu —
+        // most setups have exactly one orchestrator.
+        let is_first = orchestrators.is_empty();
+        let (is_remote, orch_name) = if is_first {
+            (true, "remote".to_string())
         } else {
-            "local".into()
-        };
+            eprintln!("Orchestrators: {}", existing_names.join(", "));
+            let add_more = match ask(Confirm::new("Add another orchestrator?")
+                .with_default(false)
+                .prompt())
+            {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    eprintln!("Cancelled.");
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("Prompt failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if !add_more {
+                break;
+            }
 
-        let orch_name = match ask_unique_name("Orchestrator name:", &default_name, &existing_names)
-        {
-            Ok(Some(n)) => n,
-            Ok(None) => {
-                eprintln!("Cancelled.");
-                return ExitCode::SUCCESS;
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
+            // Explicit menu for the rare add-another flow.
+            let add_opts = vec![
+                "Remote  — connect to an existing orchestrator",
+                "Embedded — run orchestrator locally with nsed serve",
+            ];
+            let choice = match ask(Select::new("Add orchestrator:", add_opts).prompt()) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    eprintln!("Cancelled.");
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("Prompt failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let is_remote = choice.starts_with("Remote");
+            let default_name = if is_remote {
+                if orchestrators.contains_key("remote") {
+                    format!("remote_{}", orchestrators.len() + 1)
+                } else {
+                    "remote".into()
+                }
+            } else if orchestrators.contains_key("local") {
+                format!("local_{}", orchestrators.len() + 1)
+            } else {
+                "local".into()
+            };
+
+            let name = match ask_unique_name("Orchestrator name:", &default_name, &existing_names) {
+                Ok(Some(n)) => n,
+                Ok(None) => {
+                    eprintln!("Cancelled.");
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            (is_remote, name)
         };
 
         if is_remote {
@@ -1231,11 +1249,18 @@ async fn redeem_operator_invite_in_wizard(
 }
 
 /// Persist a fresh `.creds` + `.seed` pair to `~/.nsed/agent.{creds,seed}`
-/// after a unified-grant redeem. Files are written mode 0600 on Unix and
-/// refuse to overwrite a pre-existing file at either path (the wizard
-/// has no `--force` flag — operators with existing creds should use
-/// `quorum redeem --force` instead). Returns the resolved paths so the
-/// caller can echo them to the user.
+/// after a unified-grant redeem. Files are written mode 0600 on Unix.
+///
+/// If a file already exists at either path, it's rotated to a
+/// timestamped `.bak-<unix-ts>` sidecar before the new write —
+/// previously the wizard refused, which lost the freshly-minted
+/// token (the orchestrator had already burned the JTI by the time
+/// this function ran, so failing here meant the operator had to ask
+/// for a new invite). The old creds are never deleted, just renamed,
+/// so an operator who needs the previous identity can recover it
+/// from `.bak-<ts>`.
+///
+/// Returns the resolved paths so the caller can echo them to the user.
 fn persist_agent_creds(
     creds_content: &str,
     user_seed: &str,
@@ -1251,18 +1276,34 @@ fn persist_agent_creds(
     seed_path.push(".nsed");
     seed_path.push("agent.seed");
 
-    for (label, path) in [("creds", &creds_path), ("seed", &seed_path)] {
-        if path.exists() {
-            return Err(format!(
-                "{label} file already exists at {} — refusing to overwrite. Move it aside or run \
-                 `quorum redeem --force` after the wizard completes.",
-                path.display()
-            ));
-        }
-    }
-
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Failed to create {}: {e}", dir.display()))?;
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for path in [&creds_path, &seed_path] {
+        if path.exists() {
+            let bak = path.with_extension(format!(
+                "{}.bak-{}",
+                path.extension().and_then(|s| s.to_str()).unwrap_or(""),
+                ts
+            ));
+            std::fs::rename(path, &bak).map_err(|e| {
+                format!(
+                    "Failed to rotate existing {} to {}: {e}",
+                    path.display(),
+                    bak.display()
+                )
+            })?;
+            eprintln!(
+                "  ↻ Rotated existing {} → {} (recoverable if needed)",
+                path.display(),
+                bak.display()
+            );
+        }
+    }
 
     write_secret_file(&creds_path, creds_content)
         .map_err(|e| format!("Failed to write {}: {e}", creds_path.display()))?;
