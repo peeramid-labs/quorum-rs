@@ -388,8 +388,12 @@ fn sample_agents() -> Vec<AgentSlot> {
         Some(0.90),
     );
     a1.apply_preset();
+    // Previously paired DEFAULT with ARCHIT (Security ensemble);
+    // ARCHIT was retired so swap in VERIFY which still ships under
+    // General. Same intent: cover a two-agent rendering scenario
+    // with a non-default preset.
     let mut a2 = AgentSlot::new(
-        "ARCHIT".to_string(),
+        "VERIFY".to_string(),
         "ollama_local".to_string(),
         "llama3.2".to_string(),
         Some(0.0),
@@ -419,7 +423,7 @@ fn compose_owner_has_nats_orchestrator_and_agents() {
     assert!(compose.contains("  nsed-agent-2:"));
     assert!(compose.contains("ghcr.io/peeramid-labs/nsed-agent:latest"));
     assert!(compose.contains("NSED_AGENT_NAME: DEFAULT"));
-    assert!(compose.contains("NSED_AGENT_NAME: ARCHIT"));
+    assert!(compose.contains("NSED_AGENT_NAME: VERIFY"));
 }
 
 #[test]
@@ -678,13 +682,13 @@ fn render_agent_config_has_orchestrator_and_agents() {
     assert!(cfg.contains("together_ai:"));
     assert!(cfg.contains("agents:"));
     assert!(cfg.contains("name: \"DEFAULT\""));
-    assert!(cfg.contains("name: \"ARCHIT\""));
+    assert!(cfg.contains("name: \"VERIFY\""));
     // DEFAULT preset has temperature=0.7 and max_tokens=8096
     assert!(cfg.contains("temperature: 0.7"));
     assert!(cfg.contains("max_tokens: 8096"));
-    // ARCHIT preset has temperature=0.5 and max_tokens=4096
+    // VERIFY preset has temperature=0.5 and max_tokens=12096
     assert!(cfg.contains("temperature: 0.5"));
-    assert!(cfg.contains("max_tokens: 4096"));
+    assert!(cfg.contains("max_tokens: 12096"));
     assert!(cfg.contains("presence_penalty: 1.5"));
 }
 
@@ -716,9 +720,10 @@ fn render_agent_config_has_all_strategy_fields() {
     let agents = sample_agents();
     let cfg = render_agent_config("http://localhost:8080", &providers, &agents);
 
-    // Preset agents get persona from PRESET_CONFIGS (agent section)
+    // Preset agents get persona from PRESET_CONFIGS (agent section).
+    // DEFAULT prefix + VERIFY prefix — both in the trimmed General set.
     assert!(cfg.contains("persona: \"You are a helpful"));
-    assert!(cfg.contains("persona: \"You are a smart contract architect"));
+    assert!(cfg.contains("persona: \"You are a detail-oriented fact-checker"));
 
     // LLM strategy fields are now in the models: block under providers
     assert!(cfg.contains("context_window: 131072"));
@@ -1465,223 +1470,6 @@ fn render_agent_config_simulated_provider_section() {
     assert!(cfg.contains("concurrency: 100"));
     // Should NOT have api_key line
     assert!(!cfg.contains("api_key: \"${SIMULATED_API_KEY}\""));
-}
-
-// ── AgentSlot apply_preset — Security Audit ensemble ─────────────
-
-#[test]
-fn test_agent_slot_apply_preset_security_ensemble() {
-    let names = ["REENTRY", "STATIC", "FUZZ", "REGULAT", "ARCHIT"];
-    for name in names {
-        let mut slot = AgentSlot::new(
-            name.to_string(),
-            "prov".to_string(),
-            "model-x".to_string(),
-            None,
-            None,
-        );
-        slot.apply_preset();
-        assert!(
-            slot.persona.is_some(),
-            "Security preset {} should have a persona",
-            name
-        );
-        assert!(
-            slot.context_window.is_some(),
-            "Security preset {} should have a context_window",
-            name
-        );
-    }
-
-    // Verify specific personas
-    let mut reentry = AgentSlot::new(
-        "REENTRY".to_string(),
-        "p".to_string(),
-        "m".to_string(),
-        None,
-        None,
-    );
-    reentry.apply_preset();
-    assert!(reentry.persona.as_ref().unwrap().contains("re-entrancy"));
-
-    let mut fuzz = AgentSlot::new(
-        "FUZZ".to_string(),
-        "p".to_string(),
-        "m".to_string(),
-        None,
-        None,
-    );
-    fuzz.apply_preset();
-    assert!(fuzz.persona.as_ref().unwrap().contains("fuzz-testing"));
-
-    let mut archit = AgentSlot::new(
-        "ARCHIT".to_string(),
-        "p".to_string(),
-        "m".to_string(),
-        None,
-        None,
-    );
-    archit.apply_preset();
-    assert!(archit.persona.as_ref().unwrap().contains("architect"));
-    assert_eq!(archit.reasoning_effort.as_deref(), Some("medium"));
-    assert!((archit.temperature - 0.5).abs() < f32::EPSILON);
-}
-
-// ── AgentSlot apply_preset — Quant Strategy ensemble ─────────────
-
-#[test]
-fn test_agent_slot_apply_preset_quant_ensemble() {
-    let names = ["MOMENTUM", "MEANREV", "VOLATIL", "MACRO", "RISKMOD"];
-    for name in names {
-        let mut slot = AgentSlot::new(
-            name.to_string(),
-            "prov".to_string(),
-            "model-x".to_string(),
-            None,
-            None,
-        );
-        slot.apply_preset();
-        assert!(
-            slot.persona.is_some(),
-            "Quant preset {} should have a persona",
-            name
-        );
-        assert!(
-            slot.context_window.is_some(),
-            "Quant preset {} should have a context_window",
-            name
-        );
-    }
-
-    let mut momentum = AgentSlot::new(
-        "MOMENTUM".to_string(),
-        "p".to_string(),
-        "m".to_string(),
-        None,
-        None,
-    );
-    momentum.apply_preset();
-    assert!(momentum.persona.as_ref().unwrap().contains("momentum"));
-    assert_eq!(momentum.reasoning_effort.as_deref(), Some("medium"));
-
-    let mut volatil = AgentSlot::new(
-        "VOLATIL".to_string(),
-        "p".to_string(),
-        "m".to_string(),
-        None,
-        None,
-    );
-    volatil.apply_preset();
-    assert!(volatil.persona.as_ref().unwrap().contains("volatility"));
-    assert!((volatil.temperature - 0.5).abs() < f32::EPSILON);
-}
-
-// ── AgentSlot apply_preset — Supply Chain ensemble ────────────────
-
-#[test]
-fn test_agent_slot_apply_preset_supply_ensemble() {
-    let names = ["DEMAND", "LOGISTICS", "PROCURE", "QUALCON"];
-    for name in names {
-        let mut slot = AgentSlot::new(
-            name.to_string(),
-            "prov".to_string(),
-            "model-x".to_string(),
-            None,
-            None,
-        );
-        slot.apply_preset();
-        assert!(
-            slot.persona.is_some(),
-            "Supply preset {} should have a persona",
-            name
-        );
-    }
-
-    let mut logistics = AgentSlot::new(
-        "LOGISTICS".to_string(),
-        "p".to_string(),
-        "m".to_string(),
-        None,
-        None,
-    );
-    logistics.apply_preset();
-    assert!(logistics.persona.as_ref().unwrap().contains("logistics"));
-    assert_eq!(logistics.reasoning_effort.as_deref(), Some("medium"));
-
-    let mut qualcon = AgentSlot::new(
-        "QUALCON".to_string(),
-        "p".to_string(),
-        "m".to_string(),
-        None,
-        None,
-    );
-    qualcon.apply_preset();
-    assert!(
-        qualcon
-            .persona
-            .as_ref()
-            .unwrap()
-            .contains("quality control")
-    );
-    assert!((qualcon.temperature - 0.5).abs() < f32::EPSILON);
-}
-
-// ── AgentSlot apply_preset — Legal Review ensemble ───────────────
-
-#[test]
-fn test_agent_slot_apply_preset_legal_ensemble() {
-    let names = ["CLAUSAN", "RISKLEG", "JURISD"];
-    for name in names {
-        let mut slot = AgentSlot::new(
-            name.to_string(),
-            "prov".to_string(),
-            "model-x".to_string(),
-            None,
-            None,
-        );
-        slot.apply_preset();
-        assert!(
-            slot.persona.is_some(),
-            "Legal preset {} should have a persona",
-            name
-        );
-    }
-
-    let mut clausan = AgentSlot::new(
-        "CLAUSAN".to_string(),
-        "p".to_string(),
-        "m".to_string(),
-        None,
-        None,
-    );
-    clausan.apply_preset();
-    assert!(
-        clausan
-            .persona
-            .as_ref()
-            .unwrap()
-            .contains("clause analysis")
-    );
-
-    let mut riskleg = AgentSlot::new(
-        "RISKLEG".to_string(),
-        "p".to_string(),
-        "m".to_string(),
-        None,
-        None,
-    );
-    riskleg.apply_preset();
-    assert!(riskleg.persona.as_ref().unwrap().contains("legal risk"));
-
-    let mut jurisd = AgentSlot::new(
-        "JURISD".to_string(),
-        "p".to_string(),
-        "m".to_string(),
-        None,
-        None,
-    );
-    jurisd.apply_preset();
-    assert!(jurisd.persona.as_ref().unwrap().contains("jurisdiction"));
 }
 
 // ── AgentSlot apply_preset — General ensemble ────────────────────
@@ -2980,15 +2768,22 @@ fn agent_presets_have_valid_ensembles() {
 }
 
 #[test]
-fn agent_presets_each_ensemble_has_members() {
-    let ensembles = ["General", "Security", "Quant", "Supply", "Legal"];
-    for ensemble in ensembles {
-        let count = AGENT_PRESETS
-            .iter()
-            .filter(|a| a.ensemble == ensemble)
-            .count();
-        assert!(count > 0, "Ensemble '{}' has no agent presets", ensemble);
+fn agent_presets_only_general_ensemble() {
+    // Domain-specific ensembles (Security / Quant / Supply / Legal)
+    // were dropped in favour of a curated General set. Operators
+    // needing those domains build them via custom persona free-text
+    // or the structured `claude:` YAML block.
+    for preset in AGENT_PRESETS {
+        assert_eq!(
+            preset.ensemble, "General",
+            "only General ensemble is shipped now; got '{}' on {}",
+            preset.ensemble, preset.name
+        );
     }
+    assert!(
+        !AGENT_PRESETS.is_empty(),
+        "General ensemble must have at least one preset"
+    );
 }
 
 #[test]
@@ -3001,12 +2796,15 @@ fn agent_presets_general_ensemble_count() {
 }
 
 #[test]
-fn agent_presets_security_ensemble_count() {
+fn agent_presets_no_legacy_security_ensemble() {
+    // Regression: Security ensemble was dropped along with Quant /
+    // Supply / Legal. Asserting absence prevents accidental
+    // re-introduction.
     let count = AGENT_PRESETS
         .iter()
         .filter(|a| a.ensemble == "Security")
         .count();
-    assert_eq!(count, 5, "Security ensemble should have 5 agents");
+    assert_eq!(count, 0, "Security ensemble was retired");
 }
 
 // ── Render consistency: agent config round-trip ──────────────────
@@ -3482,13 +3280,21 @@ fn resolve_selected_names_single_match() {
 
 #[test]
 fn resolve_selected_names_multiple_matches() {
+    // AGENT_PRESETS now ships only the 4 General entries — pick
+    // three of them and verify the resolver maps display-strings
+    // back to canonical names.
     let options = build_persona_options();
-    let selected = vec![options[0].clone(), options[2].clone(), options[4].clone()];
+    assert!(
+        options.len() >= 4,
+        "test indexes options[3]; need at least 4 presets, got {}",
+        options.len()
+    );
+    let selected = vec![options[0].clone(), options[1].clone(), options[3].clone()];
     let names = resolve_selected_names(&selected, &options);
     assert_eq!(names.len(), 3);
     assert_eq!(names[0], AGENT_PRESETS[0].name);
-    assert_eq!(names[1], AGENT_PRESETS[2].name);
-    assert_eq!(names[2], AGENT_PRESETS[4].name);
+    assert_eq!(names[1], AGENT_PRESETS[1].name);
+    assert_eq!(names[2], AGENT_PRESETS[3].name);
 }
 
 #[test]

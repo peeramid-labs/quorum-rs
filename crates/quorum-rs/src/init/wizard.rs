@@ -610,24 +610,55 @@ pub(super) fn wizard_agents(
             .find(|p| p.id == provider_id && p.provider_type == "exec")
         {
             if p.id == "claude_cli" {
-                // Claude CLI provider — sensible defaults for non-interactive exec
-                let default_cmd = "claude -p --output-format json --model sonnet --verbose";
-                brand::info(&format!("  command: {default_cmd}"));
-                let Some(cmd_str) = ask(Text::new(&format!("Exec command for {name}:"))
-                    .with_default(default_cmd)
-                    .with_help_message("Flags: --model (sonnet/opus/haiku), --max-budget-usd N, --permission-mode plan")
+                // Claude CLI provider — pick model + optional
+                // context dirs/files, then assemble the exec
+                // command. Operators wanting the rich `claude:`
+                // YAML block (subagents, per-tool permissions)
+                // edit the file by hand after init.
+                let model_opts = vec!["sonnet", "opus", "haiku"];
+                let Some(model) = ask(Select::new("Claude model:", model_opts)
+                    .with_help_message(
+                        "haiku = cheap+fast, sonnet = balanced (default), opus = strongest",
+                    )
                     .with_render_config(rc)
                     .prompt())?
                 else {
                     return Ok(None);
                 };
-                match split_shell_command(&cmd_str) {
-                    Ok(parts) => Some(parts),
-                    Err(e) => {
-                        brand::warn(&format!("Invalid command — {e}"));
-                        return Ok(None);
-                    }
+
+                let Some(ctx_paths_str) = ask(Text::new(&format!(
+                    "Context paths for {name} (comma-separated, optional):"
+                ))
+                .with_default("")
+                .with_help_message(
+                    "Files or dirs claude reads as additional context (--add-dir). \
+                     Example: ./docs, ./README.md",
+                )
+                .with_render_config(rc)
+                .prompt())?
+                else {
+                    return Ok(None);
+                };
+                let context_paths: Vec<String> = ctx_paths_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                let mut parts: Vec<String> = vec![
+                    "claude".into(),
+                    "-p".into(),
+                    "--output-format".into(),
+                    "json".into(),
+                    "--model".into(),
+                    model.into(),
+                    "--verbose".into(),
+                ];
+                for path in &context_paths {
+                    parts.push("--add-dir".into());
+                    parts.push(path.clone());
                 }
+                Some(parts)
             } else {
                 // Generic exec provider — prompt for command
                 let default_cmd = if exec_tools.iter().any(|t| t.name == "python3") {
