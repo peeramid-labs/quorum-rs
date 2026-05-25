@@ -22,7 +22,16 @@ use std::path::{Path, PathBuf};
 /// `quorum init` writes and the layout `nsed serve` consumes in the
 /// parent repo. If `--config` isn't passed, the CLI walks this list
 /// and uses the first match.
-const DEFAULT_FLEET_PATHS: &[&str] = &["agent.yml", "config/default.yml"];
+// Probe order: root `agent.yml` (one-shot init), root `agent.yaml`,
+// `config/agent.yml` (where `quorum init --wizard` writes it next to
+// the workspace), then `config/default.yml` (BUSL-era convention).
+// Matches what every documented init path produces.
+const DEFAULT_FLEET_PATHS: &[&str] = &[
+    "agent.yml",
+    "agent.yaml",
+    "config/agent.yml",
+    "config/default.yml",
+];
 
 /// Default operator creds-file location written by `quorum redeem`.
 fn default_creds_path() -> Option<PathBuf> {

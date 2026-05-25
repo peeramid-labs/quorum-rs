@@ -1090,9 +1090,10 @@ fn render_yaml_writes_full_token() {
 #[test]
 fn next_steps_without_remote_omits_hint() {
     let msg = super::format_next_steps(false);
-    assert!(msg.contains("nsed config validate"));
-    assert!(msg.contains("nsed serve"));
-    assert!(msg.contains("nsed run"));
+    assert!(msg.contains("quorum validate"));
+    assert!(msg.contains("quorum run"));
+    assert!(msg.contains("quorum tui"));
+    assert!(msg.contains("quorum serve"));
     assert!(
         !msg.contains("Remote orchestrator detected"),
         "should not show remote hint when no remote orchestrators"
@@ -1102,16 +1103,17 @@ fn next_steps_without_remote_omits_hint() {
 #[test]
 fn next_steps_with_remote_includes_serve_hint() {
     let msg = super::format_next_steps(true);
-    assert!(msg.contains("nsed config validate"));
-    assert!(msg.contains("nsed serve"));
-    assert!(msg.contains("nsed run"));
+    assert!(msg.contains("quorum validate"));
+    assert!(msg.contains("quorum run"));
+    assert!(msg.contains("quorum tui"));
+    assert!(msg.contains("quorum serve"));
     assert!(
         msg.contains("Remote orchestrator detected"),
         "should show remote hint when remote orchestrator is present"
     );
     assert!(
-        msg.contains("nsed serve"),
-        "hint should reference nsed serve command"
+        msg.contains("contributing agents"),
+        "hint should explain quorum serve is for agent contribution, not dispatch"
     );
 }
 

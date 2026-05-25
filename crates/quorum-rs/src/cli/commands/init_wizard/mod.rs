@@ -201,7 +201,7 @@ pub async fn run(output_path: &Path) -> ExitCode {
         }
     }
 
-    eprintln!("nsed init — workspace setup wizard\n");
+    eprintln!("quorum init — workspace setup wizard\n");
 
     // ── Step 1: Orchestrators (loop) ────────────────────────────────────────
 
@@ -247,7 +247,7 @@ pub async fn run(output_path: &Path) -> ExitCode {
             // Explicit menu for the rare add-another flow.
             let add_opts = vec![
                 "Remote  — connect to an existing orchestrator",
-                "Embedded — run orchestrator locally with nsed serve",
+                "Embedded — run a local orchestrator process (advanced)",
             ];
             let choice = match ask(Select::new("Add orchestrator:", add_opts).prompt()) {
                 Ok(Some(c)) => c,
@@ -547,7 +547,7 @@ pub async fn run(output_path: &Path) -> ExitCode {
     // ── Step 5: Rooms (loop) ────────────────────────────────────────────────
 
     eprintln!("\n─── Rooms ─────────────────────────────────────────────────");
-    eprintln!("  A room links a policy to an orchestrator. `nsed run` uses the default room.\n");
+    eprintln!("  A room links a policy to an orchestrator. `quorum run` uses the default room.\n");
 
     let orch_names: Vec<String> = orchestrators.keys().cloned().collect();
     let policy_names: Vec<String> = policies.keys().cloned().collect();
@@ -788,18 +788,24 @@ pub async fn run(output_path: &Path) -> ExitCode {
 // ── Next-steps message ─────────────────────────────────────────────────────
 
 /// Formats the post-init "Next steps" message.
-/// When `has_remote` is true, appends a hint about running `nsed serve` first.
 fn format_next_steps(has_remote: bool) -> String {
     let mut msg = String::from("\nNext steps:\n");
-    msg.push_str("  nsed config validate        # verify config\n");
-    msg.push_str("  nsed serve                  # start agents & register policies\n");
-    msg.push_str("  nsed run \"your question\"    # start a deliberation\n");
+    msg.push_str("  quorum validate                  # parse nsed.yaml; surface schema errors\n");
+    msg.push_str("  quorum run \"your question\"       # submit a one-shot deliberation\n");
+    msg.push_str("  quorum tui                       # interactive monitor of in-flight jobs\n");
+    msg.push_str(
+        "  quorum serve --config config/agent.yml \\\n             --nats-url <from `quorum redeem` output>\n",
+    );
+    msg.push_str("                                   # run YOUR agents against the orchestrator\n");
     if has_remote {
         msg.push('\n');
         msg.push_str(
-            "  \u{2139}  Remote orchestrator detected \u{2014} run `nsed serve` to register\n",
+            "  \u{2139}  Remote orchestrator detected. `quorum serve` is only needed if\n",
         );
-        msg.push_str("     your agents and policies before starting deliberation.\n");
+        msg.push_str("     you're contributing agents to the deliberation pool. Pure dispatch\n");
+        msg.push_str(
+            "     (`quorum run` / `tui`) works against the remote agents already there.\n",
+        );
     }
     msg
 }

@@ -221,9 +221,29 @@ pub fn load_config(config_path: &Path) -> anyhow::Result<AgentFleetConfig> {
     }
 
     // Directory mode: default.yml + {env}.yml overlay
+    // Disambiguate before falling into the directory branch: if the
+    // path doesn't exist at all, the user passed a typo'd file
+    // (e.g. `--config agent.yml` when wizard wrote `config/agent.yml`).
+    // The old "Config file not found: agent.yml/default.yml" error
+    // made it look like we were treating their file as a directory.
+    if !config_path.exists() {
+        anyhow::bail!(
+            "Config path not found: {} (pass --config PATH explicitly, or run `quorum init` to scaffold one)",
+            config_path.display()
+        );
+    }
+    if !config_path.is_dir() {
+        anyhow::bail!(
+            "Config path {} is neither a regular file nor a directory",
+            config_path.display()
+        );
+    }
     let default_path = config_path.join("default.yml");
     if !default_path.exists() {
-        anyhow::bail!("Config file not found: {}", default_path.display());
+        anyhow::bail!(
+            "Directory {} does not contain `default.yml` (expected for directory-mode config)",
+            config_path.display()
+        );
     }
 
     let default_contents = std::fs::read_to_string(&default_path)?;
