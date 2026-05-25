@@ -227,6 +227,7 @@ pub async fn run(output_path: &Path) -> ExitCode {
             eprintln!("Orchestrators: {}", existing_names.join(", "));
             let add_more = match ask(Confirm::new("Add another orchestrator?")
                 .with_default(false)
+                .with_help_message("Press Enter for No — most setups have one")
                 .prompt())
             {
                 Ok(Some(v)) => v,
