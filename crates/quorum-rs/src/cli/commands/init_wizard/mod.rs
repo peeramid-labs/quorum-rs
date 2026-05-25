@@ -467,75 +467,114 @@ pub async fn run(output_path: &Path) -> ExitCode {
     // ── Step 3: Policies (loop) ─────────────────────────────────────────────
 
     eprintln!("\n─── Policies ──────────────────────────────────────────────");
-    eprintln!("  Deliberation rules: how many rounds, when to stop, which agents participate.\n");
+    eprintln!("  Deliberation rules: how many rounds, when to stop, which agents participate.");
+    eprintln!(
+        "  Skip this to dispatch via remote orchestrator policies\n  \
+         (run with `quorum run --policy <remote_id> --room <name> ...`).\n"
+    );
+
+    // Default no — most operators on remote orchestrators use the
+    // admin's pre-registered policies. Local policy definition is
+    // only needed for self-managed fleets or custom deliberation
+    // rules.
+    let define_local_policies = match ask(
+        Confirm::new("Define local policies + rooms now?")
+            .with_default(false)
+            .with_help_message(
+                "Press Enter for No — operators on remote orchestrators usually dispatch via --policy <id>",
+            )
+            .prompt(),
+    )
+    .map_err(|e| e.to_string())
+    {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            eprintln!("Cancelled.");
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("Prompt failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let mut policies: HashMap<String, PolicyConfig> = HashMap::new();
     // Track which policies use static mode and need agent assignment later.
     let mut static_policies: Vec<String> = Vec::new();
 
-    loop {
-        let existing_names: Vec<String> = policies.keys().cloned().collect();
-        if !existing_names.is_empty() {
-            eprintln!("Policies: {}", existing_names.join(", "));
-        }
+    if !define_local_policies {
+        eprintln!(
+            "  Skipped local policy + room definition. Use `quorum run --policy <id> --room <name> ...`\n  \
+             or re-run `quorum init` later to add them."
+        );
+    }
 
-        if !policies.is_empty() {
-            let add_more = match ask(Confirm::new("Add another policy?")
-                .with_default(false)
-                .prompt())
+    if define_local_policies {
+        loop {
+            let existing_names: Vec<String> = policies.keys().cloned().collect();
+            if !existing_names.is_empty() {
+                eprintln!("Policies: {}", existing_names.join(", "));
+            }
+
+            if !policies.is_empty() {
+                let add_more = match ask(Confirm::new("Add another policy?")
+                    .with_default(false)
+                    .prompt())
+                {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        eprintln!("Cancelled.");
+                        return ExitCode::SUCCESS;
+                    }
+                    Err(e) => {
+                        eprintln!("Prompt failed: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                if !add_more {
+                    break;
+                }
+            }
+
+            let default_name = if policies.is_empty() {
+                "default".into()
+            } else {
+                format!("policy_{}", policies.len() + 1)
+            };
+
+            let policy_name = match ask_unique_name("Policy name:", &default_name, &existing_names)
             {
-                Ok(Some(v)) => v,
+                Ok(Some(n)) => n,
                 Ok(None) => {
                     eprintln!("Cancelled.");
                     return ExitCode::SUCCESS;
                 }
                 Err(e) => {
-                    eprintln!("Prompt failed: {e}");
+                    eprintln!("error: {e}");
                     return ExitCode::FAILURE;
                 }
             };
-            if !add_more {
-                break;
-            }
-        }
 
-        let default_name = if policies.is_empty() {
-            "default".into()
-        } else {
-            format!("policy_{}", policies.len() + 1)
-        };
-
-        let policy_name = match ask_unique_name("Policy name:", &default_name, &existing_names) {
-            Ok(Some(n)) => n,
-            Ok(None) => {
-                eprintln!("Cancelled.");
-                return ExitCode::SUCCESS;
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-
-        let policy = match wizard_policy() {
-            Ok(Some((p, is_static))) => {
-                if is_static {
-                    static_policies.push(policy_name.clone());
+            let policy = match wizard_policy() {
+                Ok(Some((p, is_static))) => {
+                    if is_static {
+                        static_policies.push(policy_name.clone());
+                    }
+                    p
                 }
-                p
-            }
-            Ok(None) => {
-                eprintln!("Cancelled.");
-                return ExitCode::SUCCESS;
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
+                Ok(None) => {
+                    eprintln!("Cancelled.");
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
 
-        policies.insert(policy_name, policy);
-    }
+            policies.insert(policy_name, policy);
+        }
+    } // close `if define_local_policies { loop { … } }`
 
     // ── Step 4: Agent Assignment (for static policies) ──────────────────────
 
@@ -563,110 +602,126 @@ pub async fn run(output_path: &Path) -> ExitCode {
     }
 
     // ── Step 5: Rooms (loop) ────────────────────────────────────────────────
-
-    eprintln!("\n─── Rooms ─────────────────────────────────────────────────");
-    eprintln!("  A room links a policy to an orchestrator. `quorum run` uses the default room.\n");
+    // A room links a local policy to an orchestrator. If the
+    // operator skipped local policies (Step 3 No-default), they're
+    // dispatching against remote orchestrator policies via
+    // `quorum run --policy <id> --room <name>` so the local rooms
+    // map can stay empty.
 
     let orch_names: Vec<String> = orchestrators.keys().cloned().collect();
     let policy_names: Vec<String> = policies.keys().cloned().collect();
     let mut rooms: HashMap<String, RoomConfig> = HashMap::new();
 
-    loop {
-        let existing_names: Vec<String> = rooms.keys().cloned().collect();
-        if !existing_names.is_empty() {
-            eprintln!("Rooms: {}", existing_names.join(", "));
-        }
+    if !policies.is_empty() {
+        eprintln!("\n─── Rooms ─────────────────────────────────────────────────");
+        eprintln!(
+            "  A room links a policy to an orchestrator. `quorum run` uses the default room.\n"
+        );
+    }
 
-        if !rooms.is_empty() {
-            let add_more = match ask(Confirm::new("Add another room?")
-                .with_default(false)
-                .prompt())
-            {
-                Ok(Some(v)) => v,
+    if !policies.is_empty() {
+        loop {
+            let existing_names: Vec<String> = rooms.keys().cloned().collect();
+            if !existing_names.is_empty() {
+                eprintln!("Rooms: {}", existing_names.join(", "));
+            }
+
+            if !rooms.is_empty() {
+                let add_more = match ask(Confirm::new("Add another room?")
+                    .with_default(false)
+                    .prompt())
+                {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        eprintln!("Cancelled.");
+                        return ExitCode::SUCCESS;
+                    }
+                    Err(e) => {
+                        eprintln!("Prompt failed: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                if !add_more {
+                    break;
+                }
+            }
+
+            let default_name = if rooms.is_empty() {
+                "main".into()
+            } else {
+                format!("room_{}", rooms.len() + 1)
+            };
+
+            let room_name = match ask_unique_name("Room name:", &default_name, &existing_names) {
+                Ok(Some(n)) => n,
                 Ok(None) => {
                     eprintln!("Cancelled.");
                     return ExitCode::SUCCESS;
                 }
                 Err(e) => {
-                    eprintln!("Prompt failed: {e}");
+                    eprintln!("error: {e}");
                     return ExitCode::FAILURE;
                 }
             };
-            if !add_more {
-                break;
-            }
-        }
 
-        let default_name = if rooms.is_empty() {
-            "main".into()
-        } else {
-            format!("room_{}", rooms.len() + 1)
-        };
-
-        let room_name = match ask_unique_name("Room name:", &default_name, &existing_names) {
-            Ok(Some(n)) => n,
-            Ok(None) => {
-                eprintln!("Cancelled.");
-                return ExitCode::SUCCESS;
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-
-        // Pick policy
-        let policy_ref = if policy_names.len() == 1 {
-            eprintln!("  Using policy '{}' (only one defined)", policy_names[0]);
-            policy_names[0].clone()
-        } else {
-            match ask(Select::new("Policy for this room:", policy_names.clone()).prompt()) {
-                Ok(Some(p)) => p,
-                Ok(None) => {
-                    eprintln!("Cancelled.");
-                    return ExitCode::SUCCESS;
+            // Pick policy
+            let policy_ref = if policy_names.len() == 1 {
+                eprintln!("  Using policy '{}' (only one defined)", policy_names[0]);
+                policy_names[0].clone()
+            } else {
+                match ask(Select::new("Policy for this room:", policy_names.clone()).prompt()) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => {
+                        eprintln!("Cancelled.");
+                        return ExitCode::SUCCESS;
+                    }
+                    Err(e) => {
+                        eprintln!("Prompt failed: {e}");
+                        return ExitCode::FAILURE;
+                    }
                 }
-                Err(e) => {
-                    eprintln!("Prompt failed: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-        };
+            };
 
-        // Pick orchestrator
-        let orch_ref = if orch_names.len() == 1 {
-            eprintln!(
-                "  Using orchestrator '{}' (only one defined)",
-                orch_names[0]
+            // Pick orchestrator
+            let orch_ref = if orch_names.len() == 1 {
+                eprintln!(
+                    "  Using orchestrator '{}' (only one defined)",
+                    orch_names[0]
+                );
+                Some(orch_names[0].clone())
+            } else {
+                match ask(Select::new("Orchestrator for this room:", orch_names.clone()).prompt()) {
+                    Ok(Some(o)) => Some(o),
+                    Ok(None) => {
+                        eprintln!("Cancelled.");
+                        return ExitCode::SUCCESS;
+                    }
+                    Err(e) => {
+                        eprintln!("Prompt failed: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            };
+
+            rooms.insert(
+                room_name,
+                RoomConfig {
+                    policy: policy_ref,
+                    orchestrator: orch_ref,
+                },
             );
-            Some(orch_names[0].clone())
-        } else {
-            match ask(Select::new("Orchestrator for this room:", orch_names.clone()).prompt()) {
-                Ok(Some(o)) => Some(o),
-                Ok(None) => {
-                    eprintln!("Cancelled.");
-                    return ExitCode::SUCCESS;
-                }
-                Err(e) => {
-                    eprintln!("Prompt failed: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-        };
-
-        rooms.insert(
-            room_name,
-            RoomConfig {
-                policy: policy_ref,
-                orchestrator: orch_ref,
-            },
-        );
-    }
+        }
+    } // close `if !policies.is_empty() { loop { … } }`
 
     // ── Default room ────────────────────────────────────────────────────────
 
     let room_names: Vec<String> = rooms.keys().cloned().collect();
-    let default_room = if room_names.len() == 1 {
+    let default_room = if room_names.is_empty() {
+        // No local rooms because operator skipped policy step. The
+        // `default_room` field is optional — leave it None so
+        // `quorum run` requires an explicit `--room` argument.
+        None
+    } else if room_names.len() == 1 {
         Some(room_names[0].clone())
     } else {
         match ask(Select::new("Default room:", room_names).prompt()) {
