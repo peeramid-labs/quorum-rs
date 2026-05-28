@@ -18,7 +18,7 @@ use std::process::ExitCode;
 
 use inquire::{Confirm, CustomType, InquireError, MultiSelect, Select, Text};
 
-use crate::cli::remote::{AgentInfo, RemoteOrchestrator};
+use crate::cli::remote::{AgentInfo, DiscoveredPolicy, RemoteOrchestrator};
 use crate::cli::workspace::{
     AgentsConfig, ContextRef, OrchestratorConfig, OrchestratorMode, PolicyConfig, RoleConfig,
     RoomConfig, WorkspaceConfig,
@@ -210,6 +210,7 @@ pub async fn run(output_path: &Path) -> ExitCode {
 
     let mut orchestrators: HashMap<String, OrchestratorConfig> = HashMap::new();
     let mut discovered_agents: HashMap<String, Vec<AgentInfo>> = HashMap::new();
+    let mut discovered_policies: HashMap<String, Vec<DiscoveredPolicy>> = HashMap::new();
 
     loop {
         let existing_names: Vec<String> = orchestrators.keys().cloned().collect();
@@ -289,9 +290,12 @@ pub async fn run(output_path: &Path) -> ExitCode {
 
         if is_remote {
             match wizard_remote_orchestrator().await {
-                Ok(Some((orch, agents))) => {
+                Ok(Some((orch, agents, policies))) => {
                     if !agents.is_empty() {
                         discovered_agents.insert(orch_name.clone(), agents);
+                    }
+                    if !policies.is_empty() {
+                        discovered_policies.insert(orch_name.clone(), policies);
                     }
                     orchestrators.insert(orch_name, orch);
                 }
@@ -501,12 +505,36 @@ pub async fn run(output_path: &Path) -> ExitCode {
     let mut policies: HashMap<String, PolicyConfig> = HashMap::new();
     // Track which policies use static mode and need agent assignment later.
     let mut static_policies: Vec<String> = Vec::new();
+    // Rooms populated either by the skip-local branch (remote policy
+    // MultiSelect) or by the explicit "define local policies + rooms"
+    // path below. Declared up here so both branches feed the same map.
+    let mut rooms: HashMap<String, RoomConfig> = HashMap::new();
 
     if !define_local_policies {
-        eprintln!(
-            "  Skipped local policy + room definition. Use `quorum run --policy <id> --room <name> ...`\n  \
-             or re-run `quorum init` later to add them."
-        );
+        // Operator skipped local policies — show the (tenancy-filtered)
+        // remote policy list the orchestrator already returned so they
+        // can pick which ones become local rooms. Empty when the probe
+        // failed or auth was skipped; falls through to the prior CLI-
+        // flag hint in that case.
+        let total_remote: usize = discovered_policies.values().map(Vec::len).sum();
+        if total_remote == 0 {
+            eprintln!(
+                "  Skipped local policy + room definition. Use `quorum run --policy <id> --room <name> ...`\n  \
+                 or re-run `quorum init` later to add them."
+            );
+        } else {
+            match populate_rooms_from_remote(&discovered_policies, &mut rooms) {
+                Ok(true) => {}
+                Ok(false) => {
+                    eprintln!("Cancelled.");
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
     }
 
     if define_local_policies {
@@ -610,7 +638,6 @@ pub async fn run(output_path: &Path) -> ExitCode {
 
     let orch_names: Vec<String> = orchestrators.keys().cloned().collect();
     let policy_names: Vec<String> = policies.keys().cloned().collect();
-    let mut rooms: HashMap<String, RoomConfig> = HashMap::new();
 
     if !policies.is_empty() {
         eprintln!("\n─── Rooms ─────────────────────────────────────────────────");
@@ -901,10 +928,114 @@ pub fn resolve_orchestrator_url(orchestrators: &HashMap<String, OrchestratorConf
     "http://localhost:8080".to_string()
 }
 
+/// Render a discovered remote policy as a single MultiSelect option
+/// label. Prefix with the orchestrator name only when more than one
+/// orchestrator is in play — keeps the common single-orch case
+/// uncluttered while still disambiguating multi-orch setups.
+fn format_remote_policy_option(orch: &str, multi_orch: bool, policy: &DiscoveredPolicy) -> String {
+    let tag_hint = if policy.tags.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", policy.tags.join(", "))
+    };
+    if multi_orch {
+        format!(
+            "{orch}/{id} — {name}{tag_hint}",
+            id = policy.policy_id,
+            name = policy.name
+        )
+    } else {
+        format!(
+            "{id} — {name}{tag_hint}",
+            id = policy.policy_id,
+            name = policy.name
+        )
+    }
+}
+
+/// Pick a room-name slug that does not collide with anything already
+/// in `rooms`. Tries `policy_id` first; on collision falls back to
+/// `<orch>__<policy_id>`; on further collision appends a counter.
+fn unique_room_name(rooms: &HashMap<String, RoomConfig>, orch: &str, policy_id: &str) -> String {
+    if !rooms.contains_key(policy_id) {
+        return policy_id.to_string();
+    }
+    let qualified = format!("{orch}__{policy_id}");
+    if !rooms.contains_key(&qualified) {
+        return qualified;
+    }
+    let mut n = 2usize;
+    loop {
+        let candidate = format!("{qualified}_{n}");
+        if !rooms.contains_key(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Prompt the operator to pick from the (already tenancy-filtered)
+/// remote policies surfaced by orchestrator discovery, and turn each
+/// pick into a local `RoomConfig` that references the remote policy
+/// id + orchestrator name.
+///
+/// Returns `Ok(true)` on normal completion (including empty
+/// selection — operator deliberately picked nothing), `Ok(false)`
+/// when the prompt was cancelled (Esc / ^C), and `Err(_)` on prompt
+/// failure.
+fn populate_rooms_from_remote(
+    discovered: &HashMap<String, Vec<DiscoveredPolicy>>,
+    rooms: &mut HashMap<String, RoomConfig>,
+) -> Result<bool, String> {
+    let multi_orch = discovered.len() > 1;
+    let mut entries: Vec<(String, DiscoveredPolicy, String)> = Vec::new();
+    let mut orch_keys: Vec<&String> = discovered.keys().collect();
+    orch_keys.sort();
+    for orch in orch_keys {
+        for policy in &discovered[orch] {
+            let label = format_remote_policy_option(orch, multi_orch, policy);
+            entries.push((orch.clone(), policy.clone(), label));
+        }
+    }
+
+    let labels: Vec<String> = entries.iter().map(|(_, _, l)| l.clone()).collect();
+
+    eprintln!("\n─── Remote Policies ───────────────────────────────────────");
+    eprintln!("  Pick which orchestrator-side policies become local rooms. Empty = none.\n");
+
+    let picked = match ask(
+        MultiSelect::new("Remote policies to wire as rooms:", labels.clone())
+            .with_help_message(
+                "Space toggles, Enter confirms. Empty selection skips room creation.",
+            )
+            .prompt(),
+    )
+    .map_err(|e| e.to_string())?
+    {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+
+    for label in picked {
+        let Some((orch, policy, _)) = entries.iter().find(|(_, _, l)| l == &label) else {
+            continue;
+        };
+        let room_name = unique_room_name(rooms, orch, &policy.policy_id);
+        rooms.insert(
+            room_name,
+            RoomConfig {
+                policy: policy.policy_id.clone(),
+                orchestrator: Some(orch.clone()),
+            },
+        );
+    }
+    Ok(true)
+}
+
 // ── Sub-wizards ─────────────────────────────────────────────────────────────
 
-async fn wizard_remote_orchestrator() -> Result<Option<(OrchestratorConfig, Vec<AgentInfo>)>, String>
-{
+async fn wizard_remote_orchestrator()
+-> Result<Option<(OrchestratorConfig, Vec<AgentInfo>, Vec<DiscoveredPolicy>)>, String> {
     let address = match ask(Text::new("Orchestrator URL:")
         .with_default("https://api.peeramid.xyz")
         .prompt())
@@ -1001,9 +1132,13 @@ async fn wizard_remote_orchestrator() -> Result<Option<(OrchestratorConfig, Vec<
         config_file: None,
     };
 
-    // Probe the orchestrator for agents (best-effort)
+    // Probe the orchestrator for agents + policies (best-effort).
+    // Both lists are scoped server-side by the caller's tenancy
+    // (per PR #445 filter_*_by_tenancy), so what we get back is
+    // already what this operator is allowed to dispatch into.
     let resolved_token = resolve_env_token("token", &token_raw);
     let mut agents = Vec::new();
+    let mut policies = Vec::new();
 
     if !resolved_token.trim().is_empty() {
         eprintln!("Probing {address} ...");
@@ -1020,6 +1155,13 @@ async fn wizard_remote_orchestrator() -> Result<Option<(OrchestratorConfig, Vec<
                     }
                     Err(e) => eprintln!("  ✗ Agent discovery failed: {e}"),
                 }
+                match client.discover_policies().await {
+                    Ok(p) => {
+                        eprintln!("  ✓ {} policy(s) discovered", p.len());
+                        policies = p;
+                    }
+                    Err(e) => eprintln!("  ✗ Policy discovery failed: {e}"),
+                }
             }
             Err(e) => eprintln!("  ✗ Could not create client: {e}"),
         }
@@ -1027,7 +1169,7 @@ async fn wizard_remote_orchestrator() -> Result<Option<(OrchestratorConfig, Vec<
         eprintln!("  ⚠ Token not resolved — skipping probe (set env var and re-run)");
     }
 
-    Ok(Some((orch, agents)))
+    Ok(Some((orch, agents, policies)))
 }
 
 fn wizard_embedded_orchestrator() -> Result<Option<OrchestratorConfig>, String> {

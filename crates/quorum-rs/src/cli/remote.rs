@@ -10,6 +10,17 @@ use serde::Serialize;
 use crate::cli::request::DeliberationRequest;
 use crate::cli::workspace::PolicyConfig;
 
+/// Minimal projection of a remote policy entry returned by
+/// `GET /policies` — just what discovery needs (id + display name +
+/// tags). Avoids pulling the full TUI-only `PolicyInfo` shape.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscoveredPolicy {
+    pub policy_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
 // ── Response structs for status / trace commands ──────────────────────
 
 /// Health-check response from `GET /health`.
@@ -551,6 +562,37 @@ impl RemoteOrchestrator {
     /// Get the base URL of this orchestrator.
     pub fn address(&self) -> &str {
         &self.base_url
+    }
+
+    /// Discover the policies the authenticated caller can dispatch
+    /// into. Returns a minimal projection (id + name + tags) — the
+    /// full PolicyInfo lives behind `feature = "tui"` and pulls in
+    /// shapes the wizard / non-TUI code doesn't need.
+    ///
+    /// Server-side filtering: `/policies` already calls
+    /// `filter_policies_by_tenancy`, so the response only includes
+    /// policies whose tags glob-match the caller's grants (admins
+    /// see everything).
+    pub async fn discover_policies(&self) -> Result<Vec<DiscoveredPolicy>, RemoteError> {
+        let url = format!("{}/policies", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RemoteError::ApiError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        resp.json()
+            .await
+            .map_err(|e| RemoteError::ParseError(format!("policies: {e}")))
     }
 
     /// List policies — `GET /policies` with optional tag filter.

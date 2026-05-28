@@ -1,5 +1,5 @@
 use super::*;
-use crate::cli::remote::AgentInfo;
+use crate::cli::remote::{AgentInfo, DiscoveredPolicy};
 use crate::cli::workspace::ContextRef;
 
 // ── Helper to build a simple config via the new API ─────────────────────────
@@ -1242,4 +1242,81 @@ fn persist_agent_creds_rotates_existing_seed_to_backup() {
         .unwrap_or_else(|| panic!("no seed backup found in {entries:?}"));
     let backup_body = std::fs::read_to_string(nsed_dir.join(backup)).unwrap();
     assert_eq!(backup_body, "pre-existing-seed");
+}
+
+// ── Remote-policy → local-room helpers ──────────────────────────────────────
+
+fn discovered(id: &str, name: &str, tags: &[&str]) -> DiscoveredPolicy {
+    DiscoveredPolicy {
+        policy_id: id.to_string(),
+        name: name.to_string(),
+        tags: tags.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+#[test]
+fn format_remote_policy_option_single_orch_drops_orch_prefix() {
+    let p = discovered("pol.alpha", "Alpha", &["pl:acme"]);
+    let label = super::format_remote_policy_option("remote", false, &p);
+    assert!(
+        label.starts_with("pol.alpha — Alpha"),
+        "expected id+name first, got: {label}"
+    );
+    assert!(label.contains("[pl:acme]"), "tag hint missing: {label}");
+    assert!(
+        !label.contains("remote/"),
+        "single-orch label must not be qualified, got: {label}"
+    );
+}
+
+#[test]
+fn format_remote_policy_option_multi_orch_qualifies_with_orch_name() {
+    let p = discovered("pol.alpha", "Alpha", &[]);
+    let label = super::format_remote_policy_option("east", true, &p);
+    assert!(
+        label.starts_with("east/pol.alpha — Alpha"),
+        "expected `east/<id> — <name>` prefix, got: {label}"
+    );
+    // No tag hint when tags empty.
+    assert!(
+        !label.contains('['),
+        "empty-tag label should have no [], got: {label}"
+    );
+}
+
+#[test]
+fn unique_room_name_uses_policy_id_when_free() {
+    let rooms: HashMap<String, RoomConfig> = HashMap::new();
+    let name = super::unique_room_name(&rooms, "remote", "alpha");
+    assert_eq!(name, "alpha");
+}
+
+#[test]
+fn unique_room_name_falls_back_to_qualified_on_clash() {
+    let mut rooms: HashMap<String, RoomConfig> = HashMap::new();
+    rooms.insert(
+        "alpha".to_string(),
+        RoomConfig {
+            policy: "old".into(),
+            orchestrator: None,
+        },
+    );
+    let name = super::unique_room_name(&rooms, "east", "alpha");
+    assert_eq!(name, "east__alpha");
+}
+
+#[test]
+fn unique_room_name_appends_counter_on_double_clash() {
+    let mut rooms: HashMap<String, RoomConfig> = HashMap::new();
+    for n in ["alpha", "east__alpha"] {
+        rooms.insert(
+            n.to_string(),
+            RoomConfig {
+                policy: "x".into(),
+                orchestrator: None,
+            },
+        );
+    }
+    let name = super::unique_room_name(&rooms, "east", "alpha");
+    assert_eq!(name, "east__alpha_2");
 }
