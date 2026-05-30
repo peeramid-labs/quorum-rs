@@ -10,22 +10,16 @@ use std::process::ExitCode;
 
 use crate::cli::workspace::WorkspaceConfig;
 
-/// Load the workspace yaml at `path`, validate it against the
-/// [`WorkspaceConfig`] schema, and print a one-line summary.
+/// Streams + exit-code contract for the module-level command.
 ///
-/// Behaviour:
-///
-/// - On success: prints a single line to stdout naming the policy /
-///   orchestrator / room counts and the resolved `default_room`
-///   (`"(none)"` when the field is absent), and returns
+/// - Success: writes the one-line summary to **stdout** (counts +
+///   resolved `default_room`, `"(none)"` when absent) and returns
 ///   [`ExitCode::SUCCESS`].
-/// - On any failure (path missing, file unreadable, yaml syntax
-///   error, schema validation error): prints the error to stderr
-///   and returns [`ExitCode::FAILURE`].
-///
-/// The function performs no network calls, no LLM invocations, and
-/// no filesystem mutation — safe to wire into pre-commit hooks or
-/// CI pipelines.
+/// - Failure (path missing, file unreadable, yaml syntax error,
+///   schema validation error): writes the error message to
+///   **stderr** and returns [`ExitCode::FAILURE`]. No further
+///   diagnostics are emitted — the error string from the
+///   [`WorkspaceConfig::load`] chain is the whole report.
 pub fn run(path: &Path) -> ExitCode {
     let config = match WorkspaceConfig::load(path) {
         Ok(c) => c,

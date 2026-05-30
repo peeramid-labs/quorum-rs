@@ -1,3 +1,16 @@
+//! `quorum` binary entry point.
+//!
+//! Thin dispatch shim — clap parses the `Cli` struct below, the
+//! `match cli.command` arm forwards to the corresponding
+//! `quorum_rs::cli::commands::<subcommand>::run` function, and the
+//! returned [`ExitCode`] becomes the process exit status. Every
+//! subcommand owns its own argument plumbing, error printing, and
+//! signal handling inside the SDK so library consumers can drive
+//! the same flow from their own binary without depending on this
+//! main.
+//!
+//! See [`quorum_rs::cli::commands`] for the subcommand map.
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
