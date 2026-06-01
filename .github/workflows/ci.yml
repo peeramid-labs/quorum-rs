@@ -4,7 +4,9 @@ on:
   push:
     branches: [dev]
   pull_request:
-    branches: [dev]
+    # `feat/**` lets stacked PRs (e.g. PR-B targets `feat/foo`,
+    # PR-A targets `dev`) trigger CI on both legs of the stack.
+    branches: [dev, 'feat/**']
     types: [opened, synchronize, labeled]
   workflow_dispatch:
 
