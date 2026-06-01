@@ -30,7 +30,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use utoipa::ToSchema;
 
 /// Combined application state for the multi-agent status server.
@@ -77,6 +77,17 @@ pub(super) struct GlobalConfigUpdate {
 
 /// Unified HTTP server serving all agents on a single port.
 pub struct MultiAgentStatusServer;
+
+/// Resolve the dashboard bind address from an env-var-shaped string.
+///
+/// `Some("0.0.0.0")` → `0.0.0.0` (LAN-visible). `Some("malformed")`
+/// silently falls back to loopback so a typo doesn't take the
+/// dashboard offline — operators see the loopback bind in the
+/// `info!` log and can correct. `None` → loopback.
+fn resolve_dashboard_bind(raw: Option<&str>) -> std::net::IpAddr {
+    raw.and_then(|s| s.parse().ok())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+}
 
 impl MultiAgentStatusServer {
     /// Start the multi-agent status server on the given port.
@@ -170,7 +181,31 @@ impl MultiAgentStatusServer {
 
         let app = build_router(state);
 
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        // Bind address resolution: `QUORUM_DASHBOARD_BIND` env var
+        // (any address `IpAddr::from_str` accepts — `0.0.0.0` for
+        // LAN-visible, `::` for dual-stack, specific iface IP for
+        // pinned binding) falls back to `127.0.0.1` for the
+        // historical loopback-only behaviour. CLI surface in
+        // `quorum serve --dashboard-bind` sets the env var before
+        // dispatching into the runner.
+        let ip = resolve_dashboard_bind(std::env::var("QUORUM_DASHBOARD_BIND").ok().as_deref());
+        let addr = SocketAddr::from((ip, port));
+        // Dashboard ships with NO authentication. Loopback binds
+        // (the default) are an implicit access control — anything
+        // wider exposes status, chat-capture, buffer inspection,
+        // and live config tuning to anyone on the network segment.
+        // Operators opt into this via `--dashboard-bind` or
+        // `QUORUM_DASHBOARD_BIND`; the warn line makes the
+        // decision visible in the boot log so it can't be missed.
+        if !ip.is_loopback() {
+            warn!(
+                bind = %ip,
+                "dashboard bound to non-loopback address — control plane is reachable \
+                 from the network with no built-in authentication. Restrict access via \
+                 the host firewall, an external reverse proxy with auth, or revert to \
+                 the loopback default."
+            );
+        }
         info!(
             "Multi-agent dashboard → http://{}/  ({} agents)  Swagger UI → http://{}/swagger-ui/",
             addr, agent_count, addr

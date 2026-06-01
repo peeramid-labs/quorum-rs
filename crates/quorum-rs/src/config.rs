@@ -205,6 +205,14 @@ pub struct AgentFleetConfig {
     /// described in `docs/agent-telemetry.md`.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    /// Optional unified-dashboard port. When set, `quorum serve`
+    /// (with the `status-server` feature compiled in) starts a
+    /// LAN-visible HTTP control plane on this port exposing
+    /// per-agent status, chat capture, buffer inspection, and live
+    /// config tuning. A CLI `--dashboard-port` flag overrides this
+    /// value at runtime; absent both, no dashboard is started.
+    #[serde(default)]
+    pub dashboard_port: Option<u16>,
 }
 
 /// Load and merge config files from a config path (file or directory).
@@ -982,6 +990,7 @@ agents:
             orchestrators: vec![],
             response_sla_secs: None,
             telemetry: Default::default(),
+            dashboard_port: None,
         };
 
         let (agent, provider) = load_agent_from_config(&config, "alpha").unwrap();
@@ -1002,6 +1011,7 @@ agents:
             orchestrators: vec![],
             response_sla_secs: None,
             telemetry: Default::default(),
+            dashboard_port: None,
         };
 
         let err = load_agent_from_config(&config, "MISSING").unwrap_err();
@@ -1021,6 +1031,7 @@ agents:
             orchestrators: vec![],
             response_sla_secs: None,
             telemetry: Default::default(),
+            dashboard_port: None,
         };
 
         let err = load_agent_from_config(&config, "ALPHA").unwrap_err();
@@ -1052,6 +1063,7 @@ agents:
             orchestrators: vec![],
             response_sla_secs: None,
             telemetry: Default::default(),
+            dashboard_port: None,
         };
 
         let (_, provider) = load_agent_from_config(&config, "AGENT").unwrap();
@@ -1087,6 +1099,7 @@ agents:
             orchestrators: vec![],
             response_sla_secs: None,
             telemetry: Default::default(),
+            dashboard_port: None,
         };
 
         // Non-OpenAI provider should NOT get OPENAI_API_KEY fallback
@@ -1116,6 +1129,7 @@ agents:
             orchestrators: vec![],
             response_sla_secs: None,
             telemetry: Default::default(),
+            dashboard_port: None,
         }
     }
 
@@ -1287,6 +1301,7 @@ agents:
             orchestrators: vec![],
             response_sla_secs: None,
             telemetry: Default::default(),
+            dashboard_port: None,
         };
 
         let err = load_agent_from_config(&config, "BAD").unwrap_err();
@@ -1424,6 +1439,7 @@ base_url: "http://localhost"
             orchestrators: vec![],
             response_sla_secs: None,
             telemetry: Default::default(),
+            dashboard_port: None,
         };
 
         let (agent, provider) = load_agent_from_config(&config, "Researcher").unwrap();
@@ -1478,6 +1494,7 @@ base_url: "http://localhost"
             orchestrators: vec![],
             response_sla_secs: None,
             telemetry: Default::default(),
+            dashboard_port: None,
         };
 
         let (a, _) = load_agent_from_config(&config, "FULL").unwrap();
@@ -1534,6 +1551,7 @@ base_url: "http://localhost"
             orchestrators: vec![],
             response_sla_secs: None,
             telemetry: Default::default(),
+            dashboard_port: None,
         };
 
         let (agent, _) = load_agent_from_config(&config, "OVERRIDER").unwrap();
@@ -1556,6 +1574,7 @@ base_url: "http://localhost"
             orchestrators: vec![],
             response_sla_secs: None,
             telemetry: Default::default(),
+            dashboard_port: None,
         };
 
         let err = load_agent_from_config(&config, "BAD").unwrap_err();
@@ -1577,6 +1596,7 @@ base_url: "http://localhost"
             orchestrators: vec![],
             response_sla_secs: None,
             telemetry: Default::default(),
+            dashboard_port: None,
         };
 
         let err = load_agent_from_config(&config, "BAD").unwrap_err();
@@ -1598,6 +1618,7 @@ base_url: "http://localhost"
             orchestrators: vec![],
             response_sla_secs: None,
             telemetry: Default::default(),
+            dashboard_port: None,
         };
 
         let err = load_agent_from_config(&config, "BAD").unwrap_err();
@@ -1635,6 +1656,7 @@ base_url: "http://localhost"
             orchestrators: vec![],
             response_sla_secs: None,
             telemetry: Default::default(),
+            dashboard_port: None,
         };
 
         let (agent, _) = load_agent_from_config(&config, "AGENT").unwrap();
@@ -1658,6 +1680,7 @@ base_url: "http://localhost"
             orchestrators: vec![],
             response_sla_secs: None,
             telemetry: Default::default(),
+            dashboard_port: None,
         };
 
         let (agent, _) = load_agent_from_config(&config, "OLD_STYLE").unwrap();
@@ -1695,6 +1718,7 @@ base_url: "http://localhost"
             orchestrators: vec![],
             response_sla_secs: None,
             telemetry: Default::default(),
+            dashboard_port: None,
         };
 
         let (agent, _) = load_agent_from_config(&config, "BOTH").unwrap();
@@ -1868,6 +1892,7 @@ providers:
             orchestrators: vec![],
             response_sla_secs: None,
             telemetry: Default::default(),
+            dashboard_port: None,
         };
 
         let (agent, _) = load_agent_from_config(&config, "AGENT").unwrap();

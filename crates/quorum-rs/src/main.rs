@@ -277,6 +277,24 @@ enum Commands {
         /// set to a non-default value.
         #[arg(long, value_name = "PREFIX")]
         api_prefix: Option<String>,
+
+        /// LAN-visible unified dashboard port. Starts an HTTP
+        /// control plane exposing per-agent status, chat capture,
+        /// buffer inspection, and live config tuning. Falls back to
+        /// `dashboard_port` in `agent.yml`. Requires the binary
+        /// built with the `status-server` feature; a warning is
+        /// logged when the flag is set but the feature is missing.
+        #[arg(long, value_name = "PORT")]
+        dashboard_port: Option<u16>,
+
+        /// Address the dashboard binds to. Defaults to `127.0.0.1`
+        /// (loopback only — invisible from LAN). Pass `0.0.0.0`
+        /// (or a specific interface IP) to make the dashboard
+        /// reachable from other hosts. Also configurable via the
+        /// `QUORUM_DASHBOARD_BIND` env var; the flag wins when
+        /// both are set.
+        #[arg(long, value_name = "ADDR")]
+        dashboard_bind: Option<String>,
     },
 
     /// Validate a workspace yaml against the `WorkspaceConfig` schema.
@@ -442,6 +460,8 @@ async fn main() -> ExitCode {
             ref agents,
             ref stream_name,
             ref api_prefix,
+            dashboard_port,
+            ref dashboard_bind,
         } => {
             let agents_filter: Option<&[String]> = if agents.is_empty() {
                 None
@@ -458,6 +478,8 @@ async fn main() -> ExitCode {
                 agents_filter,
                 stream_name.as_deref(),
                 api_prefix.as_deref(),
+                dashboard_port,
+                dashboard_bind.as_deref(),
             )
             .await
             {

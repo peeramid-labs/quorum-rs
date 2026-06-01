@@ -17,7 +17,7 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [features]
-default = ["audit", "cli", "tui"]
+default = ["audit", "cli", "tui", "status-server"]
 audit = ["dep:quorum-crypto-core", "dep:hex"]
 status-server = ["dep:open", "dep:utoipa-swagger-ui"]
 # CLI runtime — pulls in clap/inquire/dotenvy so library-only users

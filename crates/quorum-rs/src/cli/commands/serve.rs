@@ -175,8 +175,26 @@ pub async fn run(
     agent_filter: Option<&[String]>,
     stream_name: Option<&str>,
     api_prefix: Option<&str>,
+    dashboard_port: Option<u16>,
+    dashboard_bind: Option<&str>,
 ) -> Result<()> {
     crate::serve::install_default_tracing();
+
+    // `--dashboard-bind` flag wins over `QUORUM_DASHBOARD_BIND` env
+    // var. Setting the env var here keeps the bind resolution
+    // localized to `MultiAgentStatusServer::run_control_plane` —
+    // library consumers driving the runner from their own binary
+    // can set the env var directly without depending on this CLI
+    // surface.
+    if let Some(bind) = dashboard_bind {
+        // SAFETY: env var mutation must happen before the runner
+        // spawns the status server. Reached from a single-thread
+        // entry point before tokio multi-threading kicks in for
+        // worker tasks.
+        unsafe {
+            std::env::set_var("QUORUM_DASHBOARD_BIND", bind);
+        }
+    }
 
     let config_path = resolve_config_path(config)?;
     let fleet = crate::config::load_config(&config_path)
@@ -198,6 +216,7 @@ pub async fn run(
             .map(|s| s.to_string())
             .unwrap_or_else(|| "sphera".to_string()),
         cancel: Some(cancel.clone()),
+        dashboard_port,
     };
 
     // Race the runner against a shutdown signal. On signal we

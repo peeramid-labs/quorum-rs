@@ -2656,3 +2656,38 @@ async fn list_agents_includes_all() {
     // test_state has ALPHA and BETA
     assert!(agents.len() >= 2);
 }
+
+#[test]
+fn resolve_dashboard_bind_falls_back_to_loopback_on_none() {
+    assert_eq!(
+        super::resolve_dashboard_bind(None),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    );
+}
+
+#[test]
+fn resolve_dashboard_bind_parses_lan_address() {
+    assert_eq!(
+        super::resolve_dashboard_bind(Some("0.0.0.0")),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    );
+}
+
+#[test]
+fn resolve_dashboard_bind_parses_specific_iface() {
+    assert_eq!(
+        super::resolve_dashboard_bind(Some("192.168.1.42")),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 42))
+    );
+}
+
+/// Malformed env-var input must NOT panic — silent fallback to
+/// loopback so a typo doesn't take the dashboard offline (operator
+/// will see the loopback bind in the info-log + correct from there).
+#[test]
+fn resolve_dashboard_bind_falls_back_on_garbage() {
+    assert_eq!(
+        super::resolve_dashboard_bind(Some("not-an-ip")),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    );
+}

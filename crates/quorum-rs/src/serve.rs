@@ -97,6 +97,12 @@ pub struct ServeOptions {
     /// runner only exits when workers exhaust their retry budget
     /// or complete naturally.
     pub cancel: Option<tokio_util::sync::CancellationToken>,
+    /// LAN-visible unified dashboard port. When `Some`, starts the
+    /// `MultiAgentRunner`'s dashboard control plane on this port —
+    /// requires the `status-server` feature compiled in. Overrides
+    /// `AgentFleetConfig::dashboard_port`; when both are `None`, no
+    /// dashboard is started.
+    pub dashboard_port: Option<u16>,
 }
 
 impl Default for ServeOptions {
@@ -108,6 +114,7 @@ impl Default for ServeOptions {
             stream_name: "sphera_jobs".to_string(),
             api_prefix: "sphera".to_string(),
             cancel: None,
+            dashboard_port: None,
         }
     }
 }
@@ -265,6 +272,15 @@ pub async fn build_worker(
 /// systemd, etc.). For a CLI binary, see
 /// `quorum_rs::cli::commands::serve::run` for the
 /// signal-handling wrapper.
+/// Resolve the dashboard port from the CLI flag and the fleet config.
+///
+/// CLI flag wins so operators can override what they get from the
+/// committed `agent.yml` (e.g. a CI run wanting to bind to a fixed
+/// port without re-rendering the yaml).
+fn resolve_dashboard_port(opt_port: Option<u16>, fleet_port: Option<u16>) -> Option<u16> {
+    opt_port.or(fleet_port)
+}
+
 pub async fn serve_fleet(fleet: &AgentFleetConfig, opts: ServeOptions) -> Result<()> {
     let filter = opts
         .agent_filter
@@ -285,6 +301,29 @@ pub async fn serve_fleet(fleet: &AgentFleetConfig, opts: ServeOptions) -> Result
     );
 
     let mut runner = MultiAgentRunner::new();
+
+    // Dashboard wiring: CLI flag (opts) wins over fleet config.
+    // The `enable_dashboard` call is a no-op without the
+    // `status-server` feature — the inner spawn is feature-gated
+    // inside MultiAgentRunner::run — but a warn-log here makes the
+    // no-op visible to operators who set a port and see no dashboard.
+    if let Some(port) = resolve_dashboard_port(opts.dashboard_port, fleet.dashboard_port) {
+        #[cfg(feature = "status-server")]
+        {
+            info!(dashboard_port = port, "enabling unified dashboard");
+            runner.enable_dashboard(port);
+        }
+        #[cfg(not(feature = "status-server"))]
+        {
+            tracing::warn!(
+                dashboard_port = port,
+                "dashboard_port set but `status-server` feature not compiled in — no dashboard will start. \
+                 Rebuild with `--features status-server` (or run a build that has it in `default`)."
+            );
+            let _ = port;
+        }
+    }
+
     for name in &names {
         match build_worker(
             fleet,
@@ -534,5 +573,36 @@ api_key: "sk-test"
         assert_eq!(p.base_url, "http://localhost:9999/v1");
         assert_eq!(p.api_key, "sk-test");
         assert!(p.models.is_empty());
+    }
+
+    #[test]
+    fn resolve_dashboard_port_cli_flag_wins() {
+        assert_eq!(
+            super::resolve_dashboard_port(Some(8081), Some(9090)),
+            Some(8081)
+        );
+    }
+
+    #[test]
+    fn resolve_dashboard_port_falls_back_to_fleet() {
+        assert_eq!(super::resolve_dashboard_port(None, Some(9090)), Some(9090));
+    }
+
+    #[test]
+    fn resolve_dashboard_port_returns_none_when_both_absent() {
+        assert_eq!(super::resolve_dashboard_port(None, None), None);
+    }
+
+    /// `dashboard_port` is a top-level optional yaml field — verifies
+    /// that an operator who hand-writes `dashboard_port: 8081` in
+    /// `agent.yml` actually gets that value out of `AgentFleetConfig`
+    /// (regression against the silent-ignore behaviour before this
+    /// field existed).
+    #[test]
+    fn fleet_yaml_carries_dashboard_port() {
+        let yaml = "providers: {}\nagents: []\ndashboard_port: 8081\n";
+        let cfg: AgentFleetConfig =
+            serde_yaml::from_str(yaml).expect("fleet yaml must parse with dashboard_port");
+        assert_eq!(cfg.dashboard_port, Some(8081));
     }
 }
