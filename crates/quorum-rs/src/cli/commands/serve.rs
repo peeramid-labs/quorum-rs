@@ -1,18 +1,34 @@
 //! `quorum serve` — load a fleet config and run agents.
 //!
 //! Thin CLI wrapper around [`quorum_rs::serve::serve_fleet`].
-//! Resolves the NATS URL + creds from a combination of flags and
-//! sensible defaults (`~/.nsed/agent.creds` from `quorum redeem`),
-//! installs a default tracing subscriber, traps SIGTERM / SIGINT so
-//! the runner shuts down gracefully, and surfaces the SDK error
-//! verbatim on failure.
+//! Installs a default tracing subscriber, traps SIGTERM / SIGINT
+//! and propagates a `CancellationToken` into every worker before
+//! the runner future drops, and resolves the NATS URL from the
+//! orchestrator at startup (or accepts an explicit `--nats-url`
+//! override for offline / dev setups).
 //!
 //! The actual fleet dispatch (which agent type, what tools, how to
 //! talk to the orchestrator's NATS bus) lives in the SDK so library
 //! consumers can drive the same flow from their own binary —
 //! useful for embedding agents in a larger service or wrapping the
 //! runner with custom telemetry / dashboards.
+//!
+//! ## NATS URL resolution
+//!
+//! 1. `--nats-url <URL>` — explicit operator override.
+//! 2. Workspace config (`nsed.yaml`) → resolve the room → look up the
+//!    orchestrator entry → `mode: embedded` reads `nats_url`
+//!    directly; `mode: remote` calls `GET /api/runtime/nats`.
+//! 3. Hard error otherwise. **No localhost fallback. No silent
+//!    fallback through `agent.yml.telemetry.endpoints[]` (that field
+//!    is an observability sink, not a connection target).**
+//!
+//! The error path names the workspace path tried, the room resolved,
+//! and the orchestrator address — so an operator can fix the missing
+//! config without guessing.
 
+use crate::cli::remote::{RemoteError, RemoteOrchestrator};
+use crate::cli::workspace::{OrchestratorMode, WorkspaceConfig};
 use crate::nats_utils::NatsAuth;
 use crate::serve::{ServeOptions, serve_fleet};
 use anyhow::{Context, Result};
@@ -75,12 +91,85 @@ fn resolve_nats_auth(creds_arg: Option<&Path>) -> Option<NatsAuth> {
     None
 }
 
+async fn resolve_nats_url(
+    nats_url_flag: Option<&str>,
+    workspace_path: &Path,
+    room_flag: Option<&str>,
+) -> Result<String> {
+    if let Some(u) = nats_url_flag {
+        return Ok(u.to_string());
+    }
+
+    let workspace = WorkspaceConfig::load(workspace_path).with_context(|| {
+        format!(
+            "no --nats-url passed and workspace config not loadable at {}",
+            workspace_path.display()
+        )
+    })?;
+
+    let (room_name, room) = workspace
+        .resolve_room(room_flag)
+        .with_context(|| "could not resolve a room for NATS-URL lookup")?;
+
+    let orch_name = room.orchestrator.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "room `{room_name}` has no orchestrator wired — set `orchestrator: <name>` \
+             or pass --nats-url"
+        )
+    })?;
+
+    let orch = workspace.orchestrators.get(orch_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "room `{room_name}` references orchestrator `{orch_name}` which is not in \
+             workspace.orchestrators"
+        )
+    })?;
+
+    match orch.mode.as_ref() {
+        Some(OrchestratorMode::Embedded) => orch.nats_url.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "orchestrator `{orch_name}` is embedded but has no `nats_url` set — fix the \
+                 workspace config or pass --nats-url"
+            )
+        }),
+        Some(OrchestratorMode::Remote) | None => {
+            let address = orch.address.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "orchestrator `{orch_name}` is remote but has no `address` — fix the \
+                     workspace config or pass --nats-url"
+                )
+            })?;
+            let token_raw = orch.token.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "orchestrator `{orch_name}` is remote but has no `token` — fix the \
+                     workspace config or pass --nats-url"
+                )
+            })?;
+            let token = crate::config::resolve_env_token("token", token_raw);
+            let client = RemoteOrchestrator::new(address, &token).with_context(|| {
+                format!("building HTTP client for orchestrator `{orch_name}` at {address}")
+            })?;
+            client.runtime_nats().await.map_err(|e| match e {
+                RemoteError::ApiError { status, body } => anyhow::anyhow!(
+                    "orchestrator `{orch_name}` at {address} returned {status} on \
+                     /api/runtime/nats: {body}. Pass --nats-url to bypass."
+                ),
+                other => anyhow::anyhow!(
+                    "querying orchestrator `{orch_name}` at {address} for NATS URL: {other}"
+                ),
+            })
+        }
+    }
+}
+
 /// Entry point invoked by `Commands::Serve` in `main.rs`. Returns
 /// when the runner exits (any worker fails, or SIGTERM / SIGINT
 /// triggers the abort path).
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: Option<&Path>,
+    workspace_path: &Path,
+    room: Option<&str>,
     nats_url: Option<&str>,
     nats_creds: Option<&Path>,
     agent_filter: Option<&[String]>,
@@ -93,20 +182,13 @@ pub async fn run(
     let fleet = crate::config::load_config(&config_path)
         .with_context(|| format!("failed to load fleet config at {}", config_path.display()))?;
 
-    // The cancellation token threads through serve_fleet →
-    // MultiAgentRunner → each worker task. Without it, the
-    // `tokio::select!` shutdown path below would just drop the
-    // runner future — and tokio tasks spawned INSIDE that future
-    // (one per agent) would detach and keep running. With the
-    // token, the shutdown branch calls `.cancel()` and the
-    // runner aborts every worker before returning. CR flagged
-    // this as the major finding on PR #13.
+    let resolved_nats_url = resolve_nats_url(nats_url, workspace_path, room).await?;
+    tracing::info!(nats_url = %resolved_nats_url, "resolved NATS URL");
+
     let cancel = tokio_util::sync::CancellationToken::new();
 
     let opts = ServeOptions {
-        nats_url: nats_url
-            .map(|s| s.to_string())
-            .unwrap_or_else(default_nats_url),
+        nats_url: resolved_nats_url,
         nats_auth: resolve_nats_auth(nats_creds),
         agent_filter: agent_filter.map(|v| v.to_vec()),
         stream_name: stream_name
@@ -127,24 +209,10 @@ pub async fn run(
         _ = shutdown_signal() => {
             tracing::info!("shutdown signal received; cancelling workers");
             cancel.cancel();
-            // Give workers a brief window to drop their NATS
-            // connections cleanly. The select! will then drop the
-            // runner future; with the cancel token already fired,
-            // the runner's own cancel-aware loop has by then
-            // either completed or is mid-abort — both are safe.
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             Ok(())
         }
     }
-}
-
-/// Default NATS URL when neither `--nats-url` nor `$NATS_URL` are
-/// set. Picked to match the local dev orchestrator's bind address;
-/// production deployments must pass `--nats-url` explicitly
-/// because the orchestrator never advertises NATS over an unsealed
-/// channel.
-fn default_nats_url() -> String {
-    std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string())
 }
 
 /// Cross-platform shutdown signal future. SIGTERM + SIGINT on Unix;
@@ -184,8 +252,6 @@ mod tests {
     /// resolver bails with guidance about what paths it tried.
     #[test]
     fn resolve_config_path_bails_when_nothing_exists() {
-        // Run from a tempdir so default paths don't accidentally
-        // resolve to a file the test runner has lying around.
         let tmp = TempDir::new().unwrap();
         let cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
@@ -214,19 +280,12 @@ mod tests {
     /// Without explicit creds AND without `~/.nsed/agent.creds`,
     /// returns None — runner connects unauthenticated, which is
     /// fine for a local dev NATS without an account JWT.
-    ///
-    /// `#[serial(home)]` because the test mutates process-wide
-    /// `$HOME`; any other test touching HOME (or that ends up
-    /// reading it via XDG/dirs) must opt into the same group.
     #[test]
     #[serial_test::serial(home)]
     fn resolve_nats_auth_returns_none_when_no_creds_anywhere() {
-        // Steer the default path at a tempdir that has no creds.
         let tmp = TempDir::new().unwrap();
         let prev_home = std::env::var_os("HOME");
-        // SAFETY: serialised via `#[serial(home)]`; the prev/restore
-        // dance below guarantees the env var is back to its prior
-        // value once this test completes.
+        // SAFETY: serialised via `#[serial(home)]`.
         unsafe {
             std::env::set_var("HOME", tmp.path());
         }
@@ -238,5 +297,65 @@ mod tests {
             }
         }
         assert!(auth.is_none());
+    }
+
+    /// Offline / dev clusters can't reach the orchestrator at all —
+    /// the workspace path may be wrong, missing, or unparseable. The
+    /// `--nats-url` short-circuit must hold even then.
+    #[tokio::test]
+    async fn resolve_nats_url_explicit_flag_wins() {
+        let tmp = TempDir::new().unwrap();
+        let missing_ws = tmp.path().join("nsed.yaml");
+        let resolved = resolve_nats_url(Some("nats://explicit:4222"), &missing_ws, None)
+            .await
+            .expect("explicit URL must short-circuit workspace lookup");
+        assert_eq!(resolved, "nats://explicit:4222");
+    }
+
+    /// Workspace missing AND no `--nats-url` → structured error
+    /// naming the workspace path. No localhost fallback.
+    #[tokio::test]
+    async fn resolve_nats_url_fails_loud_when_workspace_missing() {
+        let tmp = TempDir::new().unwrap();
+        let missing_ws = tmp.path().join("nsed.yaml");
+        let err = resolve_nats_url(None, &missing_ws, None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("nsed.yaml") && msg.contains("--nats-url"),
+            "error must name workspace + suggest --nats-url; got: {msg}"
+        );
+        assert!(
+            !msg.contains("localhost"),
+            "error must NOT suggest localhost fallback; got: {msg}"
+        );
+    }
+
+    /// Embedded orchestrator with a `nats_url` set → use it directly.
+    /// Verifies the embedded short-circuit path: no HTTP call attempted,
+    /// the value flows from yaml straight into the runner.
+    #[tokio::test]
+    async fn resolve_nats_url_embedded_uses_inline_field() {
+        let tmp = TempDir::new().unwrap();
+        let ws_path = tmp.path().join("nsed.yaml");
+        std::fs::write(
+            &ws_path,
+            r#"
+orchestrators:
+  local:
+    mode: embedded
+    nats_url: "nats://embedded-host:4222"
+policies:
+  default:
+    agents: [a, b]
+rooms:
+  main:
+    policy: default
+    orchestrator: local
+default_room: main
+"#,
+        )
+        .unwrap();
+        let resolved = resolve_nats_url(None, &ws_path, None).await.unwrap();
+        assert_eq!(resolved, "nats://embedded-host:4222");
     }
 }

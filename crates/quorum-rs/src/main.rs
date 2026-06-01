@@ -215,24 +215,41 @@ enum Commands {
         max_attempts: u32,
     },
 
-    /// Run a fleet of agents from a YAML config. The SDK analog of
-    /// the proprietary `nsed serve` binary — boots one
+    /// Run a fleet of agents from a YAML config. Boots one
     /// `NatsNsedWorker` per agent, wires them into a
     /// `MultiAgentRunner`, and runs until SIGTERM.
     ///
     /// Operator pre-flight: `quorum redeem <invite>` to write
     /// `~/.nsed/agent.creds`, then point this command at your
-    /// `agent.yml` and the orchestrator's NATS URL.
+    /// `agent.yml`. The NATS URL is resolved from the orchestrator
+    /// at startup — no `agent.yml` field stashes it.
     Serve {
         /// Path to the fleet config (`agent.yml`). When omitted,
         /// searches `./agent.yml` then `./config/default.yml`.
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
 
-        /// NATS server URL. Falls back to `$NATS_URL`, then
-        /// `nats://localhost:4222`. Production deployments should
-        /// always pass this explicitly — the orchestrator returns
-        /// the right URL in the `/redeem` response.
+        /// Workspace yaml (`nsed.yaml`). Defaults to top-level
+        /// `--config` (i.e. `./nsed.yaml`). Used to look up the
+        /// orchestrator address for NATS-URL discovery.
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+
+        /// Room to serve. Selects which orchestrator entry from
+        /// the workspace config is queried for the NATS URL. When
+        /// omitted, falls back to `default_room` then to "the only
+        /// room defined" — same resolution rules `quorum run` uses.
+        #[arg(long, value_name = "NAME")]
+        room: Option<String>,
+
+        /// NATS server URL. When set, skips the orchestrator query
+        /// entirely — the runner connects to this URL with the
+        /// configured creds. Intended as an explicit operator
+        /// override for offline / dev clusters where the runtime
+        /// discovery path can't reach the orchestrator. Production
+        /// operators should leave this unset; `quorum serve`
+        /// resolves the URL from the orchestrator via
+        /// `GET /api/runtime/nats`.
         #[arg(long, value_name = "URL")]
         nats_url: Option<String>,
 
@@ -418,6 +435,8 @@ async fn main() -> ExitCode {
 
         Commands::Serve {
             ref config,
+            ref workspace,
+            ref room,
             ref nats_url,
             ref nats_creds,
             ref agents,
@@ -429,8 +448,11 @@ async fn main() -> ExitCode {
             } else {
                 Some(agents.as_slice())
             };
+            let workspace_path = workspace.as_deref().unwrap_or(cli.config_path());
             match commands::serve::run(
                 config.as_deref(),
+                workspace_path,
+                room.as_deref(),
                 nats_url.as_deref(),
                 nats_creds.as_deref(),
                 agents_filter,

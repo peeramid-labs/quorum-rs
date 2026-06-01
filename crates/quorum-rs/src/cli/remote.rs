@@ -324,6 +324,44 @@ impl RemoteOrchestrator {
         })
     }
 
+    /// Resolve the orchestrator's agent-facing NATS URL via
+    /// `GET /api/runtime/nats`.
+    ///
+    /// Returns the same value `CredentialManager` would hand out at
+    /// mint time on `/credentials/register` or `/redeem`. The SDK
+    /// uses this on `quorum serve` startup to learn the URL once
+    /// without re-running the registration round-trip.
+    ///
+    /// Bearer-authenticated. 503 on orchestrators where credential
+    /// issuance is disabled (operator must pass `--nats-url`).
+    pub async fn runtime_nats(&self) -> Result<String, RemoteError> {
+        #[derive(serde::Deserialize)]
+        struct RuntimeNats {
+            nats_url: String,
+        }
+        let url = format!("{}/api/runtime/nats", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RemoteError::ApiError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let parsed: RuntimeNats = resp
+            .json()
+            .await
+            .map_err(|e| RemoteError::ParseError(format!("runtime/nats: {e}")))?;
+        Ok(parsed.nats_url)
+    }
+
     /// Health check — `GET /health` (public, no auth).
     pub async fn health(&self) -> Result<HealthResponse, RemoteError> {
         let url = format!("{}/health", self.base_url);
