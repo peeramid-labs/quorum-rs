@@ -113,39 +113,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Pull NATS Image
-        run: docker pull nats:alpine
-
       - name: Start NATS (JetStream)
         run: |
-          # Start NATS with JetStream enabled (-js)
-          docker run -d --name nats-ci -p 4222:4222 -p 8222:8222 nats:alpine -js -m 8222
+          # Attach NATS to the same per-workflow network as this job container,
+          # so it is reachable by DNS alias "nats" without publishing host ports.
+          # Unique name avoids collisions across parallel runs/retries.
+          JOB_CT=$(hostname)
+          JOB_NET=$(docker inspect "$JOB_CT" \
+            --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}')
+          NAME="nats-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker run -d \
+            --name "$NAME" \
+            --network "$JOB_NET" \
+            --network-alias nats \
+            nats:alpine -js -m 8222
+          echo "NATS_NAME=$NAME" >> $GITHUB_ENV
 
-          # Verify container is actually running (catches immediate crashes)
-          sleep 2
-          if ! docker ps --filter "name=nats-ci" --filter "status=running" -q | grep -q .; then
-            echo "❌ NATS container failed to start. Logs:"
-            docker logs nats-ci
-            exit 1
-          fi
-
-          # Wait for NATS HTTP monitoring to be ready
+          # Wait for NATS HTTP monitoring to be ready (probe via DNS alias)
           echo "Waiting for NATS..."
           for i in $(seq 1 30); do
-            if curl -sf http://localhost:8222/varz > /dev/null 2>&1; then
+            if docker run --rm --network "$JOB_NET" curlimages/curl:latest \
+               -sf http://nats:8222/varz > /dev/null 2>&1; then
               echo "NATS is up."
               exit 0
             fi
-            # Check container is still running each iteration
-            if ! docker ps --filter "name=nats-ci" --filter "status=running" -q | grep -q .; then
+            if ! docker ps --filter "name=$NAME" --filter "status=running" -q | grep -q .; then
               echo "❌ NATS container died. Logs:"
-              docker logs nats-ci
+              docker logs "$NAME"
               exit 1
             fi
             sleep 1
           done
           echo "❌ NATS failed to respond within 30s. Logs:"
-          docker logs nats-ci
+          docker logs "$NAME"
           exit 1
 
       - name: Install Rust
@@ -168,10 +168,10 @@ jobs:
 
       - name: Set up Environment Variables
         run: |
-          # Point NATS to the local docker container
-          echo "NATS_URL=nats://localhost:4222" >> $GITHUB_ENV
+          # NATS reachable via DNS alias on per-workflow network
+          echo "NATS_URL=nats://nats:4222" >> $GITHUB_ENV
           echo "RUST_LOG=info" >> $GITHUB_ENV
-          echo "CARGO_BUILD_JOBS=4" >> $GITHUB_ENV
+          echo "CARGO_BUILD_JOBS=2" >> $GITHUB_ENV
 
       - name: Run Tests & Coverage
         run: |
@@ -242,6 +242,10 @@ jobs:
           git commit -q -m "ci: coverage ${PERCENT}% (${BRANCH}) [skip ci]"
           git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git push origin gh-pages --force
+
+      - name: Cleanup NATS
+        if: always()
+        run: docker rm -f "${NATS_NAME:-nats-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}}" || true
 
   # ── Conventional-commit PR title gate ──────────────────────────────
   typos:
