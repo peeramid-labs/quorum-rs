@@ -50,7 +50,7 @@
 //! ```
 
 use crate::agents::ProposerEvaluatorAgent;
-use crate::agents::config::AgentConfig;
+use crate::agents::config::{AgentConfig, BuiltinToolGrant};
 use crate::agents::exec_agent::ExecAgent;
 use crate::agents::mcp_agent::{ClaudeAgent, McpAgent};
 use crate::config::{AgentFleetConfig, load_agent_from_config, resolve_agent_names};
@@ -58,6 +58,7 @@ use crate::llms::OpenAICompatibleModel;
 use crate::multi_agent::MultiAgentRunner;
 use crate::nats_utils::NatsAuth;
 use crate::prompts::defaults::DefaultPromptSet;
+use crate::tools::{ScopedGrepTool, ScopedReadFileTool, Tool};
 use crate::workers::{NatsNsedWorker, WorkerConfig};
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -155,6 +156,68 @@ fn redact_userinfo(url: &str) -> String {
 /// Returns `Ok(None)` for provider types this build doesn't yet
 /// support (and logs a warning) — keeps the fleet from refusing to
 /// boot when ONE agent's config is unsupported.
+/// Instantiate the concrete [`Tool`] implementations declared in
+/// `agent_config.builtin_tools`.
+///
+/// Each grant variant maps to one in-process tool. `ReadFile` /
+/// `Grep` route to the scoped sandbox impls in `crate::tools`;
+/// `PdfQuery` is skipped with a structured warning because the
+/// `ScopedPdfQueryTool` impl lives in the BUSL `nsed-agent` crate
+/// and hasn't been ported yet — operators needing `pdf_query` stay
+/// on `nsed serve` until the port lands.
+///
+/// Returns `Err(reason)` when a grant cannot be honoured at all
+/// (e.g. `Grep` roots that fail canonicalization). Callers skip the
+/// whole agent in that case rather than booting it with a
+/// half-armed tool set; pinning a fleet on a misconfigured root is
+/// a per-agent issue, not a fleet-wide failure.
+fn instantiate_builtin_tools(agent_config: &AgentConfig) -> Result<Vec<Box<dyn Tool>>, String> {
+    let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+    for grant in &agent_config.builtin_tools {
+        match grant {
+            BuiltinToolGrant::ReadFile { roots, max_bytes } => {
+                // ScopedReadFileTool::new is infallible — unresolvable
+                // roots are dropped with a warn, the read path then
+                // denies every call with READ_FILE_OUT_OF_SANDBOX if
+                // all roots were dropped. Matches the BUSL
+                // nsed-cli/serve.rs:931-938 semantic.
+                let root_paths: Vec<std::path::PathBuf> =
+                    roots.iter().map(std::path::PathBuf::from).collect();
+                let tool = ScopedReadFileTool::new(agent_config.name.clone(), &root_paths)
+                    .with_max_bytes(*max_bytes as u64);
+                tools.push(Box::new(tool));
+            }
+            BuiltinToolGrant::Grep {
+                roots,
+                max_bytes,
+                max_results,
+                timeout_secs,
+            } => {
+                let tool = ScopedGrepTool::new(
+                    agent_config.name.clone(),
+                    roots,
+                    *max_bytes,
+                    *max_results,
+                    *timeout_secs,
+                )?;
+                tools.push(Box::new(tool));
+            }
+            other => {
+                // Most likely `PdfQuery` — log loudly and skip the
+                // whole agent. Booting an agent whose system prompt
+                // tells it to use `pdf_query` when the tool isn't
+                // wired guarantees confused LLM behaviour.
+                return Err(format!(
+                    "builtin tool variant `{other:?}` is not supported by `quorum serve` yet \
+                     (likely PdfQuery — impl lives in the BUSL nsed-agent crate, port pending). \
+                     Run `nsed serve` for this agent until the port lands."
+                ));
+            }
+        }
+    }
+    Ok(tools)
+}
+
 pub async fn build_worker(
     fleet: &AgentFleetConfig,
     agent_name: &str,
@@ -239,12 +302,30 @@ pub async fn build_worker(
             };
             let api_key = provider.api_key.clone();
             let llm = OpenAICompatibleModel::new(base_url, api_key, provider.engine.clone());
+            let builtin_tools = match instantiate_builtin_tools(&agent_config) {
+                Ok(tools) => tools,
+                Err(reason) => {
+                    warn!(
+                        agent = %agent_name_owned,
+                        reason = %reason,
+                        "skipping agent: failed to instantiate builtin_tools"
+                    );
+                    return Ok(None);
+                }
+            };
+            if !builtin_tools.is_empty() {
+                info!(
+                    agent = %agent_name_owned,
+                    count = builtin_tools.len(),
+                    "attached SDK-builtin tool grants"
+                );
+            }
             let agent = ProposerEvaluatorAgent::new(
                 agent_config.clone(),
                 Box::new(llm),
                 Box::new(DefaultPromptSet::new()),
                 vec![],
-                vec![],
+                builtin_tools,
             );
             NatsNsedWorker::new(agent, agent_config.clone(), worker_config, None).await?
         }
@@ -604,5 +685,89 @@ api_key: "sk-test"
         let cfg: AgentFleetConfig =
             serde_yaml::from_str(yaml).expect("fleet yaml must parse with dashboard_port");
         assert_eq!(cfg.dashboard_port, Some(8081));
+    }
+
+    fn agent_with_grants(name: &str, grants: Vec<BuiltinToolGrant>) -> AgentConfig {
+        AgentConfig {
+            name: name.to_string(),
+            builtin_tools: grants,
+            ..Default::default()
+        }
+    }
+
+    /// Read+Grep grants on a valid root → both tools instantiate.
+    /// Verifies the regression against the pre-fix `vec![], vec![]`
+    /// behaviour at serve.rs:246-247.
+    #[test]
+    fn instantiate_builtin_tools_wires_read_and_grep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().display().to_string();
+        let grants = vec![
+            BuiltinToolGrant::ReadFile {
+                roots: vec![root.clone()],
+                max_bytes: 1024,
+            },
+            BuiltinToolGrant::Grep {
+                roots: vec![root],
+                max_bytes: 1024,
+                max_results: 10,
+                timeout_secs: 5,
+            },
+        ];
+        let cfg = agent_with_grants("test-agent", grants);
+        let tools = super::instantiate_builtin_tools(&cfg).expect("both grants must instantiate");
+        assert_eq!(tools.len(), 2, "expected one tool per grant");
+    }
+
+    /// Empty `builtin_tools` returns empty vec (no tools to wire) —
+    /// not an error.
+    #[test]
+    fn instantiate_builtin_tools_empty_grants_returns_empty() {
+        let cfg = agent_with_grants("test-agent", vec![]);
+        let tools = super::instantiate_builtin_tools(&cfg).expect("empty grants must succeed");
+        assert!(tools.is_empty());
+    }
+
+    /// Unsupported variant (today: PdfQuery) → Err with a message
+    /// pointing operators at `nsed serve`. Caller of
+    /// `instantiate_builtin_tools` will skip the whole agent.
+    #[test]
+    fn instantiate_builtin_tools_pdf_query_returns_err() {
+        let grants = vec![BuiltinToolGrant::PdfQuery {
+            trees_root: "/tmp".into(),
+            script_path: "/tmp/x".into(),
+            python_bin: "python3".into(),
+            max_bytes: 1024,
+            max_results: 10,
+            timeout_secs: 5,
+        }];
+        let cfg = agent_with_grants("test-agent", grants);
+        let err = super::instantiate_builtin_tools(&cfg).unwrap_err();
+        assert!(
+            err.contains("PdfQuery") && err.contains("nsed serve"),
+            "error must name the variant + redirect to nsed serve; got: {err}"
+        );
+    }
+
+    /// Grep grant with an unresolvable root → Err. The whole agent
+    /// gets skipped at the caller — preferable to booting an agent
+    /// whose system prompt advertises grep_search but whose tool
+    /// rejects every call.
+    #[test]
+    fn instantiate_builtin_tools_grep_bad_root_returns_err() {
+        let grants = vec![BuiltinToolGrant::Grep {
+            roots: vec!["/path/that/does/not/exist/12345".into()],
+            max_bytes: 1024,
+            max_results: 10,
+            timeout_secs: 5,
+        }];
+        let cfg = agent_with_grants("test-agent", grants);
+        let err = super::instantiate_builtin_tools(&cfg).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("canonicalize")
+                || err.to_lowercase().contains("not found")
+                || err.contains("/path/that/does/not/exist"),
+            "error must mention the bad root; got: {err}"
+        );
     }
 }
