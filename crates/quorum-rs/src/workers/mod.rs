@@ -1671,11 +1671,20 @@ impl NatsNsedWorker {
                         "{}.{}.result.event.agent_error",
                         self.config.subject_prefix, session_id
                     );
+                    // `reason` is a short machine-readable classifier so
+                    // the orchestrator (and telemetry consumers) can group
+                    // bails as parse_error / timeout / tool_error / etc.
+                    // without re-parsing `error`. Treated identically to a
+                    // missing vote — the orchestrator advances the round on
+                    // this event the same way it would on a phase-timeout
+                    // for this agent.
+                    let reason = classify_abstention_reason(&err_str);
                     let error_payload = serde_json::json!({
                         "agent_id": self.agent_id,
                         "round": context.round_number,
                         "action": action,
                         "error": err_str,
+                        "reason": reason,
                         "status": "Failed"
                     });
                     if let Err(pub_err) = self
@@ -2314,6 +2323,30 @@ fn is_transient_error(err: &anyhow::Error) -> bool {
         "connection aborted",
     ];
     PATTERNS.iter().any(|p| msg.contains(p))
+}
+
+/// Categorise a task-execution error into a short machine-readable
+/// abstention reason. The reason flows into the
+/// [`Proposal::abstained`] / [`Evaluation::abstained`] sentinel
+/// payload the worker publishes on bail so the orchestrator (and
+/// telemetry consumers) can distinguish parse failures from iteration
+/// caps without parsing the full error string.
+fn classify_abstention_reason(err: &str) -> String {
+    let lower = err.to_lowercase();
+    if lower.contains("failed to parse structured output") || lower.contains("missing field") {
+        "parse_error".into()
+    } else if lower.contains("max_iterations")
+        || lower.contains("max iterations")
+        || lower.contains("iteration budget")
+    {
+        "iter_budget_exhausted".into()
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        "timeout".into()
+    } else if lower.contains("tool") && (lower.contains("error") || lower.contains("failed")) {
+        "tool_error".into()
+    } else {
+        "error".into()
+    }
 }
 
 #[cfg(test)]
@@ -6419,6 +6452,47 @@ mod tests {
         // Transport errors often appear as part of a longer message
         let err = anyhow::anyhow!("sending proposal failed: broken pipe (os error 32)");
         assert!(is_transient_error(&err));
+    }
+
+    #[test]
+    fn classify_parse_error() {
+        let r = classify_abstention_reason(
+            "Failed to parse structured output after 4 attempts. Last error: missing field `evaluations`",
+        );
+        assert_eq!(r, "parse_error");
+    }
+
+    #[test]
+    fn classify_iter_budget() {
+        assert_eq!(
+            classify_abstention_reason("agent loop exhausted iteration budget"),
+            "iter_budget_exhausted"
+        );
+        assert_eq!(
+            classify_abstention_reason("hit max_iterations cap"),
+            "iter_budget_exhausted"
+        );
+    }
+
+    #[test]
+    fn classify_timeout() {
+        assert_eq!(
+            classify_abstention_reason("upstream timed out after 60s"),
+            "timeout"
+        );
+    }
+
+    #[test]
+    fn classify_tool_error() {
+        assert_eq!(
+            classify_abstention_reason("tool 'user_grep_repo' failed: out of sandbox"),
+            "tool_error"
+        );
+    }
+
+    #[test]
+    fn classify_fallback() {
+        assert_eq!(classify_abstention_reason("kaboom"), "error");
     }
 }
 pub mod nsed_worker;
