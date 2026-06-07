@@ -4464,8 +4464,11 @@ mod tests {
     #[tokio::test]
     async fn chat_capable_json_response() {
         use crate::agents::ChatCapable;
+        // Drain stdin first to avoid the EPIPE race
+        // (`chat_capable_empty_response_errors` calls out the pattern).
         let (agent, _dir) = make_chat_test_agent(
             r#"#!/bin/sh
+cat > /dev/null
 cat <<'RESP'
 {"type":"result","subtype":"success","result":"Hello from Claude","cost_usd":0.001,"duration_ms":50}
 RESP
@@ -4554,8 +4557,14 @@ echo "Plain text response"
         // branch already rejects empty stdout; the JSON branch now
         // does the same.
         use crate::agents::ChatCapable;
+        // Drain stdin first (see `chat_capable_empty_response_errors`):
+        // without it the child exits before the parent finishes
+        // writing the prompt and the test sees EPIPE
+        // "failed to write chat prompt" instead of the expected
+        // "empty or unexpected JSON response" error.
         let (agent, _dir) = make_chat_test_agent(
             r#"#!/bin/sh
+cat > /dev/null
 cat <<'RESP'
 {"type":"result","subtype":"success","result":"","cost_usd":0.0,"duration_ms":1}
 RESP
@@ -4577,8 +4586,10 @@ RESP
         // the trim-then-check gate catches this as the same silent
         // Claude failure class as a literal "".
         use crate::agents::ChatCapable;
+        // Drain stdin first — same EPIPE race fix.
         let (agent, _dir) = make_chat_test_agent(
             r#"#!/bin/sh
+cat > /dev/null
 cat <<'RESP'
 {"type":"result","subtype":"success","result":"   \n\t  ","cost_usd":0.0,"duration_ms":1}
 RESP
@@ -4599,8 +4610,10 @@ RESP
         // with leading/trailing whitespace should round-trip trimmed,
         // not raw.
         use crate::agents::ChatCapable;
+        // Drain stdin first to avoid the EPIPE race.
         let (agent, _dir) = make_chat_test_agent(
             r#"#!/bin/sh
+cat > /dev/null
 cat <<'RESP'
 {"type":"result","subtype":"success","result":"  hello world  \n","cost_usd":0.0,"duration_ms":1}
 RESP
