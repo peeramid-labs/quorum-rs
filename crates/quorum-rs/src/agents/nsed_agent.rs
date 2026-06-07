@@ -2454,7 +2454,7 @@ async fn react_loop(
     let loop_start = std::time::Instant::now();
     let mut iteration_durations: Vec<std::time::Duration> = Vec::new();
 
-    for _ in 0..max_iterations {
+    for iteration_index in 0..max_iterations {
         let iter_start = std::time::Instant::now();
 
         // Regenerate system message (without scratchpad)
@@ -2491,18 +2491,32 @@ async fn react_loop(
         };
         let elapsed = loop_start.elapsed().as_secs_f64();
         let remaining_budget = context.phase_budget_remaining_secs - elapsed;
-        // Force finalization when a phase budget was configured AND:
-        // 1. Budget is now exhausted, OR
-        // 2. We have iteration history and remaining budget ≤ 3× average iteration time
-        let force_finalize = context.phase_budget_remaining_secs > 0.0
+        let remaining_iterations = max_iterations.saturating_sub(iteration_index);
+        let force_finalize_time = context.phase_budget_remaining_secs > 0.0
             && ((remaining_budget <= 0.0)
                 || (avg_iteration_secs > 0.0 && remaining_budget <= avg_iteration_secs * 3.0));
+        // Size of the "terminate or die" tail window — the last N
+        // iterations have non-terminal tools stripped so the model's
+        // only legal move is to call the terminal tool. N retries
+        // absorb transient malformed terminal calls (truncation, bad
+        // JSON). Override per-workload via NSED_FINALIZE_WINDOW;
+        // default 3 balances empirical LLM tool-call error rates
+        // (~5–20% per attempt) against wasted free-thinking budget.
+        let force_finalize_window: usize = std::env::var("NSED_FINALIZE_WINDOW")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        let force_finalize_iters =
+            max_iterations > force_finalize_window && remaining_iterations <= force_finalize_window;
+        let force_finalize = force_finalize_time || force_finalize_iters;
 
         let active_tool_schemas = if force_finalize {
             warn!(
                 agent = %agent_config.name,
+                trigger = if force_finalize_iters { "iter_budget_low" } else { "time_budget_low" },
                 avg_iter_secs = format!("{:.2}", avg_iteration_secs),
                 remaining_budget_secs = format!("{:.2}", remaining_budget),
+                remaining_iterations = remaining_iterations,
                 "⏱️ Budget low — stripping non-terminal tools to force finalization."
             );
             // Keep only the terminal tool
