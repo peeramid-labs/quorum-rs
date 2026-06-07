@@ -1667,10 +1667,6 @@ impl NatsNsedWorker {
                 }
 
                 if !suppress_error_event {
-                    let error_subject = format!(
-                        "{}.{}.result.event.agent_error",
-                        self.config.subject_prefix, session_id
-                    );
                     // `reason` is a short machine-readable classifier so
                     // the orchestrator (and telemetry consumers) can group
                     // bails as parse_error / timeout / tool_error / etc.
@@ -1687,12 +1683,48 @@ impl NatsNsedWorker {
                         "reason": reason,
                         "status": "Failed"
                     });
+                    let error_bytes = serde_json::to_vec(&error_payload)?;
+
+                    // TODO(removal): legacy session-wide event. Kept so
+                    // existing dashboard SSE + audit consumers keep
+                    // working through the migration. Remove once every
+                    // consumer (dashboard.html, audit, telemetry
+                    // forwarder) has switched to subscribing on the
+                    // round-scoped `.failed` subject published below. At
+                    // that point, drop this block and the corresponding
+                    // `.legacy_subject_format` test.
+                    let legacy_subject = format!(
+                        "{}.{}.result.event.agent_error",
+                        self.config.subject_prefix, session_id
+                    );
                     if let Err(pub_err) = self
                         .nats
-                        .publish(error_subject, serde_json::to_vec(&error_payload)?.into())
+                        .publish(legacy_subject, error_bytes.clone().into())
                         .await
                     {
-                        warn!("Failed to publish error event: {}", pub_err);
+                        warn!("Failed to publish legacy agent_error event: {}", pub_err);
+                    }
+
+                    // Round-scoped failure marker for the orchestrator's
+                    // per-phase consumer. Mirrors the verdict subject
+                    // hierarchy (`result.{round}.{agent}.{action}`) with a
+                    // `.failed` suffix so a single
+                    // `filter_subjects=[verdict, verdict.failed]` consumer
+                    // can wait on success-or-failure without payload-
+                    // snooping for round / action / session.
+                    if should_publish_failure_marker(action, is_payment_error) {
+                        let failed_subject = failed_result_subject(
+                            &self.config.subject_prefix,
+                            &session_id,
+                            context.round_number,
+                            &self.agent_id,
+                            action,
+                        );
+                        if let Err(pub_err) =
+                            self.nats.publish(failed_subject, error_bytes.into()).await
+                        {
+                            warn!("Failed to publish round-scoped .failed marker: {}", pub_err);
+                        }
                     }
                 }
 
@@ -2347,6 +2379,37 @@ fn classify_abstention_reason(err: &str) -> String {
     } else {
         "error".into()
     }
+}
+
+/// Build the round-scoped failure marker subject. Mirrors the verdict
+/// subject hierarchy (`{prefix}.{session}.result.{round}.{agent}.{action}`)
+/// with a `.failed` tail. Pure-format so the exact wire shape is
+/// pinned by unit test and the orchestrator can derive matching
+/// `filter_subjects` from the same constants.
+fn failed_result_subject(
+    prefix: &str,
+    session_id: &str,
+    round: u32,
+    agent_id: &str,
+    action: &str,
+) -> String {
+    format!("{prefix}.{session_id}.result.{round}.{agent_id}.{action}.failed")
+}
+
+/// Should the worker emit a `.failed` marker on bail for this action?
+///
+/// - `propose` / `evaluate`: yes — those phases have orchestrator-side
+///   collectors that need the round-scoped signal.
+/// - other actions (passthrough, heartbeat handlers, etc.): no — no
+///   round-scoped collector waits on them.
+/// - payment errors: no — orchestrator may retry once credits return;
+///   a `.failed` marker would mislead the collector into permanently
+///   counting the agent as a no-show for the round.
+fn should_publish_failure_marker(action: &str, is_payment_error: bool) -> bool {
+    if is_payment_error {
+        return false;
+    }
+    matches!(action, "propose" | "evaluate")
 }
 
 #[cfg(test)]
@@ -6493,6 +6556,59 @@ mod tests {
     #[test]
     fn classify_fallback() {
         assert_eq!(classify_abstention_reason("kaboom"), "error");
+    }
+
+    #[test]
+    fn failed_subject_format_pins_exact_wire_shape() {
+        let s = failed_result_subject("nsed", "sess-abc", 3, "ReviewerAlpha", "evaluate");
+        assert_eq!(s, "nsed.sess-abc.result.3.ReviewerAlpha.evaluate.failed");
+    }
+
+    #[test]
+    fn failed_subject_round_zero_renders() {
+        // Round 0 is uncommon in production but legal; the worker must
+        // not panic on it.
+        let s = failed_result_subject("nsed", "x", 0, "A", "propose");
+        assert_eq!(s, "nsed.x.result.0.A.propose.failed");
+    }
+
+    #[test]
+    fn failed_subject_custom_prefix_propagates() {
+        // SDK consumers can override `subject_prefix` for multi-tenant
+        // isolation. The failure-marker fn must respect that prefix
+        // instead of hard-coding "nsed".
+        let s = failed_result_subject("tenantX", "sess", 1, "A", "propose");
+        assert!(s.starts_with("tenantX."));
+        assert!(s.ends_with(".A.propose.failed"));
+    }
+
+    #[test]
+    fn failure_marker_emitted_for_propose() {
+        assert!(should_publish_failure_marker("propose", false));
+    }
+
+    #[test]
+    fn failure_marker_emitted_for_evaluate() {
+        assert!(should_publish_failure_marker("evaluate", false));
+    }
+
+    #[test]
+    fn failure_marker_skipped_for_other_actions() {
+        for action in ["passthrough", "heartbeat", "unknown", ""] {
+            assert!(
+                !should_publish_failure_marker(action, false),
+                "action {action:?} should not trigger a .failed marker"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_marker_skipped_for_payment_errors() {
+        // Payment errors get auto-retry once credits return; a
+        // permanent missing-vote signal would mislead the round
+        // collector into counting the agent as a no-show.
+        assert!(!should_publish_failure_marker("propose", true));
+        assert!(!should_publish_failure_marker("evaluate", true));
     }
 }
 pub mod nsed_worker;
