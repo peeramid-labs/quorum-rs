@@ -11,5 +11,6 @@ Goal-oriented recipes. Assume the reader is already competent — get them to th
 | [Inspect telemetry with the NATS CLI](inspect-telemetry-with-nats-cli.md) | You want to live-tail and filter events with `nats sub` + `jq`. |
 | [Opt out of telemetry](opt-out-telemetry.md) | You need every telemetry emission disabled at the agent boundary. |
 | [Expose the agent dashboard on the LAN](expose-agent-dashboard-on-lan.md) | You want the unified per-agent dashboard (status, chat capture, buffer inspection, live config) reachable from another host — and you understand it ships unauthenticated. |
+| [Compose a persona from shared files](compose-persona-from-shared-files.md) | Your fleet shares a 4–30 line persona block (review style, output format, safety rules) across many agents and you want a single-source-of-truth file rather than copies. |
 
 For the underlying *why*, jump to [explanation](../explanation/README.md). For schema and field-level definitions, jump to [reference](../reference/README.md).

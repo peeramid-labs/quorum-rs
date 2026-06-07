@@ -26,6 +26,81 @@ where
     map.end()
 }
 
+/// One layer of a stacked-persona definition. See
+/// [`deserialize_persona`] for the yaml-side semantic.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PersonaLayer {
+    Text {
+        prompt: String,
+    },
+    /// Markdown file — `prompt` is a filesystem path. The file is read
+    /// at parse time and its content stacked into the resolved persona.
+    /// Paths resolve relative to the process CWD when `quorum serve`
+    /// (or whatever loaded the fleet config) was invoked.
+    Md {
+        prompt: PathBuf,
+    },
+}
+
+/// What the yaml field may carry — either a plain string (back-compat)
+/// or an ordered array of layers. Internal: the public field type stays
+/// `Option<String>` because the layered form is resolved eagerly into
+/// a single joined string at parse time.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PersonaInput {
+    Inline(String),
+    Layered(Vec<PersonaLayer>),
+}
+
+/// Custom deserializer attached to [`AgentConfig::persona`].
+///
+/// Accepts:
+///
+/// 1. A plain string → returned as-is (`Some(string)`). This is the
+///    pre-existing shape; operators with old `agent.yml` files are
+///    unaffected.
+/// 2. An ordered array of `{type: text|md, prompt: ...}` layer specs.
+///    `text` layers contribute their `prompt` string verbatim; `md`
+///    layers read the file at `prompt` and contribute its content.
+///    Layers are joined with `\n\n` into a single persona string.
+/// 3. `null` / absent → `None`.
+///
+/// File-read failure on an `md` layer surfaces as a parse error
+/// (with the failing path named) — operators see the problem at
+/// fleet boot, not after the agent is already advertising a partial
+/// persona.
+fn deserialize_persona<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let opt: Option<PersonaInput> = Option::deserialize(deserializer)?;
+    match opt {
+        None => Ok(None),
+        Some(PersonaInput::Inline(s)) => Ok(Some(s)),
+        Some(PersonaInput::Layered(layers)) => {
+            let mut parts: Vec<String> = Vec::with_capacity(layers.len());
+            for layer in layers {
+                match layer {
+                    PersonaLayer::Text { prompt } => parts.push(prompt),
+                    PersonaLayer::Md { prompt } => {
+                        let content = std::fs::read_to_string(&prompt).map_err(|e| {
+                            D::Error::custom(format!(
+                                "persona md layer at `{}` could not be read: {e}",
+                                prompt.display()
+                            ))
+                        })?;
+                        parts.push(content);
+                    }
+                }
+            }
+            Ok(Some(parts.join("\n\n")))
+        }
+    }
+}
+
 /// Configuration for a specific agent.
 #[derive(Debug, Deserialize, Clone, Serialize, ToSchema)]
 pub struct AgentConfig {
@@ -48,7 +123,7 @@ pub struct AgentConfig {
     pub max_tokens: i32,
     #[serde(default)]
     pub system_prompt_override: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_persona")]
     pub persona: Option<String>,
     #[serde(default = "default_max_react_iterations")]
     pub max_react_iterations: Option<i32>,
@@ -1743,5 +1818,70 @@ mod tests {
             ..AgentConfig::default()
         };
         cfg.validate_compaction_knobs().unwrap();
+    }
+
+    // ── persona deserialization ─────────────────────────────────────
+
+    fn parse_agent_persona(yaml_fragment: &str) -> Option<String> {
+        let yaml = format!("name: test\n{yaml_fragment}");
+        let cfg: AgentConfig = serde_yaml::from_str(&yaml).expect("agent yaml must parse");
+        cfg.persona
+    }
+
+    /// Plain-string persona — back-compat path. Operators with old
+    /// `agent.yml` files must keep parsing as if this PR never landed.
+    #[test]
+    fn persona_inline_string_back_compat() {
+        let persona = parse_agent_persona("persona: \"you are a careful reviewer\"");
+        assert_eq!(persona.as_deref(), Some("you are a careful reviewer"));
+    }
+
+    #[test]
+    fn persona_absent_stays_none() {
+        let persona = parse_agent_persona("");
+        assert!(persona.is_none());
+    }
+
+    #[test]
+    fn persona_layered_text_joins_with_double_newline() {
+        let persona = parse_agent_persona(
+            "persona:\n\
+             - type: text\n  prompt: \"a\"\n\
+             - type: text\n  prompt: \"b\"\n",
+        );
+        assert_eq!(persona.as_deref(), Some("a\n\nb"));
+    }
+
+    /// Md layer reads the referenced file. Mixed with text layers in
+    /// order produces the expected stacked string.
+    #[test]
+    fn persona_layered_md_reads_file_and_stacks_with_text() {
+        let sandbox_dir = tempfile::tempdir().unwrap();
+        let md_path = sandbox_dir.path().join("body.md");
+        std::fs::write(&md_path, "from-md\n").unwrap();
+        let yaml = format!(
+            "persona:\n\
+             - type: text\n  prompt: \"lead\"\n\
+             - type: md\n  prompt: \"{}\"\n\
+             - type: text\n  prompt: \"tail\"\n",
+            md_path.display()
+        );
+        let persona = parse_agent_persona(&yaml);
+        assert_eq!(persona.as_deref(), Some("lead\n\nfrom-md\n\n\ntail"));
+    }
+
+    /// Missing md file → parse error naming the path. Operators see
+    /// the failure at fleet boot rather than at agent advertisement.
+    #[test]
+    fn persona_layered_md_missing_file_errors_with_path() {
+        let yaml = "name: test\n\
+                    persona:\n\
+                    - type: md\n  prompt: \"/path/does/not/exist/persona.md\"\n";
+        let err = serde_yaml::from_str::<AgentConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/path/does/not/exist/persona.md") && msg.contains("could not be read"),
+            "error must name the missing path; got: {msg}"
+        );
     }
 }
