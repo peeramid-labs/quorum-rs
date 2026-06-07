@@ -2495,17 +2495,8 @@ async fn react_loop(
         let force_finalize_time = context.phase_budget_remaining_secs > 0.0
             && ((remaining_budget <= 0.0)
                 || (avg_iteration_secs > 0.0 && remaining_budget <= avg_iteration_secs * 3.0));
-        // Size of the "terminate or die" tail window — the last N
-        // iterations have non-terminal tools stripped so the model's
-        // only legal move is to call the terminal tool. N retries
-        // absorb transient malformed terminal calls (truncation, bad
-        // JSON). Override per-workload via NSED_FINALIZE_WINDOW;
-        // default 3 balances empirical LLM tool-call error rates
-        // (~5–20% per attempt) against wasted free-thinking budget.
-        let force_finalize_window: usize = std::env::var("NSED_FINALIZE_WINDOW")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(3);
+        let force_finalize_window =
+            resolve_finalize_window(std::env::var("NSED_FINALIZE_WINDOW").ok().as_deref());
         let force_finalize_iters =
             max_iterations > force_finalize_window && remaining_iterations <= force_finalize_window;
         let force_finalize = force_finalize_time || force_finalize_iters;
@@ -3457,14 +3448,71 @@ async fn react_loop(
     })
 }
 
+/// Size of the "terminate or die" tail window — the last N iterations
+/// of `react_loop` have non-terminal tools stripped so the model's
+/// only legal move is to call the terminal tool. N retries absorb
+/// transient malformed terminal calls (truncation, bad JSON).
+/// Override per-workload via `NSED_FINALIZE_WINDOW`; default 3
+/// balances empirical LLM tool-call error rates (~5–20% per attempt)
+/// against wasted free-thinking budget.
+///
+/// Pure-input form (consumes `Option<&str>` instead of reading the env
+/// directly) so the resolution can be unit-tested without env-var
+/// race hazards.
+const DEFAULT_FINALIZE_WINDOW: usize = 3;
+
+fn resolve_finalize_window(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_FINALIZE_WINDOW)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        FailureDumpParams, StructuredBatchEvaluationResponse, StructuredProposalResponse,
-        apply_tool_output_cap, empty_terminal_tool_content, extract_evaluation_sections,
-        strip_scratchpad, strip_thinking_prefix, strip_working_memory, write_failure_dump,
+        DEFAULT_FINALIZE_WINDOW, FailureDumpParams, StructuredBatchEvaluationResponse,
+        StructuredProposalResponse, apply_tool_output_cap, empty_terminal_tool_content,
+        extract_evaluation_sections, resolve_finalize_window, strip_scratchpad,
+        strip_thinking_prefix, strip_working_memory, write_failure_dump,
     };
     use serial_test::serial;
+
+    #[test]
+    fn finalize_window_defaults_when_env_unset() {
+        assert_eq!(resolve_finalize_window(None), DEFAULT_FINALIZE_WINDOW);
+        assert_eq!(resolve_finalize_window(None), 3);
+    }
+
+    #[test]
+    fn finalize_window_parses_valid_value() {
+        assert_eq!(resolve_finalize_window(Some("5")), 5);
+        assert_eq!(resolve_finalize_window(Some("1")), 1);
+        assert_eq!(resolve_finalize_window(Some("10")), 10);
+    }
+
+    #[test]
+    fn finalize_window_falls_back_on_malformed_value() {
+        assert_eq!(
+            resolve_finalize_window(Some("abc")),
+            DEFAULT_FINALIZE_WINDOW
+        );
+        assert_eq!(resolve_finalize_window(Some("")), DEFAULT_FINALIZE_WINDOW);
+        assert_eq!(
+            resolve_finalize_window(Some("3.5")),
+            DEFAULT_FINALIZE_WINDOW
+        );
+        assert_eq!(resolve_finalize_window(Some("-1")), DEFAULT_FINALIZE_WINDOW);
+    }
+
+    #[test]
+    fn finalize_window_rejects_zero() {
+        // Zero would disable the tail-window guard entirely (the
+        // `max_iterations > N && remaining_iterations <= N` check
+        // collapses to "never trigger"); treat as malformed and fall
+        // back so a stray `=0` env doesn't silently turn the safety
+        // net off.
+        assert_eq!(resolve_finalize_window(Some("0")), DEFAULT_FINALIZE_WINDOW);
+    }
 
     use super::{
         ChatCompletionRequestAssistantMessage, ChatCompletionRequestMessage,
