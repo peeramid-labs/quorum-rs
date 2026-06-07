@@ -43,6 +43,37 @@ pub enum LlmError {
 }
 
 impl LlmError {
+    /// Render the full error chain (this error + every wrapped
+    /// `source`) as a multi-line string, root cause last:
+    ///
+    /// ```text
+    /// transport
+    ///   caused by: hyper error
+    ///   caused by: connection reset by peer (os error 104)
+    /// ```
+    ///
+    /// `LlmError` only wraps a source on `Transport`, `Parse`, and
+    /// `Other`; the structured variants (`RateLimit`,
+    /// `PaymentRequired`, `ServerError`, `ContextOverflow`) render
+    /// as a single line because they carry their detail inline in
+    /// the `thiserror` format string.
+    ///
+    /// Operators see the chain in logs (`tracing::error!(error.chain
+    /// = %err.display_chain(), ...)`) and dashboards (the JSON
+    /// shape exposes one string field) without losing the root
+    /// cause to a flattened one-liner.
+    pub fn display_chain(&self) -> String {
+        use std::error::Error as _;
+        let mut out = self.to_string();
+        let mut cursor: Option<&dyn std::error::Error> = self.source();
+        while let Some(layer) = cursor {
+            out.push_str("\n  caused by: ");
+            out.push_str(&layer.to_string());
+            cursor = layer.source();
+        }
+        out
+    }
+
     /// Map a typed error to the telemetry taxonomy.
     pub fn classify(&self) -> (LlmErrorClass, Option<u16>) {
         match self {
@@ -164,5 +195,71 @@ mod tests {
             downcast,
             Some(LlmError::ServerError { status: 502 })
         ));
+    }
+
+    /// Single-layer variant (no `#[source]` wrapper) renders as the
+    /// thiserror `Display` text alone.
+    #[test]
+    fn display_chain_single_layer_emits_one_line() {
+        let chain = LlmError::ServerError { status: 503 }.display_chain();
+        assert_eq!(chain, "server error (status 503)");
+        assert!(
+            !chain.contains("caused by"),
+            "single-layer variant must not include a `caused by` line: {chain}"
+        );
+    }
+
+    /// Wrapped variant walks one `source` level and renders the
+    /// inner error on a `caused by` line.
+    #[test]
+    fn display_chain_two_layers_renders_caused_by() {
+        let inner = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset by peer");
+        let err = LlmError::Transport(Box::new(inner));
+        let chain = err.display_chain();
+        assert_eq!(chain, "transport\n  caused by: reset by peer");
+    }
+
+    /// Each `caused by` layer gets its own line; the root cause
+    /// appears last. This locks the rendering convention that log
+    /// shippers + dashboards depend on for stable splitting.
+    #[test]
+    fn display_chain_three_layers_walks_full_source_tree() {
+        // Build a triple-nested chain by hand: inner io::Error,
+        // wrapped in a SerdeJsonError-shaped layer, wrapped in
+        // LlmError::Parse.
+        #[derive(Debug)]
+        struct MidLayer(Box<dyn std::error::Error + Send + Sync + 'static>);
+        impl std::fmt::Display for MidLayer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "mid layer")
+            }
+        }
+        impl std::error::Error for MidLayer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(self.0.as_ref())
+            }
+        }
+        let root = std::io::Error::other("bad json byte");
+        let mid = MidLayer(Box::new(root));
+        let err = LlmError::Parse(Box::new(mid));
+        let chain = err.display_chain();
+        assert_eq!(
+            chain,
+            "parse\n  caused by: mid layer\n  caused by: bad json byte"
+        );
+    }
+
+    /// Variants that carry detail in the format string (vs `#[source]`)
+    /// still render their detail inline — the chain helper doesn't
+    /// strip information for them.
+    #[test]
+    fn display_chain_preserves_inline_detail_on_structured_variants() {
+        let chain = LlmError::ContextOverflow {
+            tokens: 9000,
+            limit: 8192,
+        }
+        .display_chain();
+        assert!(chain.contains("9000"), "tokens missing: {chain}");
+        assert!(chain.contains("8192"), "limit missing: {chain}");
     }
 }
