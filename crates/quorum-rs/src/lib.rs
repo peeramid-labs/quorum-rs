@@ -20,6 +20,10 @@
 pub mod agent_manager;
 pub mod agents;
 pub mod api_error_middleware;
+/// Brand strings — banner ASCII, copy snippets used by `quorum
+/// init` and `quorum validate`. Kept in one module so a future
+/// rebrand changes one file, not 12 string-literal sites.
+pub mod brand;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod config;
@@ -27,6 +31,11 @@ pub mod control_plane;
 #[cfg(feature = "audit")]
 pub mod crypto;
 pub mod events;
+/// Workspace + agent-fleet config primitives that `quorum init`
+/// composes: provider catalog, persona presets, yaml renderer,
+/// env-file merger, generic wizard helpers. No CLI surface —
+/// the binary-facing wizard lives at `cli::commands::init_wizard`.
+pub mod init;
 pub mod llms;
 pub mod middleware;
 pub mod multi_agent;
