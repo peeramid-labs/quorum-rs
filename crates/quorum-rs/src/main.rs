@@ -102,10 +102,24 @@ enum Commands {
         verbose: bool,
     },
 
-    /// Bootstrap a workspace config file (nsed.yaml) pointing at a
-    /// remote orchestrator + room. Non-interactive: pass flags or
-    /// take defaults; no prompts.
+    /// Bootstrap a workspace config (nsed.yaml or agent.yml).
+    ///
+    /// Default mode is the interactive wizard — prompts for the
+    /// orchestrator, redeem flow, providers, presets, agents, and
+    /// rooms; writes a fully-wired workspace from operator answers.
+    ///
+    /// `--non-interactive` (or any of `--agent-fleet` /
+    /// `--orchestrator-url` / `--room` / `--token-env` /
+    /// `--agents`, all of which imply non-interactive) drops to the
+    /// one-shot template renderer for the cases where prompting
+    /// isn't possible (scripts, Docker entrypoints, CI).
     Init {
+        /// Skip the interactive wizard and run the one-shot
+        /// template renderer. Implied when stdin is not a TTY or
+        /// when any one-shot-only flag is set.
+        #[arg(long)]
+        non_interactive: bool,
+
         /// Write an `agent.yml` fleet config (consumed by `quorum
         /// serve`) instead of the client-side `nsed.yaml` (consumed
         /// by `quorum run`/`status`/`trace`/`tui`). The two YAMLs
@@ -419,6 +433,7 @@ async fn main() -> ExitCode {
             }
         }
         Commands::Init {
+            non_interactive,
             agent_fleet,
             ref orchestrator_url,
             ref room,
@@ -426,7 +441,28 @@ async fn main() -> ExitCode {
             ref agents,
             force,
         } => {
-            if agent_fleet {
+            // Decide between the interactive wizard and the
+            // one-shot template renderer. The wizard only runs when
+            // every condition is met: stdin is a TTY, no
+            // `--non-interactive`, no one-shot-only flag set,
+            // and the agent-fleet renderer wasn't requested.
+            //
+            // Any flag implies the operator wants the one-shot
+            // path (scripted / Docker / CI), so the wizard is
+            // skipped without forcing them to add
+            // `--non-interactive` too.
+            let one_shot_flags_set = !orchestrator_url.is_empty()
+                && orchestrator_url != commands::init::DEFAULT_ORCHESTRATOR_URL
+                || room != commands::init::DEFAULT_ROOM
+                || token_env != commands::init::DEFAULT_TOKEN_ENV
+                || !agents.is_empty();
+            let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+            let use_wizard =
+                !non_interactive && !agent_fleet && !one_shot_flags_set && stdin_is_tty;
+
+            if use_wizard {
+                commands::init_wizard::run(cli.config_path()).await
+            } else if agent_fleet {
                 // `agent.yml` is the conventional name `quorum
                 // serve` looks for; fall back to it when --config
                 // wasn't passed. Reusing `cli.config_path()` would
