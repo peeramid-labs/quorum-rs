@@ -41,6 +41,15 @@ As a CLI binary (same crate, default features build the `quorum` binary):
 cargo install quorum-rs
 ```
 
+As a Claude Code plugin (slash commands + auto-loaded context wrapping the CLI):
+
+```
+/plugin marketplace add peeramid-labs/plugin-marketplace
+/plugin install quorum
+```
+
+The plugin layers `/quorum:init`, `/quorum:redeem`, `/quorum:run`, `/quorum:serve`, `/quorum:status`, `/quorum:trace`, `/quorum:validate`, `/quorum:tui` onto the binary. See [docs/how-to/use-the-claude-code-plugin.md](docs/how-to/use-the-claude-code-plugin.md).
+
 ## How it works
 
 Each round, every agent — potentially a different model, prompt, or

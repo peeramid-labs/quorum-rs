@@ -12,5 +12,6 @@ Goal-oriented recipes. Assume the reader is already competent — get them to th
 | [Opt out of telemetry](opt-out-telemetry.md) | You need every telemetry emission disabled at the agent boundary. |
 | [Expose the agent dashboard on the LAN](expose-agent-dashboard-on-lan.md) | You want the unified per-agent dashboard (status, chat capture, buffer inspection, live config) reachable from another host — and you understand it ships unauthenticated. |
 | [Compose a persona from shared files](compose-persona-from-shared-files.md) | Your fleet shares a 4–30 line persona block (review style, output format, safety rules) across many agents and you want a single-source-of-truth file rather than copies. |
+| [Use the Claude Code plugin](use-the-claude-code-plugin.md) | You want `/quorum:init`, `:redeem`, `:run`, `:serve`, `:status`, `:trace`, `:validate`, `:tui` as slash commands inside Claude Code, with `.env` auto-detection and failure-mode guidance on top of the CLI. |
 
 For the underlying *why*, jump to [explanation](../explanation/README.md). For schema and field-level definitions, jump to [reference](../reference/README.md).
