@@ -159,7 +159,12 @@ jobs:
           fi
 
           echo "--- Commits since $PREV_REF ---"
-          echo "$COMMITS" | head -50
+          # GH Actions shell runs with `pipefail`, so a closing pipe
+          # from head turns the upstream writer's SIGPIPE into a step
+          # failure (exit 141). Feed COMMITS into awk via a here-
+          # string — bash writes the whole buffer and closes, so
+          # awk's early `exit` after 50 lines never trips a signal.
+          awk 'NR<=50; NR==50 {exit 0}' <<< "$COMMITS"
           echo "---"
 
           # Conventional-commit → bump-type
