@@ -255,16 +255,33 @@ jobs:
           fetch-depth: 0
 
       # Same mutability rule as the tag itself — re-running with the
-      # same `--tag` should overwrite the existing GH pre-release.
-      - name: Delete existing GH release (if any)
+      # same `--tag` should overwrite the existing pre-release. The
+      # forgejo runner ships without the `gh` CLI, so we hit the
+      # forge's REST directly. `github.api_url` resolves to whichever
+      # forge fired the run.
+      - name: Delete existing forge release (if any)
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORGE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORGE_API: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
           TAG: ${{ needs.validate.outputs.tag }}
-        run: gh release delete "$TAG" --yes 2>/dev/null || true
+        run: |
+          REL_ID=$(curl -fsSL \
+            -H "Authorization: token ${FORGE_TOKEN}" \
+            "${FORGE_API}/repos/${REPO}/releases/tags/${TAG}" \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("id",""))' \
+            2>/dev/null || echo "")
+          if [ -n "$REL_ID" ]; then
+            curl -fsSL -X DELETE \
+              -H "Authorization: token ${FORGE_TOKEN}" \
+              "${FORGE_API}/repos/${REPO}/releases/${REL_ID}" || true
+          fi
 
-      - name: Create GitHub Pre-Release
+      - name: Create forge Pre-Release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORGE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORGE_API: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
           TAG: ${{ needs.validate.outputs.tag }}
           CRATE: ${{ needs.validate.outputs.crate }}
           VERSION: ${{ needs.validate.outputs.version }}
@@ -292,7 +309,15 @@ jobs:
 
           NOTES=$(printf '%s\n\n⚠️ **This is a pre-release** — not recommended for production use.\n\nInstall (semver opt-in required for pre-releases):\n\n```\n%s\n```\n\nCommit: %s' \
             "$HEADER" "$INSTALL_LINES" "$TAG_COMMIT")
-          gh release create "$TAG" \
-            --prerelease \
-            --title "$TAG" \
-            --notes "$NOTES"
+
+          # JSON-encode body via env+python so newlines + backticks
+          # survive intact; printf'ing into a JSON string literal
+          # would break on the embedded ``` fences.
+          export TAG NOTES
+          PAYLOAD=$(python3 -c 'import json,os; print(json.dumps({"tag_name":os.environ["TAG"],"name":os.environ["TAG"],"body":os.environ["NOTES"],"prerelease":True,"draft":False}))')
+          curl -fsSL -X POST \
+            -H "Authorization: token ${FORGE_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "${PAYLOAD}" \
+            "${FORGE_API}/repos/${REPO}/releases" \
+            >/dev/null

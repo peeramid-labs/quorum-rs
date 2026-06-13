@@ -24,7 +24,10 @@ jobs:
       - name: Validate or fix PR title
         if: "!startsWith(github.event.pull_request.head.ref, 'release/')"
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Forgejo runner has no `gh` CLI — hit the forge's REST.
+          FORGE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORGE_API: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
@@ -52,7 +55,13 @@ jobs:
           if [ -n "$SUGGESTED" ]; then
             echo "📝 Found conventional commit: $SUGGESTED"
             echo "Updating PR title..."
-            gh pr edit "$PR_NUMBER" --title "$SUGGESTED"
+            export SUGGESTED
+            PAYLOAD=$(python3 -c 'import json,os; print(json.dumps({"title":os.environ["SUGGESTED"]}))')
+            curl -fsSL -X PATCH \
+              -H "Authorization: token ${FORGE_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "${PAYLOAD}" \
+              "${FORGE_API}/repos/${REPO}/pulls/${PR_NUMBER}" >/dev/null
             echo "✅ PR title updated to: $SUGGESTED"
             exit 0
           fi
