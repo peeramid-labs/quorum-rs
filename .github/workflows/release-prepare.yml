@@ -124,9 +124,13 @@ jobs:
           # classification. `%s` alone would silently downgrade a
           # major-bump-deserving release to a minor/patch.
           #
-          # Commit messages are newline-separated; the trailing
-          # %x00 sentinel keeps multi-line bodies from being lost in
-          # the grep filtering below.
+          # `grep -a` forces text mode: an earlier revision separated
+          # commits with `%x00`, but NUL bytes flipped grep into
+          # binary mode and SUPPRESSED matching output entirely
+          # ("Binary file (standard input) matches"), which made the
+          # workflow conclude there were no commits to release.
+          # Blank-line separation between commit bodies is already
+          # enough for downstream line-based filters.
           #
           # When PREV_TAG is empty (first release) `git log HEAD`
           # walks the entire history INCLUDING the root commit —
@@ -136,19 +140,19 @@ jobs:
           # markers (if any) actually count toward the bump
           # classification.
           if [ -z "$PREV_TAG" ]; then
-            COMMITS=$(git log HEAD --format="%B%x00" 2>/dev/null \
-              | grep -v "^chore(release):" \
-              | grep -v "^Merge pull request.*release/" \
+            COMMITS=$(git log HEAD --format="%B" 2>/dev/null \
+              | grep -av "^chore(release):" \
+              | grep -av "^Merge pull request.*release/" \
               || true)
             PREV_REF="<first commit>"
           else
             PREV_REF="$PREV_TAG"
-            COMMITS=$(git log "${PREV_REF}..HEAD" --format="%B%x00" 2>/dev/null \
-              | grep -v "^chore(release):" \
-              | grep -v "^Merge pull request.*release/" \
+            COMMITS=$(git log "${PREV_REF}..HEAD" --format="%B" 2>/dev/null \
+              | grep -av "^chore(release):" \
+              | grep -av "^Merge pull request.*release/" \
               || true)
           fi
-          if [ -z "$(echo "$COMMITS" | tr -d '[:space:]\0')" ]; then
+          if [ -z "$(echo "$COMMITS" | tr -d '[:space:]')" ]; then
             echo "No new commits since $PREV_REF (only release machinery) — skipping"
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
