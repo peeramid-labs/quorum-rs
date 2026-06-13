@@ -53,6 +53,13 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      # Forgejo's act runner ignores fetch-depth:0 and ships a 5-commit
+      # shallow clone, so the bump classifier only ever sees the 5
+      # newest commits and silently downgrades feat-eligible releases
+      # to patch. Force a full fetch.
+      - name: Deepen history (act runner ignores fetch-depth)
+        run: git fetch --prune --unshallow 2>/dev/null || git fetch --prune --depth=999999
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -212,10 +219,15 @@ jobs:
           VERSION: ${{ steps.bump.outputs.new_version }}
         run: |
           BRANCH="release/${CRATE}/v${VERSION}"
+          # Forgejo ignores the `?head=` query filter and returns
+          # every open PR, so trusting `d[0]` would falsely report
+          # ANY unrelated open PR as the existing release PR. Filter
+          # client-side by head.ref instead.
+          export BRANCH
           EXISTING=$(curl -fsSL \
             -H "Authorization: token ${FORGE_TOKEN}" \
-            "${FORGE_API}/repos/${REPO}/pulls?state=open&head=${BRANCH}" \
-            | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[0]["number"] if d else "")' \
+            "${FORGE_API}/repos/${REPO}/pulls?state=open" \
+            | python3 -c 'import json,os,sys; d=json.load(sys.stdin); print(next((p["number"] for p in d if p.get("head",{}).get("ref")==os.environ["BRANCH"]), ""))' \
             2>/dev/null || echo "")
           if [ -n "$EXISTING" ]; then
             echo "Release PR #${EXISTING} already exists for ${BRANCH}"
