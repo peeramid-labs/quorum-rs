@@ -56,9 +56,26 @@ jobs:
       # Forgejo's act runner ignores fetch-depth:0 and ships a 5-commit
       # shallow clone, so the bump classifier only ever sees the 5
       # newest commits and silently downgrades feat-eligible releases
-      # to patch. Force a full fetch.
+      # to patch. Force a full fetch + verify how many commits we got.
       - name: Deepen history (act runner ignores fetch-depth)
-        run: git fetch --prune --unshallow 2>/dev/null || git fetch --prune --depth=999999
+        run: |
+          set -x
+          echo "── before deepen ──"
+          git rev-parse --is-shallow-repository || true
+          git rev-list --count HEAD || true
+          # `--unshallow` errors on a non-shallow repo; mask that one
+          # case but surface any real failure via the fallback fetch.
+          if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+            git fetch --prune --unshallow
+          else
+            # Already deep, but some checkout setups omit older refs.
+            # Refetch the branch with explicit deep depth to be safe.
+            git fetch --prune origin "+refs/heads/dev:refs/remotes/origin/dev" --depth=999999 || true
+          fi
+          echo "── after deepen ──"
+          git rev-list --count HEAD
+          echo "── feats visible ──"
+          git log HEAD --format="%s" | grep -cE "^feat" || echo 0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
