@@ -142,81 +142,44 @@ jobs:
           fi
           PREV_TAG=$(git tag --list --sort=-version:refname "$TAG_PATTERN" | head -1)
 
-          # `%B` captures the full commit message (subject + body +
-          # footers) so `BREAKING CHANGE:` footers — which only appear
-          # in commit bodies — actually influence the bump
-          # classification. `%s` alone would silently downgrade a
-          # major-bump-deserving release to a minor/patch.
-          #
-          # `grep -a` forces text mode: an earlier revision separated
-          # commits with `%x00`, but NUL bytes flipped grep into
-          # binary mode and SUPPRESSED matching output entirely
-          # ("Binary file (standard input) matches"), which made the
-          # workflow conclude there were no commits to release.
-          # Blank-line separation between commit bodies is already
-          # enough for downstream line-based filters.
-          #
-          # When PREV_TAG is empty (first release) `git log HEAD`
-          # walks the entire history INCLUDING the root commit —
-          # `git log root..HEAD` would have excluded it (`..` is an
-          # exclusive range). Two branches in the command instead of
-          # a single ref so the root commit's conventional-commit
-          # markers (if any) actually count toward the bump
-          # classification.
+          # Use slop-cli's pattern: walk subjects only (%s, one line
+          # per commit, no body noise that tripped earlier %B-based
+          # regex variants), bound the range with the actual root
+          # commit hash when there's no prior tag (so the .. range
+          # works the same in both paths). Proven on slop-cli's
+          # forgejo runner.
           if [ -z "$PREV_TAG" ]; then
-            COMMITS=$(git log HEAD --format="%B" 2>/dev/null \
-              | grep -av "^chore(release):" \
-              | grep -av "^Merge pull request.*release/" \
-              || true)
-            PREV_REF="<first commit>"
+            PREV_REF=$(git rev-list --max-parents=0 HEAD | head -1)
           else
             PREV_REF="$PREV_TAG"
-            COMMITS=$(git log "${PREV_REF}..HEAD" --format="%B" 2>/dev/null \
-              | grep -av "^chore(release):" \
-              | grep -av "^Merge pull request.*release/" \
-              || true)
           fi
+          RANGE="${PREV_REF}..HEAD"
+
+          COMMITS=$(git log "$RANGE" --format="%s" 2>/dev/null \
+            | grep -v "^chore(release):" \
+            | grep -v "^Merge pull request.*release/" \
+            || true)
           if [ -z "$(echo "$COMMITS" | tr -d '[:space:]')" ]; then
             echo "No new commits since $PREV_REF (only release machinery) — skipping"
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "--- Commits since $PREV_REF ---"
-          # GH Actions shell runs with `pipefail`, so a closing pipe
-          # from head turns the upstream writer's SIGPIPE into a step
-          # failure (exit 141). Feed COMMITS into awk via a here-
-          # string — bash writes the whole buffer and closes, so
-          # awk's early `exit` after 50 lines never trips a signal.
-          awk 'NR<=50; NR==50 {exit 0}' <<< "$COMMITS"
+          echo "--- Commits since $PREV_REF (range=$RANGE) ---"
+          echo "$COMMITS" | head -30 || true
           echo "---"
 
-          # Resolve git log range so the classifier walks the same
-          # commits as the COMMITS buffer above.
-          if [ -z "$PREV_TAG" ]; then RANGE="HEAD"; else RANGE="${PREV_TAG}..HEAD"; fi
+          # Diagnostic counters so a future misclassification is
+          # visible without another instrumentation round.
+          echo "feats matched: $(echo "$COMMITS" | grep -cE '^[Ff]eat' || echo 0)"
 
-          # Diagnostic: feat-shape matches via three different paths
-          # so we can pin the runner's actual grep behavior next
-          # time this misclassifies.
-          echo "STEP: classifier diagnostics (range=$RANGE)"
-          echo "COMMITS lines: $(printf '%s' "$COMMITS" | wc -l)"
-          echo "feats via subjects only: $(git log $RANGE --format='%s' | grep -cE '^feat[(!:]' || echo 0)"
-          echo "feats via plain ^feat: $(git log $RANGE --format='%s' | grep -c '^feat' || echo 0)"
-          echo "first 3 feat subjects:"
-          git log $RANGE --format='%s' | grep -E '^feat' | head -3 || true
-
-          # Walk subjects directly off git log (bypasses the buffered
-          # \$COMMITS string in case echo / shell quoting drops lines
-          # on the runner). Same effective coverage; tighter loop.
+          # Classify bump from conventional commits. Same regex shape
+          # as slop-cli — proven working on a forgejo act runner.
           BUMP="patch"
-          if git log $RANGE --format='%s' | grep -qiE '^feat[(!:]'; then
+          if echo "$COMMITS" | grep -qiE "^feat(\(|!|:)"; then
             BUMP="minor"
           fi
-          # Two breaking-change forms: `<type>!:` shorthand on the
-          # subject, OR a `BREAKING CHANGE:` footer in the body
-          # (per Conventional Commits §footer).
-          if git log $RANGE --format='%s' | grep -qiE '^[a-z]+(\([^)]*\))?!:' \
-             || git log $RANGE --format='%B' | grep -qi 'BREAKING CHANGE'; then
+          if echo "$COMMITS" | grep -qiE "(^[a-z]+(\(.*\))?!:)|BREAKING CHANGE"; then
             BUMP="major"
           fi
 
