@@ -191,21 +191,32 @@ jobs:
           awk 'NR<=50; NR==50 {exit 0}' <<< "$COMMITS"
           echo "---"
 
-          # Conventional-commit → bump-type. Use character classes
-          # instead of `\(`-escaped parens because the act runner's
-          # grep treats `\(` as a BRE group-start marker even under
-          # `-E`, which makes `feat(\(|!|:)` parse as malformed and
-          # silently fail to match — every feat-eligible release
-          # would otherwise downgrade to patch.
+          # Resolve git log range so the classifier walks the same
+          # commits as the COMMITS buffer above.
+          if [ -z "$PREV_TAG" ]; then RANGE="HEAD"; else RANGE="${PREV_TAG}..HEAD"; fi
+
+          # Diagnostic: feat-shape matches via three different paths
+          # so we can pin the runner's actual grep behavior next
+          # time this misclassifies.
+          echo "STEP: classifier diagnostics (range=$RANGE)"
+          echo "COMMITS lines: $(printf '%s' "$COMMITS" | wc -l)"
+          echo "feats via subjects only: $(git log $RANGE --format='%s' | grep -cE '^feat[(!:]' || echo 0)"
+          echo "feats via plain ^feat: $(git log $RANGE --format='%s' | grep -c '^feat' || echo 0)"
+          echo "first 3 feat subjects:"
+          git log $RANGE --format='%s' | grep -E '^feat' | head -3 || true
+
+          # Walk subjects directly off git log (bypasses the buffered
+          # \$COMMITS string in case echo / shell quoting drops lines
+          # on the runner). Same effective coverage; tighter loop.
           BUMP="patch"
-          if echo "$COMMITS" | grep -qiE '^feat[(!:]'; then
+          if git log $RANGE --format='%s' | grep -qiE '^feat[(!:]'; then
             BUMP="minor"
           fi
           # Two breaking-change forms: `<type>!:` shorthand on the
           # subject, OR a `BREAKING CHANGE:` footer in the body
           # (per Conventional Commits §footer).
-          if echo "$COMMITS" | grep -qiE '^[a-z]+(\([^)]*\))?!:' \
-             || echo "$COMMITS" | grep -qi 'BREAKING CHANGE'; then
+          if git log $RANGE --format='%s' | grep -qiE '^[a-z]+(\([^)]*\))?!:' \
+             || git log $RANGE --format='%B' | grep -qi 'BREAKING CHANGE'; then
             BUMP="major"
           fi
 
@@ -330,7 +341,12 @@ jobs:
           # release-notes lookup also keys on $TAG, so both sides match.
           NEW_SECTION=$(git-cliff --tag "$TAG" --unreleased --strip header 2>/dev/null || true)
           if [ -n "$NEW_SECTION" ] && [ -f CHANGELOG.md ]; then
-            HEADER_END=$(grep -n "^## " CHANGELOG.md | head -1 | cut -d: -f1)
+            # `|| true` keeps the pipeline from exiting non-zero
+            # when CHANGELOG.md has no `## ` sections yet (fresh
+            # scaffold). Without it, pipefail propagates the
+            # no-match grep exit out of the $() and bash kills the
+            # step before we reach the empty-HEADER_END else branch.
+            HEADER_END=$(grep -n "^## " CHANGELOG.md | head -1 | cut -d: -f1 || true)
             if [ -n "$HEADER_END" ]; then
               {
                 head -n $((HEADER_END - 1)) CHANGELOG.md

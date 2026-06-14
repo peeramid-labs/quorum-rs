@@ -5,11 +5,10 @@
 //!
 //! # Quick Start
 //!
-//! ```rust,no_run
-//! use nsed_agent::multi_agent::MultiAgentRunner;
-//! use nsed_agent::agents::ProposerEvaluatorAgent;
-//! use nsed_agent::workers::{NatsNsedWorker, NatsNsedWorkerExt, WorkerConfig};
-//! use crate::agents::AgentConfig;
+//! ```rust,ignore
+//! use quorum_rs::multi_agent::MultiAgentRunner;
+//! use quorum_rs::agents::{AgentConfig, ProposerEvaluatorAgent};
+//! use quorum_rs::workers::{NatsNsedWorker, NatsNsedWorkerExt, WorkerConfig};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
