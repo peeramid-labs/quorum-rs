@@ -191,15 +191,21 @@ jobs:
           awk 'NR<=50; NR==50 {exit 0}' <<< "$COMMITS"
           echo "---"
 
-          # Conventional-commit → bump-type
+          # Conventional-commit → bump-type. Use character classes
+          # instead of `\(`-escaped parens because the act runner's
+          # grep treats `\(` as a BRE group-start marker even under
+          # `-E`, which makes `feat(\(|!|:)` parse as malformed and
+          # silently fail to match — every feat-eligible release
+          # would otherwise downgrade to patch.
           BUMP="patch"
-          if echo "$COMMITS" | grep -qiE "^feat(\(|!|:)"; then
+          if echo "$COMMITS" | grep -qiE '^feat[(!:]'; then
             BUMP="minor"
           fi
           # Two breaking-change forms: `<type>!:` shorthand on the
           # subject, OR a `BREAKING CHANGE:` footer in the body
           # (per Conventional Commits §footer).
-          if echo "$COMMITS" | grep -qiE "(^[a-z]+(\(.*\))?!:)|BREAKING CHANGE"; then
+          if echo "$COMMITS" | grep -qiE '^[a-z]+(\([^)]*\))?!:' \
+             || echo "$COMMITS" | grep -qi 'BREAKING CHANGE'; then
             BUMP="major"
           fi
 
