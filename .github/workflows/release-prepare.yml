@@ -275,16 +275,42 @@ jobs:
             TAG="${CRATE}-v${VERSION}"
           fi
 
+          # Print every shell command + show which set-* / cargo step
+          # actually fails on the runner. Defaults strip `set -e` only
+          # for the bump bracket so we can capture exit codes before
+          # bailing — outside that bracket `set -e` stays on.
+          set -x
+          echo "STEP: cargo version"
+          cargo --version 2>&1
+          echo "STEP: checkout new branch"
           git checkout -b "$BRANCH"
 
-          # Bump version(s)
+          echo "STEP: set-version ($CRATE -> $VERSION)"
+          set +e
           case "$CRATE" in
-            llm-repair)         cargo set-version -p llm-repair "$VERSION" ;;
-            quorum-crypto-core) cargo set-version -p quorum-crypto-core "$VERSION" ;;
-            quorum-rs)          cargo set-version -p quorum-rs "$VERSION" ;;
-            all)                cargo set-version --workspace "$VERSION" ;;
+            llm-repair)         cargo set-version -p llm-repair "$VERSION" 2>&1 ;;
+            quorum-crypto-core) cargo set-version -p quorum-crypto-core "$VERSION" 2>&1 ;;
+            quorum-rs)          cargo set-version -p quorum-rs "$VERSION" 2>&1 ;;
+            all)                cargo set-version --workspace "$VERSION" 2>&1 ;;
           esac
-          cargo generate-lockfile
+          rc=$?
+          set -e
+          echo "STEP: set-version exit=$rc"
+          if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+
+          echo "STEP: generate-lockfile"
+          set +e
+          cargo generate-lockfile 2>&1
+          rc=$?
+          set -e
+          echo "STEP: lockfile exit=$rc"
+          if [ "$rc" -ne 0 ]; then
+            echo "STEP: Cargo.toml head (quorum-rs)"
+            head -25 crates/quorum-rs/Cargo.toml || true
+            echo "STEP: Cargo.lock head"
+            head -20 Cargo.lock || true
+            exit "$rc"
+          fi
 
           # Prepend the new section to CHANGELOG.md (if it exists). The
           # workflow stays useful even before a CHANGELOG.md is committed —
