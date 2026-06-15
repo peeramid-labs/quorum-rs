@@ -59,19 +59,24 @@ async fn main() -> anyhow::Result<()> {
 Pass concrete `Tool` impls into the `extra_context_tools` / `sandbox_tools` vectors:
 
 ```rust
-use quorum_rs::tools::{ScopedReadFileTool, ScopedGrepTool};
+use quorum_rs::tools::{ScopedReadFileTool, ScopedGrepTool, Tool};
 use std::path::PathBuf;
 
-let sandbox = vec![
-    Box::new(ScopedReadFileTool::new(
-        "cortex-a",
-        &[PathBuf::from("/var/data/corpus")],
-    )) as Box<dyn quorum_rs::tools::Tool>,
-    Box::new(ScopedGrepTool::new(
-        "cortex-a",
-        &[PathBuf::from("/var/data/corpus")],
-    )),
-];
+// ScopedReadFileTool::new(agent_name, roots: &[PathBuf]) — infallible.
+let read = ScopedReadFileTool::new("cortex-a", &[PathBuf::from("/var/data/corpus")])
+    .with_max_bytes(1 << 20);
+
+// ScopedGrepTool::new(agent_name, roots: &[String], max_bytes, max_results,
+// timeout_secs) — returns Err on an empty roots allow-list.
+let grep = ScopedGrepTool::new(
+    "cortex-a".into(),
+    &["/var/data/corpus".to_string()],
+    1 << 20, // max_bytes
+    100,     // max_results
+    10,      // timeout_secs
+)?;
+
+let sandbox: Vec<Box<dyn Tool>> = vec![Box::new(read), Box::new(grep)];
 ```
 
 See [Sandboxed builtin tools](../reference/sandboxed-tools.md) for the full catalog.
@@ -93,21 +98,30 @@ The SDK ships the trait but no default detector — bring your own (regex regist
 
 Implement [`NsedAgent`](https://docs.rs/quorum-rs/latest/quorum_rs/agents/trait.NsedAgent.html) directly when you need full control over proposal + evaluation logic.
 
+`NsedAgent` requires `Send + Sync + Debug + Clone` (the worker clones the agent across task boundaries). Derive `Clone`; provide a `Debug` impl — `SimpleOpenAIModel` is `Clone` but not `Debug`, so skip that field.
+
 ```rust
-use quorum_rs::agents::{NsedAgent, AgentContext, AgentConfig, Proposal, Evaluation, Stance};
+use quorum_rs::agents::{NsedAgent, AgentContext, AgentConfig, Proposal, Evaluation};
 use quorum_rs::llms::SimpleOpenAIModel;
 use quorum_rs::workers::{NatsNsedWorker, WorkerConfig};
 use async_trait::async_trait;
 use anyhow::Result;
 
+#[derive(Clone)]
 struct MyAgent {
     name: String,
     llm: SimpleOpenAIModel,
 }
 
+impl std::fmt::Debug for MyAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MyAgent").field("name", &self.name).finish()
+    }
+}
+
 #[async_trait]
 impl NsedAgent for MyAgent {
-    fn name(&self) -> &str { &self.name }
+    fn name(&self) -> String { self.name.clone() }
 
     async fn propose(&self, context: &AgentContext) -> Result<Proposal> {
         // Your proposal logic — call self.llm and shape the result.
@@ -117,9 +131,10 @@ impl NsedAgent for MyAgent {
     async fn evaluate(
         &self,
         context: &AgentContext,
-        proposals: &[Proposal],
-    ) -> Result<Vec<Evaluation>> {
-        // Your evaluation logic — return Vec<Evaluation> with stance + scores.
+    ) -> Result<Vec<(String, Evaluation)>> {
+        // Return (target_agent_id, Evaluation) pairs — your verdict on each
+        // peer proposal. Peer proposals come from `context` (and the RAG
+        // context tools), not as a separate argument.
         unimplemented!()
     }
 }
@@ -147,6 +162,10 @@ async fn main() -> Result<()> {
 ```
 
 The `AgentContext` argument carries everything the agent needs about the current deliberation: round number, task description, persistence handle, peer proposals from earlier rounds, scratchpad, telemetry context.
+
+### Running it under `quorum serve`
+
+Hand-wiring a worker in `main()` (above) is one option. The other is to let `quorum serve` boot your agent from a fleet `agent.yml` like any built-in provider — register a [`ProviderFactory`](../explanation/provider-registry.md) for a custom `provider.type` and pass the registry via `ServeOptions.registry`. Then operators add your agent to the fleet with a few lines of YAML, no Rust. See [Register a custom provider](register-a-custom-provider.md).
 
 ## Path 3: non-Rust agent
 
