@@ -1,4 +1,4 @@
-//! Shared subprocess plumbing for CLI-agent providers (#17, phase 2).
+//! Shared subprocess plumbing for CLI-agent providers.
 //!
 //! [`ExecAgent`](crate::agents::exec_agent::ExecAgent) and
 //! [`McpAgent`](crate::agents::mcp_agent::McpAgent) both spawn an
@@ -20,7 +20,7 @@ use crate::agents::AgentContext;
 /// Resolve the effective per-call timeout: explicit `timeout_secs` if
 /// set, else the remaining phase budget rounded up (min 1s), else the
 /// 300s default.
-pub(crate) fn effective_timeout(timeout_secs: Option<u64>, ctx: &AgentContext) -> Duration {
+pub fn effective_timeout(timeout_secs: Option<u64>, ctx: &AgentContext) -> Duration {
     let secs = timeout_secs.unwrap_or_else(|| {
         let budget = ctx.phase_budget_remaining_secs;
         if budget > 0.0 {
@@ -38,7 +38,7 @@ pub(crate) fn effective_timeout(timeout_secs: Option<u64>, ctx: &AgentContext) -
 ///
 /// `kind` is the provider label used in error messages (`"exec"` /
 /// `"mcp"`). Returns an error if `command` is empty or the spawn fails.
-pub(crate) fn spawn_child(
+pub fn spawn_child(
     kind: &str,
     agent_name: &str,
     command: &[String],

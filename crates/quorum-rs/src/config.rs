@@ -411,6 +411,23 @@ pub fn load_agent_from_config(
     config: &AgentFleetConfig,
     agent_name: &str,
 ) -> anyhow::Result<(AgentConfig, ProviderEntry)> {
+    load_agent_from_config_with_registry(
+        config,
+        agent_name,
+        &crate::providers::ProviderRegistry::with_builtins(),
+    )
+}
+
+/// Like [`load_agent_from_config`] but consults `registry` for the
+/// "is this provider local (no API key needed)?" check. A registered
+/// third-party provider whose factory returns `requires_api_key() == false`
+/// is then exempt from placeholder-key validation — a local custom CLI
+/// provider (e.g. `codex`) needs no fake `api_key` in its YAML.
+pub fn load_agent_from_config_with_registry(
+    config: &AgentFleetConfig,
+    agent_name: &str,
+    registry: &crate::providers::ProviderRegistry,
+) -> anyhow::Result<(AgentConfig, ProviderEntry)> {
     let mut agent = config
         .agents
         .iter()
@@ -519,10 +536,16 @@ pub fn load_agent_from_config(
     // Only require API keys for remote providers
     let is_local_url = provider_entry.base_url.starts_with("http://localhost")
         || provider_entry.base_url.starts_with("http://127.0.0.1");
-    let is_local_provider = matches!(
-        provider_entry.provider_type.as_str(),
-        "ollama" | "vllm" | "local" | "simulated" | "stub" | "exec" | "mcp" | "claude"
-    ) || is_local_provider_id(&agent.provider_id);
+    // A registered provider whose factory reports `requires_api_key() ==
+    // false` is local (covers third-party custom providers, e.g. a local
+    // `codex` CLI). The `matches!` keeps the few types that have no factory
+    // (`vllm` / `local` / `stub`) exempt too.
+    let is_local_provider = registry.is_local(provider_entry.provider_type.as_str())
+        || matches!(
+            provider_entry.provider_type.as_str(),
+            "ollama" | "vllm" | "local" | "simulated" | "stub" | "exec" | "mcp" | "claude"
+        )
+        || is_local_provider_id(&agent.provider_id);
     if !is_local_url && !is_local_provider && is_placeholder_key(&provider_entry.api_key) {
         anyhow::bail!(
             "No API key for provider '{}'. Set {} env var.",
@@ -611,6 +634,57 @@ pub fn derive_orch_id(url: &str) -> String {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    /// A registered custom provider whose factory is not remote
+    /// (`requires_api_key() == false`) is exempt from API-key validation —
+    /// a local `codex` CLI needs no fake `api_key` in its YAML. The plain
+    /// loader (built-ins only) still enforces the key for the unknown type.
+    #[test]
+    fn custom_local_provider_keyless_passes_via_registry() {
+        use crate::providers::{ProviderFactory, ProviderRegistry};
+
+        struct LocalCustomFactory;
+        impl ProviderFactory for LocalCustomFactory {
+            fn provider_type(&self) -> &str {
+                "my_codex_t"
+            }
+            fn build_agent(
+                &self,
+                _agent_config: &AgentConfig,
+                _provider: &ProviderEntry,
+            ) -> anyhow::Result<Option<std::sync::Arc<dyn crate::agents::NsedAgent>>> {
+                Ok(None)
+            }
+        }
+
+        let config: AgentFleetConfig = serde_yaml::from_str(
+            r#"
+providers:
+  cdx:
+    type: my_codex_t
+agents:
+  - name: CDX
+    provider_id: cdx
+    model_name: codex
+"#,
+        )
+        .unwrap();
+
+        // Plain loader knows only built-ins → unknown remote type → needs a key.
+        let err = load_agent_from_config(&config, "CDX").unwrap_err();
+        assert!(
+            err.to_string().contains("No API key"),
+            "unknown type must require a key via the plain loader; got: {err}"
+        );
+
+        // Registry that knows the (local) custom factory → keyless passes.
+        let mut registry = ProviderRegistry::with_builtins();
+        registry.register(std::sync::Arc::new(LocalCustomFactory));
+        assert!(
+            load_agent_from_config_with_registry(&config, "CDX", &registry).is_ok(),
+            "registered local custom provider must pass validation without an api_key"
+        );
+    }
 
     // ─── ProviderEntry deserialization ───────────────────────────────────
 

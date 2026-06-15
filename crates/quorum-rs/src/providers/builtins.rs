@@ -1,4 +1,4 @@
-//! Built-in [`ProviderFactory`] implementations (#17).
+//! Built-in [`ProviderFactory`] implementations.
 //!
 //! Each factory reproduces one arm of the old
 //! [`crate::serve::build_worker`] dispatch verbatim, including its
@@ -10,7 +10,7 @@ use anyhow::Result;
 use tracing::{info, warn};
 
 use super::ProviderFactory;
-use crate::agents::config::AgentConfig;
+use crate::agents::config::{AgentConfig, ClaudeProviderConfig};
 use crate::agents::exec_agent::ExecAgent;
 use crate::agents::mcp_agent::{ClaudeAgent, McpAgent};
 use crate::agents::{NsedAgent, ProposerEvaluatorAgent};
@@ -79,8 +79,15 @@ impl ProviderFactory for McpFactory {
     }
 }
 
-/// `claude` — Claude Code CLI subprocess. Missing `claude:` section
-/// falls back to defaults (the CLI is usable with zero config).
+/// `claude` — Claude Code CLI subprocess.
+///
+/// Config resolution — also the reference for the generic
+/// `provider_config` channel a third-party `codex` factory uses:
+///
+/// 1. the typed `claude:` section, if present (wins);
+/// 2. else [`AgentConfig::provider_config`] deserialized into
+///    [`ClaudeProviderConfig`];
+/// 3. else defaults (the CLI is usable with zero config).
 pub struct ClaudeFactory;
 
 impl ProviderFactory for ClaudeFactory {
@@ -93,7 +100,18 @@ impl ProviderFactory for ClaudeFactory {
         agent_config: &AgentConfig,
         _provider: &ProviderEntry,
     ) -> Result<Option<Arc<dyn NsedAgent>>> {
-        let claude_cfg = agent_config.claude.clone().unwrap_or_default();
+        let claude_cfg = match agent_config.claude.clone() {
+            Some(cfg) => cfg,
+            None if !agent_config.provider_config.is_empty() => agent_config
+                .provider_config_as::<ClaudeProviderConfig>()
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "claude agent '{}': failed to parse `provider_config`: {e}",
+                        agent_config.name
+                    )
+                })?,
+            None => ClaudeProviderConfig::default(),
+        };
         Ok(Some(Arc::new(ClaudeAgent::new(
             agent_config.clone(),
             claude_cfg,
@@ -294,6 +312,92 @@ agents:
             .unwrap()
             .expect("claude must build from defaults");
         assert_eq!(agent.name(), "claude-agent");
+    }
+
+    /// The built-in `claude` provider sources its typed config from the
+    /// generic `provider_config` map (no `claude:` section) — the same
+    /// pattern a third-party `codex` factory uses.
+    #[test]
+    fn claude_builds_from_provider_config() {
+        let (cfg, provider) = resolve(
+            r#"
+providers:
+  claude_cli:
+    type: claude
+agents:
+  - name: claude-agent
+    provider_id: claude_cli
+    model_name: claude-sonnet
+    provider_config:
+      permission_mode: "acceptEdits"
+      timeout_secs: 120
+"#,
+            "claude-agent",
+        );
+        assert!(
+            cfg.claude.is_none(),
+            "no typed claude: section in this fixture"
+        );
+        let agent = ClaudeFactory
+            .build_agent(&cfg, &provider)
+            .unwrap()
+            .expect("claude must build from provider_config");
+        assert_eq!(agent.name(), "claude-agent");
+    }
+
+    /// Precedence: a present typed `claude:` section wins, and the
+    /// `provider_config` map is not even parsed (here it would fail —
+    /// `timeout_secs` is a string — proving it was ignored).
+    #[test]
+    fn claude_section_wins_over_provider_config() {
+        let (cfg, provider) = resolve(
+            r#"
+providers:
+  claude_cli:
+    type: claude
+agents:
+  - name: claude-agent
+    provider_id: claude_cli
+    model_name: claude-sonnet
+    claude:
+      permission_mode: "acceptEdits"
+    provider_config:
+      timeout_secs: "not-a-number"
+"#,
+            "claude-agent",
+        );
+        let agent = ClaudeFactory
+            .build_agent(&cfg, &provider)
+            .unwrap()
+            .expect("typed claude: section must win, provider_config ignored");
+        assert_eq!(agent.name(), "claude-agent");
+    }
+
+    /// A malformed `provider_config` (when it IS the config source) is a
+    /// hard error, not a silent skip — the factory surfaces the parse
+    /// failure so the operator fixes the YAML.
+    #[test]
+    fn claude_bad_provider_config_errors() {
+        let (cfg, provider) = resolve(
+            r#"
+providers:
+  claude_cli:
+    type: claude
+agents:
+  - name: claude-agent
+    provider_id: claude_cli
+    model_name: claude-sonnet
+    provider_config:
+      timeout_secs: "not-a-number"
+"#,
+            "claude-agent",
+        );
+        let err = ClaudeFactory.build_agent(&cfg, &provider).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("failed to parse `provider_config`"),
+            "got: {err}"
+        );
     }
 
     #[test]

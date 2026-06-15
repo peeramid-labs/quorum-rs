@@ -1,4 +1,4 @@
-//! Provider registry + factory pattern (#17).
+//! Provider registry + factory pattern.
 //!
 //! Adding a new agent provider used to mean editing the
 //! `match provider.provider_type { … }` dispatch in
@@ -30,9 +30,11 @@
 /// Built-in [`ProviderFactory`] implementations registered by
 /// [`ProviderRegistry::with_builtins`].
 pub mod builtins;
-/// Shared subprocess spawn + timeout helpers for the CLI-agent
-/// providers (`exec`, `mcp`).
-pub(crate) mod cli_base;
+/// Shared subprocess spawn + timeout helpers for CLI-agent providers.
+/// Public so third-party `ProviderFactory` crates (e.g. a `codex`
+/// provider) can reuse the exact spawn/timeout plumbing the built-in
+/// `exec` / `mcp` providers use, instead of reimplementing it.
+pub mod cli_base;
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -75,6 +75,18 @@ The three OpenAI-wire-compatible types share one factory implementation, registe
 
 `exec` and `mcp` both spawn an external process with piped stdio and a budget-derived timeout, then diverge completely — `exec` is one-shot stdin→stdout; `mcp` writes a line envelope and then runs a live MCP session over the same pipes. Only that spawn-and-timeout prologue is genuinely shared, so it lives in one place (`providers::cli_base`): `effective_timeout` (explicit `timeout_secs`, else phase budget, else 300s) and `spawn_child` (pipes + `kill_on_drop`, `working_dir`, `env`, then `extra_env` layered last for session-identity vars). The protocol halves stay in their own agents — the base is the overlap and nothing more, not a `use_mcp`-flag mega-struct that fuses two unrelated protocols.
 
+`cli_base` is **public** — a third-party CLI-agent provider (a `codex` factory, say) reuses `spawn_child`/`effective_timeout` instead of reimplementing the spawn dance.
+
+## Config without a core struct: `provider_config`
+
+Built-in providers have typed config sections on `AgentConfig` (`exec:` / `mcp:` / `claude:`). A third-party provider can't add a field to that core struct without forking — so `AgentConfig` carries a generic `provider_config: HashMap<String, serde_yaml::Value>`. A factory deserializes the whole block into its own type with `AgentConfig::provider_config_as::<T>()`:
+
+```rust
+let cfg: CodexConfig = agent_config.provider_config_as()?;
+```
+
+The typed built-in sections (`exec:` / `mcp:` / `claude:`) remain — `provider_config` is an additional channel, not a replacement. The built-in `claude` provider also reads from it: `ClaudeFactory` falls back to `provider_config` when no typed `claude:` section is set (the typed section wins when present), so the generic path is exercised by a real shipping provider, not only custom ones.
+
 ## What a third party gets
 
 A downstream crate implements `ProviderFactory` for its own type, registers it, and passes the registry to `serve_fleet` via `ServeOptions.registry` — no SDK change, no fork:

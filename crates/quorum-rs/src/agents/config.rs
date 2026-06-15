@@ -267,6 +267,20 @@ pub struct AgentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude: Option<ClaudeProviderConfig>,
 
+    /// Free-form provider config for **third-party** [`ProviderFactory`]
+    /// implementations. Built-in providers (`exec` / `mcp` / `claude`) use
+    /// their typed sections above; a custom `provider.type` reads its knobs
+    /// from here, so registering a new provider needs no new field on this
+    /// core struct.
+    ///
+    /// Deserialize the whole map into a typed struct with
+    /// [`AgentConfig::provider_config_as`], or index the map directly.
+    ///
+    /// [`ProviderFactory`]: crate::providers::ProviderFactory
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[schema(value_type = Object)]
+    pub provider_config: HashMap<String, serde_yaml::Value>,
+
     /// OpenRouter-specific request extensions (provider routing + ZDR).
     /// Injected into the request body as `"provider": { ... }` when the
     /// underlying base URL is OpenRouter. Non-OpenRouter providers will
@@ -441,6 +455,32 @@ fn default_pdf_query_timeout_secs() -> u64 {
 }
 
 impl AgentConfig {
+    /// Deserialize the whole [`provider_config`](Self::provider_config) map
+    /// into a typed struct `T`. Third-party [`ProviderFactory`] impls use
+    /// this to read their bespoke YAML config without adding a typed section
+    /// to this core struct:
+    ///
+    /// ```ignore
+    /// #[derive(serde::Deserialize)]
+    /// struct CodexConfig { permission_mode: String, sandbox: bool }
+    /// let cfg: CodexConfig = agent_config.provider_config_as()?;
+    /// ```
+    ///
+    /// An empty map deserializes to whatever `T` makes of an empty mapping
+    /// (e.g. a struct whose fields all have `#[serde(default)]`).
+    ///
+    /// [`ProviderFactory`]: crate::providers::ProviderFactory
+    pub fn provider_config_as<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> Result<T, serde_yaml::Error> {
+        let mapping: serde_yaml::Mapping = self
+            .provider_config
+            .iter()
+            .map(|(k, v)| (serde_yaml::Value::String(k.clone()), v.clone()))
+            .collect();
+        serde_yaml::from_value(serde_yaml::Value::Mapping(mapping))
+    }
+
     /// Validate that at most one provider section is populated and, when
     /// `resolved_provider_type` is known, that it matches the populated section.
     pub fn validate_provider_sections(
@@ -933,6 +973,7 @@ impl Default for AgentConfig {
             exec: None,
             mcp: None,
             claude: None,
+            provider_config: HashMap::new(),
             openrouter: None,
             builtin_tools: Vec::new(),
             prompt_exposure_guard: false,
@@ -953,6 +994,66 @@ pub fn is_openai_family_provider(config: &AgentConfig) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn provider_config_deserializes_into_typed_struct() {
+        #[derive(Debug, serde::Deserialize, PartialEq)]
+        struct CodexConfig {
+            permission_mode: String,
+            sandbox: bool,
+            #[serde(default)]
+            extra_args: Vec<String>,
+        }
+
+        let cfg: AgentConfig = serde_yaml::from_str(
+            r#"
+name: codex-a
+provider_id: my_codex
+model_name: codex-mini
+provider_config:
+  permission_mode: "auto"
+  sandbox: true
+  extra_args: ["--yolo"]
+"#,
+        )
+        .expect("agent yaml must parse");
+
+        let codex: CodexConfig = cfg.provider_config_as().expect("typed read");
+        assert_eq!(
+            codex,
+            CodexConfig {
+                permission_mode: "auto".into(),
+                sandbox: true,
+                extra_args: vec!["--yolo".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn provider_config_empty_yields_all_defaults() {
+        #[derive(Debug, serde::Deserialize)]
+        struct AllDefault {
+            #[serde(default)]
+            flag: bool,
+        }
+        let cfg = AgentConfig::default();
+        assert!(cfg.provider_config.is_empty());
+        let parsed: AllDefault = cfg.provider_config_as().expect("empty map → defaults");
+        assert!(!parsed.flag);
+    }
+
+    #[test]
+    fn provider_config_omitted_from_serialization_when_empty() {
+        let cfg = AgentConfig {
+            name: "x".into(),
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        assert!(
+            !yaml.contains("provider_config"),
+            "empty provider_config must be skipped in serialization"
+        );
+    }
 
     #[test]
     fn test_builtin_tools_roundtrip() {

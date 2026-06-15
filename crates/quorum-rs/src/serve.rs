@@ -50,7 +50,7 @@
 //! ```
 
 use crate::agents::config::{AgentConfig, BuiltinToolGrant};
-use crate::config::{AgentFleetConfig, load_agent_from_config, resolve_agent_names};
+use crate::config::{AgentFleetConfig, load_agent_from_config_with_registry, resolve_agent_names};
 use crate::multi_agent::MultiAgentRunner;
 use crate::nats_utils::NatsAuth;
 use crate::providers::ProviderRegistry;
@@ -231,8 +231,9 @@ pub async fn build_worker(
     api_prefix: &str,
     registry: &ProviderRegistry,
 ) -> Result<Option<(NatsNsedWorker, AgentConfig)>> {
-    let (agent_config, provider) = load_agent_from_config(fleet, agent_name)
-        .with_context(|| format!("failed to load agent '{agent_name}' from fleet config"))?;
+    let (agent_config, provider) =
+        load_agent_from_config_with_registry(fleet, agent_name, registry)
+            .with_context(|| format!("failed to load agent '{agent_name}' from fleet config"))?;
 
     let consumer_name = format!("agent_{}", agent_config.name);
     let mut worker_config =
