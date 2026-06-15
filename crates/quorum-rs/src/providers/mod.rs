@@ -27,6 +27,8 @@
 //! hard-coded dispatch, including the "skip this agent cleanly
 //! (`Ok(None)`)" semantics when a config section is missing.
 
+/// Built-in [`ProviderFactory`] implementations registered by
+/// [`ProviderRegistry::with_builtins`].
 pub mod builtins;
 pub(crate) mod cli_base;
 
