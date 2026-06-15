@@ -47,11 +47,12 @@ async fn live_openai_codex_gpt55_smoke() {
         .await
         .expect("live Codex Responses call");
 
-    let content = response.response.choices[0]
-        .message
-        .content
-        .as_deref()
-        .unwrap_or("");
+    let content = response
+        .response
+        .choices
+        .first()
+        .and_then(|choice| choice.message.content.as_deref())
+        .expect("live Codex response should include a first choice with content");
     assert!(
         content.contains("QUORUM_OPENAI_CODEX_OK"),
         "unexpected live response: {content:?}"

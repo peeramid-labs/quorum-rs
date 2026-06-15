@@ -21,9 +21,8 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::Semaphore;
 
-const OPENAI_AUTH_BASE_URL: &str = "https://auth.openai.com";
-const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const OPENAI_CODEX_DEVICE_CALLBACK_URL: &str = "https://auth.openai.com/deviceauth/callback";
+const OPENAI_AUTH_BASE_URL_DEFAULT: &str = "https://auth.openai.com";
+const OPENAI_CODEX_CLIENT_ID_DEFAULT: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_CODEX_DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEVICE_CODE_TIMEOUT_MS: u64 = 15 * 60_000;
 const DEVICE_CODE_DEFAULT_INTERVAL_MS: u64 = 5_000;
@@ -75,7 +74,8 @@ struct DeviceTokenResponse {
 #[derive(Debug, Deserialize)]
 struct OAuthTokenResponse {
     access_token: String,
-    refresh_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_i64")]
     expires_in: Option<i64>,
 }
@@ -135,19 +135,19 @@ impl OpenAICodexAuthStore {
             tokens,
         };
         let text = serde_json::to_string_pretty(&auth)?;
-        std::fs::write(&self.path, text)?;
-        set_private_file_permissions(&self.path)?;
+        atomic_write_private(&self.path, text.as_bytes())?;
         Ok(())
     }
 
     pub fn import_from_codex_cli(&self) -> anyhow::Result<bool> {
         let codex_home = std::env::var("CODEX_HOME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                home_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join(".codex")
-            });
+            .or_else(|| home_dir().ok().map(|home| home.join(".codex")));
+        let Some(codex_home) = codex_home else {
+            return Ok(false);
+        };
         self.import_from_codex_cli_home(&codex_home)
     }
 
@@ -317,10 +317,11 @@ impl AiModel for OpenAICodexModel {
 
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after_ms = retry_after_ms_from_headers(response.headers());
             let error_body = response.text().await.unwrap_or_default();
             if status.as_u16() == 429 {
                 return Err(LlmError::RateLimit {
-                    retry_after_ms: None,
+                    retry_after_ms,
                     status: 429,
                 });
             }
@@ -378,8 +379,9 @@ where
     Fut: std::future::Future<Output = ()>,
 {
     let user_code = request_device_code(client).await?;
+    let auth_base_url = openai_auth_base_url();
     on_verification(DeviceCodePrompt {
-        verification_url: format!("{OPENAI_AUTH_BASE_URL}/codex/device"),
+        verification_url: format!("{auth_base_url}/codex/device"),
         user_code: user_code.user_code.clone(),
         expires_in_ms: DEVICE_CODE_TIMEOUT_MS,
     })
@@ -411,10 +413,11 @@ where
 async fn request_device_code(client: &reqwest::Client) -> anyhow::Result<UserCodeResponse> {
     let response = client
         .post(format!(
-            "{OPENAI_AUTH_BASE_URL}/api/accounts/deviceauth/usercode"
+            "{}/api/accounts/deviceauth/usercode",
+            openai_auth_base_url()
         ))
         .headers(openai_codex_auth_headers("application/json")?)
-        .json(&json!({ "client_id": OPENAI_CODEX_CLIENT_ID }))
+        .json(&json!({ "client_id": openai_codex_client_id() }))
         .send()
         .await?;
     let status = response.status();
@@ -443,7 +446,8 @@ async fn poll_device_code(
     while std::time::Instant::now() < deadline {
         let response = client
             .post(format!(
-                "{OPENAI_AUTH_BASE_URL}/api/accounts/deviceauth/token"
+                "{}/api/accounts/deviceauth/token",
+                openai_auth_base_url()
             ))
             .headers(openai_codex_auth_headers("application/json")?)
             .json(&json!({
@@ -457,7 +461,7 @@ async fn poll_device_code(
         if status.is_success() {
             return Ok(serde_json::from_str(&body)?);
         }
-        if status.as_u16() == 403 || status.as_u16() == 404 {
+        if status.as_u16() == 403 {
             tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
             continue;
         }
@@ -474,45 +478,49 @@ async fn exchange_authorization_code(
     authorization_code: &str,
     code_verifier: &str,
 ) -> anyhow::Result<OpenAICodexTokens> {
+    let redirect_uri = openai_codex_device_callback_url();
+    let client_id = openai_codex_client_id();
     let response = client
-        .post(format!("{OPENAI_AUTH_BASE_URL}/oauth/token"))
+        .post(format!("{}/oauth/token", openai_auth_base_url()))
         .headers(openai_codex_auth_headers(
             "application/x-www-form-urlencoded",
         )?)
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", authorization_code),
-            ("redirect_uri", OPENAI_CODEX_DEVICE_CALLBACK_URL),
-            ("client_id", OPENAI_CODEX_CLIENT_ID),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("client_id", client_id.as_str()),
             ("code_verifier", code_verifier),
         ])
         .send()
         .await?;
-    parse_oauth_token_response(response, "exchange").await
+    parse_oauth_token_response(response, "exchange", None).await
 }
 
 pub async fn refresh_openai_codex_token(
     client: &reqwest::Client,
     refresh_token: &str,
 ) -> anyhow::Result<OpenAICodexTokens> {
+    let client_id = openai_codex_client_id();
     let response = client
-        .post(format!("{OPENAI_AUTH_BASE_URL}/oauth/token"))
+        .post(format!("{}/oauth/token", openai_auth_base_url()))
         .headers(openai_codex_auth_headers(
             "application/x-www-form-urlencoded",
         )?)
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
-            ("client_id", OPENAI_CODEX_CLIENT_ID),
+            ("client_id", client_id.as_str()),
         ])
         .send()
         .await?;
-    parse_oauth_token_response(response, "refresh").await
+    parse_oauth_token_response(response, "refresh", Some(refresh_token)).await
 }
 
 async fn parse_oauth_token_response(
     response: reqwest::Response,
     operation: &str,
+    previous_refresh_token: Option<&str>,
 ) -> anyhow::Result<OpenAICodexTokens> {
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
@@ -531,9 +539,37 @@ async fn parse_oauth_token_response(
     Ok(OpenAICodexTokens {
         account_id: resolve_chatgpt_account_id(&token_response.access_token),
         access_token: token_response.access_token,
-        refresh_token: token_response.refresh_token,
+        refresh_token: token_response
+            .refresh_token
+            .or_else(|| previous_refresh_token.map(ToOwned::to_owned))
+            .ok_or_else(|| {
+                anyhow::anyhow!("OpenAI Codex token {operation} response missing refresh_token")
+            })?,
         expires_at_ms,
     })
+}
+
+fn openai_auth_base_url() -> String {
+    std::env::var("QUORUM_OPENAI_AUTH_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| OPENAI_AUTH_BASE_URL_DEFAULT.to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn openai_codex_client_id() -> String {
+    std::env::var("QUORUM_OPENAI_CODEX_CLIENT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| OPENAI_CODEX_CLIENT_ID_DEFAULT.to_string())
+}
+
+fn openai_codex_device_callback_url() -> String {
+    std::env::var("QUORUM_OPENAI_CODEX_DEVICE_CALLBACK_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("{}/deviceauth/callback", openai_auth_base_url()))
 }
 
 fn openai_codex_auth_headers(content_type: &str) -> anyhow::Result<reqwest::header::HeaderMap> {
@@ -570,6 +606,14 @@ fn codex_responses_headers(
         );
     }
     Ok(headers)
+}
+
+fn retry_after_ms_from_headers(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .and_then(|seconds| seconds.checked_mul(1000))
 }
 
 fn refresh_lock() -> &'static tokio::sync::Mutex<()> {
@@ -1048,6 +1092,20 @@ fn set_private_file_permissions(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn atomic_write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    set_private_file_permissions(tmp.path())?;
+    {
+        use std::io::Write as _;
+        tmp.write_all(data)?;
+        tmp.flush()?;
+    }
+    tmp.persist(path)?;
+    set_private_file_permissions(path)?;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn set_private_dir_permissions(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -1098,12 +1156,57 @@ mod tests {
         ChatCompletionRequestUserMessageContent, ChatCompletionTool, ChatCompletionToolType,
         FunctionObject,
     };
+    use std::ffi::OsString;
 
     fn jwt(payload: Value) -> String {
         format!(
             "x.{}.y",
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
         )
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let original = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    struct CurrentDirGuard(PathBuf);
+
+    impl CurrentDirGuard {
+        fn change_to(path: &Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self(original)
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).unwrap();
+        }
     }
 
     #[test]
@@ -1185,6 +1288,116 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(response.expires_in, Some(3600));
+    }
+
+    #[test]
+    fn oauth_token_response_allows_missing_refresh_token() {
+        let response: OAuthTokenResponse = serde_json::from_value(json!({
+            "access_token": "access",
+            "expires_in": 3600
+        }))
+        .unwrap();
+        assert!(response.refresh_token.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(openai_auth_env)]
+    fn auth_env_overrides_are_trimmed_and_optional() {
+        let _auth_base = EnvVarGuard::set(
+            "QUORUM_OPENAI_AUTH_BASE_URL",
+            "https://auth.example.test///",
+        );
+        let _client_id = EnvVarGuard::set("QUORUM_OPENAI_CODEX_CLIENT_ID", "client-test");
+        let _callback = EnvVarGuard::unset("QUORUM_OPENAI_CODEX_DEVICE_CALLBACK_URL");
+
+        assert_eq!(openai_auth_base_url(), "https://auth.example.test");
+        assert_eq!(openai_codex_client_id(), "client-test");
+        assert_eq!(
+            openai_codex_device_callback_url(),
+            "https://auth.example.test/deviceauth/callback"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(openai_auth_env)]
+    async fn refresh_without_refresh_token_preserves_previous_token() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let _auth_base = EnvVarGuard::set("QUORUM_OPENAI_AUTH_BASE_URL", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "new-access",
+                "expires_in": "3600"
+            })))
+            .mount(&server)
+            .await;
+
+        let tokens = refresh_openai_codex_token(&reqwest::Client::new(), "old-refresh")
+            .await
+            .unwrap();
+        assert_eq!(tokens.access_token, "new-access");
+        assert_eq!(tokens.refresh_token, "old-refresh");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(openai_auth_env)]
+    async fn authorization_exchange_requires_refresh_token() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let _auth_base = EnvVarGuard::set("QUORUM_OPENAI_AUTH_BASE_URL", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "new-access",
+                "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+
+        let err = exchange_authorization_code(&reqwest::Client::new(), "code", "verifier")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("missing refresh_token"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(openai_auth_env)]
+    async fn poll_device_code_fails_fast_on_404() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let _auth_base = EnvVarGuard::set("QUORUM_OPENAI_AUTH_BASE_URL", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/deviceauth/token"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("unknown\n device\r session"))
+            .mount(&server)
+            .await;
+
+        let err = poll_device_code(
+            &reqwest::Client::new(),
+            &UserCodeResponse {
+                device_auth_id: "device-id".to_string(),
+                user_code: "USER-CODE".to_string(),
+                interval: Some(0),
+            },
+        )
+        .await
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("404"), "unexpected error: {message}");
+        assert!(
+            message.contains("unknown device session"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]
@@ -1316,6 +1529,17 @@ mod tests {
         let read = store.read().unwrap().unwrap();
         assert_eq!(read.provider, "openai-codex");
         assert_eq!(read.tokens.account_id.as_deref(), Some("acct"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(store.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[test]
@@ -1347,5 +1571,39 @@ mod tests {
         let auth = store.read().unwrap().unwrap();
         assert_eq!(auth.tokens.refresh_token, "refresh-nested");
         assert_eq!(auth.tokens.account_id.as_deref(), Some("acct_from_file"));
+    }
+
+    #[test]
+    #[serial_test::serial(openai_auth_env)]
+    fn import_from_codex_cli_does_not_fall_back_to_cwd_without_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex_home = dir.path().join(".codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let token = jwt(json!({
+            "exp": (now_ms() / 1000) + 3600,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct_cwd"
+            }
+        }));
+        std::fs::write(
+            codex_home.join("auth.json"),
+            serde_json::to_string(&json!({
+                "tokens": {
+                    "access_token": token,
+                    "refresh_token": "refresh-cwd",
+                    "account_id": "acct_cwd"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let _cwd_guard = CurrentDirGuard::change_to(dir.path());
+        let _codex_home = EnvVarGuard::unset("CODEX_HOME");
+        let _home = EnvVarGuard::unset("HOME");
+
+        let store = OpenAICodexAuthStore::new(dir.path().join("quorum-auth.json"));
+        assert!(!store.import_from_codex_cli().unwrap());
+        assert!(store.read().unwrap().is_none());
     }
 }
