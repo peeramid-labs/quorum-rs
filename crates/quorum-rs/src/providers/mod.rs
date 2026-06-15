@@ -30,6 +30,8 @@
 /// Built-in [`ProviderFactory`] implementations registered by
 /// [`ProviderRegistry::with_builtins`].
 pub mod builtins;
+/// Shared subprocess spawn + timeout helpers for the CLI-agent
+/// providers (`exec`, `mcp`).
 pub(crate) mod cli_base;
 
 use std::collections::HashMap;
