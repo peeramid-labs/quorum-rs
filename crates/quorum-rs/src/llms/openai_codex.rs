@@ -539,11 +539,6 @@ async fn parse_oauth_token_response(
 fn openai_codex_auth_headers(content_type: &str) -> anyhow::Result<reqwest::header::HeaderMap> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(reqwest::header::CONTENT_TYPE, content_type.parse()?);
-    headers.insert(reqwest::header::USER_AGENT, "quorum-rs".parse()?);
-    headers.insert(
-        reqwest::header::HeaderName::from_static("originator"),
-        "quorum-rs".parse()?,
-    );
     Ok(headers)
 }
 
@@ -1147,6 +1142,14 @@ mod tests {
             headers.get("User-Agent").unwrap(),
             "codex_cli_rs/0.0.0 (quorum-rs)"
         );
+    }
+
+    #[test]
+    fn auth_headers_match_codex_device_auth_flow() {
+        let headers = openai_codex_auth_headers("application/json").unwrap();
+        assert_eq!(headers.get("Content-Type").unwrap(), "application/json");
+        assert!(headers.get("originator").is_none());
+        assert!(headers.get("User-Agent").is_none());
     }
 
     #[test]
