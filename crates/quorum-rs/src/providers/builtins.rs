@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use super::ProviderFactory;
@@ -15,7 +15,7 @@ use crate::agents::exec_agent::ExecAgent;
 use crate::agents::mcp_agent::{ClaudeAgent, McpAgent};
 use crate::agents::{NsedAgent, ProposerEvaluatorAgent};
 use crate::config::ProviderEntry;
-use crate::llms::OpenAICompatibleModel;
+use crate::llms::{OpenAICodexAuthStore, OpenAICodexModel, OpenAICompatibleModel};
 use crate::prompts::defaults::DefaultPromptSet;
 use crate::serve::instantiate_builtin_tools;
 
@@ -116,6 +116,78 @@ impl ProviderFactory for ClaudeFactory {
             agent_config.clone(),
             claude_cfg,
             Arc::new(DefaultPromptSet::new()),
+        ))))
+    }
+}
+
+/// `openai-codex` — ChatGPT/Codex OAuth-backed Responses provider.
+///
+/// This is intentionally separate from issue #16's Codex CLI provider. It does
+/// not spawn `codex`; it uses the user's ChatGPT subscription OAuth tokens and
+/// the Codex backend directly so `gpt-5.5` can run without an OpenAI API key.
+pub struct OpenAICodexFactory;
+
+impl ProviderFactory for OpenAICodexFactory {
+    fn provider_type(&self) -> &str {
+        "openai-codex"
+    }
+
+    fn build_agent(
+        &self,
+        agent_config: &AgentConfig,
+        provider: &ProviderEntry,
+    ) -> Result<Option<Arc<dyn NsedAgent>>> {
+        let auth_store = OpenAICodexAuthStore::default()
+            .context("failed to resolve OpenAI Codex auth store path")?;
+        if auth_store.read()?.is_none() {
+            let imported = auth_store
+                .import_from_codex_cli()
+                .context("failed to import OpenAI Codex auth from CODEX_HOME")?;
+            if imported {
+                info!(
+                    agent = %agent_config.name,
+                    auth_path = %auth_store.path().display(),
+                    "imported OpenAI Codex auth from Codex CLI"
+                );
+            } else {
+                anyhow::bail!(
+                    "OpenAI Codex auth is missing for agent '{}'. Run `quorum auth openai-codex`.",
+                    agent_config.name
+                );
+            }
+        }
+
+        let base_url = if provider.base_url.trim().is_empty() {
+            None
+        } else {
+            Some(provider.base_url.clone())
+        };
+        let llm = OpenAICodexModel::new(base_url, auth_store);
+        let builtin_tools = match instantiate_builtin_tools(agent_config) {
+            Ok(tools) => tools,
+            Err(reason) => {
+                warn!(
+                    agent = %agent_config.name,
+                    reason = %reason,
+                    "skipping agent: failed to instantiate builtin_tools"
+                );
+                return Ok(None);
+            }
+        };
+        if !builtin_tools.is_empty() {
+            info!(
+                agent = %agent_config.name,
+                count = builtin_tools.len(),
+                "attached SDK-builtin tool grants"
+            );
+        }
+
+        Ok(Some(Arc::new(ProposerEvaluatorAgent::new(
+            agent_config.clone(),
+            Box::new(llm),
+            Box::new(DefaultPromptSet::new()),
+            vec![],
+            builtin_tools,
         ))))
     }
 }

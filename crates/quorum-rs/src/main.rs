@@ -34,6 +34,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Authenticate provider accounts used by agent runtimes.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
+
     /// Run a deliberation task.
     Run {
         /// The task or question to deliberate on. Mutually exclusive
@@ -317,6 +323,14 @@ enum Commands {
     Validate,
 }
 
+#[derive(Subcommand)]
+enum AuthCommands {
+    /// Sign in with ChatGPT/Codex OAuth for subscription-backed OpenAI.
+    OpenaiCodex,
+    /// Show locally configured provider auth.
+    Status,
+}
+
 impl Cli {
     fn config_path(&self) -> &Path {
         self.config.as_deref().unwrap_or(Path::new("nsed.yaml"))
@@ -329,6 +343,10 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Auth { command } => match command {
+            AuthCommands::OpenaiCodex => commands::auth::login_openai_codex().await,
+            AuthCommands::Status => commands::auth::status(),
+        },
         Commands::Run {
             ref task,
             ref task_file,

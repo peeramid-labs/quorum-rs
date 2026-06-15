@@ -54,17 +54,18 @@ An unknown `provider_type` (typo, or a factory nobody registered) is itself an `
 
 ### `requires_api_key` ⇒ `is_local`
 
-`ProviderRegistry::is_local(type)` is `registered && !requires_api_key()`. This is the single source of truth for the placeholder-API-key exemption that used to be a hand-maintained `matches!("exec" | "mcp" | "claude" | …)`. A subprocess provider (`exec`, `mcp`, `claude`), local Ollama, and the simulator are local; `openai` is not.
+`ProviderRegistry::is_local(type)` is `registered && !requires_api_key()`. This is the single source of truth for the placeholder-API-key exemption that used to be a hand-maintained `matches!("exec" | "mcp" | "claude" | …)`. A subprocess provider (`exec`, `mcp`, `claude`), local Ollama, the simulator, and ChatGPT/Codex OAuth (`openai-codex`) are local/keyless; `openai` is not.
 
 ## Built-in factories
 
-`ProviderRegistry::with_builtins()` registers exactly the providers the old dispatch supported, with identical behaviour:
+`ProviderRegistry::with_builtins()` registers the SDK-shipped providers:
 
 | `type` | Factory | Agent | `requires_api_key` |
 |---|---|---|---|
 | `exec` | `ExecFactory` | `ExecAgent` | no |
 | `mcp` | `McpFactory` | `McpAgent` | no |
 | `claude` | `ClaudeFactory` | `ClaudeAgent` | no |
+| `openai-codex` | `OpenAICodexFactory` | `ProposerEvaluatorAgent` + `OpenAICodexModel` | no |
 | `openai` | `OpenAiCompatibleFactory` | `ProposerEvaluatorAgent` + `OpenAICompatibleModel` | **yes** |
 | `ollama` | `OpenAiCompatibleFactory` | same | no |
 | `simulated` | `OpenAiCompatibleFactory` | same | no |

@@ -533,6 +533,10 @@ pub fn load_agent_from_config_with_registry(
         .validate_compaction_knobs()
         .map_err(|e| anyhow::anyhow!(e))?;
 
+    if provider_entry.provider_type == "openai-codex" && agent.model_name.trim().is_empty() {
+        agent.model_name = "gpt-5.5".to_string();
+    }
+
     // Only require API keys for remote providers
     let is_local_url = provider_entry.base_url.starts_with("http://localhost")
         || provider_entry.base_url.starts_with("http://127.0.0.1");
@@ -1343,6 +1347,39 @@ agents:
         let (agent, provider) = load_agent_from_config(&config, "PY_AGENT").unwrap();
         assert_eq!(provider.provider_type, "exec");
         assert_eq!(agent.name, "PY_AGENT");
+    }
+
+    #[test]
+    fn test_openai_codex_provider_skips_api_key_check() {
+        let yaml = r#"
+providers:
+  openai_codex:
+    type: openai-codex
+agents:
+  - name: CODEX_AGENT
+    provider_id: openai_codex
+    model_name: gpt-5.5
+"#;
+        let config: AgentFleetConfig = serde_yaml::from_str(yaml).unwrap();
+        let (agent, provider) = load_agent_from_config(&config, "CODEX_AGENT").unwrap();
+        assert_eq!(provider.provider_type, "openai-codex");
+        assert_eq!(agent.model_name, "gpt-5.5");
+    }
+
+    #[test]
+    fn test_openai_codex_provider_defaults_to_gpt55() {
+        let yaml = r#"
+providers:
+  openai_codex:
+    type: openai-codex
+agents:
+  - name: CODEX_AGENT
+    provider_id: openai_codex
+"#;
+        let config: AgentFleetConfig = serde_yaml::from_str(yaml).unwrap();
+        let (agent, provider) = load_agent_from_config(&config, "CODEX_AGENT").unwrap();
+        assert_eq!(provider.provider_type, "openai-codex");
+        assert_eq!(agent.model_name, "gpt-5.5");
     }
 
     #[test]

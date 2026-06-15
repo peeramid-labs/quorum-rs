@@ -23,8 +23,8 @@
 //! ```
 //!
 //! The built-in factories (`exec`, `mcp`, `claude`, `openai`,
-//! `ollama`, `simulated`) preserve the exact behaviour of the old
-//! hard-coded dispatch, including the "skip this agent cleanly
+//! `openai-codex`, `ollama`, `simulated`) preserve the exact behaviour
+//! of the old hard-coded dispatch, including the "skip this agent cleanly
 //! (`Ok(None)`)" semantics when a config section is missing.
 
 /// Built-in [`ProviderFactory`] implementations registered by
@@ -100,6 +100,7 @@ impl ProviderRegistry {
         registry.register(Arc::new(builtins::ExecFactory));
         registry.register(Arc::new(builtins::McpFactory));
         registry.register(Arc::new(builtins::ClaudeFactory));
+        registry.register(Arc::new(builtins::OpenAICodexFactory));
         // One OpenAI-compatible factory per wire-compatible type. Only
         // `openai` requires an API key; `ollama` and `simulated` are
         // local (the old dispatch exempted them via `is_local`).
@@ -199,7 +200,15 @@ mod tests {
         let registry = ProviderRegistry::with_builtins();
         assert_eq!(
             registry.provider_types(),
-            vec!["claude", "exec", "mcp", "ollama", "openai", "simulated"]
+            vec![
+                "claude",
+                "exec",
+                "mcp",
+                "ollama",
+                "openai",
+                "openai-codex",
+                "simulated"
+            ]
         );
     }
 
@@ -207,7 +216,14 @@ mod tests {
     fn is_local_matches_old_dispatch_exemptions() {
         let registry = ProviderRegistry::with_builtins();
         // Local providers (no API key) — exempt from key validation.
-        for local in ["exec", "mcp", "claude", "ollama", "simulated"] {
+        for local in [
+            "exec",
+            "mcp",
+            "claude",
+            "openai-codex",
+            "ollama",
+            "simulated",
+        ] {
             assert!(registry.is_local(local), "{local} must be local");
         }
         // Remote — needs a key.
@@ -220,7 +236,14 @@ mod tests {
     fn requires_api_key_only_for_openai() {
         let registry = ProviderRegistry::with_builtins();
         assert!(registry.get("openai").unwrap().requires_api_key());
-        for local in ["exec", "mcp", "claude", "ollama", "simulated"] {
+        for local in [
+            "exec",
+            "mcp",
+            "claude",
+            "openai-codex",
+            "ollama",
+            "simulated",
+        ] {
             assert!(!registry.get(local).unwrap().requires_api_key());
         }
     }
