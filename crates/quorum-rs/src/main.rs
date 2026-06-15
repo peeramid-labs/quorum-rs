@@ -17,10 +17,21 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use quorum_rs::cli::commands;
 
+/// `<pkg-version> (<git-sha> <commit-date>)` — git fields come from
+/// `build.rs` (or "unknown" when built without git).
+const QUORUM_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("QUORUM_GIT_SHA"),
+    " ",
+    env!("QUORUM_GIT_DATE"),
+    ")"
+);
+
 #[derive(Parser)]
 #[command(
     name = "quorum",
-    version,
+    version = QUORUM_VERSION,
     about = "Multi-agent deliberation from the command line"
 )]
 struct Cli {
@@ -583,5 +594,16 @@ mod config_path_tests {
     fn defaults_to_yaml_when_neither_present() {
         let got = resolve_config_path(None, |_| false);
         assert_eq!(got, PathBuf::from("nsed.yaml"));
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::QUORUM_VERSION;
+
+    #[test]
+    fn version_carries_pkg_and_git_fields() {
+        assert!(QUORUM_VERSION.starts_with(env!("CARGO_PKG_VERSION")));
+        assert!(QUORUM_VERSION.contains('(') && QUORUM_VERSION.ends_with(')'));
     }
 }
