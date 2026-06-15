@@ -428,6 +428,23 @@ impl NatsNsedWorker {
         config: WorkerConfig,
         telemetry: Option<TelemetryEmitterMux>,
     ) -> Result<Self> {
+        Self::from_dyn_agent(Arc::new(agent), agent_config, config, telemetry).await
+    }
+
+    /// Like [`NatsNsedWorker::new`] but takes an already-erased
+    /// `Arc<dyn NsedAgent>`. The [`ProviderRegistry`] dispatch path
+    /// produces trait objects (the concrete agent type is chosen at
+    /// runtime by a [`ProviderFactory`]), so it can't satisfy the
+    /// `impl NsedAgent` bound on `new`.
+    ///
+    /// [`ProviderRegistry`]: crate::providers::ProviderRegistry
+    /// [`ProviderFactory`]: crate::providers::ProviderFactory
+    pub async fn from_dyn_agent(
+        agent: Arc<dyn NsedAgent>,
+        agent_config: AgentConfig,
+        config: WorkerConfig,
+        telemetry: Option<TelemetryEmitterMux>,
+    ) -> Result<Self> {
         let agent_id = agent.name();
         let nats = connect_nats(&config.nats_url, config.nats_auth.as_ref()).await?;
         let js = jetstream::new(nats.clone());
@@ -477,7 +494,7 @@ impl NatsNsedWorker {
         );
 
         Ok(Self {
-            agent: Arc::new(agent),
+            agent,
             agent_config,
             nats,
             js,

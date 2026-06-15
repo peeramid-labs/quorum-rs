@@ -217,6 +217,7 @@ pub async fn run(
             .unwrap_or_else(|| "sphera".to_string()),
         cancel: Some(cancel.clone()),
         dashboard_port,
+        registry: None,
     };
 
     // Race the runner against a shutdown signal. On signal we
