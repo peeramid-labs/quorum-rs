@@ -49,15 +49,11 @@
 //! # }
 //! ```
 
-use crate::agents::ProposerEvaluatorAgent;
 use crate::agents::config::{AgentConfig, BuiltinToolGrant};
-use crate::agents::exec_agent::ExecAgent;
-use crate::agents::mcp_agent::{ClaudeAgent, McpAgent};
 use crate::config::{AgentFleetConfig, load_agent_from_config, resolve_agent_names};
-use crate::llms::OpenAICompatibleModel;
 use crate::multi_agent::MultiAgentRunner;
 use crate::nats_utils::NatsAuth;
-use crate::prompts::defaults::DefaultPromptSet;
+use crate::providers::ProviderRegistry;
 use crate::tools::{ScopedGrepTool, ScopedReadFileTool, Tool};
 use crate::workers::{NatsNsedWorker, WorkerConfig};
 use anyhow::{Context, Result};
@@ -104,6 +100,11 @@ pub struct ServeOptions {
     /// `AgentFleetConfig::dashboard_port`; when both are `None`, no
     /// dashboard is started.
     pub dashboard_port: Option<u16>,
+    /// Provider dispatch table. `None` (the default) uses the SDK's
+    /// built-in providers ([`ProviderRegistry::with_builtins`]). Set
+    /// this to a registry with custom factories registered to add
+    /// third-party provider types without forking the SDK.
+    pub registry: Option<Arc<ProviderRegistry>>,
 }
 
 impl Default for ServeOptions {
@@ -116,6 +117,7 @@ impl Default for ServeOptions {
             api_prefix: "sphera".to_string(),
             cancel: None,
             dashboard_port: None,
+            registry: None,
         }
     }
 }
@@ -171,7 +173,9 @@ fn redact_userinfo(url: &str) -> String {
 /// whole agent in that case rather than booting it with a
 /// half-armed tool set; pinning a fleet on a misconfigured root is
 /// a per-agent issue, not a fleet-wide failure.
-fn instantiate_builtin_tools(agent_config: &AgentConfig) -> Result<Vec<Box<dyn Tool>>, String> {
+pub(crate) fn instantiate_builtin_tools(
+    agent_config: &AgentConfig,
+) -> Result<Vec<Box<dyn Tool>>, String> {
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
     for grant in &agent_config.builtin_tools {
         match grant {
@@ -225,6 +229,7 @@ pub async fn build_worker(
     nats_auth: Option<&NatsAuth>,
     stream_name: &str,
     api_prefix: &str,
+    registry: &ProviderRegistry,
 ) -> Result<Option<(NatsNsedWorker, AgentConfig)>> {
     let (agent_config, provider) = load_agent_from_config(fleet, agent_name)
         .with_context(|| format!("failed to load agent '{agent_name}' from fleet config"))?;
@@ -237,108 +242,17 @@ pub async fn build_worker(
         worker_config = worker_config.with_nats_auth(auth.clone());
     }
 
-    let agent_name_owned = agent_config.name.clone();
-    let worker = match provider.provider_type.as_str() {
-        "exec" => {
-            let exec_cfg = match agent_config.exec.clone() {
-                Some(c) => c,
-                None => {
-                    warn!(
-                        agent = %agent_name_owned,
-                        "provider_type=exec but no `exec` section in agent config — skipping"
-                    );
-                    return Ok(None);
-                }
-            };
-            let agent = ExecAgent::new(agent_name_owned.clone(), exec_cfg);
-            NatsNsedWorker::new(agent, agent_config.clone(), worker_config, None).await?
-        }
-        "mcp" => {
-            let mcp_cfg = match agent_config.mcp.clone() {
-                Some(c) => c,
-                None => {
-                    warn!(
-                        agent = %agent_name_owned,
-                        "provider_type=mcp but no `mcp` section in agent config — skipping"
-                    );
-                    return Ok(None);
-                }
-            };
-            let agent = McpAgent::new(agent_name_owned.clone(), mcp_cfg);
-            NatsNsedWorker::new(agent, agent_config.clone(), worker_config, None).await?
-        }
-        "claude" => {
-            let claude_cfg = agent_config.claude.clone().unwrap_or_default();
-            let agent = ClaudeAgent::new(
-                agent_config.clone(),
-                claude_cfg,
-                Arc::new(DefaultPromptSet::new()),
-            );
-            NatsNsedWorker::new(agent, agent_config.clone(), worker_config, None).await?
-        }
-        // Other LLM provider types ("openai", "ollama", "simulated",
-        // or any other type that's known to speak the OpenAI wire
-        // format) go through the OpenAI-compatible client. Anything
-        // truly unrecognised (typo in `type`, a custom provider not
-        // yet supported by this dispatch) is SKIPPED with an error
-        // log rather than silently routed to OpenAI — without this
-        // guard a typoed `type: oepnai` would leak the agent's API
-        // key to api.openai.com because of the
-        // "default base_url = openai" fallback below.
-        other if other == "openai" || other == "ollama" || other == "simulated" => {
-            let base_url = if provider.base_url.is_empty() {
-                if provider.provider_type == "openai" {
-                    "https://api.openai.com/v1".to_string()
-                } else {
-                    warn!(
-                        agent = %agent_name_owned,
-                        provider_type = %other,
-                        "no `base_url` set for non-openai provider type — skipping"
-                    );
-                    return Ok(None);
-                }
-            } else {
-                provider.base_url.clone()
-            };
-            let api_key = provider.api_key.clone();
-            let llm = OpenAICompatibleModel::new(base_url, api_key, provider.engine.clone());
-            let builtin_tools = match instantiate_builtin_tools(&agent_config) {
-                Ok(tools) => tools,
-                Err(reason) => {
-                    warn!(
-                        agent = %agent_name_owned,
-                        reason = %reason,
-                        "skipping agent: failed to instantiate builtin_tools"
-                    );
-                    return Ok(None);
-                }
-            };
-            if !builtin_tools.is_empty() {
-                info!(
-                    agent = %agent_name_owned,
-                    count = builtin_tools.len(),
-                    "attached SDK-builtin tool grants"
-                );
-            }
-            let agent = ProposerEvaluatorAgent::new(
-                agent_config.clone(),
-                Box::new(llm),
-                Box::new(DefaultPromptSet::new()),
-                vec![],
-                builtin_tools,
-            );
-            NatsNsedWorker::new(agent, agent_config.clone(), worker_config, None).await?
-        }
-        other => {
-            warn!(
-                agent = %agent_name_owned,
-                provider_type = %other,
-                "unknown provider_type — skipping. Supported types: openai, ollama, simulated, exec, mcp, claude"
-            );
-            return Ok(None);
-        }
+    // Dispatch is now a single registry lookup. Each provider arm
+    // lives in a `ProviderFactory` (see `crate::providers::builtins`);
+    // `Ok(None)` means "skip this agent cleanly" (missing config
+    // section, unknown type, …) — already warned by the factory.
+    let agent = match registry.build_agent(&provider.provider_type, &agent_config, &provider)? {
+        Some(agent) => agent,
+        None => return Ok(None),
     };
 
+    let worker =
+        NatsNsedWorker::from_dyn_agent(agent, agent_config.clone(), worker_config, None).await?;
     Ok(Some((worker, agent_config)))
 }
 
@@ -381,6 +295,13 @@ pub async fn serve_fleet(fleet: &AgentFleetConfig, opts: ServeOptions) -> Result
         "starting fleet"
     );
 
+    // Provider dispatch table: caller-supplied (third parties can
+    // register custom factories) or the SDK built-ins.
+    let registry = opts
+        .registry
+        .clone()
+        .unwrap_or_else(|| Arc::new(ProviderRegistry::with_builtins()));
+
     let mut runner = MultiAgentRunner::new();
 
     // Dashboard wiring: CLI flag (opts) wins over fleet config.
@@ -413,6 +334,7 @@ pub async fn serve_fleet(fleet: &AgentFleetConfig, opts: ServeOptions) -> Result
             opts.nats_auth.as_ref(),
             &opts.stream_name,
             &opts.api_prefix,
+            &registry,
         )
         .await
         {
@@ -545,6 +467,7 @@ agents:
             None,
             "sphera_jobs",
             "sphera",
+            &ProviderRegistry::with_builtins(),
         )
         .await;
         assert!(
