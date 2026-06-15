@@ -11,11 +11,11 @@ use std::time::Duration;
 
 use crate::agents::config::ExecProviderConfig;
 use crate::agents::{AgentContext, Evaluation, NsedAgent, Proposal};
+use crate::providers::cli_base;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 use tracing::warn;
 
 // ─── Delimiter markers for stdout pollution resistance ───────────────────────
@@ -65,23 +65,11 @@ impl ExecAgent {
 
     /// Resolve the effective timeout for a single call.
     fn effective_timeout(&self, ctx: &AgentContext) -> Duration {
-        let secs = self.config.timeout_secs.unwrap_or_else(|| {
-            let budget = ctx.phase_budget_remaining_secs;
-            if budget > 0.0 {
-                (budget.ceil() as u64).max(1)
-            } else {
-                300
-            }
-        });
-        Duration::from_secs(secs)
+        cli_base::effective_timeout(self.config.timeout_secs, ctx)
     }
 
     /// Spawn the subprocess, write the envelope to stdin, and return stdout.
     async fn run_subprocess(&self, phase: &str, ctx: &AgentContext) -> Result<String> {
-        if self.config.command.is_empty() {
-            bail!("exec agent '{}': command is empty", self.name);
-        }
-
         let timeout = self.effective_timeout(ctx);
         let envelope = serde_json::to_string(&ExecEnvelope {
             phase,
@@ -89,26 +77,14 @@ impl ExecAgent {
         })
         .context("failed to serialize agent context to JSON")?;
 
-        let mut cmd = Command::new(&self.config.command[0]);
-        cmd.args(&self.config.command[1..])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-
-        if let Some(ref dir) = self.config.working_dir {
-            cmd.current_dir(dir);
-        }
-        for (k, v) in &self.config.env {
-            cmd.env(k, v);
-        }
-
-        let mut child = cmd.spawn().with_context(|| {
-            format!(
-                "exec agent '{}': failed to spawn {:?}",
-                self.name, self.config.command
-            )
-        })?;
+        let mut child = cli_base::spawn_child(
+            "exec",
+            &self.name,
+            &self.config.command,
+            self.config.working_dir.as_deref(),
+            &self.config.env,
+            &[],
+        )?;
 
         // Write envelope to stdin, then close it.
         // BrokenPipe means the subprocess closed its stdin (exited early or ignores it).

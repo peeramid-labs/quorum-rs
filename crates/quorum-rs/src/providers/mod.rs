@@ -28,6 +28,7 @@
 //! (`Ok(None)`)" semantics when a config section is missing.
 
 pub mod builtins;
+pub(crate) mod cli_base;
 
 use std::collections::HashMap;
 use std::sync::Arc;

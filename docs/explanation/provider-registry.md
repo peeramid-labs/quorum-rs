@@ -71,6 +71,10 @@ An unknown `provider_type` (typo, or a factory nobody registered) is itself an `
 
 The three OpenAI-wire-compatible types share one factory implementation, registered three times with the per-type `requires_api_key` flag. Only `openai` gets the `https://api.openai.com/v1` base-URL default; the others must set `base_url` explicitly (a guard so a typoed `type:` can't leak an API key to api.openai.com).
 
+## Shared subprocess plumbing
+
+`exec` and `mcp` both spawn an external process with piped stdio and a budget-derived timeout, then diverge completely — `exec` is one-shot stdin→stdout; `mcp` writes a line envelope and then runs a live MCP session over the same pipes. Only that spawn-and-timeout prologue is genuinely shared, so it lives in one place (`providers::cli_base`): `effective_timeout` (explicit `timeout_secs`, else phase budget, else 300s) and `spawn_child` (pipes + `kill_on_drop`, `working_dir`, `env`, then `extra_env` layered last for session-identity vars). The protocol halves stay in their own agents — the base is the overlap and nothing more, not a `use_mcp`-flag mega-struct that fuses two unrelated protocols.
+
 ## What a third party gets
 
 A downstream crate implements `ProviderFactory` for its own type, registers it, and passes the registry to `serve_fleet` via `ServeOptions.registry` — no SDK change, no fork:
