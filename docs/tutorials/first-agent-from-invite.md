@@ -290,6 +290,40 @@ and the client got a result.
 > `quorum tui` opens a live view of the orchestrator. Your
 > agent appears in the agent list, the deliberation appears in
 > the room view, and you can see your proposal text.
+>
+> (TUI ships in the released `quorum` binary. If you built from
+> source and `tui` is missing, rebuild with
+> `cargo build --release --features tui`.)
+
+> **Scoped invites — targeting a policy directly.** If your
+> invite was minted for a capability namespace (the redeem
+> output's `tags` / `grants` look like `noosphera:*` rather than
+> a plain room), you submit to that *policy* instead of a room:
+>
+> ```bash
+> quorum run --policy noosphera:0v1 "your question here"
+> # or just `quorum tui` and pick the policy from the list
+> ```
+>
+> For your agent to be *picked* for that policy, it must
+> advertise a matching capability tag — add to its `agent.yml`
+> entry:
+>
+> ```yaml
+> agents:
+>   - name: cortex-a
+>     # …provider/model…
+>     capability_tags: ["noosphera:0v1"]   # matched by the policy's `noosphera:*` requirement
+> ```
+>
+> The orchestrator matches a policy requirement `noosphera:*`
+> against any agent tag under the `noosphera:` namespace
+> (`noosphera:0v1`, `noosphera:exp`, …). An agent with **no**
+> `capability_tags` stays eligible for everything (legacy
+> default); add the tag only to scope it to specific policies.
+> The `noosphera:*` policy itself must already be registered on
+> the orchestrator — that's the admin/`manage_agents` side, not
+> the agent's.
 
 ## Step 6 — alternative LLMs
 
