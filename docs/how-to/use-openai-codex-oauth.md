@@ -9,8 +9,16 @@ Sign in once:
 quorum auth openai-codex
 ```
 
-The command prints a browser URL and a user code. After approval, credentials
-are stored at `~/.nsed/openai-codex.json` with private file permissions.
+The command opens a browser OAuth flow and listens for the local callback on
+`127.0.0.1:1455`. If the callback does not arrive, paste the final redirect URL
+back into the terminal. After approval, credentials are stored at
+`~/.nsed/openai-codex.json` with private file permissions.
+
+For the older Codex device-code flow, run:
+
+```sh
+quorum auth openai-codex --device-code
+```
 
 Use the provider from `agent.yml`:
 

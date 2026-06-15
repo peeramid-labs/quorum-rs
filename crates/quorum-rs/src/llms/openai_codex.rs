@@ -16,15 +16,25 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use tokio::sync::Semaphore;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Semaphore, oneshot};
 
 const OPENAI_AUTH_BASE_URL: &str = "https://auth.openai.com";
+const OPENAI_CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_CODEX_DEVICE_CALLBACK_URL: &str = "https://auth.openai.com/deviceauth/callback";
+const OPENAI_CODEX_BROWSER_CALLBACK_HOST: &str = "127.0.0.1";
+const OPENAI_CODEX_BROWSER_CALLBACK_PORT: u16 = 1455;
+const OPENAI_CODEX_BROWSER_CALLBACK_PATH: &str = "/auth/callback";
+const OPENAI_CODEX_BROWSER_SCOPE: &str = "openid profile email offline_access";
+const OPENAI_CODEX_BROWSER_ORIGINATOR: &str = "quorum-rs";
 const OPENAI_CODEX_DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const BROWSER_CALLBACK_FALLBACK_MS: u64 = 15_000;
 const DEVICE_CODE_TIMEOUT_MS: u64 = 15 * 60_000;
 const DEVICE_CODE_DEFAULT_INTERVAL_MS: u64 = 5_000;
 const DEVICE_CODE_MIN_INTERVAL_MS: u64 = 1_000;
@@ -57,12 +67,45 @@ pub struct DeviceCodePrompt {
     pub expires_in_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserOAuthPrompt {
+    pub authorization_url: String,
+    pub redirect_uri: String,
+    pub callback_port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualCodePrompt {
+    pub authorization_url: String,
+    pub redirect_uri: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserOAuthFlow {
+    authorization_url: String,
+    redirect_uri: String,
+    verifier: String,
+    state: String,
+}
+
+struct OAuthCallbackServer {
+    receiver: oneshot::Receiver<String>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for OAuthCallbackServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct UserCodeResponse {
     device_auth_id: String,
     #[serde(alias = "usercode")]
     user_code: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
     interval: Option<u64>,
 }
 
@@ -76,7 +119,7 @@ struct DeviceTokenResponse {
 struct OAuthTokenResponse {
     access_token: String,
     refresh_token: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
     expires_in: Option<i64>,
 }
 
@@ -369,6 +412,84 @@ async fn send_codex_responses_request(
         .map_err(transport_error)
 }
 
+pub async fn login_openai_codex_browser<F, Fut, M, ManualFut>(
+    client: &reqwest::Client,
+    on_authorization: F,
+    on_manual_code: M,
+) -> anyhow::Result<OpenAICodexTokens>
+where
+    F: FnOnce(BrowserOAuthPrompt) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+    M: FnOnce(ManualCodePrompt) -> ManualFut,
+    ManualFut: std::future::Future<Output = anyhow::Result<String>>,
+{
+    let flow = create_browser_oauth_flow()?;
+    let (mut server, server_error) = match start_local_oauth_server(flow.state.clone()).await {
+        Ok(server) => (Some(server), None),
+        Err(err) => (None, Some(err.to_string())),
+    };
+
+    on_authorization(BrowserOAuthPrompt {
+        authorization_url: flow.authorization_url.clone(),
+        redirect_uri: flow.redirect_uri.clone(),
+        callback_port: OPENAI_CODEX_BROWSER_CALLBACK_PORT,
+    })
+    .await;
+
+    let code = if let Some(server) = server.as_mut() {
+        match wait_for_callback_code(server).await? {
+            Some(code) => code,
+            None => {
+                wait_for_manual_code_or_callback(
+                    server,
+                    ManualCodePrompt {
+                        authorization_url: flow.authorization_url.clone(),
+                        redirect_uri: flow.redirect_uri.clone(),
+                        reason: format!(
+                            "No OAuth callback arrived within {} seconds.",
+                            BROWSER_CALLBACK_FALLBACK_MS / 1000
+                        ),
+                    },
+                    &flow.state,
+                    on_manual_code,
+                )
+                .await?
+            }
+        }
+    } else {
+        let input = on_manual_code(ManualCodePrompt {
+            authorization_url: flow.authorization_url.clone(),
+            redirect_uri: flow.redirect_uri.clone(),
+            reason: server_error
+                .map(|err| format!("The local OAuth callback server could not be started: {err}"))
+                .unwrap_or_else(|| {
+                    "The local OAuth callback server could not be started.".to_string()
+                }),
+        })
+        .await?;
+        parse_oauth_authorization_input(&input, &flow.state)?
+    };
+
+    exchange_authorization_code(client, &code, &flow.verifier, &flow.redirect_uri).await
+}
+
+pub async fn login_and_store_openai_codex_browser<F, Fut, M, ManualFut>(
+    store: &OpenAICodexAuthStore,
+    on_authorization: F,
+    on_manual_code: M,
+) -> anyhow::Result<OpenAICodexTokens>
+where
+    F: FnOnce(BrowserOAuthPrompt) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+    M: FnOnce(ManualCodePrompt) -> ManualFut,
+    ManualFut: std::future::Future<Output = anyhow::Result<String>>,
+{
+    let client = reqwest::Client::new();
+    let tokens = login_openai_codex_browser(&client, on_authorization, on_manual_code).await?;
+    store.write(tokens.clone())?;
+    Ok(tokens)
+}
+
 pub async fn login_openai_codex_device_code<F, Fut>(
     client: &reqwest::Client,
     on_verification: F,
@@ -390,6 +511,7 @@ where
         client,
         &authorization.authorization_code,
         &authorization.code_verifier,
+        OPENAI_CODEX_DEVICE_CALLBACK_URL,
     )
     .await
 }
@@ -406,6 +528,290 @@ where
     let tokens = login_openai_codex_device_code(&client, on_verification).await?;
     store.write(tokens.clone())?;
     Ok(tokens)
+}
+
+fn create_browser_oauth_flow() -> anyhow::Result<BrowserOAuthFlow> {
+    let (verifier, challenge) = generate_pkce_pair();
+    let state = random_hex_state();
+    create_browser_oauth_flow_with_values(verifier, challenge, state)
+}
+
+fn create_browser_oauth_flow_with_values(
+    verifier: String,
+    challenge: String,
+    state: String,
+) -> anyhow::Result<BrowserOAuthFlow> {
+    let redirect_uri = format!(
+        "http://{}:{}{}",
+        OPENAI_CODEX_BROWSER_CALLBACK_HOST,
+        OPENAI_CODEX_BROWSER_CALLBACK_PORT,
+        OPENAI_CODEX_BROWSER_CALLBACK_PATH
+    );
+    let mut url = reqwest::Url::parse(OPENAI_CODEX_AUTHORIZE_URL)?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", OPENAI_CODEX_CLIENT_ID)
+        .append_pair("redirect_uri", &redirect_uri)
+        .append_pair("scope", OPENAI_CODEX_BROWSER_SCOPE)
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", &state)
+        .append_pair("id_token_add_organizations", "true")
+        .append_pair("codex_cli_simplified_flow", "true")
+        .append_pair("originator", OPENAI_CODEX_BROWSER_ORIGINATOR);
+    Ok(BrowserOAuthFlow {
+        authorization_url: url.to_string(),
+        redirect_uri,
+        verifier,
+        state,
+    })
+}
+
+fn generate_pkce_pair() -> (String, String) {
+    let verifier = URL_SAFE_NO_PAD.encode(random_bytes_32());
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
+fn random_bytes_32() -> [u8; 32] {
+    let first = uuid::Uuid::new_v4();
+    let second = uuid::Uuid::new_v4();
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(first.as_bytes());
+    bytes[16..].copy_from_slice(second.as_bytes());
+    bytes
+}
+
+fn random_hex_state() -> String {
+    uuid::Uuid::new_v4()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+async fn start_local_oauth_server(state: String) -> anyhow::Result<OAuthCallbackServer> {
+    let listener = TcpListener::bind((
+        std::net::Ipv4Addr::LOCALHOST,
+        OPENAI_CODEX_BROWSER_CALLBACK_PORT,
+    ))
+    .await?;
+    let (sender, receiver) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        run_oauth_callback_server(listener, state, sender).await;
+    });
+    Ok(OAuthCallbackServer { receiver, task })
+}
+
+async fn run_oauth_callback_server(
+    listener: TcpListener,
+    state: String,
+    sender: oneshot::Sender<String>,
+) {
+    let mut sender = Some(sender);
+    loop {
+        let Ok((stream, _addr)) = listener.accept().await else {
+            break;
+        };
+        let Some(result) = handle_oauth_callback(stream, &state).await else {
+            continue;
+        };
+        match result {
+            Ok(code) => {
+                if let Some(sender) = sender.take() {
+                    let _ = sender.send(code);
+                }
+                break;
+            }
+            Err(_) => continue,
+        }
+    }
+}
+
+async fn handle_oauth_callback(
+    mut stream: TcpStream,
+    expected_state: &str,
+) -> Option<anyhow::Result<String>> {
+    let mut buf = [0u8; 8192];
+    let n = match stream.read(&mut buf).await {
+        Ok(0) | Err(_) => return None,
+        Ok(n) => n,
+    };
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/");
+    let parsed = reqwest::Url::parse(&format!("http://localhost{path}"));
+    let result = match parsed {
+        Ok(url) if url.path() != OPENAI_CODEX_BROWSER_CALLBACK_PATH => {
+            write_oauth_callback_response(
+                &mut stream,
+                "404 Not Found",
+                "Callback route not found.",
+            )
+            .await;
+            return None;
+        }
+        Ok(url) => {
+            let state = url
+                .query_pairs()
+                .find_map(|(key, value)| (key == "state").then(|| value.into_owned()));
+            let code = url
+                .query_pairs()
+                .find_map(|(key, value)| (key == "code").then(|| value.into_owned()));
+            if state.as_deref() != Some(expected_state) {
+                write_oauth_callback_response(&mut stream, "400 Bad Request", "State mismatch.")
+                    .await;
+                Err(anyhow::anyhow!("state mismatch"))
+            } else if let Some(code) = code.filter(|code| !code.trim().is_empty()) {
+                write_oauth_callback_response(
+                    &mut stream,
+                    "200 OK",
+                    "OpenAI authentication completed. You can close this window.",
+                )
+                .await;
+                Ok(code)
+            } else {
+                write_oauth_callback_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    "Missing authorization code.",
+                )
+                .await;
+                Err(anyhow::anyhow!("missing authorization code"))
+            }
+        }
+        Err(err) => {
+            write_oauth_callback_response(
+                &mut stream,
+                "400 Bad Request",
+                "Invalid OAuth callback URL.",
+            )
+            .await;
+            Err(anyhow::anyhow!(err))
+        }
+    };
+    Some(result)
+}
+
+async fn write_oauth_callback_response(stream: &mut TcpStream, status: &str, message: &str) {
+    let body = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>OpenAI OAuth</title></head><body><p>{}</p></body></html>",
+        html_escape(message)
+    );
+    let response = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+async fn wait_for_callback_code(
+    server: &mut OAuthCallbackServer,
+) -> anyhow::Result<Option<String>> {
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(BROWSER_CALLBACK_FALLBACK_MS),
+        &mut server.receiver,
+    )
+    .await
+    {
+        Ok(Ok(code)) => Ok(Some(code)),
+        Ok(Err(_)) => anyhow::bail!("OpenAI OAuth callback server stopped before receiving a code"),
+        Err(_) => Ok(None),
+    }
+}
+
+async fn wait_for_manual_code_or_callback<M, ManualFut>(
+    server: &mut OAuthCallbackServer,
+    prompt: ManualCodePrompt,
+    expected_state: &str,
+    on_manual_code: M,
+) -> anyhow::Result<String>
+where
+    M: FnOnce(ManualCodePrompt) -> ManualFut,
+    ManualFut: std::future::Future<Output = anyhow::Result<String>>,
+{
+    let manual_future = on_manual_code(prompt);
+    tokio::pin!(manual_future);
+    tokio::select! {
+        callback = &mut server.receiver => match callback {
+            Ok(code) => Ok(code),
+            Err(_) => {
+                let input = manual_future.await?;
+                parse_oauth_authorization_input(&input, expected_state)
+            }
+        },
+        input = &mut manual_future => {
+            parse_oauth_authorization_input(&input?, expected_state)
+        }
+    }
+}
+
+fn parse_oauth_authorization_input(input: &str, expected_state: &str) -> anyhow::Result<String> {
+    let value = input.trim();
+    if value.is_empty() {
+        anyhow::bail!("missing authorization code");
+    }
+
+    if let Ok(url) = reqwest::Url::parse(value) {
+        return parse_oauth_authorization_params(url.query(), expected_state);
+    }
+    if value.contains("code=") {
+        return parse_oauth_authorization_params(
+            Some(value.trim_start_matches('?')),
+            expected_state,
+        );
+    }
+    if let Some((code, state)) = value.split_once('#') {
+        validate_oauth_state(Some(state), expected_state)?;
+        return non_empty_authorization_code(code);
+    }
+    non_empty_authorization_code(value)
+}
+
+fn parse_oauth_authorization_params(
+    query: Option<&str>,
+    expected_state: &str,
+) -> anyhow::Result<String> {
+    let Some(query) = query else {
+        anyhow::bail!("missing authorization code");
+    };
+    let form_url = reqwest::Url::parse(&format!("http://localhost/?{query}"))?;
+    let state = form_url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()));
+    validate_oauth_state(state.as_deref(), expected_state)?;
+    let code = form_url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "code").then(|| value.into_owned()));
+    non_empty_authorization_code(code.as_deref().unwrap_or_default())
+}
+
+fn validate_oauth_state(state: Option<&str>, expected_state: &str) -> anyhow::Result<()> {
+    if let Some(state) = state
+        && state != expected_state
+    {
+        anyhow::bail!("state mismatch");
+    }
+    Ok(())
+}
+
+fn non_empty_authorization_code(code: &str) -> anyhow::Result<String> {
+    let code = code.trim();
+    if code.is_empty() {
+        anyhow::bail!("missing authorization code");
+    }
+    Ok(code.to_string())
 }
 
 async fn request_device_code(client: &reqwest::Client) -> anyhow::Result<UserCodeResponse> {
@@ -473,6 +879,7 @@ async fn exchange_authorization_code(
     client: &reqwest::Client,
     authorization_code: &str,
     code_verifier: &str,
+    redirect_uri: &str,
 ) -> anyhow::Result<OpenAICodexTokens> {
     let response = client
         .post(format!("{OPENAI_AUTH_BASE_URL}/oauth/token"))
@@ -482,7 +889,7 @@ async fn exchange_authorization_code(
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", authorization_code),
-            ("redirect_uri", OPENAI_CODEX_DEVICE_CALLBACK_URL),
+            ("redirect_uri", redirect_uri),
             ("client_id", OPENAI_CODEX_CLIENT_ID),
             ("code_verifier", code_verifier),
         ])
@@ -598,6 +1005,51 @@ fn fallback_expiry_from_codex_last_refresh(value: Option<&Value>) -> Option<i64>
         _ => None,
     }?;
     Some(millis.saturating_add(60 * 60_000))
+}
+
+fn deserialize_optional_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_optional_integer(deserializer, "u64").and_then(|value| {
+        value
+            .map(|number| {
+                u64::try_from(number).map_err(|_| {
+                    serde::de::Error::custom(format!("expected u64-compatible value, got {number}"))
+                })
+            })
+            .transpose()
+    })
+}
+
+fn deserialize_optional_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_optional_integer(deserializer, "i64")
+}
+
+fn deserialize_optional_integer<'de, D>(
+    deserializer: D,
+    expected: &'static str,
+) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom(format!("expected {expected}"))),
+        Some(Value::String(raw)) => raw.trim().parse::<i64>().map(Some).map_err(|_| {
+            serde::de::Error::custom(format!("expected {expected}-compatible string"))
+        }),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected {expected}, got {other}"
+        ))),
+    }
 }
 
 fn build_responses_request(
@@ -1114,6 +1566,152 @@ mod tests {
                 .unwrap()
                 .timestamp_millis()
                 + 60 * 60_000
+        );
+    }
+
+    #[test]
+    fn parses_device_code_numeric_strings() {
+        let response: UserCodeResponse = serde_json::from_value(json!({
+            "device_auth_id": "dev_123",
+            "user_code": "ABCD-EFGH",
+            "interval": "5"
+        }))
+        .unwrap();
+        assert_eq!(response.interval, Some(5));
+    }
+
+    #[test]
+    fn parses_oauth_expires_in_numeric_string() {
+        let response: OAuthTokenResponse = serde_json::from_value(json!({
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_in": "3600"
+        }))
+        .unwrap();
+        assert_eq!(response.expires_in, Some(3600));
+    }
+
+    #[test]
+    fn browser_oauth_flow_uses_pkce_loopback_and_openclaw_params() {
+        let flow = create_browser_oauth_flow_with_values(
+            "verifier".to_string(),
+            "challenge".to_string(),
+            "state-123".to_string(),
+        )
+        .unwrap();
+        let url = reqwest::Url::parse(&flow.authorization_url).unwrap();
+        assert_eq!(
+            url.as_str().split('?').next().unwrap(),
+            OPENAI_CODEX_AUTHORIZE_URL
+        );
+        assert_eq!(flow.redirect_uri, "http://127.0.0.1:1455/auth/callback");
+        assert_eq!(
+            url.query_pairs()
+                .find(|(k, _)| k == "response_type")
+                .unwrap()
+                .1,
+            "code"
+        );
+        assert_eq!(
+            url.query_pairs().find(|(k, _)| k == "client_id").unwrap().1,
+            OPENAI_CODEX_CLIENT_ID
+        );
+        assert_eq!(
+            url.query_pairs()
+                .find(|(k, _)| k == "redirect_uri")
+                .unwrap()
+                .1,
+            flow.redirect_uri
+        );
+        assert_eq!(
+            url.query_pairs().find(|(k, _)| k == "scope").unwrap().1,
+            OPENAI_CODEX_BROWSER_SCOPE
+        );
+        assert_eq!(
+            url.query_pairs()
+                .find(|(k, _)| k == "code_challenge")
+                .unwrap()
+                .1,
+            "challenge"
+        );
+        assert_eq!(
+            url.query_pairs()
+                .find(|(k, _)| k == "code_challenge_method")
+                .unwrap()
+                .1,
+            "S256"
+        );
+        assert_eq!(
+            url.query_pairs().find(|(k, _)| k == "state").unwrap().1,
+            "state-123"
+        );
+        assert_eq!(
+            url.query_pairs()
+                .find(|(k, _)| k == "id_token_add_organizations")
+                .unwrap()
+                .1,
+            "true"
+        );
+        assert_eq!(
+            url.query_pairs()
+                .find(|(k, _)| k == "codex_cli_simplified_flow")
+                .unwrap()
+                .1,
+            "true"
+        );
+        assert_eq!(
+            url.query_pairs()
+                .find(|(k, _)| k == "originator")
+                .unwrap()
+                .1,
+            OPENAI_CODEX_BROWSER_ORIGINATOR
+        );
+    }
+
+    #[test]
+    fn pkce_pair_uses_base64url_sha256_challenge() {
+        let (verifier, challenge) = generate_pkce_pair();
+        assert_eq!(verifier.len(), 43);
+        assert_eq!(challenge.len(), 43);
+        assert_eq!(
+            challenge,
+            URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+        );
+    }
+
+    #[test]
+    fn parses_manual_authorization_inputs() {
+        assert_eq!(
+            parse_oauth_authorization_input(
+                "http://127.0.0.1:1455/auth/callback?code=oauth-code&state=oauth-state",
+                "oauth-state"
+            )
+            .unwrap(),
+            "oauth-code"
+        );
+        assert_eq!(
+            parse_oauth_authorization_input("code=query-code&state=oauth-state", "oauth-state")
+                .unwrap(),
+            "query-code"
+        );
+        assert_eq!(
+            parse_oauth_authorization_input("?code=query-code&state=oauth-state", "oauth-state")
+                .unwrap(),
+            "query-code"
+        );
+        assert_eq!(
+            parse_oauth_authorization_input("hash-code#oauth-state", "oauth-state").unwrap(),
+            "hash-code"
+        );
+        assert_eq!(
+            parse_oauth_authorization_input("raw-code", "oauth-state").unwrap(),
+            "raw-code"
+        );
+        assert!(
+            parse_oauth_authorization_input("code=wrong&state=other-state", "oauth-state")
+                .unwrap_err()
+                .to_string()
+                .contains("state mismatch")
         );
     }
 

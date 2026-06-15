@@ -326,7 +326,15 @@ enum Commands {
 #[derive(Subcommand)]
 enum AuthCommands {
     /// Sign in with ChatGPT/Codex OAuth for subscription-backed OpenAI.
-    OpenaiCodex,
+    OpenaiCodex {
+        /// Use the legacy Codex device-code flow instead of browser callback OAuth.
+        #[arg(long)]
+        device_code: bool,
+
+        /// Print the browser URL without trying to open it automatically.
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Show locally configured provider auth.
     Status,
 }
@@ -344,7 +352,10 @@ async fn main() -> ExitCode {
 
     match cli.command {
         Commands::Auth { command } => match command {
-            AuthCommands::OpenaiCodex => commands::auth::login_openai_codex().await,
+            AuthCommands::OpenaiCodex {
+                device_code,
+                no_open,
+            } => commands::auth::login_openai_codex(device_code, !no_open).await,
             AuthCommands::Status => commands::auth::status(),
         },
         Commands::Run {
