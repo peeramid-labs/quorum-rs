@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use crate::agents::config::McpProviderConfig;
 use crate::agents::{AgentContext, Evaluation, NsedAgent, PersistenceStore, Proposal};
+use crate::providers::cli_base;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -502,15 +503,7 @@ impl McpAgent {
 
     /// Resolve the effective timeout for a single phase call.
     fn effective_timeout(&self, ctx: &AgentContext) -> Duration {
-        let secs = self.config.timeout_secs.unwrap_or_else(|| {
-            let budget = ctx.phase_budget_remaining_secs;
-            if budget > 0.0 {
-                (budget.ceil() as u64).max(1)
-            } else {
-                300
-            }
-        });
-        Duration::from_secs(secs)
+        cli_base::effective_timeout(self.config.timeout_secs, ctx)
     }
 
     /// Spawn the subprocess, push context to stdin, then run MCP over the same pipes.
@@ -522,48 +515,32 @@ impl McpAgent {
     /// The subprocess can parse the initial JSON line for immediate context,
     /// then speak MCP for tool calls and terminal submission.
     async fn run_mcp_session(&self, phase: ActivePhase, ctx: &AgentContext) -> Result<McpResult> {
-        if self.config.command.is_empty() {
-            bail!("mcp agent '{}': command is empty", self.name);
-        }
-
         let timeout = self.effective_timeout(ctx);
-        let program = &self.config.command[0];
-        let args = &self.config.command[1..];
-
-        let mut cmd = Command::new(program);
-        cmd.args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
 
         let phase_str = match phase {
             ActivePhase::Proposing => "propose",
             ActivePhase::Evaluating => "evaluate",
         };
 
-        if let Some(ref dir) = self.config.working_dir {
-            cmd.current_dir(dir);
-        }
-        for (k, v) in &self.config.env {
-            cmd.env(k, v);
-        }
-
         // Inject session identity as env vars so stateful agents (e.g. Claude CLI
         // with --session-id) can maintain conversation continuity across rounds.
+        // Layered after `config.env` so identity always wins.
+        let mut extra_env: Vec<(&str, String)> = Vec::new();
         if let Some(ref sid) = ctx.session_id {
-            cmd.env("NSED_SESSION_ID", sid);
+            extra_env.push(("NSED_SESSION_ID", sid.clone()));
         }
-        cmd.env("NSED_AGENT_NAME", &self.name);
-        cmd.env("NSED_ROUND", ctx.round_number.to_string());
-        cmd.env("NSED_PHASE", phase_str);
+        extra_env.push(("NSED_AGENT_NAME", self.name.clone()));
+        extra_env.push(("NSED_ROUND", ctx.round_number.to_string()));
+        extra_env.push(("NSED_PHASE", phase_str.to_string()));
 
-        let mut child = cmd.spawn().with_context(|| {
-            format!(
-                "mcp agent '{}': failed to spawn {:?}",
-                self.name, self.config.command
-            )
-        })?;
+        let mut child = cli_base::spawn_child(
+            "mcp",
+            &self.name,
+            &self.config.command,
+            self.config.working_dir.as_deref(),
+            &self.config.env,
+            &extra_env,
+        )?;
 
         let child_stdout = child.stdout.take().expect("stdout piped");
         let mut child_stdin = child.stdin.take().expect("stdin piped");

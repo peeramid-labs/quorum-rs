@@ -283,4 +283,6 @@ async fn main() -> anyhow::Result<()> {
 
 - [Tutorial: your first agent from an invite code](../tutorials/first-agent-from-invite.md) — hand-holding walkthrough.
 - [Agent development guide](agent-development.md) — when you outgrow `serve` and want to write a custom `NsedAgent` impl.
+- [Register a custom provider](register-a-custom-provider.md) — add a `provider.type` the SDK doesn't ship, without forking.
+- [About the provider registry](../explanation/provider-registry.md) — how `serve` picks the agent implementation for each `provider.type`.
 - [Redeem an invite code](redeem-invite-code.md) — what `quorum redeem` does under the hood + how to embed it in your own binary.

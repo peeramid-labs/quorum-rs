@@ -53,6 +53,7 @@ quorum tui                 Interactive terminal UI (live deliberation view)
 |---|---|---|
 | `agents` | `NsedAgent`, `AgentContext`, `Proposal`, `Evaluation`, `ChatCapable`, `OutputLeakDetector` | Agent trait + deliberation data structures + pluggable output guard |
 | `agents::config` | `AgentConfig`, `TaskPrecision` | Agent configuration (model, provider, limits) |
+| `providers` | `ProviderFactory`, `ProviderRegistry`, `cli_base` | Dispatch registry mapping `provider.type` → agent factory (register custom providers without forking); `cli_base` shares exec/mcp subprocess spawn + timeout helpers |
 | `llms` | `AiModel`, `RequestConfig`, `SimpleOpenAIModel`, `OpenAICompatibleModel`, `RateLimiter` | LLM abstraction + production streaming client + simulator / stub for tests |
 | `prompts` | `PromptSet`, `DefaultPromptSet` | Prompt template interface + benchmark-validated default proposer/evaluator templates |
 | `tools` | `Tool`, `ToolDefinition`, `ScopedGrepTool`, `ScopedReadFileTool` | Tool-use interface (OpenAI function calling) + sandboxed filesystem tools |

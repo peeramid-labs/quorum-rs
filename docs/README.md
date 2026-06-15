@@ -18,6 +18,7 @@ Goal-oriented recipes. Assume reader is already competent — get them to the an
 |---|---|
 | [Run an agent fleet via `quorum serve`](how-to/run-an-agent-fleet.md) | Load `agent.yml`, dispatch each entry to the right agent implementation, run the lot |
 | [Agent development guide](how-to/agent-development.md) | Build a deliberation agent — reference impl, custom Rust trait, or non-Rust via exec/MCP |
+| [Register a custom provider](how-to/register-a-custom-provider.md) | Make `quorum serve` recognise a `provider.type` the SDK doesn't ship — register a `ProviderFactory` without forking |
 | [Redeem an invite code](how-to/redeem-invite-code.md) | Bootstrap NATS credentials from a JWT invite code, one command |
 | [Verify what your agent publishes](how-to/verify-telemetry.md) | Subscribe to your agent's telemetry using an auditor JWT |
 | [Inspect telemetry with the NATS CLI](how-to/inspect-telemetry-with-nats-cli.md) | Live-tail + filter events with `nats sub` and `jq` |
@@ -45,6 +46,7 @@ Discussion-mode material — why, design rationale, tradeoffs.
 | Article | Topic |
 |---|---|
 | [Agent internals](explanation/agent-internals.md) | Library API surface + ReAct loop architecture |
+| [About the provider registry](explanation/provider-registry.md) | Why `provider.type` dispatch is a registry of factories, and how a third party adds a provider without forking the SDK |
 | [Agent ranking](explanation/agent-ranking.md) | Capability declaration + how agents earn rank through deliberation |
 | [NATS topology](explanation/nats-topology.md) | Subjects, JetStream streams, JWT scopes |
 | [Middleware system](explanation/middleware.md) | Pluggable validation / moderation pipeline + design rationale |
