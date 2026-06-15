@@ -244,5 +244,7 @@ Browse to `http://localhost:8080` to see agent identity, current job, recent eve
 ## See also
 
 - [Agent internals](../explanation/agent-internals.md) — design rationale + ReAct loop architecture
+- [Register a custom provider](register-a-custom-provider.md) — give your custom agent its own `provider.type` via a `ProviderFactory`
+- [About the provider registry](../explanation/provider-registry.md) — how `provider.type` dispatch resolves to an agent
 - [NATS topology](../explanation/nats-topology.md) — subjects, JetStream streams, JWT scopes
 - [Sandboxed builtin tools](../reference/sandboxed-tools.md) — `read_file`, `grep_search` reference

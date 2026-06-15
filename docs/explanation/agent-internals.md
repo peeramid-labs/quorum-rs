@@ -79,6 +79,7 @@ The orchestrator can run **without any agents**. Agents can **join and leave at 
 | Module | Key Types | Purpose |
 |---|---|---|
 | `agents` | `ProposerEvaluatorAgent`, `UserToolHandler`, `NatsUserToolHandlerFactory` | ReAct-style agent with tool-use loop + direct `chat()` method + `ChatCapable` impl |
+| `providers` | `ProviderFactory`, `ProviderRegistry`, `cli_base` | Dispatch registry mapping `provider.type` → factory that builds the agent (third parties register their own); `cli_base` holds the exec/mcp shared subprocess spawn + timeout helpers. See [About the provider registry](provider-registry.md). |
 | `llms` | `OpenAICompatibleModel`, `RateLimiter` | LLM client (any compatible API) with streaming + rate limiting |
 | `llms::strategies` | `NativeStrategy`, `HarmonyStrategy`, `XmlRegexStrategy` | Provider-specific request/response adaptation |
 | `llms::simulated` | `SimulatedModel` | Deterministic model for testing |
