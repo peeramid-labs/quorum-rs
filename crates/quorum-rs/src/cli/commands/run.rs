@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::cli::remote::{JobOutcome, RemoteOrchestrator};
+use crate::cli::remote::{DiscoveredPolicy, JobOutcome, RemoteOrchestrator};
 use crate::cli::request::{DeliberationRequest, build_request, build_request_raw_policy_id};
 use crate::cli::workspace::{OrchestratorConfig, OrchestratorMode, PolicyConfig, WorkspaceConfig};
 use crate::config::resolve_env_token;
@@ -55,9 +55,23 @@ pub async fn run(
     let resolved = if let Some(policy_ref) = policy_flag {
         match resolve_adhoc_run(&config, policy_ref, task, room_flag) {
             Ok(result) => result,
-            Err(msg) => {
-                eprintln!("error: {msg}");
-                return ExitCode::FAILURE;
+            // Not a local policy name or hex id — try resolving it as a
+            // remote policy label via the orchestrator's /policies catalog.
+            Err(local_err) => {
+                match resolve_remote_policy(&config, policy_ref, task, room_flag).await {
+                    Ok(Some(result)) => {
+                        eprintln!("Resolved remote policy '{policy_ref}'");
+                        result
+                    }
+                    Ok(None) => {
+                        eprintln!("error: {local_err}");
+                        return ExitCode::FAILURE;
+                    }
+                    Err(e) => {
+                        eprintln!("error: resolving remote policy '{policy_ref}': {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
             }
         }
     } else {
@@ -291,6 +305,51 @@ fn resolve_adhoc_run<'a>(
     }
 }
 
+/// Find a remote policy's hash id by its human label (`name`), falling back
+/// to an exact `policy_id` match. Returns the `policy_id` to submit with.
+fn find_policy_id_by_label(policies: &[DiscoveredPolicy], policy_ref: &str) -> Option<String> {
+    policies
+        .iter()
+        .find(|p| p.name == policy_ref || p.policy_id == policy_ref)
+        .map(|p| p.policy_id.clone())
+}
+
+/// Resolve `--policy <ref>` as a REMOTE policy label: query the
+/// orchestrator's grant-filtered `/policies` and match `ref` against a
+/// registered policy's name. Lets operators submit to an orchestrator-
+/// registered policy by its human label without defining it locally.
+///
+/// Returns `Ok(None)` when no remote policy matches (caller falls back to
+/// the local "unknown policy" error).
+async fn resolve_remote_policy<'a>(
+    config: &'a WorkspaceConfig,
+    policy_ref: &str,
+    task: &str,
+    room_flag: Option<&str>,
+) -> Result<Option<ResolvedRun<'a>>, String> {
+    let (orch_name, orch) = resolve_orchestrator(config, room_flag)?;
+    if orch.mode.as_ref() != Some(&OrchestratorMode::Remote) {
+        return Ok(None);
+    }
+    let address = resolve_orch_field(&orch.address, "address", &orch_name)
+        .map_err(|_| format!("orchestrator '{orch_name}' has no address configured"))?;
+    let token = resolve_orch_field(&orch.token, "token", &orch_name)
+        .map_err(|_| format!("orchestrator '{orch_name}' has no token configured"))?;
+    let client = RemoteOrchestrator::new(&address, &token).map_err(|e| e.to_string())?;
+    let policies = client
+        .discover_policies()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(
+        find_policy_id_by_label(&policies, policy_ref).map(|policy_id| ResolvedRun {
+            req: build_request_raw_policy_id(&policy_id, task),
+            orch_name,
+            orch,
+            role_policy: None,
+        }),
+    )
+}
+
 /// Resolve room-based run: standard room → policy → orchestrator flow.
 fn resolve_room_run<'a>(
     config: &'a WorkspaceConfig,
@@ -431,6 +490,41 @@ mod tests {
     use crate::cli::workspace::{
         OrchestratorConfig, OrchestratorMode, PolicyConfig, RoleConfig, RoomConfig, WorkspaceConfig,
     };
+
+    fn discovered(policy_id: &str, name: &str) -> DiscoveredPolicy {
+        DiscoveredPolicy {
+            policy_id: policy_id.to_string(),
+            name: name.to_string(),
+            tags: vec![],
+        }
+    }
+
+    #[test]
+    fn label_resolves_to_policy_id_by_name() {
+        let policies = vec![
+            discovered("aaaa", "nsed:mid:0v1"),
+            discovered("bbbb", "noosphera:0v1"),
+        ];
+        assert_eq!(
+            find_policy_id_by_label(&policies, "noosphera:0v1").as_deref(),
+            Some("bbbb")
+        );
+    }
+
+    #[test]
+    fn label_resolves_by_exact_policy_id() {
+        let policies = vec![discovered("bbbb", "noosphera:0v1")];
+        assert_eq!(
+            find_policy_id_by_label(&policies, "bbbb").as_deref(),
+            Some("bbbb")
+        );
+    }
+
+    #[test]
+    fn unknown_label_is_none() {
+        let policies = vec![discovered("bbbb", "noosphera:0v1")];
+        assert!(find_policy_id_by_label(&policies, "does-not-exist").is_none());
+    }
     use std::collections::HashMap;
 
     // --- task-file / output-dir helpers ----------------------------------

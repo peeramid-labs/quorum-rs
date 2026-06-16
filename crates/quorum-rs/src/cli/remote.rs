@@ -1900,6 +1900,49 @@ mod tests {
         }
     }
 
+    /// Contract test: `GET /policies` returns the orchestrator's full
+    /// `PolicyInfo` shape (policy_id/name/tags + max_rounds/effort/
+    /// is_role_based/sla/…). `discover_policies` must pull the three
+    /// discovery fields and ignore the rest. Pins the cross-crate wire
+    /// contract that `--policy <label>` resolution relies on.
+    #[tokio::test]
+    async fn discover_policies_parses_full_policy_info_shape() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/policies"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "policy_id": "abc123",
+                    "name": "noosphera:0v1",
+                    "tags": ["noosphera:0v1"],
+                    "max_rounds": 3,
+                    "effort": 0.6,
+                    "is_role_based": true,
+                    "sla": { "job_timeout_secs": 1200 }
+                },
+                {
+                    "policy_id": "def456",
+                    "name": "nsed:mid:0v1",
+                    "tags": ["mid:0v1"],
+                    "max_rounds": 6,
+                    "effort": 0.6,
+                    "is_role_based": true
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        let client = RemoteOrchestrator::new(&server.uri(), "tok").unwrap();
+        let policies = client.discover_policies().await.unwrap();
+        assert_eq!(policies.len(), 2);
+        let noosphera_policy = policies
+            .iter()
+            .find(|p| p.name == "noosphera:0v1")
+            .expect("noosphera policy present");
+        assert_eq!(noosphera_policy.policy_id, "abc123");
+        assert_eq!(noosphera_policy.tags, vec!["noosphera:0v1".to_string()]);
+    }
+
     #[test]
     fn build_policy_push_body_strips_context() {
         use crate::cli::workspace::RoleConfig;
