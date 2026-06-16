@@ -340,42 +340,6 @@ fn resolve_config_path(explicit: Option<&Path>, exists: impl Fn(&Path) -> bool) 
     PathBuf::from("nsed.yaml")
 }
 
-#[cfg(test)]
-mod config_path_tests {
-    use super::resolve_config_path;
-    use std::path::{Path, PathBuf};
-
-    #[test]
-    fn explicit_path_wins_even_if_absent() {
-        let got = resolve_config_path(Some(Path::new("custom.yml")), |_| false);
-        assert_eq!(got, PathBuf::from("custom.yml"));
-    }
-
-    #[test]
-    fn prefers_yaml_when_present() {
-        let got = resolve_config_path(None, |p| p == Path::new("nsed.yaml"));
-        assert_eq!(got, PathBuf::from("nsed.yaml"));
-    }
-
-    #[test]
-    fn falls_back_to_yml_when_only_yml_present() {
-        let got = resolve_config_path(None, |p| p == Path::new("nsed.yml"));
-        assert_eq!(got, PathBuf::from("nsed.yml"));
-    }
-
-    #[test]
-    fn yaml_wins_when_both_present() {
-        let got = resolve_config_path(None, |_| true);
-        assert_eq!(got, PathBuf::from("nsed.yaml"));
-    }
-
-    #[test]
-    fn defaults_to_yaml_when_neither_present() {
-        let got = resolve_config_path(None, |_| false);
-        assert_eq!(got, PathBuf::from("nsed.yaml"));
-    }
-}
-
 #[tokio::main]
 async fn main() -> ExitCode {
     dotenvy::dotenv().ok();
@@ -583,5 +547,41 @@ async fn main() -> ExitCode {
         }
 
         Commands::Validate => commands::validate::run(&cli.config_path()),
+    }
+}
+
+#[cfg(test)]
+mod config_path_tests {
+    use super::resolve_config_path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn explicit_path_wins_even_if_absent() {
+        let got = resolve_config_path(Some(Path::new("custom.yml")), |_| false);
+        assert_eq!(got, PathBuf::from("custom.yml"));
+    }
+
+    #[test]
+    fn prefers_yaml_when_present() {
+        let got = resolve_config_path(None, |p| p == Path::new("nsed.yaml"));
+        assert_eq!(got, PathBuf::from("nsed.yaml"));
+    }
+
+    #[test]
+    fn falls_back_to_yml_when_only_yml_present() {
+        let got = resolve_config_path(None, |p| p == Path::new("nsed.yml"));
+        assert_eq!(got, PathBuf::from("nsed.yml"));
+    }
+
+    #[test]
+    fn yaml_wins_when_both_present() {
+        let got = resolve_config_path(None, |_| true);
+        assert_eq!(got, PathBuf::from("nsed.yaml"));
+    }
+
+    #[test]
+    fn defaults_to_yaml_when_neither_present() {
+        let got = resolve_config_path(None, |_| false);
+        assert_eq!(got, PathBuf::from("nsed.yaml"));
     }
 }
