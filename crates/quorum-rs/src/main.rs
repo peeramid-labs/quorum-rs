@@ -27,7 +27,7 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Path to workspace config file [default: ./nsed.yaml]
+    /// Path to workspace config file [default: ./nsed.yaml, then ./nsed.yml]
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
 }
@@ -318,8 +318,61 @@ enum Commands {
 }
 
 impl Cli {
-    fn config_path(&self) -> &Path {
-        self.config.as_deref().unwrap_or(Path::new("nsed.yaml"))
+    fn config_path(&self) -> PathBuf {
+        resolve_config_path(self.config.as_deref(), |p| p.exists())
+    }
+}
+
+/// Resolve the workspace config path: an explicit `--config` wins;
+/// otherwise prefer `nsed.yaml`, then `nsed.yml`, falling back to
+/// `nsed.yaml` (so a not-found error names the canonical file).
+///
+/// `exists` is injected so this stays a pure, fs-free unit.
+fn resolve_config_path(explicit: Option<&Path>, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_path_buf();
+    }
+    for candidate in ["nsed.yaml", "nsed.yml"] {
+        if exists(Path::new(candidate)) {
+            return PathBuf::from(candidate);
+        }
+    }
+    PathBuf::from("nsed.yaml")
+}
+
+#[cfg(test)]
+mod config_path_tests {
+    use super::resolve_config_path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn explicit_path_wins_even_if_absent() {
+        let got = resolve_config_path(Some(Path::new("custom.yml")), |_| false);
+        assert_eq!(got, PathBuf::from("custom.yml"));
+    }
+
+    #[test]
+    fn prefers_yaml_when_present() {
+        let got = resolve_config_path(None, |p| p == Path::new("nsed.yaml"));
+        assert_eq!(got, PathBuf::from("nsed.yaml"));
+    }
+
+    #[test]
+    fn falls_back_to_yml_when_only_yml_present() {
+        let got = resolve_config_path(None, |p| p == Path::new("nsed.yml"));
+        assert_eq!(got, PathBuf::from("nsed.yml"));
+    }
+
+    #[test]
+    fn yaml_wins_when_both_present() {
+        let got = resolve_config_path(None, |_| true);
+        assert_eq!(got, PathBuf::from("nsed.yaml"));
+    }
+
+    #[test]
+    fn defaults_to_yaml_when_neither_present() {
+        let got = resolve_config_path(None, |_| false);
+        assert_eq!(got, PathBuf::from("nsed.yaml"));
     }
 }
 
@@ -357,7 +410,7 @@ async fn main() -> ExitCode {
             #[cfg(feature = "tui")]
             if tui {
                 return quorum_rs::cli::tui::run_tui_with_task(
-                    config_path,
+                    &config_path,
                     Some(&resolved_task),
                     room.as_deref(),
                     policy.as_deref(),
@@ -365,7 +418,7 @@ async fn main() -> ExitCode {
                 .await;
             }
             commands::run::run(
-                config_path,
+                &config_path,
                 &resolved_task,
                 room.as_deref(),
                 policy.as_deref(),
@@ -377,16 +430,16 @@ async fn main() -> ExitCode {
             .await
         }
         #[cfg(feature = "tui")]
-        Commands::Tui => quorum_rs::cli::tui::run_tui(cli.config_path()).await,
+        Commands::Tui => quorum_rs::cli::tui::run_tui(&cli.config_path()).await,
         Commands::Status { ref orchestrator } => {
-            commands::status::run(cli.config_path(), orchestrator.as_deref()).await
+            commands::status::run(&cli.config_path(), orchestrator.as_deref()).await
         }
         Commands::Trace {
             ref job_id,
             ref orchestrator,
             verbose,
         } => {
-            commands::trace::run(cli.config_path(), job_id, orchestrator.as_deref(), verbose).await
+            commands::trace::run(&cli.config_path(), job_id, orchestrator.as_deref(), verbose).await
         }
         Commands::Redeem {
             ref code,
@@ -461,7 +514,7 @@ async fn main() -> ExitCode {
                 !non_interactive && !agent_fleet && !one_shot_flags_set && stdin_is_tty;
 
             if use_wizard {
-                commands::init_wizard::run(cli.config_path()).await
+                commands::init_wizard::run(&cli.config_path()).await
             } else if agent_fleet {
                 // `agent.yml` is the conventional name `quorum
                 // serve` looks for; fall back to it when --config
@@ -469,15 +522,16 @@ async fn main() -> ExitCode {
                 // emit `nsed.yaml` here which is the wrong file
                 // for the agent runner to read.
                 let default_path = std::path::Path::new("agent.yml");
+                let resolved = cli.config_path();
                 let target = if cli.config.is_some() {
-                    cli.config_path()
+                    resolved.as_path()
                 } else {
                     default_path
                 };
                 commands::init::run_agent_fleet(target, agents, force)
             } else {
                 commands::init::run(
-                    cli.config_path(),
+                    &cli.config_path(),
                     orchestrator_url,
                     room,
                     token_env,
@@ -504,7 +558,8 @@ async fn main() -> ExitCode {
             } else {
                 Some(agents.as_slice())
             };
-            let workspace_path = workspace.as_deref().unwrap_or(cli.config_path());
+            let resolved_workspace = cli.config_path();
+            let workspace_path = workspace.as_deref().unwrap_or(&resolved_workspace);
             match commands::serve::run(
                 config.as_deref(),
                 workspace_path,
@@ -527,6 +582,6 @@ async fn main() -> ExitCode {
             }
         }
 
-        Commands::Validate => commands::validate::run(cli.config_path()),
+        Commands::Validate => commands::validate::run(&cli.config_path()),
     }
 }
