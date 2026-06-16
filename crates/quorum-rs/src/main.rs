@@ -95,6 +95,13 @@ enum Commands {
         orchestrator: Option<String>,
     },
 
+    /// List the rooms you can submit to (grant-filtered by the orchestrator).
+    Rooms {
+        /// Target a specific orchestrator by name.
+        #[arg(short = 'o', long)]
+        orchestrator: Option<String>,
+    },
+
     /// Launch the interactive terminal UI.
     #[cfg(feature = "tui")]
     Tui,
@@ -408,6 +415,9 @@ async fn main() -> ExitCode {
         Commands::Tui => quorum_rs::cli::tui::run_tui(&cli.config_path()).await,
         Commands::Status { ref orchestrator } => {
             commands::status::run(&cli.config_path(), orchestrator.as_deref()).await
+        }
+        Commands::Rooms { ref orchestrator } => {
+            commands::rooms::run(&cli.config_path(), orchestrator.as_deref()).await
         }
         Commands::Trace {
             ref job_id,
