@@ -23,7 +23,7 @@
 //! ```
 //!
 //! The built-in factories (`exec`, `mcp`, `claude`, `openai`,
-//! `openai-codex`, `ollama`, `simulated`) preserve the exact behaviour
+//! `openai-oauth`, `ollama`, `simulated`) preserve the exact behaviour
 //! of the old hard-coded dispatch, including the "skip this agent cleanly
 //! (`Ok(None)`)" semantics when a config section is missing.
 
@@ -206,7 +206,7 @@ mod tests {
                 "mcp",
                 "ollama",
                 "openai",
-                "openai-codex",
+                "openai-oauth",
                 "simulated"
             ]
         );
@@ -220,7 +220,7 @@ mod tests {
             "exec",
             "mcp",
             "claude",
-            "openai-codex",
+            "openai-oauth",
             "ollama",
             "simulated",
         ] {
@@ -240,7 +240,7 @@ mod tests {
             "exec",
             "mcp",
             "claude",
-            "openai-codex",
+            "openai-oauth",
             "ollama",
             "simulated",
         ] {

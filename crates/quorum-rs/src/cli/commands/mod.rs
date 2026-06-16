@@ -19,7 +19,6 @@
 //! | [`trace`] | `quorum trace` | Display a deliberation trace. |
 //! | [`validate`] | `quorum validate` | Schema-check a workspace yaml. |
 
-pub mod auth;
 pub mod common;
 pub mod init;
 pub mod init_wizard;

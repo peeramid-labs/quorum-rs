@@ -120,7 +120,7 @@ impl ProviderFactory for ClaudeFactory {
     }
 }
 
-/// `openai-codex` — ChatGPT/Codex OAuth-backed Responses provider.
+/// `openai-oauth` — ChatGPT OAuth-backed Responses provider.
 ///
 /// This is intentionally separate from issue #16's Codex CLI provider. It does
 /// not spawn `codex`; it uses the user's ChatGPT subscription OAuth tokens and
@@ -129,7 +129,7 @@ pub struct OpenAICodexFactory;
 
 impl ProviderFactory for OpenAICodexFactory {
     fn provider_type(&self) -> &str {
-        "openai-codex"
+        "openai-oauth"
     }
 
     fn build_agent(
@@ -138,20 +138,20 @@ impl ProviderFactory for OpenAICodexFactory {
         provider: &ProviderEntry,
     ) -> Result<Option<Arc<dyn NsedAgent>>> {
         let auth_store = OpenAICodexAuthStore::default()
-            .context("failed to resolve OpenAI Codex auth store path")?;
+            .context("failed to resolve OpenAI OAuth auth store path")?;
         if auth_store.read()?.is_none() {
             let imported = auth_store
                 .import_from_codex_cli()
-                .context("failed to import OpenAI Codex auth from CODEX_HOME")?;
+                .context("failed to import OpenAI OAuth auth from CODEX_HOME")?;
             if imported {
                 info!(
                     agent = %agent_config.name,
                     auth_path = %auth_store.path().display(),
-                    "imported OpenAI Codex auth from Codex CLI"
+                    "imported OpenAI OAuth auth from Codex CLI"
                 );
             } else {
                 anyhow::bail!(
-                    "OpenAI Codex auth is missing for agent '{}'. Run `quorum auth openai-codex`.",
+                    "OpenAI OAuth auth is missing for agent '{}'. Run `quorum init` and choose the OpenAI OAuth subscription provider.",
                     agent_config.name
                 );
             }

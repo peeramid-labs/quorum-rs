@@ -105,6 +105,10 @@ impl OpenAICodexAuthStore {
     }
 
     pub fn default_path() -> anyhow::Result<PathBuf> {
+        Ok(home_dir()?.join(".nsed").join("openai-oauth.json"))
+    }
+
+    fn legacy_default_path() -> anyhow::Result<PathBuf> {
         Ok(home_dir()?.join(".nsed").join("openai-codex.json"))
     }
 
@@ -117,10 +121,22 @@ impl OpenAICodexAuthStore {
     }
 
     pub fn read(&self) -> anyhow::Result<Option<OpenAICodexAuthFile>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let text = std::fs::read_to_string(&self.path)?;
+        let path = if self.path.exists() {
+            self.path.clone()
+        } else {
+            let is_default_path = Self::default_path()
+                .map(|default_path| self.path == default_path)
+                .unwrap_or(false);
+            if !is_default_path {
+                return Ok(None);
+            }
+            let legacy_path = Self::legacy_default_path()?;
+            if !legacy_path.exists() {
+                return Ok(None);
+            }
+            legacy_path
+        };
+        let text = std::fs::read_to_string(path)?;
         let auth = serde_json::from_str(&text)?;
         Ok(Some(auth))
     }
@@ -131,7 +147,7 @@ impl OpenAICodexAuthStore {
             set_private_dir_permissions(parent)?;
         }
         let auth = OpenAICodexAuthFile {
-            provider: "openai-codex".to_string(),
+            provider: "openai-oauth".to_string(),
             tokens,
         };
         let text = serde_json::to_string_pretty(&auth)?;
@@ -230,7 +246,7 @@ impl OpenAICodexModel {
             .read()
             .map_err(anyhow_error)?
             .ok_or_else(|| {
-                other_msg("OpenAI Codex auth is missing; run `quorum auth openai-codex`")
+                other_msg("OpenAI OAuth auth is missing; run `quorum init` and choose OpenAI OAuth")
             })?;
 
         if force_refresh || auth.tokens.expires_at_ms - now_ms() <= REFRESH_SKEW_MS {
@@ -256,7 +272,7 @@ impl OpenAICodexModel {
                                 .read()
                                 .map_err(anyhow_error)?
                                 .ok_or_else(|| {
-                                    other_msg("OpenAI Codex auth disappeared during refresh")
+                                    other_msg("OpenAI OAuth auth disappeared during refresh")
                                 })?;
                         if latest.tokens.refresh_token == auth.tokens.refresh_token {
                             return Err(anyhow_error(err));
@@ -331,7 +347,7 @@ impl AiModel for OpenAICodexModel {
                 });
             }
             return Err(other_msg(format!(
-                "OpenAI Codex Responses request failed with status {status}: {error_body}"
+                "OpenAI OAuth Responses request failed with status {status}: {error_body}"
             )));
         }
 
@@ -526,7 +542,7 @@ async fn parse_oauth_token_response(
     let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
         anyhow::bail!(
-            "OpenAI Codex token {operation} failed ({status}): {}",
+            "OpenAI OAuth token {operation} failed ({status}): {}",
             sanitize_error_text(&body)
         );
     }
@@ -543,7 +559,7 @@ async fn parse_oauth_token_response(
             .refresh_token
             .or_else(|| previous_refresh_token.map(ToOwned::to_owned))
             .ok_or_else(|| {
-                anyhow::anyhow!("OpenAI Codex token {operation} response missing refresh_token")
+                anyhow::anyhow!("OpenAI OAuth token {operation} response missing refresh_token")
             })?,
         expires_at_ms,
     })
@@ -1005,7 +1021,7 @@ fn parse_responses_body(
     }
 
     Err(other_msg(
-        "OpenAI Codex stream did not include a completed response",
+        "OpenAI OAuth stream did not include a completed response",
     ))
 }
 
@@ -1527,7 +1543,7 @@ mod tests {
             })
             .unwrap();
         let read = store.read().unwrap().unwrap();
-        assert_eq!(read.provider, "openai-codex");
+        assert_eq!(read.provider, "openai-oauth");
         assert_eq!(read.tokens.account_id.as_deref(), Some("acct"));
 
         #[cfg(unix)]
@@ -1540,6 +1556,38 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    #[serial_test::serial(openai_auth_env)]
+    fn auth_store_reads_legacy_openai_codex_file() {
+        let home = tempfile::tempdir().unwrap();
+        let nsed = home.path().join(".nsed");
+        std::fs::create_dir_all(&nsed).unwrap();
+        std::fs::write(
+            nsed.join("openai-codex.json"),
+            serde_json::to_string(&OpenAICodexAuthFile {
+                provider: "openai-codex".to_string(),
+                tokens: OpenAICodexTokens {
+                    access_token: "legacy-access".to_string(),
+                    refresh_token: "legacy-refresh".to_string(),
+                    expires_at_ms: 123,
+                    account_id: Some("acct_legacy".to_string()),
+                },
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let _home = EnvVarGuard::set("HOME", home.path());
+
+        let store = OpenAICodexAuthStore::default().unwrap();
+        assert_eq!(
+            store.path(),
+            home.path().join(".nsed").join("openai-oauth.json")
+        );
+        let auth = store.read().unwrap().unwrap();
+        assert_eq!(auth.tokens.refresh_token, "legacy-refresh");
+        assert_eq!(auth.tokens.account_id.as_deref(), Some("acct_legacy"));
     }
 
     #[test]

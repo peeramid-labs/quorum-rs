@@ -533,7 +533,7 @@ pub fn load_agent_from_config_with_registry(
         .validate_compaction_knobs()
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    if provider_entry.provider_type == "openai-codex" && agent.model_name.trim().is_empty() {
+    if provider_entry.provider_type == "openai-oauth" && agent.model_name.trim().is_empty() {
         agent.model_name = "gpt-5.5".to_string();
     }
 
@@ -1350,35 +1350,35 @@ agents:
     }
 
     #[test]
-    fn test_openai_codex_provider_skips_api_key_check() {
+    fn test_openai_oauth_provider_skips_api_key_check() {
         let yaml = r#"
 providers:
-  openai_codex:
-    type: openai-codex
+  openai_oauth:
+    type: openai-oauth
 agents:
-  - name: CODEX_AGENT
-    provider_id: openai_codex
+  - name: OAUTH_AGENT
+    provider_id: openai_oauth
     model_name: gpt-5.5
 "#;
         let config: AgentFleetConfig = serde_yaml::from_str(yaml).unwrap();
-        let (agent, provider) = load_agent_from_config(&config, "CODEX_AGENT").unwrap();
-        assert_eq!(provider.provider_type, "openai-codex");
+        let (agent, provider) = load_agent_from_config(&config, "OAUTH_AGENT").unwrap();
+        assert_eq!(provider.provider_type, "openai-oauth");
         assert_eq!(agent.model_name, "gpt-5.5");
     }
 
     #[test]
-    fn test_openai_codex_provider_defaults_to_gpt55() {
+    fn test_openai_oauth_provider_defaults_to_gpt55() {
         let yaml = r#"
 providers:
-  openai_codex:
-    type: openai-codex
+  openai_oauth:
+    type: openai-oauth
 agents:
-  - name: CODEX_AGENT
-    provider_id: openai_codex
+  - name: OAUTH_AGENT
+    provider_id: openai_oauth
 "#;
         let config: AgentFleetConfig = serde_yaml::from_str(yaml).unwrap();
-        let (agent, provider) = load_agent_from_config(&config, "CODEX_AGENT").unwrap();
-        assert_eq!(provider.provider_type, "openai-codex");
+        let (agent, provider) = load_agent_from_config(&config, "OAUTH_AGENT").unwrap();
+        assert_eq!(provider.provider_type, "openai-oauth");
         assert_eq!(agent.model_name, "gpt-5.5");
     }
 

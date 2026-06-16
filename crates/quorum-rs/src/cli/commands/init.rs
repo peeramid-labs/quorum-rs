@@ -192,6 +192,14 @@ providers:
     base_url: "https://api.openai.com/v1"
     api_key: "${{OPENAI_API_KEY}}"   # resolved from your shell env at runtime
 
+  # ── OpenAI OAuth subscription ─────────────────────────────────────────
+  # For ChatGPT/Codex subscription-backed agents, prefer interactive
+  # `quorum init` and choose "OpenAI OAuth" so init performs the device
+  # login and writes ~/.nsed/openai-oauth.json. If auth already exists,
+  # uncomment this block and point agents at provider_id: openai_oauth.
+  # openai_oauth:
+  #   type: openai-oauth
+
   # ── Claude CLI ───────────────────────────────────────────────────────
   # Uncomment if you have `claude` on $PATH and want the CLI to be the
   # agent runtime. No api_key here — Claude CLI handles its own auth.
@@ -254,7 +262,7 @@ pub fn run_agent_fleet(target: &Path, agents: &[String], force: bool) -> ExitCod
         "Wrote agent fleet config to {}\n\n\
          Next steps:\n\
          \x20 1. Edit {} — pick a provider section (only the first is active),\n\
-         \x20    set the api_key env var (or remove it if your provider doesn't need one).\n\
+         \x20    set the api_key env var, or use interactive `quorum init` for OpenAI OAuth.\n\
          \x20 2. Make sure ~/.nsed/agent.creds exists (run `quorum redeem <invite>` first).\n\
          \x20 3. Run: quorum serve --nats-url <url-from-quorum-redeem>",
         target.display(),
@@ -435,6 +443,14 @@ mod tests {
         assert!(
             yaml.contains("# claude_cli:"),
             "claude provider must ship commented"
+        );
+        assert!(
+            yaml.contains("# openai_oauth:"),
+            "OpenAI OAuth subscription provider must ship commented"
+        );
+        assert!(
+            yaml.contains("#   type: openai-oauth"),
+            "OpenAI OAuth provider type must be visible"
         );
         assert!(
             yaml.contains("# exec_local:"),

@@ -9,10 +9,12 @@ use super::ask;
 use super::presets::{AGENT_PRESETS, AgentSlot, is_tested_model};
 use super::providers::{
     DetectedTool, FetchedModel, ModelInfo, Provider, build_claude_exec_provider,
-    build_exec_provider, build_ollama_provider, build_provider_env_key, build_simulated_provider,
-    derive_provider_pricing, fetch_models, fetched_to_model_infos, sanitize_provider_id,
+    build_exec_provider, build_ollama_provider, build_openai_oauth_provider,
+    build_provider_env_key, build_simulated_provider, derive_provider_pricing, fetch_models,
+    fetched_to_model_infos, sanitize_provider_id,
 };
 use crate::brand;
+use crate::llms::openai_codex::{OpenAICodexAuthStore, login_and_store_openai_codex_device_code};
 
 /// Split a command string into tokens, respecting single and double quotes.
 ///
@@ -75,6 +77,54 @@ fn try_load_dotenv() {
 
 // ── Phase 2: provider configuration ───────────────────────────────────────
 
+async fn ensure_openai_oauth_auth() -> Result<bool> {
+    let rc = brand::render_config();
+    let store = OpenAICodexAuthStore::default()?;
+    if store.read()?.is_some() {
+        brand::success(&format!(
+            "OpenAI OAuth auth found at {}.",
+            store.path().display()
+        ));
+        return Ok(true);
+    }
+
+    if store.import_from_codex_cli()? {
+        brand::success(&format!(
+            "Imported OpenAI OAuth auth from Codex CLI into {}.",
+            store.path().display()
+        ));
+        return Ok(true);
+    }
+
+    let Some(sign_in) = ask(Confirm::new("Sign in to OpenAI OAuth now?")
+        .with_default(true)
+        .with_render_config(rc)
+        .prompt())?
+    else {
+        return Ok(false);
+    };
+    if !sign_in {
+        return Ok(false);
+    }
+
+    login_and_store_openai_codex_device_code(&store, |prompt| async move {
+        println!();
+        println!("Open this URL in your browser:");
+        println!("  {}", prompt.verification_url);
+        println!();
+        println!("Enter this code:");
+        println!("  {}", prompt.user_code);
+        println!();
+        println!("Waiting for OpenAI authorization...");
+    })
+    .await?;
+    brand::success(&format!(
+        "OpenAI OAuth auth saved to {}.",
+        store.path().display()
+    ));
+    Ok(true)
+}
+
 pub(super) async fn wizard_providers(
     ollama_models: &Option<Vec<FetchedModel>>,
     exec_tools: &[DetectedTool],
@@ -128,6 +178,7 @@ pub(super) async fn wizard_providers(
         "OpenRouter    (https://openrouter.ai/api/v1)",
         "Ollama        (local, http://localhost:11434/v1)",
         "OpenAI        (https://api.openai.com/v1)",
+        "OpenAI OAuth  (ChatGPT/Codex subscription)",
         "OpenAI-compatible  (enter URL manually)",
         "Exec          (external process, e.g. Python/Claude CLI)",
         "Simulated     (testing/CI, no real LLM calls)",
@@ -173,6 +224,23 @@ pub(super) async fn wizard_providers(
                 brand::success(
                     "Exec provider added. Configure command per agent in the next step.",
                 );
+            }
+            continue;
+        }
+
+        if choice.starts_with("OpenAI OAuth") {
+            if providers.iter().any(|p| p.provider_type == "openai-oauth") {
+                brand::warn("An OpenAI OAuth provider already exists — skipping.");
+                continue;
+            }
+            match ensure_openai_oauth_auth().await? {
+                true => {
+                    providers.push(build_openai_oauth_provider());
+                    brand::success("OpenAI OAuth provider added.");
+                }
+                false => {
+                    brand::warn("OpenAI OAuth provider skipped.");
+                }
             }
             continue;
         }
