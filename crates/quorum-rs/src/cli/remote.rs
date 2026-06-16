@@ -21,6 +21,19 @@ pub struct DiscoveredPolicy {
     pub tags: Vec<String>,
 }
 
+/// Minimal projection of a room from `GET /rooms` (grant-filtered
+/// server-side). Reads the discovery fields and ignores the rest.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscoveredRoom {
+    pub id: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub visibility: String,
+    #[serde(default)]
+    pub eligible_agent_count: usize,
+}
+
 // ── Response structs for status / trace commands ──────────────────────
 
 /// Health-check response from `GET /health`.
@@ -631,6 +644,31 @@ impl RemoteOrchestrator {
         resp.json()
             .await
             .map_err(|e| RemoteError::ParseError(format!("policies: {e}")))
+    }
+
+    /// List rooms the caller can use — `GET /rooms`. Grant-filtered
+    /// server-side (admins see all; others see public rooms plus rooms
+    /// whose tags glob-match their grants).
+    pub async fn discover_rooms(&self) -> Result<Vec<DiscoveredRoom>, RemoteError> {
+        let url = format!("{}/rooms", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RemoteError::ApiError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        resp.json()
+            .await
+            .map_err(|e| RemoteError::ParseError(format!("rooms: {e}")))
     }
 
     /// List policies — `GET /policies` with optional tag filter.
@@ -1941,6 +1979,45 @@ mod tests {
             .expect("noosphera policy present");
         assert_eq!(noosphera_policy.policy_id, "abc123");
         assert_eq!(noosphera_policy.tags, vec!["noosphera:0v1".to_string()]);
+    }
+
+    /// Contract test: `GET /rooms` returns the orchestrator's full
+    /// `RoomInfo` shape (id/tags/visibility/eligible_agent_count +
+    /// eligible_agent_ids). `discover_rooms` pulls the discovery fields
+    /// and ignores the rest.
+    #[tokio::test]
+    async fn discover_rooms_parses_full_room_info_shape() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rooms"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": "noosphera",
+                    "tags": ["noosphera:0v1"],
+                    "visibility": "private",
+                    "eligible_agent_count": 3,
+                    "eligible_agent_ids": ["NoospheraEpic", "CortexB"]
+                },
+                {
+                    "id": "public-room",
+                    "tags": [],
+                    "visibility": "public",
+                    "eligible_agent_count": 0
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        let client = RemoteOrchestrator::new(&server.uri(), "tok").unwrap();
+        let rooms = client.discover_rooms().await.unwrap();
+        assert_eq!(rooms.len(), 2);
+        let noosphera_room = rooms
+            .iter()
+            .find(|r| r.id == "noosphera")
+            .expect("noosphera room present");
+        assert_eq!(noosphera_room.tags, vec!["noosphera:0v1".to_string()]);
+        assert_eq!(noosphera_room.visibility, "private");
+        assert_eq!(noosphera_room.eligible_agent_count, 3);
     }
 
     #[test]
