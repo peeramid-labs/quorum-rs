@@ -522,6 +522,14 @@ pub(super) fn suggest_provider_id(preset_id: &str, existing: &[Provider]) -> Str
     }
 }
 
+/// Split a comma-separated path list into trimmed, non-empty entries.
+fn split_paths(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 pub(super) fn wizard_agents(
     providers: &[Provider],
     exec_tools: &[DetectedTool],
@@ -707,6 +715,37 @@ pub(super) fn wizard_agents(
         );
         slot.exec_command = exec_command;
         slot.apply_preset();
+
+        // claude_cli already collected context dirs via --add-dir above.
+        if slot.provider_id != "claude_cli" {
+            let Some(read_str) = ask(Text::new(&format!(
+                "Read access for {name} — files/dirs for context (comma-separated, optional):"
+            ))
+            .with_default("")
+            .with_help_message("Granted to the agent's read tool. Example: ./docs, ./src/api.rs")
+            .with_render_config(rc)
+            .prompt())?
+            else {
+                return Ok(None);
+            };
+            slot.read_paths = split_paths(&read_str);
+
+            let Some(write_str) = ask(Text::new(&format!(
+                "Write access for {name} — directories to manage (comma-separated, optional):"
+            ))
+            .with_default("")
+            .with_help_message(
+                "Claude agents get write tools; exec agents use the first as working_dir; \
+                 native LLMs have no write tool (rendered as a note).",
+            )
+            .with_render_config(rc)
+            .prompt())?
+            else {
+                return Ok(None);
+            };
+            slot.write_dirs = split_paths(&write_str);
+        }
+
         agents.push(slot);
     }
 
@@ -722,7 +761,17 @@ pub(super) fn wizard_agents(
 
 #[cfg(test)]
 mod tests {
-    use super::split_shell_command;
+    use super::{split_paths, split_shell_command};
+
+    #[test]
+    fn split_paths_trims_and_drops_empties() {
+        assert_eq!(
+            split_paths(" ./docs , src/api.rs ,, "),
+            vec!["./docs".to_string(), "src/api.rs".to_string()]
+        );
+        assert!(split_paths("").is_empty());
+        assert!(split_paths("  ,  ").is_empty());
+    }
 
     #[test]
     fn simple_command() {

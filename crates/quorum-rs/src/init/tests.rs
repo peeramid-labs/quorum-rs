@@ -7643,3 +7643,104 @@ fn shell_quote_single_quote_escaped() {
 fn shell_quote_empty_string() {
     assert_eq!(shell_quote(""), "''");
 }
+
+// ── per-agent file/dir access ───────────────────────────────────────
+
+/// Helper: a single provider of the given type, id `prov`.
+fn provider_of_type(provider_type: &str) -> Vec<Provider> {
+    vec![Provider {
+        id: "prov".to_string(),
+        base_url: "https://api.example.com/v1".to_string(),
+        api_key: Some("sk-test".to_string()),
+        input_price: None,
+        output_price: None,
+        provider_type: provider_type.to_string(),
+        models: vec![],
+        engine: None,
+    }]
+}
+
+fn access_agent(read: &[&str], write: &[&str]) -> AgentSlot {
+    let mut a = AgentSlot::new(
+        "A".to_string(),
+        "prov".to_string(),
+        "m".to_string(),
+        None,
+        None,
+    );
+    a.read_paths = read.iter().map(|s| s.to_string()).collect();
+    a.write_dirs = write.iter().map(|s| s.to_string()).collect();
+    a
+}
+
+#[test]
+fn render_agent_access_native_read_emits_builtin_read_file() {
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        &provider_of_type("openai"),
+        &[access_agent(&["docs/", "src/api.rs"], &[])],
+    );
+    assert!(cfg.contains("    builtin_tools:"));
+    assert!(cfg.contains("      - type: read_file"));
+    assert!(cfg.contains("        roots: [\"docs/\", \"src/api.rs\"]"));
+}
+
+#[test]
+fn render_agent_access_native_write_emits_note_not_tool() {
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        &provider_of_type("openai"),
+        &[access_agent(&[], &["./out"])],
+    );
+    assert!(
+        cfg.contains("# write access requested but openai has no write tool"),
+        "native provider must explain write isn't supported, got:\n{cfg}"
+    );
+    assert!(!cfg.contains("writable: true"));
+}
+
+#[test]
+fn render_agent_access_claude_read_only_emits_add_dirs_no_writable() {
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        &provider_of_type("claude"),
+        &[access_agent(&["docs/"], &[])],
+    );
+    assert!(cfg.contains("    claude:"));
+    assert!(cfg.contains("      add_dirs: [\"docs/\"]"));
+    assert!(!cfg.contains("writable: true"));
+}
+
+#[test]
+fn render_agent_access_claude_write_emits_writable_and_merges_dirs() {
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        &provider_of_type("claude"),
+        &[access_agent(&["docs/"], &["./src"])],
+    );
+    assert!(cfg.contains("      add_dirs: [\"docs/\", \"./src\"]"));
+    assert!(cfg.contains("      writable: true"));
+}
+
+#[test]
+fn render_agent_access_none_emits_no_access_block() {
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        &provider_of_type("openai"),
+        &[access_agent(&[], &[])],
+    );
+    assert!(!cfg.contains("builtin_tools:"));
+    assert!(!cfg.contains("    claude:"));
+    assert!(!cfg.contains("add_dirs:"));
+}
+
+#[test]
+fn render_agent_access_exec_uses_working_dir_prefers_write() {
+    let mut a = access_agent(&["./read"], &["./work"]);
+    a.exec_command = Some(vec!["python3".to_string(), "agent.py".to_string()]);
+    let cfg = render_agent_config("http://nsed:8080", &provider_of_type("exec"), &[a]);
+    assert!(cfg.contains("    exec:"));
+    assert!(cfg.contains("      working_dir: \"./work\""));
+    assert!(!cfg.contains("builtin_tools:"));
+    assert!(!cfg.contains("    claude:"));
+}

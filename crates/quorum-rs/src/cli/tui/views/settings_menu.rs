@@ -1,4 +1,3 @@
-use crossterm::event::Event;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -12,21 +11,6 @@ use crate::cli::tui::event::{self, AppEvent};
 
 const MENU_ITEMS: &[(&str, &str, ViewId)] = &[
     (
-        "Agents",
-        "View connected agents and their status",
-        ViewId::Agents,
-    ),
-    (
-        "Policies",
-        "Browse and manage deliberation policies",
-        ViewId::Policies,
-    ),
-    (
-        "Rooms",
-        "List, create, and delete rooms (admin / manage_rooms)",
-        ViewId::Rooms,
-    ),
-    (
         "Orchestrators",
         "Check orchestrator health and config",
         ViewId::Orchestrators,
@@ -34,7 +18,8 @@ const MENU_ITEMS: &[(&str, &str, ViewId)] = &[
     ("Config", "View workspace configuration", ViewId::Settings),
 ];
 
-/// Settings sub-menu — Agents, Policies, Orchestrators, Config.
+/// Settings sub-menu — Orchestrators and Config. Agents, Policies, and Rooms
+/// are top-level tabs in the shell tab bar, not buried here.
 pub struct SettingsMenuView {
     list_state: ListState,
 }
@@ -73,19 +58,6 @@ impl View for SettingsMenuView {
         if event::is_enter(event) {
             let (_, _, view_id) = &MENU_ITEMS[self.list_state.selected];
             return Some(ViewAction::Push(view_id.clone()));
-        }
-
-        // Number key shortcuts (1-4)
-        if let Event::Key(key_event) = event
-            && let crossterm::event::KeyCode::Char(c) = key_event.code
-            && let Some(idx) = c.to_digit(10)
-        {
-            let idx = idx as usize;
-            if idx >= 1 && idx <= MENU_ITEMS.len() {
-                self.list_state.selected = idx - 1;
-                let (_, _, view_id) = &MENU_ITEMS[idx - 1];
-                return Some(ViewAction::Push(view_id.clone()));
-            }
         }
 
         None
@@ -132,12 +104,7 @@ impl View for SettingsMenuView {
         render_key_hints(
             frame,
             chunks[1],
-            &[
-                ("↑↓", "Navigate"),
-                ("Enter", "Select"),
-                ("1-4", "Jump"),
-                ("Esc", "Back"),
-            ],
+            &[("↑↓", "Navigate"), ("Enter", "Select"), ("Esc", "Back")],
         );
     }
 }
@@ -145,7 +112,7 @@ impl View for SettingsMenuView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
     fn make_key_event(code: KeyCode) -> AppEvent {
         AppEvent::Terminal(Event::Key(KeyEvent {
@@ -170,18 +137,10 @@ mod tests {
     }
 
     #[test]
-    fn enter_pushes_agents() {
+    fn enter_pushes_first_item() {
         let mut view = SettingsMenuView::new();
         let action = view.update(&make_key_event(KeyCode::Enter));
-        assert_eq!(action, Some(ViewAction::Push(ViewId::Agents)));
-    }
-
-    #[test]
-    fn number_key_jumps() {
-        let mut view = SettingsMenuView::new();
-        let action = view.update(&make_key_event(KeyCode::Char('2')));
-        assert_eq!(action, Some(ViewAction::Push(ViewId::Policies)));
-        assert_eq!(view.list_state.selected, 1);
+        assert_eq!(action, Some(ViewAction::Push(ViewId::Orchestrators)));
     }
 
     #[test]
@@ -189,13 +148,6 @@ mod tests {
         let mut view = SettingsMenuView::new();
         view.update(&make_key_event(KeyCode::Down));
         assert_eq!(view.list_state.selected, 1);
-    }
-
-    #[test]
-    fn number_out_of_range_ignored() {
-        let mut view = SettingsMenuView::new();
-        let action = view.update(&make_key_event(KeyCode::Char('9')));
-        assert!(action.is_none());
     }
 
     #[test]

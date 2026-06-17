@@ -47,6 +47,15 @@ pub(super) struct AgentSlot {
     pub description: Option<String>,
     /// Exec provider command (e.g. `["python3", "agent.py"]`).
     pub exec_command: Option<Vec<String>>,
+    /// Files/dirs this agent may read for context. Rendered per provider:
+    /// `builtin_tools: read_file` roots (native LLM), `add_dirs` (Claude),
+    /// or `working_dir` (exec). Empty (default) grants no file access.
+    pub read_paths: Vec<String>,
+    /// Directories this agent may write to / manage. Only Claude agents get
+    /// write tools (`add_dirs` + `writable: true`); exec agents use the first
+    /// as `working_dir`; native-LLM agents have no write tool (rendered as a
+    /// note). Empty (default) grants no write access.
+    pub write_dirs: Vec<String>,
 }
 
 impl AgentSlot {
@@ -80,6 +89,8 @@ impl AgentSlot {
             capability_tags: vec![],
             description: None,
             exec_command: None,
+            read_paths: vec![],
+            write_dirs: vec![],
         }
     }
 

@@ -2,7 +2,32 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph};
+
+/// Pure fill computation for a room's panel: returns the `eligible/desired`
+/// (or bare `eligible`) label and whether the panel is filled — `Some(true)`
+/// when `eligible >= desired`, `Some(false)` when short, `None` when no policy
+/// target is bound.
+pub fn fill_status(eligible: usize, desired: Option<usize>) -> (String, Option<bool>) {
+    match desired {
+        Some(d) => (format!("{eligible}/{d}"), Some(eligible >= d)),
+        None => (eligible.to_string(), None),
+    }
+}
+
+/// Table cell for a room's panel fill: `eligible/desired` with a green ✓ when
+/// filled, red ✗ when short. No policy target → the bare eligible count.
+pub fn fill_cell(eligible: usize, desired: Option<usize>) -> Cell<'static> {
+    let (label, ok) = fill_status(eligible, desired);
+    match ok {
+        Some(ok) => {
+            let glyph = if ok { '✓' } else { '✗' };
+            let color = if ok { Color::Green } else { Color::Red };
+            Cell::from(format!("{label} {glyph}")).style(Style::default().fg(color))
+        }
+        None => Cell::from(label),
+    }
+}
 
 /// Compute a centered rectangle within `area` using percentage dimensions.
 pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -168,6 +193,29 @@ impl ListState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fill_status_against_target() {
+        assert_eq!(fill_status(3, Some(3)), ("3/3".to_string(), Some(true)));
+        assert_eq!(fill_status(5, Some(3)), ("5/3".to_string(), Some(true)));
+        assert_eq!(fill_status(1, Some(3)), ("1/3".to_string(), Some(false)));
+    }
+
+    #[test]
+    fn fill_status_no_target() {
+        assert_eq!(fill_status(2, None), ("2".to_string(), None));
+    }
+
+    #[test]
+    fn fill_cell_glyph_reflects_fill() {
+        // Cell content isn't directly inspectable; assert via fill_status,
+        // then that fill_cell builds without panic for each branch.
+        let _short = fill_cell(1, Some(3));
+        let _full = fill_cell(3, Some(3));
+        let _none = fill_cell(2, None);
+        assert_eq!(fill_status(1, Some(3)).1, Some(false));
+        assert_eq!(fill_status(3, Some(3)).1, Some(true));
+    }
 
     #[test]
     fn truncate_short() {

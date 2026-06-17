@@ -71,6 +71,7 @@ pub enum FetchRequest {
         id: String,
         tags: Vec<String>,
         visibility: String,
+        policy: Option<String>,
     },
     /// Delete a room via `DELETE /admin/api/rooms/{id}`.
     DeleteRoom {
@@ -125,5 +126,12 @@ pub trait View {
     /// Returns actions to execute (e.g., initial data fetches).
     fn on_enter(&mut self) -> Vec<ViewAction> {
         Vec::new()
+    }
+
+    /// `true` when the view is capturing free-text/keystroke input (a form
+    /// or filter field), so the shell must NOT steal number/Tab keys for
+    /// top-level tab switching. Defaults to `false`.
+    fn captures_input(&self) -> bool {
+        false
     }
 }

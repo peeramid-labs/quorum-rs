@@ -180,6 +180,20 @@ enum Commands {
         #[arg(long, value_delimiter = ',', num_args = 0..)]
         agents: Vec<String>,
 
+        /// Invite code (JWT) for single-command onboarding. When set,
+        /// `init` first redeems the code — writing creds/token/endpoint
+        /// like `quorum redeem` — then scaffolds the matching config:
+        /// `agent.yml` for an agent code, `nsed.yaml` for an operator
+        /// code. Skips the interactive wizard.
+        #[arg(long, value_name = "CODE")]
+        invite: Option<String>,
+
+        /// Directory the redeemed creds/token/endpoint are written to
+        /// during `--invite` onboarding. Defaults to `~/.nsed`. Ignored
+        /// without `--invite`.
+        #[arg(long, value_name = "DIR")]
+        out_dir: Option<std::path::PathBuf>,
+
         /// Overwrite an existing workspace file.
         #[arg(long)]
         force: bool,
@@ -462,8 +476,33 @@ async fn main() -> ExitCode {
             ref room,
             ref token_env,
             ref agents,
+            ref invite,
+            ref out_dir,
             force,
         } => {
+            // `--invite` is the one-command onboarding path: redeem the
+            // code, then scaffold the config its audience implies. Takes
+            // precedence over the wizard / one-shot template selection.
+            if let Some(code) = invite {
+                let client_target = cli.config_path();
+                let fleet_target = if cli.config.is_some() {
+                    cli.config_path()
+                } else {
+                    std::path::PathBuf::from("agent.yml")
+                };
+                return commands::init::run_onboard(
+                    code,
+                    orchestrator_url,
+                    out_dir.as_deref(),
+                    &client_target,
+                    &fleet_target,
+                    room,
+                    token_env,
+                    agents,
+                    force,
+                )
+                .await;
+            }
             // Decide between the interactive wizard and the
             // one-shot template renderer. The wizard only runs when
             // every condition is met: stdin is a TTY, no

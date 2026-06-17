@@ -812,10 +812,22 @@ pub(super) fn render_agent_config(
                 .iter()
                 .map(|p| format!("\"{}\"", escape_yaml_double_quoted(p)))
                 .collect();
-            // TODO(slop): `.unwrap()` / `.expect()` outside tests — propagate the error with `?` or handle it
             writeln!(out, "    exec:").unwrap();
-            // TODO(slop): `.unwrap()` / `.expect()` outside tests — propagate the error with `?` or handle it
             writeln!(out, "      command: [{}]", parts.join(", ")).unwrap();
+            // An exec subprocess gets a single working directory: prefer a
+            // write dir (it can mutate there), else the first read path.
+            if let Some(wd) = agent
+                .write_dirs
+                .first()
+                .or_else(|| agent.read_paths.first())
+            {
+                writeln!(
+                    out,
+                    "      working_dir: \"{}\"",
+                    escape_yaml_double_quoted(wd)
+                )
+                .unwrap();
+            }
         }
 
         // Persona
@@ -863,6 +875,17 @@ pub(super) fn render_agent_config(
             .unwrap();
         }
 
+        // File/dir access — mapped to the right knob for this agent's
+        // provider. exec working_dir is emitted in the exec block above.
+        let provider_type = providers
+            .iter()
+            .find(|p| p.id == agent.provider_id)
+            .map(|p| p.provider_type.as_str())
+            .unwrap_or("openai");
+        if provider_type != "exec" {
+            render_agent_access(&mut out, agent, provider_type);
+        }
+
         // Remaining optional fields (always commented — rarely changed)
         // TODO(slop): `.unwrap()` / `.expect()` outside tests — propagate the error with `?` or handle it
         writeln!(out, "    # textual_feedback: true").unwrap();
@@ -877,6 +900,52 @@ pub(super) fn render_agent_config(
     }
 
     out
+}
+
+/// Emit an agent's read/write file access, mapped to the knob its provider
+/// supports: Claude → `add_dirs` (+ `writable: true` when write dirs are
+/// granted); native-LLM → `builtin_tools: read_file` roots (write is not a
+/// native tool, so write dirs render as a note). Exec is handled separately
+/// via `working_dir`, so this is only called for non-exec providers.
+fn render_agent_access(out: &mut String, agent: &AgentSlot, provider_type: &str) {
+    if agent.read_paths.is_empty() && agent.write_dirs.is_empty() {
+        return;
+    }
+    let quote_list = |paths: &[String]| -> String {
+        paths
+            .iter()
+            .map(|p| format!("\"{}\"", escape_yaml_double_quoted(p)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if provider_type == "claude" {
+        // Claude grants tool access per directory; read + write paths share
+        // the add_dirs list, and `writable` gates the Write/Edit tools.
+        let mut dirs: Vec<String> = Vec::new();
+        for p in agent.read_paths.iter().chain(agent.write_dirs.iter()) {
+            if !dirs.contains(p) {
+                dirs.push(p.clone());
+            }
+        }
+        writeln!(out, "    claude:").unwrap();
+        writeln!(out, "      add_dirs: [{}]", quote_list(&dirs)).unwrap();
+        if !agent.write_dirs.is_empty() {
+            writeln!(out, "      writable: true").unwrap();
+        }
+    } else {
+        if !agent.read_paths.is_empty() {
+            writeln!(out, "    builtin_tools:").unwrap();
+            writeln!(out, "      - type: read_file").unwrap();
+            writeln!(out, "        roots: [{}]", quote_list(&agent.read_paths)).unwrap();
+        }
+        if !agent.write_dirs.is_empty() {
+            writeln!(
+                out,
+                "    # write access requested but {provider_type} has no write tool — use a claude provider to grant it"
+            )
+            .unwrap();
+        }
+    }
 }
 
 /// Render the orchestrator `config/default.yml` file.

@@ -164,6 +164,13 @@ Generate a starter `agent.yml`:
 quorum init --agent-fleet --agents cortex-a
 ```
 
+> **One-command onboarding:** `quorum init --invite <code>` folds Steps
+> 2 and 3 together — it redeems the code (writing creds/token/endpoint
+> like `quorum redeem`) and then scaffolds the matching config in one
+> shot. An agent code writes `agent.yml`; an operator code writes the
+> client-side `nsed.yaml`. Add `--out-dir ./creds` to redirect the
+> redeemed credentials.
+
 The flag is the important bit — without `--agent-fleet`, `quorum
 init` writes the *client-side* `nsed.yaml` instead (Step 5 uses
 that one). With `--agent-fleet` it writes an `agent.yml` with:
@@ -193,6 +200,14 @@ has the per-provider notes.
 > ./fleet/agent.yml` to `quorum init` to write there instead.
 > You'll then need to point `quorum serve --config
 > ./fleet/agent.yml` in Step 4.
+
+> **File access:** the interactive wizard (`quorum init` with no flags)
+> asks each agent for **read access** (files/dirs for context) and
+> **write access** (directories to manage). These map to the right knob
+> per provider in `agent.yml`: native-LLM agents get a
+> `builtin_tools: read_file` block, Claude agents get `add_dirs` +
+> `writable: true`, and exec agents get a `working_dir`. Leave a prompt
+> blank to grant no access.
 
 ✅ **Checkpoint:** `cat agent.yml` prints a `providers:` block
 with `openai:` active and the env var you exported is set.
