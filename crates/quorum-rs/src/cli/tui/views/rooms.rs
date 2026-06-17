@@ -56,6 +56,10 @@ pub struct RoomsView {
     list_state: ListState,
     mode: Mode,
     form: CreateForm,
+    /// Last create/delete failure (e.g. `server returned 403: …`). Shown as
+    /// a persistent red banner until the next successful mutation — the
+    /// transient status line is too easy to miss.
+    last_error: Option<String>,
 }
 
 impl RoomsView {
@@ -67,6 +71,7 @@ impl RoomsView {
             list_state: ListState::new(0),
             mode: Mode::List,
             form: CreateForm::default(),
+            last_error: None,
         }
     }
 
@@ -94,20 +99,20 @@ impl RoomsView {
         if event::is_enter(ev) {
             let id = self.form.id.trim().to_string();
             if id.is_empty() {
-                return Some(ViewAction::SetStatus(
-                    "Room id required".into(),
-                    super::StatusLevel::Error,
-                ));
+                self.last_error = Some("Room id required".to_string());
+                return None;
             }
-            let action = ViewAction::Fetch(FetchRequest::CreateRoom {
+            // Keep the form open and clear any prior error. On success a
+            // `RoomMutated` event closes the form; on failure a
+            // `FetchError` populates `last_error` (shown in red) so the
+            // operator sees exactly why and can edit + retry.
+            self.last_error = None;
+            return Some(ViewAction::Fetch(FetchRequest::CreateRoom {
                 orchestrator: self.orchestrator.clone(),
                 id,
                 tags: self.form.tag_list(),
                 visibility: self.form.visibility().to_string(),
-            });
-            self.mode = Mode::List;
-            self.form = CreateForm::default();
-            return Some(action);
+            }));
         }
         if let Event::Key(key) = ev
             && key.kind == KeyEventKind::Press
@@ -200,23 +205,28 @@ impl View for RoomsView {
                 self.rooms = LoadState::Loaded(rooms.clone());
                 None
             }
-            // A create/delete landed — refresh the list to reflect it.
+            // A create/delete landed — close the form, clear the error,
+            // and refresh the list to reflect it.
             AppEvent::Data(DataEvent::RoomMutated { orchestrator, .. })
                 if *orchestrator == self.orchestrator =>
             {
+                self.mode = Mode::List;
+                self.form = CreateForm::default();
+                self.last_error = None;
                 self.rooms = LoadState::Loading;
                 Some(self.fetch())
             }
             AppEvent::Data(DataEvent::FetchError { context, error }) if context == "rooms" => {
-                // Keep the (possibly stale) list visible on a mutation
-                // error; only a failed initial load replaces it.
+                // Persist the failure as a red banner (the transient status
+                // line is too easy to miss) and keep the form open so the
+                // operator can read the server message and retry. Keep the
+                // (possibly stale) list visible on a mutation error; only a
+                // failed initial load replaces it.
+                self.last_error = Some(error.clone());
                 if matches!(self.rooms, LoadState::Loading | LoadState::NotLoaded) {
                     self.rooms = LoadState::Error(error.clone());
                 }
-                Some(ViewAction::SetStatus(
-                    error.clone(),
-                    super::StatusLevel::Error,
-                ))
+                None
             }
             _ => None,
         }
@@ -228,12 +238,29 @@ impl View for RoomsView {
             Mode::ConfirmDelete(_) => 3,
             Mode::List => 0,
         };
+        let err_height = if self.last_error.is_some() { 3 } else { 0 };
         let chunks = Layout::vertical([
             Constraint::Length(form_height),
+            Constraint::Length(err_height),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
         .split(area);
+
+        if let Some(err) = &self.last_error {
+            let banner = Paragraph::new(Line::from(Span::styled(
+                err.clone(),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red))
+                    .title(" Error "),
+            )
+            .wrap(ratatui::widgets::Wrap { trim: true });
+            frame.render_widget(banner, chunks[1]);
+        }
 
         match &self.mode {
             Mode::Create => self.draw_create_form(frame, chunks[0]),
@@ -254,14 +281,14 @@ impl View for RoomsView {
 
         match &self.rooms {
             LoadState::NotLoaded | LoadState::Loading => {
-                render_loading(frame, chunks[1], "Loading rooms...");
+                render_loading(frame, chunks[2], "Loading rooms...");
             }
-            LoadState::Error(e) => render_error(frame, chunks[1], e),
+            LoadState::Error(e) => render_error(frame, chunks[2], e),
             LoadState::Loaded(rooms) => {
                 if rooms.is_empty() {
-                    render_error(frame, chunks[1], "No rooms — press 'n' to create one");
+                    render_error(frame, chunks[2], "No rooms — press 'n' to create one");
                 } else {
-                    self.draw_table(frame, chunks[1], rooms);
+                    self.draw_table(frame, chunks[2], rooms);
                 }
             }
         }
@@ -282,7 +309,7 @@ impl View for RoomsView {
                 ("Esc", "Back"),
             ],
         };
-        render_key_hints(frame, chunks[2], &hints);
+        render_key_hints(frame, chunks[3], &hints);
     }
 }
 
@@ -461,16 +488,45 @@ mod tests {
                 visibility: "public".into(),
             }))
         );
+        // Form stays open until the server confirms (RoomMutated); a
+        // failure would surface in `last_error` instead.
+        assert_eq!(v.mode, Mode::Create);
+
+        // Success closes the form, clears any error, and refetches.
+        let after = v.update(&AppEvent::Data(DataEvent::RoomMutated {
+            orchestrator: "orch".into(),
+            action: "created".into(),
+            id: "pl-test".into(),
+        }));
         assert_eq!(v.mode, Mode::List);
+        assert!(v.last_error.is_none());
+        assert!(matches!(
+            after,
+            Some(ViewAction::Fetch(FetchRequest::Rooms { .. }))
+        ));
     }
 
     #[test]
-    fn create_empty_id_errors_not_submits() {
+    fn create_empty_id_sets_error_not_submits() {
         let mut v = RoomsView::new("orch".into());
         v.mode = Mode::Create;
         let action = v.update(&key(KeyCode::Enter));
-        assert!(matches!(action, Some(ViewAction::SetStatus(_, _))));
+        assert!(action.is_none());
         assert_eq!(v.mode, Mode::Create);
+        assert!(v.last_error.is_some());
+    }
+
+    #[test]
+    fn fetch_error_sets_persistent_banner_and_keeps_form() {
+        let mut v = RoomsView::new("orch".into());
+        v.mode = Mode::Create;
+        let action = v.update(&AppEvent::Data(DataEvent::FetchError {
+            context: "rooms".into(),
+            error: "server returned 403: room tags outside your grant scope".into(),
+        }));
+        assert!(action.is_none());
+        assert_eq!(v.mode, Mode::Create); // form stays open to edit + retry
+        assert!(v.last_error.as_deref().unwrap().contains("403"));
     }
 
     #[test]
