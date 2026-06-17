@@ -164,6 +164,13 @@ Generate a starter `agent.yml`:
 quorum init --agent-fleet --agents cortex-a
 ```
 
+> **One-command onboarding:** `quorum init --invite <code>` folds Steps
+> 2 and 3 together — it redeems the code (writing creds/token/endpoint
+> like `quorum redeem`) and then scaffolds the matching config in one
+> shot. An agent code writes `agent.yml`; an operator code writes the
+> client-side `nsed.yaml`. Add `--out-dir ./creds` to redirect the
+> redeemed credentials.
+
 The flag is the important bit — without `--agent-fleet`, `quorum
 init` writes the *client-side* `nsed.yaml` instead (Step 5 uses
 that one). With `--agent-fleet` it writes an `agent.yml` with:

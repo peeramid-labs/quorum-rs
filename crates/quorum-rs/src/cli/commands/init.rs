@@ -264,10 +264,113 @@ pub fn run_agent_fleet(target: &Path, agents: &[String], force: bool) -> ExitCod
     ExitCode::SUCCESS
 }
 
+/// Retry budget for the redeem leg of `init --invite`, mirroring
+/// `quorum redeem`'s own default so onboarding is equally resilient.
+const ONBOARD_REDEEM_MAX_ATTEMPTS: u32 = 5;
+
+/// Which workspace config `init --invite` scaffolds, chosen by the invite
+/// code's audience: an agent code onboards a worker (`agent.yml`, for `quorum
+/// serve`); anything else (operator / chat / legacy / unrecognised) onboards a
+/// client (`nsed.yaml`, for `quorum run`/`status`/`tui`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum OnboardConfig {
+    Client,
+    Fleet,
+}
+
+/// Map an invite code to the config it should scaffold. Unknown / malformed
+/// codes fall back to `Client` — the redeem step that follows surfaces the
+/// real "invalid code" error, so we don't need to reject here.
+pub fn onboard_config_for_code(code: &str) -> OnboardConfig {
+    match crate::nats_utils::invite_audience(code)
+        .ok()
+        .flatten()
+        .as_deref()
+    {
+        Some(crate::nats_utils::AUD_AGENT_REDEEM) => OnboardConfig::Fleet,
+        _ => OnboardConfig::Client,
+    }
+}
+
+/// `quorum init --invite <code>` — single-command onboarding. Redeems the
+/// invite (writing creds/token/endpoint via the same path as `quorum redeem`),
+/// then scaffolds the matching workspace config: `agent.yml` for an agent
+/// code, `nsed.yaml` for an operator code.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_onboard(
+    code: &str,
+    orchestrator_url: &str,
+    out_dir: Option<&Path>,
+    client_target: &Path,
+    fleet_target: &Path,
+    room: &str,
+    token_env: &str,
+    agents: &[String],
+    force: bool,
+) -> ExitCode {
+    if let Err(e) = crate::cli::commands::redeem::run(
+        code,
+        orchestrator_url,
+        out_dir,
+        force,
+        None,
+        ONBOARD_REDEEM_MAX_ATTEMPTS,
+    )
+    .await
+    {
+        eprintln!("error: redeem failed: {e:#}");
+        return ExitCode::FAILURE;
+    }
+
+    println!("\nScaffolding workspace config…\n");
+    match onboard_config_for_code(code) {
+        OnboardConfig::Fleet => run_agent_fleet(fleet_target, agents, force),
+        OnboardConfig::Client => run(
+            client_target,
+            orchestrator_url,
+            room,
+            token_env,
+            agents,
+            force,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Build a JWT-shaped code whose payload carries `aud`. Signature is a
+    /// throwaway — `invite_audience` reads the audience without verifying.
+    fn code_with_aud(aud: &str) -> String {
+        use base64::Engine;
+        let payload = serde_json::json!({ "aud": aud }).to_string();
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+        format!("eyJhbGciOiJFUzI1NiJ9.{b64}.sig")
+    }
+
+    #[test]
+    fn onboard_config_agent_code_is_fleet() {
+        let code = code_with_aud("nsed-agent-redeem");
+        assert_eq!(onboard_config_for_code(&code), OnboardConfig::Fleet);
+    }
+
+    #[test]
+    fn onboard_config_operator_code_is_client() {
+        let code = code_with_aud("nsed-operator-redeem");
+        assert_eq!(onboard_config_for_code(&code), OnboardConfig::Client);
+    }
+
+    #[test]
+    fn onboard_config_unknown_or_malformed_is_client() {
+        assert_eq!(
+            onboard_config_for_code(&code_with_aud("something-else")),
+            OnboardConfig::Client
+        );
+        // Not JWT-shaped → invite_audience errs → defaults to Client.
+        assert_eq!(onboard_config_for_code("not-a-jwt"), OnboardConfig::Client);
+    }
 
     fn agents(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
