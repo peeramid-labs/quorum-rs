@@ -6,7 +6,7 @@ use crate::cli::workspace::WorkspaceConfig;
 use super::common::{build_remote, resolve_orchestrators};
 
 pub async fn run(config_path: &Path, orchestrator: Option<&str>) -> ExitCode {
-    let config = match WorkspaceConfig::load(config_path) {
+    let config = match WorkspaceConfig::load_or_remote_default(config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}");

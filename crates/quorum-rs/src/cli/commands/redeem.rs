@@ -258,6 +258,19 @@ async fn run_operator_redeem(
     write_secret_file(&resolved_token, &resp.token)
         .with_context(|| format!("Failed to write token file at {}", resolved_token.display()))?;
 
+    // Persist the orchestrator HTTP address beside the token so the
+    // config-free client (`quorum run`/`status`/`rooms` with no nsed.yaml)
+    // can reach this orchestrator later. Best-effort: a write failure here
+    // must not undo a successful redeem — warn and continue.
+    let endpoint_path =
+        match crate::cli::endpoint::persist_endpoint(&resolved_token, orchestrator_url) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("warning: could not persist orchestrator endpoint: {e}");
+                None
+            }
+        };
+
     // For unified codes we also got NATS creds back — write them in
     // the same `.creds` + `.seed` layout the agent path uses, so
     // downstream tooling (yaml `nats.auth.creds_file`, etc.) doesn't
@@ -297,6 +310,9 @@ async fn run_operator_redeem(
         println!();
         println!("  Operator     : {}", resp.name);
         println!("  Token file   : {}", resolved_token.display());
+        if let Some(p) = &endpoint_path {
+            println!("  Endpoint file: {}", p.display());
+        }
         println!("  Connect URL  : {nats_url}");
         println!("  Agent pubkey : {pub_key}");
         println!("  Creds file   : {}", resolved_creds.display());
@@ -307,6 +323,9 @@ async fn run_operator_redeem(
         println!();
         println!("  Operator    : {}", resp.name);
         println!("  Token file  : {}", resolved_token.display());
+        if let Some(p) = &endpoint_path {
+            println!("  Endpoint    : {}", p.display());
+        }
         if let Some(budget) = resp.budget {
             println!("  Budget cap  : {budget} credits");
         }
@@ -1072,6 +1091,85 @@ mod tests {
         // chat-only response → no .creds or .seed written
         assert!(!tmp.path().join("agent.creds").exists());
         assert!(!tmp.path().join("agent.seed").exists());
+    }
+
+    /// The agent path mints NATS creds only — it has no HTTP bearer and
+    /// must NOT write the `orchestrator` endpoint file (config-free client
+    /// resolution is an operator concern). Regression guard so a future
+    /// refactor doesn't wire persistence into the agent path.
+    #[tokio::test]
+    async fn agent_redeem_does_not_persist_endpoint() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/redeem-agent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user_jwt": "eyJ.x.y",
+                "nats_url": "nats://localhost:4222",
+                "agent_id": "bot-1",
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        run(
+            &agent_invite_code(),
+            &mock_server.uri(),
+            Some(&tmp.path().join("agent.seed")),
+            Some(&tmp.path().join("agent.creds")),
+            Some(&tmp.path().join("operator.token")),
+            false,
+            None,
+            1,
+        )
+        .await
+        .expect("agent redeem must succeed");
+
+        assert!(
+            !tmp.path().join("orchestrator").exists(),
+            "agent redeem must not write the orchestrator endpoint file"
+        );
+    }
+
+    /// Config-free onboarding: an operator redeem must persist the
+    /// orchestrator HTTP address beside the token (`<token_dir>/orchestrator`)
+    /// so `quorum run`/`status`/`rooms` can reach it later with no nsed.yaml.
+    #[tokio::test]
+    async fn redeem_operator_persists_orchestrator_endpoint() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/redeem"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "op-abc-123",
+                "name": "alice",
+                "budget": 5.0,
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let token_path = tmp.path().join("operator.token");
+
+        run(
+            &operator_invite_code(),
+            &mock_server.uri(),
+            Some(&tmp.path().join("agent.seed")),
+            Some(&tmp.path().join("agent.creds")),
+            Some(&token_path),
+            false,
+            None,
+            1,
+        )
+        .await
+        .expect("operator redeem must succeed");
+
+        let endpoint = std::fs::read_to_string(tmp.path().join("orchestrator")).unwrap();
+        assert_eq!(endpoint.trim(), mock_server.uri().trim_end_matches('/'));
     }
 
     /// Unified-code path: operator code with `capabilities=[chat,agent]`

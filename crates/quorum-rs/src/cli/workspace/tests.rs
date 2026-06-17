@@ -1146,6 +1146,26 @@ rooms:
     }
 
     #[test]
+    fn load_or_remote_default_present_file_delegates_to_load() {
+        let yaml = r#"
+policies:
+  quick:
+    agents: ["a", "b"]
+    max_rounds: 2
+orchestrators:
+  local:
+    mode: embedded
+rooms:
+  audit:
+    policy: quick
+"#;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        let config = WorkspaceConfig::load_or_remote_default(tmp.path()).unwrap();
+        assert!(!config.policies.is_empty());
+    }
+
+    #[test]
     fn load_invalid_yaml_errors() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(b"not: [valid: yaml: {{").unwrap();

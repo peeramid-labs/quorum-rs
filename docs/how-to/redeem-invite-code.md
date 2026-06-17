@@ -157,6 +157,40 @@ Pass `Some(&pubkey)` unconditionally — chat-only codes silently
 ignore the field, so the same call site handles both flavours. The
 `nsed init` wizard uses exactly this pattern.
 
+## Config-free operator client — redeem, then just run
+
+Redeeming an **operator** code (`/redeem`, the unified or chat-only
+flavour above) writes three things under `~/.nsed/`:
+
+- `operator.token` — your HTTP bearer (mode 0600).
+- `orchestrator` — the orchestrator's HTTP address, captured from the
+  URL you redeemed against.
+- `agent.creds` + `agent.seed` — only for unified (`agent`-capable) codes.
+
+With the address persisted beside the token, the discovery and submit
+commands need **no `nsed.yaml`**:
+
+```bash
+quorum redeem eyJhbGc...            # writes ~/.nsed/{operator.token,orchestrator}
+quorum rooms                        # what rooms can I submit to?
+quorum run --policy noosphera:0v1 "Summarise the Q3 risks"
+quorum status <job-id>
+```
+
+`run`, `status`, `rooms`, and `trace` synthesize a single-orchestrator
+workspace from `~/.nsed/orchestrator` + `~/.nsed/operator.token` when no
+workspace file is found. Policies and rooms are discovered live from the
+orchestrator's grant-filtered `GET /policies` and `GET /rooms`, so a
+joiner picks from `quorum rooms` instead of hand-writing config.
+
+Endpoint precedence: `$QUORUM_ORCHESTRATOR` env wins, then the persisted
+`~/.nsed/orchestrator` file. A `nsed.yaml` (via `--config`) still
+overrides everything when you need multi-orchestrator routing.
+
+> Note: in this config-free mode `quorum run` targets the single
+> redeemed orchestrator. Routing a job to a specific room id without a
+> `nsed.yaml` (`--room`) is a follow-up; today pass `--policy <label>`.
+
 ## Embedding instead of shelling out
 
 If your agent binary already drives its own startup and you'd

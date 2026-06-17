@@ -43,7 +43,7 @@ pub async fn run(
         return ExitCode::FAILURE;
     }
 
-    let config = match WorkspaceConfig::load(config_path) {
+    let config = match WorkspaceConfig::load_or_remote_default(config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}");
