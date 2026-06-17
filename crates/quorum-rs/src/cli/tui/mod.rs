@@ -263,6 +263,9 @@ fn create_view(view_id: &ViewId, app: &App) -> Box<dyn View> {
         ViewId::Agents => Box::new(AgentsView::new(
             remote_orch.unwrap_or_else(|| "(no remote orchestrator)".into()),
         )),
+        ViewId::Rooms => Box::new(views::rooms::RoomsView::new(
+            remote_orch.unwrap_or_else(|| "(no remote orchestrator)".into()),
+        )),
         ViewId::Orchestrators => Box::new(OrchestratorsView::new(app.config.orchestrators.clone())),
         ViewId::Settings => Box::new(SettingsView::from_config(
             &app.config,
@@ -318,6 +321,34 @@ fn handle_action(
                     });
                     (name, result)
                 }
+                FetchRequest::Rooms { orchestrator } => {
+                    let name = orchestrator.clone();
+                    let result = build_remote(app, &name).map(|remote| {
+                        tui_client.fetch_rooms(remote, name.clone());
+                    });
+                    (name, result)
+                }
+                FetchRequest::CreateRoom {
+                    orchestrator,
+                    id,
+                    tags,
+                    visibility,
+                } => {
+                    let name = orchestrator.clone();
+                    let (id, tags, visibility) = (id.clone(), tags.clone(), visibility.clone());
+                    let result = build_remote(app, &name).map(|remote| {
+                        tui_client.create_room(remote, name.clone(), id, tags, visibility);
+                    });
+                    (name, result)
+                }
+                FetchRequest::DeleteRoom { orchestrator, id } => {
+                    let name = orchestrator.clone();
+                    let id = id.clone();
+                    let result = build_remote(app, &name).map(|remote| {
+                        tui_client.delete_room(remote, name.clone(), id);
+                    });
+                    (name, result)
+                }
                 FetchRequest::StartSseStream {
                     orchestrator,
                     job_id,
@@ -342,6 +373,9 @@ fn handle_action(
                         FetchRequest::Health { .. } => "health",
                         FetchRequest::Agents { .. } => "agents",
                         FetchRequest::Policies { .. } => "policies",
+                        FetchRequest::Rooms { .. }
+                        | FetchRequest::CreateRoom { .. }
+                        | FetchRequest::DeleteRoom { .. } => "rooms",
                         FetchRequest::StartSseStream { .. } => "sse_stream",
                     };
                     let _ = data_tx.send(DataEvent::FetchError {

@@ -4,6 +4,7 @@ pub mod job_detail;
 pub mod main_menu;
 pub mod orchestrators;
 pub mod policies;
+pub mod rooms;
 pub mod settings;
 pub mod settings_menu;
 
@@ -60,6 +61,21 @@ pub enum FetchRequest {
     },
     Agents {
         orchestrator: String,
+    },
+    Rooms {
+        orchestrator: String,
+    },
+    /// Create (or replace) a room via `POST /admin/api/rooms`.
+    CreateRoom {
+        orchestrator: String,
+        id: String,
+        tags: Vec<String>,
+        visibility: String,
+    },
+    /// Delete a room via `DELETE /admin/api/rooms/{id}`.
+    DeleteRoom {
+        orchestrator: String,
+        id: String,
     },
     Health {
         orchestrator: String,

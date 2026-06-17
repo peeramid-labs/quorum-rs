@@ -4,7 +4,7 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc;
 
-use crate::cli::remote::{AgentInfo, HealthResponse};
+use crate::cli::remote::{AgentInfo, DiscoveredRoom, HealthResponse};
 
 /// Unified event type for the TUI event loop.
 #[derive(Debug)]
@@ -27,6 +27,17 @@ pub enum DataEvent {
     AgentsLoaded {
         orchestrator: String,
         agents: Vec<AgentInfo>,
+    },
+    RoomsLoaded {
+        orchestrator: String,
+        rooms: Vec<DiscoveredRoom>,
+    },
+    /// A room create/delete succeeded; carries a human verb for the status
+    /// line. The view refetches to refresh the list.
+    RoomMutated {
+        orchestrator: String,
+        action: String,
+        id: String,
     },
     HealthResult {
         orchestrator: String,

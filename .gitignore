@@ -10,3 +10,4 @@
 # CodeRabbit / qwen review artifacts (local-only)
 review*.txt
 qwen_review*
+.slop/
