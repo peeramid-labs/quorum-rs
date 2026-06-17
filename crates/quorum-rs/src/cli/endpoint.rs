@@ -110,16 +110,35 @@ fn remote_workspace_from(
     })
 }
 
-/// Build the config-free workspace from the real `~/.nsed/` files and the
-/// `$QUORUM_ORCHESTRATOR` override. See [`remote_workspace_from`].
+/// Build the config-free workspace, searching `dirs` in order for the
+/// one that holds the redeemed token, then reading the endpoint + token
+/// from it (`env_endpoint` still overrides the address). When no dir has
+/// a token, the last dir is used to produce the canonical "not redeemed"
+/// error.
+fn remote_workspace_in(
+    dirs: &[PathBuf],
+    env_endpoint: Option<&str>,
+) -> Result<WorkspaceConfig, String> {
+    for dir in dirs {
+        if dir.join(TOKEN_FILE).exists() {
+            return remote_workspace_from(dir, env_endpoint);
+        }
+    }
+    let last = dirs.last().cloned().unwrap_or_else(|| PathBuf::from("."));
+    remote_workspace_from(&last, env_endpoint)
+}
+
+/// Build the config-free workspace from the redeemed files + the
+/// `$QUORUM_ORCHESTRATOR` override. Searches the current directory first
+/// (so `quorum redeem --out-dir .` then running from that dir works),
+/// then `~/.nsed`. See [`remote_workspace_from`].
 pub fn remote_workspace() -> Result<WorkspaceConfig, String> {
-    let dir = nsed_dir().ok_or_else(|| {
-        "cannot determine home directory for ~/.nsed; set $QUORUM_ORCHESTRATOR and \
-         pass --token-out, or use a nsed.yaml"
-            .to_string()
-    })?;
     let env_endpoint = std::env::var(ENDPOINT_ENV).ok();
-    remote_workspace_from(dir.as_path(), env_endpoint.as_deref())
+    let mut dirs = vec![PathBuf::from(".")];
+    if let Some(home) = nsed_dir() {
+        dirs.push(home);
+    }
+    remote_workspace_in(&dirs, env_endpoint.as_deref())
 }
 
 #[cfg(test)]
@@ -303,5 +322,39 @@ mod tests {
         assert_eq!(ws.orchestrators.len(), 1);
         assert!(ws.orchestrators.contains_key("default"));
         assert!(ws.policies.is_empty() && ws.rooms.is_empty());
+    }
+
+    #[test]
+    fn remote_workspace_in_uses_first_dir_with_token() {
+        // First dir holds the redeemed files (`redeem --out-dir .` case) —
+        // it wins over a populated ~/.nsed second dir.
+        let cwd = tempfile::TempDir::new().unwrap();
+        std::fs::write(cwd.path().join("orchestrator"), "http://cwd-orch\n").unwrap();
+        std::fs::write(cwd.path().join("operator.token"), "cwd-tok\n").unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(home.path().join("orchestrator"), "http://home-orch\n").unwrap();
+        std::fs::write(home.path().join("operator.token"), "home-tok\n").unwrap();
+
+        let dirs = vec![cwd.path().to_path_buf(), home.path().to_path_buf()];
+        let ws = remote_workspace_in(&dirs, None).unwrap();
+        let orch = ws.orchestrators.get("default").unwrap();
+        assert_eq!(orch.address.as_deref(), Some("http://cwd-orch"));
+        assert_eq!(orch.token.as_deref(), Some("cwd-tok"));
+    }
+
+    #[test]
+    fn remote_workspace_in_skips_tokenless_dir() {
+        // First dir has no token → fall through to the second (~/.nsed).
+        let empty = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(home.path().join("orchestrator"), "http://home-orch\n").unwrap();
+        std::fs::write(home.path().join("operator.token"), "home-tok\n").unwrap();
+
+        let dirs = vec![empty.path().to_path_buf(), home.path().to_path_buf()];
+        let ws = remote_workspace_in(&dirs, None).unwrap();
+        assert_eq!(
+            ws.orchestrators.get("default").unwrap().address.as_deref(),
+            Some("http://home-orch")
+        );
     }
 }

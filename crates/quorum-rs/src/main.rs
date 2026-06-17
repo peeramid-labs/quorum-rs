@@ -204,26 +204,15 @@ enum Commands {
         #[arg(long)]
         url: Option<String>,
 
-        /// Path to write the `.seed` file to. Defaults to
-        /// `~/.nsed/agent.seed`.
-        #[arg(long, value_name = "PATH")]
-        seed_out: Option<PathBuf>,
-
-        /// Path to write the `.creds` file to. Defaults to
-        /// `~/.nsed/agent.creds`. Only written when the code grants
-        /// NATS credentials (any code minted via
-        /// `/admin/api/agent-invites`, or operator codes with the
-        /// `agent` capability in `capabilities`).
-        #[arg(long, value_name = "PATH")]
-        creds_out: Option<PathBuf>,
-
-        /// Path to write the HTTP bearer token to. Defaults to
-        /// `~/.nsed/operator.token`. Only written for operator
-        /// codes (those minted via `/admin/api/invites` — chat
-        /// users + operators). Agent-only codes don't carry a
-        /// bearer token.
-        #[arg(long, value_name = "PATH")]
-        token_out: Option<PathBuf>,
+        /// Directory to write all output files into, using their
+        /// default names: `agent.seed`, `agent.creds`,
+        /// `operator.token`, and the `orchestrator` endpoint.
+        /// Which files are written depends on the code: agent codes
+        /// write seed + creds; operator codes write the token (+
+        /// seed + creds for unified `agent`-capable codes) + the
+        /// orchestrator endpoint. Defaults to `~/.nsed`.
+        #[arg(long, value_name = "DIR")]
+        out_dir: Option<PathBuf>,
 
         /// Overwrite existing creds / seed / token files.
         #[arg(long)]
@@ -429,9 +418,7 @@ async fn main() -> ExitCode {
         Commands::Redeem {
             ref code,
             ref url,
-            ref seed_out,
-            ref creds_out,
-            ref token_out,
+            ref out_dir,
             force,
             ref seed_in,
             max_attempts,
@@ -454,9 +441,7 @@ async fn main() -> ExitCode {
             match commands::redeem::run(
                 code,
                 &resolved_url,
-                seed_out.as_deref(),
-                creds_out.as_deref(),
-                token_out.as_deref(),
+                out_dir.as_deref(),
                 force,
                 seed_in.as_deref(),
                 max_attempts,

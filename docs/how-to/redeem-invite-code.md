@@ -75,13 +75,14 @@ This:
    0600 on Unix; user-profile dir on Windows).
 6. Prints a summary with the connect URL and your agent pubkey.
 
-Default file locations are overridable:
+The output directory defaults to `~/.nsed`; redirect all files with
+`--out-dir`:
 
 ```bash
 quorum redeem eyJhbGc... \
     --url https://orch.example.com \
-    --creds-out /etc/my-agent/agent.creds \
-    --seed-out  /etc/my-agent/agent.seed
+    --out-dir /etc/my-agent
+# writes /etc/my-agent/{agent.seed,agent.creds,operator.token,orchestrator}
 ```
 
 `--force` overwrites existing files; without it the command bails
@@ -184,8 +185,10 @@ orchestrator's grant-filtered `GET /policies` and `GET /rooms`, so a
 joiner picks from `quorum rooms` instead of hand-writing config.
 
 Endpoint precedence: `$QUORUM_ORCHESTRATOR` env wins, then the persisted
-`~/.nsed/orchestrator` file. A `nsed.yaml` (via `--config`) still
-overrides everything when you need multi-orchestrator routing.
+`orchestrator` file. The file is looked up in the current directory
+first (so `quorum redeem --out-dir .` then running from that dir works),
+then `~/.nsed`. A `nsed.yaml` (via `--config`) still overrides everything
+when you need multi-orchestrator routing.
 
 > Note: in this config-free mode `quorum run` targets the single
 > redeemed orchestrator. Routing a job to a specific room id without a

@@ -61,7 +61,7 @@ impl App {
 
     /// Reload config from disk.
     pub fn reload_config(&mut self) -> Result<(), String> {
-        match WorkspaceConfig::load(&self.config_path) {
+        match WorkspaceConfig::load_or_remote_default(&self.config_path) {
             Ok(config) => {
                 self.config = config;
                 Ok(())
