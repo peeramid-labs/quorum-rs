@@ -127,4 +127,11 @@ pub trait View {
     fn on_enter(&mut self) -> Vec<ViewAction> {
         Vec::new()
     }
+
+    /// `true` when the view is capturing free-text/keystroke input (a form
+    /// or filter field), so the shell must NOT steal number/Tab keys for
+    /// top-level tab switching. Defaults to `false`.
+    fn captures_input(&self) -> bool {
+        false
+    }
 }

@@ -13,8 +13,13 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Borders, Tabs};
 use tokio::sync::mpsc;
 
 use crate::cli::remote::RemoteOrchestrator;
@@ -31,6 +36,58 @@ use views::policies::PoliciesView;
 use views::settings::SettingsView;
 use views::settings_menu::SettingsMenuView;
 use views::{FetchRequest, StatusLevel, View, ViewAction};
+
+/// Top-level tabs shown in the persistent shell tab bar. The active tab's
+/// view is the navigation-stack root; sub-views (e.g. JobDetail) push on top
+/// and hide the bar until popped.
+const TOP_TABS: [(&str, ViewId); 5] = [
+    ("Deliberate", ViewId::MainMenu),
+    ("Rooms", ViewId::Rooms),
+    ("Agents", ViewId::Agents),
+    ("Policies", ViewId::Policies),
+    ("Settings", ViewId::SettingsMenu),
+];
+
+/// Resolve a key event to a target tab index: digits `1`–`5` jump directly,
+/// `Tab`/`BackTab` cycle. `None` for any other key.
+fn tab_switch_target(ev: &crossterm::event::Event, current: usize) -> Option<usize> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind};
+    let Event::Key(key) = ev else {
+        return None;
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    let n = TOP_TABS.len();
+    match key.code {
+        KeyCode::Char(c) if ('1'..='5').contains(&c) => {
+            let idx = c as usize - '1' as usize;
+            (idx < n).then_some(idx)
+        }
+        KeyCode::Tab => Some((current + 1) % n),
+        KeyCode::BackTab => Some((current + n - 1) % n),
+        _ => None,
+    }
+}
+
+fn render_tab_bar(frame: &mut Frame, area: Rect, active: usize) {
+    let titles: Vec<Line> = TOP_TABS
+        .iter()
+        .enumerate()
+        .map(|(i, (label, _))| Line::from(format!(" {} {label} ", i + 1)))
+        .collect();
+    let tabs = Tabs::new(titles)
+        .select(active)
+        .block(Block::default().borders(Borders::ALL).title(" nsed "))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .divider("");
+    frame.render_widget(tabs, area);
+}
 
 /// Run the full interactive TUI starting at the main menu.
 pub async fn run_tui(config_path: &Path) -> ExitCode {
@@ -149,9 +206,17 @@ async fn setup_and_run(
 
     // Main loop
     loop {
-        // Draw
         terminal.draw(|frame| {
-            current_view.draw(frame, frame.area());
+            let area = frame.area();
+            // Tab bar only at a tab root; a pushed sub-view gets the full area.
+            if app.view_stack.len() == 1 {
+                let chunks =
+                    Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
+                render_tab_bar(frame, chunks[0], app.active_tab);
+                current_view.draw(frame, chunks[1]);
+            } else {
+                current_view.draw(frame, area);
+            }
         })?;
 
         // Wait for event
@@ -200,6 +265,26 @@ async fn setup_and_run(
                 StatusLevel::Success,
             ));
             // Fall through so the view can also process this event
+        }
+
+        // Top-level tab switch — digits 1-5 / Tab / BackTab. Only at a tab
+        // root (depth 1) and only when the active view isn't capturing text,
+        // so form/filter typing keeps its keys.
+        if app.view_stack.len() == 1
+            && !current_view.captures_input()
+            && let AppEvent::Terminal(ref ev) = app_event
+            && let Some(target) = tab_switch_target(ev, app.active_tab)
+        {
+            if target != app.active_tab {
+                app.active_tab = target;
+                app.view_stack = vec![TOP_TABS[target].1.clone()];
+                current_view = create_view(app.current_view().unwrap(), &app);
+                let actions = current_view.on_enter();
+                for a in actions {
+                    handle_action(&mut app, &mut tui_client, &data_tx, &a, config_path);
+                }
+            }
+            continue;
         }
 
         // Update view
@@ -907,5 +992,45 @@ mod tests {
         let app = test_app_with_room();
         let view = create_view(&ViewId::SettingsMenu, &app);
         let _ = view;
+    }
+
+    fn key(code: crossterm::event::KeyCode) -> crossterm::event::Event {
+        use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        crossterm::event::Event::Key(KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    #[test]
+    fn tab_switch_digits_jump_to_index() {
+        use crossterm::event::KeyCode;
+        assert_eq!(tab_switch_target(&key(KeyCode::Char('1')), 3), Some(0));
+        assert_eq!(tab_switch_target(&key(KeyCode::Char('5')), 0), Some(4));
+        // Out-of-range digit is not a tab.
+        assert_eq!(tab_switch_target(&key(KeyCode::Char('6')), 0), None);
+    }
+
+    #[test]
+    fn tab_switch_tab_and_backtab_cycle() {
+        use crossterm::event::KeyCode;
+        assert_eq!(tab_switch_target(&key(KeyCode::Tab), 4), Some(0));
+        assert_eq!(tab_switch_target(&key(KeyCode::Tab), 0), Some(1));
+        assert_eq!(tab_switch_target(&key(KeyCode::BackTab), 0), Some(4));
+    }
+
+    #[test]
+    fn tab_switch_ignores_other_keys() {
+        use crossterm::event::KeyCode;
+        assert_eq!(tab_switch_target(&key(KeyCode::Char('q')), 0), None);
+        assert_eq!(tab_switch_target(&key(KeyCode::Enter), 0), None);
+    }
+
+    #[test]
+    fn top_tabs_first_is_deliberate_root() {
+        assert_eq!(TOP_TABS[0].1, ViewId::MainMenu);
+        assert_eq!(TOP_TABS.len(), 5);
     }
 }

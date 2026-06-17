@@ -27,6 +27,7 @@ pub struct App {
     pub view_stack: Vec<ViewId>,
     pub should_quit: bool,
     pub status_message: Option<(String, super::views::StatusLevel)>,
+    pub active_tab: usize,
 }
 
 impl App {
@@ -38,6 +39,7 @@ impl App {
             view_stack: vec![ViewId::MainMenu],
             should_quit: false,
             status_message: None,
+            active_tab: 0,
         }
     }
 

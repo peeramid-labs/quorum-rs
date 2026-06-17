@@ -61,6 +61,10 @@ impl PoliciesView {
 }
 
 impl View for PoliciesView {
+    fn captures_input(&self) -> bool {
+        self.filter_active
+    }
+
     fn on_enter(&mut self) -> Vec<ViewAction> {
         self.policies = LoadState::Loading;
         vec![ViewAction::Fetch(FetchRequest::Policies {

@@ -212,6 +212,12 @@ quorum run --room demo "<topic>"   # submit a deliberation
 quorum tui                         # interactive TUI
 ```
 
+The TUI opens on a persistent tab bar — **Deliberate · Rooms · Agents ·
+Policies · Settings**. Press the number keys `1`–`5` or `Tab`/`Shift-Tab` to
+switch tabs (Settings holds Orchestrators + Config). The **Rooms** tab lists
+each room's bound policy, panel fill (`eligible/desired ✓`), tags, and the
+agents that would serve it.
+
 The `agents` field on `quorum status` should list every agent
 from your `agent.yml`. If an agent is missing, check the `serve`
 logs — `RUST_LOG=info quorum serve …` shows per-agent startup +

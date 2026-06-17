@@ -9,7 +9,6 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, 
 use super::common::{ListState, render_error, render_key_hints, truncate};
 use super::{FetchRequest, View, ViewAction};
 use crate::cli::remote::DiscoveredRoom;
-use crate::cli::tui::app::ViewId;
 use crate::cli::tui::event::{self, AppEvent, DataEvent};
 use crate::cli::workspace::RoomConfig;
 
@@ -100,6 +99,10 @@ impl MainMenuView {
 }
 
 impl View for MainMenuView {
+    fn captures_input(&self) -> bool {
+        self.task_input_active
+    }
+
     fn on_enter(&mut self) -> Vec<ViewAction> {
         // Config-free: pull the rooms the operator can submit to from the
         // orchestrator. Local-config users keep their nsed.yaml rooms.
@@ -172,10 +175,6 @@ impl View for MainMenuView {
         if event::is_key(event, 'd') && self.selected_room().is_some() {
             self.detail_visible = true;
             return None;
-        }
-        // Tab = settings menu
-        if event::is_tab(event) {
-            return Some(ViewAction::Push(ViewId::SettingsMenu));
         }
         None
     }
@@ -324,7 +323,7 @@ impl View for MainMenuView {
                 ("↑↓", "Navigate"),
                 ("Enter", "Deliberate"),
                 ("d", "Detail"),
-                ("Tab", "Settings"),
+                ("1-5/Tab", "Switch tab"),
                 ("q", "Quit"),
             ]
         };
@@ -670,10 +669,19 @@ mod tests {
     }
 
     #[test]
-    fn tab_pushes_settings_menu() {
+    fn tab_in_list_mode_is_ignored_by_view() {
+        // The shell owns Tab (tab switching); the view must not consume it.
         let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         let action = view.update(&make_key(KeyCode::Tab));
-        assert_eq!(action, Some(ViewAction::Push(ViewId::SettingsMenu)));
+        assert!(action.is_none());
+    }
+
+    #[test]
+    fn captures_input_only_while_task_input_active() {
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
+        assert!(!view.captures_input());
+        view.task_input_active = true;
+        assert!(view.captures_input());
     }
 
     #[test]

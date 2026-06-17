@@ -170,6 +170,10 @@ impl RoomsView {
 }
 
 impl View for RoomsView {
+    fn captures_input(&self) -> bool {
+        self.mode != Mode::List
+    }
+
     fn on_enter(&mut self) -> Vec<ViewAction> {
         self.rooms = LoadState::Loading;
         vec![self.fetch()]
