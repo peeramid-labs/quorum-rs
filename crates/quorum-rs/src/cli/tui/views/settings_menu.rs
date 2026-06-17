@@ -22,6 +22,11 @@ const MENU_ITEMS: &[(&str, &str, ViewId)] = &[
         ViewId::Policies,
     ),
     (
+        "Rooms",
+        "List, create, and delete rooms (admin / manage_rooms)",
+        ViewId::Rooms,
+    ),
+    (
         "Orchestrators",
         "Check orchestrator health and config",
         ViewId::Orchestrators,

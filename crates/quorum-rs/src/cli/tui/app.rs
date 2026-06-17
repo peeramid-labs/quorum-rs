@@ -11,6 +11,7 @@ pub enum ViewId {
     SettingsMenu,
     Policies,
     Agents,
+    Rooms,
     Orchestrators,
     Settings,
     JobDetail {

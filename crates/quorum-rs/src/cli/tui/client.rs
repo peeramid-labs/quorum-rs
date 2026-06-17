@@ -128,6 +128,78 @@ impl TuiClient {
         });
     }
 
+    /// Fetch the room list — `GET /rooms` (grant-filtered).
+    pub fn fetch_rooms(&self, remote: RemoteOrchestrator, orch_name: String) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match remote.discover_rooms().await {
+                Ok(rooms) => {
+                    let _ = tx.send(DataEvent::RoomsLoaded {
+                        orchestrator: orch_name,
+                        rooms,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(DataEvent::FetchError {
+                        context: "rooms".into(),
+                        error: e.to_string(),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Create a room — `POST /admin/api/rooms`.
+    pub fn create_room(
+        &self,
+        remote: RemoteOrchestrator,
+        orch_name: String,
+        id: String,
+        tags: Vec<String>,
+        visibility: String,
+    ) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match remote.create_room(&id, &tags, &visibility).await {
+                Ok(_) => {
+                    let _ = tx.send(DataEvent::RoomMutated {
+                        orchestrator: orch_name,
+                        action: "created".into(),
+                        id,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(DataEvent::FetchError {
+                        context: "rooms".into(),
+                        error: e.to_string(),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Delete a room — `DELETE /admin/api/rooms/{id}`.
+    pub fn delete_room(&self, remote: RemoteOrchestrator, orch_name: String, id: String) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            match remote.delete_room(&id).await {
+                Ok(()) => {
+                    let _ = tx.send(DataEvent::RoomMutated {
+                        orchestrator: orch_name,
+                        action: "deleted".into(),
+                        id,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(DataEvent::FetchError {
+                        context: "rooms".into(),
+                        error: e.to_string(),
+                    });
+                }
+            }
+        });
+    }
+
     /// Submit a deliberation job (static policy — no push needed).
     pub fn submit_job(
         &self,

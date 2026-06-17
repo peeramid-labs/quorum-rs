@@ -676,6 +676,60 @@ impl RemoteOrchestrator {
             .map_err(|e| RemoteError::ParseError(format!("rooms: {e}")))
     }
 
+    /// Create (or replace) a room — `POST /admin/api/rooms`. Requires the
+    /// `admin` or `manage_rooms` role (a non-admin manager is scoped to
+    /// rooms whose tags their grants cover). Returns the created room.
+    pub async fn create_room(
+        &self,
+        id: &str,
+        tags: &[String],
+        visibility: &str,
+    ) -> Result<DiscoveredRoom, RemoteError> {
+        let url = format!("{}/admin/api/rooms", self.base_url);
+        let body = serde_json::json!({ "id": id, "tags": tags, "visibility": visibility });
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&body)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RemoteError::ApiError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        resp.json()
+            .await
+            .map_err(|e| RemoteError::ParseError(format!("create room: {e}")))
+    }
+
+    /// Delete a room — `DELETE /admin/api/rooms/{id}`. Requires the `admin`
+    /// or `manage_rooms` role (scoped to the room's tags for a manager).
+    pub async fn delete_room(&self, id: &str) -> Result<(), RemoteError> {
+        let url = format!("{}/admin/api/rooms/{id}", self.base_url);
+        let resp = self
+            .client
+            .delete(&url)
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RemoteError::ApiError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(())
+    }
+
     /// List policies — `GET /policies` with optional tag filter.
     #[cfg(feature = "tui")]
     pub async fn policies(
