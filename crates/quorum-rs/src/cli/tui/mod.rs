@@ -253,6 +253,9 @@ fn create_view(view_id: &ViewId, app: &App) -> Box<dyn View> {
         ViewId::MainMenu => Box::new(MainMenuView::new(
             app.config.rooms.clone(),
             app.config.default_room.clone(),
+            remote_orch
+                .clone()
+                .unwrap_or_else(|| "(no remote orchestrator)".into()),
         )),
         ViewId::SettingsMenu => Box::new(SettingsMenuView::new()),
         ViewId::Policies => Box::new(PoliciesView::new(
@@ -402,7 +405,7 @@ fn handle_action(
             orchestrator,
             task,
             room,
-            policy: _,
+            policy,
             effort_override,
         } => {
             // Resolve room → policy from config
@@ -413,6 +416,29 @@ fn handle_action(
                     return;
                 }
             };
+            // Config-free: a remote room carries a policy *label*, not a
+            // local PolicyConfig. Resolve it against the orchestrator's
+            // /policies and submit directly (the launcher sets this).
+            if let Some(policy_label) = policy
+                && !app.config.rooms.contains_key(&room_name)
+            {
+                match build_remote(app, orchestrator) {
+                    Ok(remote) => {
+                        app.status_message =
+                            Some((format!("Submitting to {room_name}…"), StatusLevel::Info));
+                        tui_client.submit_with_remote_policy(
+                            remote,
+                            orchestrator.clone(),
+                            room_name,
+                            policy_label.clone(),
+                            task.clone(),
+                            *effort_override,
+                        );
+                    }
+                    Err(e) => app.status_message = Some((e, StatusLevel::Error)),
+                }
+                return;
+            }
             let room_config = match app.config.rooms.get(&room_name) {
                 Some(r) => r,
                 None => {

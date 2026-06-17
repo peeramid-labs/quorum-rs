@@ -7,9 +7,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, Wrap};
 
 use super::common::{ListState, render_error, render_key_hints, truncate};
-use super::{View, ViewAction};
+use super::{FetchRequest, View, ViewAction};
+use crate::cli::remote::DiscoveredRoom;
 use crate::cli::tui::app::ViewId;
-use crate::cli::tui::event::{self, AppEvent};
+use crate::cli::tui::event::{self, AppEvent, DataEvent};
 use crate::cli::workspace::RoomConfig;
 
 /// Main menu — rooms table as the primary screen.
@@ -18,6 +19,13 @@ use crate::cli::workspace::RoomConfig;
 pub struct MainMenuView {
     rooms: Vec<(String, RoomConfig)>,
     default_room: Option<String>,
+    /// Config-free remote rooms (`GET /rooms`), used when no local
+    /// `nsed.yaml` rooms are configured. A room carrying a `policy` is
+    /// submittable directly from this screen.
+    remote_rooms: Vec<DiscoveredRoom>,
+    /// Orchestrator name to fetch remote rooms / submit against in
+    /// config-free mode (the synthetic `"default"`).
+    orchestrator: String,
     list_state: ListState,
     task_input_active: bool,
     task_text: String,
@@ -35,19 +43,42 @@ pub struct MainMenuView {
 }
 
 impl MainMenuView {
-    pub fn new(rooms: HashMap<String, RoomConfig>, default_room: Option<String>) -> Self {
+    /// Build the main menu. `rooms` are local config rooms; when empty the
+    /// view runs config-free and fetches submittable rooms from `orchestrator`.
+    pub fn new(
+        rooms: HashMap<String, RoomConfig>,
+        default_room: Option<String>,
+        orchestrator: String,
+    ) -> Self {
         let mut sorted: Vec<_> = rooms.into_iter().collect();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
         let count = sorted.len();
         Self {
             rooms: sorted,
             default_room,
+            remote_rooms: Vec::new(),
+            orchestrator,
             list_state: ListState::new(count),
             task_input_active: false,
             task_text: String::new(),
             detail_visible: false,
             threshold_text: String::from("0.7"),
             threshold_input_active: false,
+        }
+    }
+
+    /// `true` when there are no local config rooms, so the screen shows
+    /// config-free remote rooms instead.
+    fn config_free(&self) -> bool {
+        self.rooms.is_empty()
+    }
+
+    /// Total rooms shown (local or, in config-free mode, remote).
+    fn shown_count(&self) -> usize {
+        if self.config_free() {
+            self.remote_rooms.len()
+        } else {
+            self.rooms.len()
         }
     }
 
@@ -69,7 +100,29 @@ impl MainMenuView {
 }
 
 impl View for MainMenuView {
+    fn on_enter(&mut self) -> Vec<ViewAction> {
+        // Config-free: pull the rooms the operator can submit to from the
+        // orchestrator. Local-config users keep their nsed.yaml rooms.
+        if self.config_free() {
+            vec![ViewAction::Fetch(FetchRequest::Rooms {
+                orchestrator: self.orchestrator.clone(),
+            })]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn update(&mut self, app_event: &AppEvent) -> Option<ViewAction> {
+        if let AppEvent::Data(DataEvent::RoomsLoaded {
+            orchestrator,
+            rooms,
+        }) = app_event
+            && *orchestrator == self.orchestrator
+        {
+            self.remote_rooms = rooms.clone();
+            self.list_state.set_count(self.remote_rooms.len());
+            return None;
+        }
         let AppEvent::Terminal(event) = app_event else {
             return None;
         };
@@ -91,7 +144,7 @@ impl View for MainMenuView {
             if event::is_down(event) {
                 self.list_state.down();
             }
-            if event::is_enter(event) && !self.rooms.is_empty() {
+            if event::is_enter(event) && self.shown_count() > 0 {
                 self.detail_visible = false;
                 self.task_input_active = true;
                 self.task_text.clear();
@@ -110,7 +163,7 @@ impl View for MainMenuView {
             self.list_state.down();
         }
         // Enter = start deliberation
-        if event::is_enter(event) && !self.rooms.is_empty() {
+        if event::is_enter(event) && self.shown_count() > 0 {
             self.task_input_active = true;
             self.task_text.clear();
             return None;
@@ -225,12 +278,16 @@ impl View for MainMenuView {
         }
 
         // Rooms table + optional detail
-        if self.rooms.is_empty() {
-            render_error(
-                frame,
-                chunks[3],
-                "No rooms configured — add rooms to nsed.yaml",
-            );
+        if self.config_free() {
+            if self.remote_rooms.is_empty() {
+                render_error(
+                    frame,
+                    chunks[3],
+                    "No rooms yet — create one in Settings → Rooms (set a policy to submit here)",
+                );
+            } else {
+                self.draw_remote_table(frame, chunks[3]);
+            }
         } else if self.detail_visible {
             let h_chunks =
                 Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
@@ -276,6 +333,69 @@ impl View for MainMenuView {
 }
 
 impl MainMenuView {
+    /// Render the config-free remote-rooms table. A room with no policy
+    /// shows `— (no policy)` so the operator knows it can't be submitted to
+    /// until one is set.
+    fn draw_remote_table(&self, frame: &mut Frame, area: Rect) {
+        let header = Row::new(vec![
+            Cell::from("Room"),
+            Cell::from("Policy"),
+            Cell::from("Tags"),
+            Cell::from("Agents"),
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+        let visible = area.height.saturating_sub(3) as usize;
+        let rows: Vec<Row> = self
+            .remote_rooms
+            .iter()
+            .enumerate()
+            .skip(self.list_state.scroll_offset)
+            .take(visible.max(1))
+            .map(|(i, room)| {
+                let style = if i == self.list_state.selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                let policy = match room.policy.as_deref() {
+                    Some(p) => p.to_string(),
+                    None => "— (no policy)".to_string(),
+                };
+                Row::new(vec![
+                    Cell::from(truncate(&room.id, 24)),
+                    Cell::from(truncate(&policy, 20)),
+                    Cell::from(truncate(&room.tags.join(", "), 26)),
+                    Cell::from(room.eligible_agent_count.to_string()),
+                ])
+                .style(style)
+            })
+            .collect();
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(26),
+                Constraint::Length(22),
+                Constraint::Min(18),
+                Constraint::Length(8),
+            ],
+        )
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(format!(
+                    " Rooms ({}) — Enter to deliberate ",
+                    self.remote_rooms.len()
+                )),
+        );
+        frame.render_widget(table, area);
+    }
+
     fn update_task_input(&mut self, event: &crossterm::event::Event) -> Option<ViewAction> {
         if event::is_escape(event) {
             self.task_input_active = false;
@@ -292,6 +412,36 @@ impl MainMenuView {
         if event::is_enter(event) && !self.task_text.is_empty() {
             self.task_input_active = false;
             self.threshold_input_active = false;
+            let effort_override = self.parsed_threshold();
+
+            // Config-free: submit to the selected remote room using the
+            // policy bound to it (resolved server-side at dispatch).
+            if self.config_free() {
+                let Some(room) = self.remote_rooms.get(self.list_state.selected) else {
+                    return Some(ViewAction::SetStatus(
+                        "No rooms available".into(),
+                        super::StatusLevel::Error,
+                    ));
+                };
+                let Some(policy) = room.policy.clone() else {
+                    return Some(ViewAction::SetStatus(
+                        format!(
+                            "Room '{}' has no policy bound — set one when creating it \
+                             (Settings → Rooms → New room → policy)",
+                            room.id
+                        ),
+                        super::StatusLevel::Error,
+                    ));
+                };
+                return Some(ViewAction::LaunchJob {
+                    orchestrator: self.orchestrator.clone(),
+                    task: self.task_text.clone(),
+                    room: Some(room.id.clone()),
+                    policy: Some(policy),
+                    effort_override,
+                });
+            }
+
             if self.rooms.is_empty() || self.list_state.selected >= self.rooms.len() {
                 return Some(ViewAction::SetStatus(
                     "No rooms available".into(),
@@ -308,7 +458,6 @@ impl MainMenuView {
                     ));
                 }
             };
-            let effort_override = self.parsed_threshold();
             return Some(ViewAction::LaunchJob {
                 orchestrator,
                 task: self.task_text.clone(),
@@ -485,28 +634,28 @@ mod tests {
 
     #[test]
     fn new_sorts_by_name() {
-        let view = MainMenuView::new(sample_rooms(), Some("local".into()));
+        let view = MainMenuView::new(sample_rooms(), Some("local".into()), "orch".into());
         assert_eq!(view.rooms[0].0, "local");
         assert_eq!(view.rooms[1].0, "remote");
     }
 
     #[test]
     fn q_quits() {
-        let mut view = MainMenuView::new(sample_rooms(), None);
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         let action = view.update(&make_key(KeyCode::Char('q')));
         assert_eq!(action, Some(ViewAction::Quit));
     }
 
     #[test]
     fn escape_quits() {
-        let mut view = MainMenuView::new(sample_rooms(), None);
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         let action = view.update(&make_key(KeyCode::Esc));
         assert_eq!(action, Some(ViewAction::Quit));
     }
 
     #[test]
     fn enter_activates_task_input() {
-        let mut view = MainMenuView::new(sample_rooms(), None);
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         let action = view.update(&make_key(KeyCode::Enter));
         assert!(action.is_none());
         assert!(view.task_input_active);
@@ -514,7 +663,7 @@ mod tests {
 
     #[test]
     fn d_opens_detail_panel() {
-        let mut view = MainMenuView::new(sample_rooms(), None);
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         let action = view.update(&make_key(KeyCode::Char('d')));
         assert!(action.is_none());
         assert!(view.detail_visible);
@@ -522,14 +671,14 @@ mod tests {
 
     #[test]
     fn tab_pushes_settings_menu() {
-        let mut view = MainMenuView::new(sample_rooms(), None);
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         let action = view.update(&make_key(KeyCode::Tab));
         assert_eq!(action, Some(ViewAction::Push(ViewId::SettingsMenu)));
     }
 
     #[test]
     fn escape_in_detail_closes_detail() {
-        let mut view = MainMenuView::new(sample_rooms(), None);
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         view.detail_visible = true;
 
         let action = view.update(&make_key(KeyCode::Esc));
@@ -539,7 +688,7 @@ mod tests {
 
     #[test]
     fn enter_in_detail_opens_task_input() {
-        let mut view = MainMenuView::new(sample_rooms(), None);
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         view.detail_visible = true;
 
         let action = view.update(&make_key(KeyCode::Enter));
@@ -550,7 +699,7 @@ mod tests {
 
     #[test]
     fn task_input_enter_launches_job() {
-        let mut view = MainMenuView::new(sample_rooms(), None);
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         view.task_input_active = true;
         view.task_text = "Review my code".into();
 
@@ -570,7 +719,7 @@ mod tests {
 
     #[test]
     fn task_input_threshold_parsed_into_effort_override() {
-        let mut view = MainMenuView::new(sample_rooms(), None);
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         view.task_input_active = true;
         view.task_text = "spicy debate".into();
         view.threshold_text = "0.42".into();
@@ -586,28 +735,28 @@ mod tests {
 
     #[test]
     fn threshold_parse_empty_yields_none() {
-        let mut view = MainMenuView::new(sample_rooms(), None);
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         view.threshold_text.clear();
         assert!(view.parsed_threshold().is_none());
     }
 
     #[test]
     fn threshold_parse_clamps_above_one() {
-        let mut view = MainMenuView::new(sample_rooms(), None);
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         view.threshold_text = "1.5".into();
         assert_eq!(view.parsed_threshold(), Some(1.0));
     }
 
     #[test]
     fn threshold_parse_clamps_negative() {
-        let mut view = MainMenuView::new(sample_rooms(), None);
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         view.threshold_text = "-0.5".into();
         assert_eq!(view.parsed_threshold(), Some(0.0));
     }
 
     #[test]
     fn tab_in_task_input_toggles_threshold_focus() {
-        let mut view = MainMenuView::new(sample_rooms(), None);
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         view.task_input_active = true;
         assert!(!view.threshold_input_active);
         view.update(&make_key(KeyCode::Tab));
@@ -618,7 +767,7 @@ mod tests {
 
     #[test]
     fn keystrokes_in_threshold_focus_edit_threshold_text() {
-        let mut view = MainMenuView::new(sample_rooms(), None);
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         view.task_input_active = true;
         view.threshold_input_active = true;
         view.threshold_text.clear();
@@ -632,7 +781,7 @@ mod tests {
 
     #[test]
     fn task_input_empty_enter_ignored() {
-        let mut view = MainMenuView::new(sample_rooms(), None);
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         view.task_input_active = true;
         view.task_text.clear();
 
@@ -642,7 +791,7 @@ mod tests {
 
     #[test]
     fn task_input_escape_cancels() {
-        let mut view = MainMenuView::new(sample_rooms(), None);
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         view.task_input_active = true;
         view.task_text = "some text".into();
 
@@ -661,7 +810,7 @@ mod tests {
                 orchestrator: None,
             },
         );
-        let mut view = MainMenuView::new(rooms, None);
+        let mut view = MainMenuView::new(rooms, None, "orch".into());
         view.task_input_active = true;
         view.task_text = "do something".into();
 
@@ -675,13 +824,122 @@ mod tests {
 
     #[test]
     fn empty_rooms_no_crash() {
-        let view = MainMenuView::new(HashMap::new(), None);
+        let view = MainMenuView::new(HashMap::new(), None, "orch".into());
         assert!(view.rooms.is_empty());
+    }
+
+    fn remote_room(id: &str, policy: Option<&str>) -> DiscoveredRoom {
+        DiscoveredRoom {
+            id: id.into(),
+            tags: vec!["team".into()],
+            visibility: "public".into(),
+            eligible_agent_count: 2,
+            policy: policy.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn config_free_when_no_local_rooms() {
+        let view = MainMenuView::new(HashMap::new(), None, "orch".into());
+        assert!(view.config_free());
+        let view = MainMenuView::new(sample_rooms(), None, "orch".into());
+        assert!(!view.config_free());
+    }
+
+    #[test]
+    fn config_free_on_enter_fetches_rooms() {
+        let mut view = MainMenuView::new(HashMap::new(), None, "orch".into());
+        let actions = view.on_enter();
+        assert_eq!(
+            actions,
+            vec![ViewAction::Fetch(FetchRequest::Rooms {
+                orchestrator: "orch".into(),
+            })]
+        );
+    }
+
+    #[test]
+    fn local_config_on_enter_does_not_fetch() {
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
+        assert!(view.on_enter().is_empty());
+    }
+
+    #[test]
+    fn rooms_loaded_populates_remote_rooms() {
+        let mut view = MainMenuView::new(HashMap::new(), None, "orch".into());
+        let action = view.update(&AppEvent::Data(DataEvent::RoomsLoaded {
+            orchestrator: "orch".into(),
+            rooms: vec![remote_room("alpha", Some("review"))],
+        }));
+        assert!(action.is_none());
+        assert_eq!(view.remote_rooms.len(), 1);
+        assert_eq!(view.list_state.count, 1);
+    }
+
+    #[test]
+    fn rooms_loaded_for_other_orchestrator_ignored() {
+        let mut view = MainMenuView::new(HashMap::new(), None, "orch".into());
+        view.update(&AppEvent::Data(DataEvent::RoomsLoaded {
+            orchestrator: "elsewhere".into(),
+            rooms: vec![remote_room("alpha", Some("review"))],
+        }));
+        assert!(view.remote_rooms.is_empty());
+    }
+
+    #[test]
+    fn config_free_submit_launches_with_bound_policy() {
+        let mut view = MainMenuView::new(HashMap::new(), None, "peeramid".into());
+        view.remote_rooms = vec![remote_room("alpha", Some("review"))];
+        view.list_state.set_count(1);
+        view.task_input_active = true;
+        view.task_text = "ship it".into();
+
+        let action = view.update(&make_key(KeyCode::Enter));
+        assert_eq!(
+            action,
+            Some(ViewAction::LaunchJob {
+                orchestrator: "peeramid".into(),
+                task: "ship it".into(),
+                room: Some("alpha".into()),
+                policy: Some("review".into()),
+                effort_override: Some(0.7),
+            })
+        );
+    }
+
+    #[test]
+    fn config_free_submit_without_policy_errors() {
+        let mut view = MainMenuView::new(HashMap::new(), None, "peeramid".into());
+        view.remote_rooms = vec![remote_room("alpha", None)];
+        view.list_state.set_count(1);
+        view.task_input_active = true;
+        view.task_text = "ship it".into();
+
+        let action = view.update(&make_key(KeyCode::Enter));
+        assert!(matches!(
+            action,
+            Some(ViewAction::SetStatus(msg, StatusLevel::Error))
+            if msg.contains("no policy bound")
+        ));
+    }
+
+    #[test]
+    fn config_free_submit_no_rooms_errors() {
+        let mut view = MainMenuView::new(HashMap::new(), None, "peeramid".into());
+        view.task_input_active = true;
+        view.task_text = "ship it".into();
+
+        let action = view.update(&make_key(KeyCode::Enter));
+        assert!(matches!(
+            action,
+            Some(ViewAction::SetStatus(msg, StatusLevel::Error))
+            if msg.contains("No rooms available")
+        ));
     }
 
     #[test]
     fn task_input_typing_appends_characters() {
-        let mut view = MainMenuView::new(sample_rooms(), None);
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         view.task_input_active = true;
 
         view.update(&make_key(KeyCode::Char('H')));
@@ -691,7 +949,7 @@ mod tests {
 
     #[test]
     fn task_input_backspace_removes_last_char() {
-        let mut view = MainMenuView::new(sample_rooms(), None);
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         view.task_input_active = true;
         view.task_text = "Hello".into();
 
@@ -705,7 +963,7 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
-        let mut view = MainMenuView::new(sample_rooms(), None);
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
         view.task_input_active = true;
         // 200 chars on an 80-col terminal → 3 wrapped lines → height 5 (3 + 2 borders)
         view.task_text = "a".repeat(200);

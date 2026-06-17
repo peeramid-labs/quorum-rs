@@ -2,7 +2,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::cli::remote::RemoteOrchestrator;
-use crate::cli::request::DeliberationRequest;
+use crate::cli::request::{DeliberationRequest, build_request_raw_policy_id};
 use crate::cli::tui::event::DataEvent;
 use crate::cli::workspace::PolicyConfig;
 
@@ -198,6 +198,67 @@ impl TuiClient {
                 Err(e) => {
                     let _ = tx.send(DataEvent::FetchError {
                         context: "rooms".into(),
+                        error: e.to_string(),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Config-free submit: resolve a remote policy label → `policy_id`
+    /// (`GET /policies`), then submit a deliberation to `room` with `task`.
+    /// Used by the main-menu launcher when a room carries a policy label
+    /// but the client has no local `PolicyConfig` (no nsed.yaml).
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_with_remote_policy(
+        &self,
+        remote: RemoteOrchestrator,
+        orch_name: String,
+        room: String,
+        policy_label: String,
+        task: String,
+        effort: Option<f32>,
+    ) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let policies = match remote.discover_policies().await {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = tx.send(DataEvent::FetchError {
+                        context: "submit".into(),
+                        error: e.to_string(),
+                    });
+                    return;
+                }
+            };
+            let Some(policy_id) = policies
+                .iter()
+                .find(|p| p.name == policy_label || p.policy_id == policy_label)
+                .map(|p| p.policy_id.clone())
+            else {
+                let _ = tx.send(DataEvent::FetchError {
+                    context: "submit".into(),
+                    error: format!(
+                        "policy {policy_label:?} not found on the orchestrator (GET /policies)"
+                    ),
+                });
+                return;
+            };
+            let mut req = build_request_raw_policy_id(&policy_id, &task);
+            req.room_id = room;
+            if let Some(e) = effort {
+                req.effort = Some(e);
+            }
+            match remote.submit(&req).await {
+                Ok(job_id) => {
+                    let _ = tx.send(DataEvent::JobSubmitted {
+                        job_id,
+                        orchestrator: orch_name,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(DataEvent::FetchError {
+                        context: "submit".into(),
                         error: e.to_string(),
                     });
                 }
