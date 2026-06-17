@@ -357,6 +357,9 @@ pub enum ConfigError {
          so a role can be designated moderator: true"
     )]
     ModeratorRequiresRoles { policy: String },
+
+    #[error("{0}")]
+    ConfigFree(String),
 }
 
 /// Human-readable name for a `PolicyMode` used in validation error
@@ -416,6 +419,19 @@ impl WorkspaceConfig {
         let config: Self = serde_yaml::from_str(&contents)?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Load `nsed.yaml` when present; otherwise synthesize a config-free
+    /// single-orchestrator workspace from the redeemed `~/.nsed/` files
+    /// (see [`crate::cli::endpoint::remote_workspace`]). The discovery and
+    /// submit commands use this so onboarding needs no workspace file —
+    /// `quorum redeem` → `quorum run`/`status`/`rooms` just work.
+    pub fn load_or_remote_default(path: &Path) -> Result<Self, ConfigError> {
+        if path.exists() {
+            Self::load(path)
+        } else {
+            crate::cli::endpoint::remote_workspace().map_err(ConfigError::ConfigFree)
+        }
     }
 
     /// Resolve which room to use based on the priority chain:
