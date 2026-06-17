@@ -71,6 +71,7 @@ pub enum FetchRequest {
         id: String,
         tags: Vec<String>,
         visibility: String,
+        policy: Option<String>,
     },
     /// Delete a room via `DELETE /admin/api/rooms/{id}`.
     DeleteRoom {

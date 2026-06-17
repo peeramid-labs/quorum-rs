@@ -32,6 +32,10 @@ pub struct DiscoveredRoom {
     pub visibility: String,
     #[serde(default)]
     pub eligible_agent_count: usize,
+    /// Optional deliberation policy bound to the room (name or policy_id).
+    /// When set, the room can be submitted to without choosing a policy.
+    #[serde(default)]
+    pub policy: Option<String>,
 }
 
 // ── Response structs for status / trace commands ──────────────────────
@@ -684,9 +688,13 @@ impl RemoteOrchestrator {
         id: &str,
         tags: &[String],
         visibility: &str,
+        policy: Option<&str>,
     ) -> Result<DiscoveredRoom, RemoteError> {
         let url = format!("{}/admin/api/rooms", self.base_url);
-        let body = serde_json::json!({ "id": id, "tags": tags, "visibility": visibility });
+        let mut body = serde_json::json!({ "id": id, "tags": tags, "visibility": visibility });
+        if let Some(p) = policy.map(str::trim).filter(|p| !p.is_empty()) {
+            body["policy"] = serde_json::Value::String(p.to_string());
+        }
         let resp = self
             .client
             .post(&url)

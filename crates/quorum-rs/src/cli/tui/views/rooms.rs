@@ -21,11 +21,16 @@ enum Mode {
     ConfirmDelete(String),
 }
 
-/// Create-room form state. `field` cycles id → tags → visibility.
+/// Number of fields in the create form: id, tags, policy, visibility.
+const FORM_FIELDS: usize = 4;
+
+/// Create-room form state. `field` cycles id → tags → policy → visibility.
 #[derive(Debug, Default, Clone)]
 struct CreateForm {
     id: String,
     tags: String,
+    /// Optional deliberation policy bound to the room (name or policy_id).
+    policy: String,
     /// `false` = private, `true` = public.
     public: bool,
     field: usize,
@@ -42,6 +47,15 @@ impl CreateForm {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect()
+    }
+    /// The policy field as an `Option`, `None` when blank.
+    fn policy_opt(&self) -> Option<String> {
+        let p = self.policy.trim();
+        if p.is_empty() {
+            None
+        } else {
+            Some(p.to_string())
+        }
     }
 }
 
@@ -112,14 +126,19 @@ impl RoomsView {
                 id,
                 tags: self.form.tag_list(),
                 visibility: self.form.visibility().to_string(),
+                policy: self.form.policy_opt(),
             }));
         }
         if let Event::Key(key) = ev
             && key.kind == KeyEventKind::Press
         {
             match key.code {
-                KeyCode::Tab | KeyCode::Down => self.form.field = (self.form.field + 1) % 3,
-                KeyCode::BackTab | KeyCode::Up => self.form.field = (self.form.field + 2) % 3,
+                KeyCode::Tab | KeyCode::Down => {
+                    self.form.field = (self.form.field + 1) % FORM_FIELDS
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    self.form.field = (self.form.field + FORM_FIELDS - 1) % FORM_FIELDS
+                }
                 KeyCode::Backspace => match self.form.field {
                     0 => {
                         self.form.id.pop();
@@ -127,16 +146,20 @@ impl RoomsView {
                     1 => {
                         self.form.tags.pop();
                     }
+                    2 => {
+                        self.form.policy.pop();
+                    }
                     _ => {}
                 },
                 KeyCode::Char(c) => match self.form.field {
                     0 => self.form.id.push(c),
                     1 => self.form.tags.push(c),
-                    // Visibility field: space / left / right toggles.
-                    2 if c == ' ' => self.form.public = !self.form.public,
+                    2 => self.form.policy.push(c),
+                    // Visibility field (3): space toggles.
+                    3 if c == ' ' => self.form.public = !self.form.public,
                     _ => {}
                 },
-                KeyCode::Left | KeyCode::Right if self.form.field == 2 => {
+                KeyCode::Left | KeyCode::Right if self.form.field == 3 => {
                     self.form.public = !self.form.public;
                 }
                 _ => {}
@@ -234,7 +257,7 @@ impl View for RoomsView {
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
         let form_height = match self.mode {
-            Mode::Create => 8,
+            Mode::Create => 9,
             Mode::ConfirmDelete(_) => 3,
             Mode::List => 0,
         };
@@ -333,13 +356,15 @@ impl RoomsView {
         let lines = vec![
             field_line("id:", self.form.id.clone(), self.form.field == 0),
             field_line("tags:", self.form.tags.clone(), self.form.field == 1),
+            field_line("policy:", self.form.policy.clone(), self.form.field == 2),
             field_line(
                 "visibility:",
                 self.form.visibility().to_string(),
-                self.form.field == 2,
+                self.form.field == 3,
             ),
             Line::from(Span::styled(
-                "tags: comma-separated identities (no '*'); visibility: space/←→ to toggle",
+                "tags: comma-separated identities (no '*'); policy: optional, lets you submit \
+                 to the room; visibility: space/←→ to toggle",
                 Style::default().fg(Color::DarkGray),
             )),
         ];
@@ -356,6 +381,7 @@ impl RoomsView {
             Cell::from("Room ID"),
             Cell::from("Visibility"),
             Cell::from("Tags"),
+            Cell::from("Policy"),
             Cell::from("Agents"),
         ])
         .style(
@@ -376,9 +402,10 @@ impl RoomsView {
                     Style::default()
                 };
                 Row::new(vec![
-                    Cell::from(truncate(&room.id, 28)),
+                    Cell::from(truncate(&room.id, 24)),
                     Cell::from(room.visibility.clone()),
-                    Cell::from(truncate(&room.tags.join(", "), 34)),
+                    Cell::from(truncate(&room.tags.join(", "), 26)),
+                    Cell::from(truncate(room.policy.as_deref().unwrap_or("—"), 18)),
                     Cell::from(room.eligible_agent_count.to_string()),
                 ])
                 .style(style)
@@ -387,9 +414,10 @@ impl RoomsView {
         let table = Table::new(
             rows,
             [
-                Constraint::Length(30),
+                Constraint::Length(26),
                 Constraint::Length(11),
-                Constraint::Min(20),
+                Constraint::Min(18),
+                Constraint::Length(20),
                 Constraint::Length(8),
             ],
         )
@@ -428,12 +456,14 @@ mod tests {
                 tags: vec!["noosphera:0v1".into()],
                 visibility: "public".into(),
                 eligible_agent_count: 2,
+                policy: Some("noosphera:0v1".into()),
             },
             DiscoveredRoom {
                 id: "test-room".into(),
                 tags: vec!["test:0v1".into()],
                 visibility: "private".into(),
                 eligible_agent_count: 0,
+                policy: None,
             },
         ]
     }
@@ -475,6 +505,11 @@ mod tests {
         for c in "pl:test:0v1".chars() {
             v.update(&typ(c));
         }
+        // Tab to policy, type a policy label.
+        v.update(&key(KeyCode::Tab));
+        for c in "noosphera:0v1".chars() {
+            v.update(&typ(c));
+        }
         // Tab to visibility, toggle to public.
         v.update(&key(KeyCode::Tab));
         v.update(&typ(' '));
@@ -486,6 +521,7 @@ mod tests {
                 id: "pl-test".into(),
                 tags: vec!["pl:test:0v1".into()],
                 visibility: "public".into(),
+                policy: Some("noosphera:0v1".into()),
             }))
         );
         // Form stays open until the server confirms (RoomMutated); a

@@ -333,11 +333,13 @@ fn handle_action(
                     id,
                     tags,
                     visibility,
+                    policy,
                 } => {
                     let name = orchestrator.clone();
-                    let (id, tags, visibility) = (id.clone(), tags.clone(), visibility.clone());
+                    let (id, tags, visibility, policy) =
+                        (id.clone(), tags.clone(), visibility.clone(), policy.clone());
                     let result = build_remote(app, &name).map(|remote| {
-                        tui_client.create_room(remote, name.clone(), id, tags, visibility);
+                        tui_client.create_room(remote, name.clone(), id, tags, visibility, policy);
                     });
                     (name, result)
                 }

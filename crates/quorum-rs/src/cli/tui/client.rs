@@ -150,6 +150,7 @@ impl TuiClient {
     }
 
     /// Create a room — `POST /admin/api/rooms`.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_room(
         &self,
         remote: RemoteOrchestrator,
@@ -157,10 +158,14 @@ impl TuiClient {
         id: String,
         tags: Vec<String>,
         visibility: String,
+        policy: Option<String>,
     ) {
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            match remote.create_room(&id, &tags, &visibility).await {
+            match remote
+                .create_room(&id, &tags, &visibility, policy.as_deref())
+                .await
+            {
                 Ok(_) => {
                     let _ = tx.send(DataEvent::RoomMutated {
                         orchestrator: orch_name,
