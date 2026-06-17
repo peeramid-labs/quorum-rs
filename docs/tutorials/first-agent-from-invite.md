@@ -201,6 +201,14 @@ has the per-provider notes.
 > You'll then need to point `quorum serve --config
 > ./fleet/agent.yml` in Step 4.
 
+> **File access:** the interactive wizard (`quorum init` with no flags)
+> asks each agent for **read access** (files/dirs for context) and
+> **write access** (directories to manage). These map to the right knob
+> per provider in `agent.yml`: native-LLM agents get a
+> `builtin_tools: read_file` block, Claude agents get `add_dirs` +
+> `writable: true`, and exec agents get a `working_dir`. Leave a prompt
+> blank to grant no access.
+
 ✅ **Checkpoint:** `cat agent.yml` prints a `providers:` block
 with `openai:` active and the env var you exported is set.
 
