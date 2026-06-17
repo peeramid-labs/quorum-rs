@@ -59,6 +59,18 @@ pub async fn run(config_path: &Path, orchestrator: Option<&str>) -> ExitCode {
                             .map(|c| format!("${c:.2}/round"))
                             .unwrap_or_else(|| "-".into());
                         println!("    {icon} {:<20} {:<16} {cost}", a.agent_id, a.model_name);
+                        let caps = if a.capability_tags.is_empty() {
+                            "-".to_string()
+                        } else {
+                            a.capability_tags.join(", ")
+                        };
+                        let ops = if a.operator_tags.is_empty() {
+                            "(none — shared, visible to all)".to_string()
+                        } else {
+                            a.operator_tags.join(", ")
+                        };
+                        println!("        caps: {caps}");
+                        println!("        op-tags: {ops}");
                     }
                 }
             }

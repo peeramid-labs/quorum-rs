@@ -62,6 +62,11 @@ pub struct AgentInfo {
     /// Principal who registered the agent.
     #[serde(default)]
     pub operator: Option<String>,
+    /// Operator tags inherited from the registering operator — the axis
+    /// `GET /agents` visibility is scoped by. Empty = untagged/shared
+    /// (visible to every caller).
+    #[serde(default)]
+    pub operator_tags: Vec<String>,
     /// Display name of the operator.
     #[serde(default)]
     pub operator_display_name: Option<String>,
