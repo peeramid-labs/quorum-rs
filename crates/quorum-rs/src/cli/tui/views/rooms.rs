@@ -311,7 +311,12 @@ impl View for RoomsView {
                 if rooms.is_empty() {
                     render_error(frame, chunks[2], "No rooms — press 'n' to create one");
                 } else {
-                    self.draw_table(frame, chunks[2], rooms);
+                    let split = Layout::horizontal([Constraint::Min(40), Constraint::Length(34)])
+                        .split(chunks[2]);
+                    self.draw_table(frame, split[0], rooms);
+                    if let Some(room) = rooms.get(self.list_state.selected) {
+                        draw_room_detail(frame, split[1], room);
+                    }
                 }
             }
         }
@@ -382,7 +387,7 @@ impl RoomsView {
             Cell::from("Visibility"),
             Cell::from("Tags"),
             Cell::from("Policy"),
-            Cell::from("Agents"),
+            Cell::from("Fill"),
         ])
         .style(
             Style::default()
@@ -406,7 +411,7 @@ impl RoomsView {
                     Cell::from(room.visibility.clone()),
                     Cell::from(truncate(&room.tags.join(", "), 26)),
                     Cell::from(truncate(room.policy.as_deref().unwrap_or("—"), 18)),
-                    Cell::from(room.eligible_agent_count.to_string()),
+                    fill_cell(room.eligible_agent_count, room.desired_agents),
                 ])
                 .style(style)
             })
@@ -418,7 +423,7 @@ impl RoomsView {
                 Constraint::Length(11),
                 Constraint::Min(18),
                 Constraint::Length(20),
-                Constraint::Length(8),
+                Constraint::Length(9),
             ],
         )
         .header(header)
@@ -429,6 +434,79 @@ impl RoomsView {
         );
         frame.render_widget(table, area);
     }
+}
+
+/// Pure fill computation: returns the `eligible/desired` (or bare `eligible`)
+/// label and whether the panel is filled — `Some(true/false)` against a policy
+/// target, `None` when no policy is bound.
+fn fill_status(eligible: usize, desired: Option<usize>) -> (String, Option<bool>) {
+    match desired {
+        Some(d) => (format!("{eligible}/{d}"), Some(eligible >= d)),
+        None => (eligible.to_string(), None),
+    }
+}
+
+/// Panel fill indicator: `eligible/desired` with a ✓ when the room can field
+/// its panel, ✗ when short. When no policy is bound (`desired` is `None`) there
+/// is no target — show the bare eligible count.
+fn fill_cell(eligible: usize, desired: Option<usize>) -> Cell<'static> {
+    let (label, ok) = fill_status(eligible, desired);
+    match ok {
+        Some(ok) => {
+            let glyph = if ok { '✓' } else { '✗' };
+            let color = if ok { Color::Green } else { Color::Red };
+            Cell::from(format!("{label} {glyph}")).style(Style::default().fg(color))
+        }
+        None => Cell::from(label),
+    }
+}
+
+/// Right-side detail for the selected room: policy, panel fill, tags, and the
+/// concrete agent ids that would serve it.
+fn draw_room_detail(frame: &mut Frame, area: Rect, room: &DiscoveredRoom) {
+    let label = Style::default().fg(Color::Cyan);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("policy:  ", label),
+            Span::raw(room.policy.as_deref().unwrap_or("— (none)").to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("fill:    ", label),
+            match fill_status(room.eligible_agent_count, room.desired_agents) {
+                (label, Some(ok)) => Span::styled(
+                    format!("{label} {}", if ok { '✓' } else { '✗' }),
+                    Style::default().fg(if ok { Color::Green } else { Color::Red }),
+                ),
+                (label, None) => Span::raw(format!("{label} (no policy target)")),
+            },
+        ]),
+        Line::from(vec![
+            Span::styled("tags:    ", label),
+            Span::raw(if room.tags.is_empty() {
+                "—".to_string()
+            } else {
+                room.tags.join(", ")
+            }),
+        ]),
+        Line::from(Span::styled(
+            format!("agents ({}):", room.eligible_agent_count),
+            label,
+        )),
+    ];
+    if room.eligible_agent_ids.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  none eligible",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for id in &room.eligible_agent_ids {
+            lines.push(Line::from(format!("  • {}", truncate(id, 28))));
+        }
+    }
+    let panel = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(" Detail "))
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    frame.render_widget(panel, area);
 }
 
 #[cfg(test)]
@@ -456,14 +534,18 @@ mod tests {
                 tags: vec!["noosphera:0v1".into()],
                 visibility: "public".into(),
                 eligible_agent_count: 2,
+                eligible_agent_ids: vec!["alice".into(), "bob".into()],
                 policy: Some("noosphera:0v1".into()),
+                desired_agents: Some(3),
             },
             DiscoveredRoom {
                 id: "test-room".into(),
                 tags: vec!["test:0v1".into()],
                 visibility: "private".into(),
                 eligible_agent_count: 0,
+                eligible_agent_ids: vec![],
                 policy: None,
+                desired_agents: None,
             },
         ]
     }
@@ -621,5 +703,34 @@ mod tests {
         assert!(action.is_none());
         assert_eq!(v.mode, Mode::List);
         assert!(v.form.id.is_empty());
+    }
+
+    #[test]
+    fn fill_status_filled_when_eligible_meets_target() {
+        assert_eq!(fill_status(3, Some(3)), ("3/3".to_string(), Some(true)));
+        assert_eq!(fill_status(5, Some(3)), ("5/3".to_string(), Some(true)));
+    }
+
+    #[test]
+    fn fill_status_short_when_below_target() {
+        assert_eq!(fill_status(1, Some(3)), ("1/3".to_string(), Some(false)));
+        assert_eq!(fill_status(0, Some(2)), ("0/2".to_string(), Some(false)));
+    }
+
+    #[test]
+    fn fill_status_no_target_when_no_policy() {
+        assert_eq!(fill_status(2, None), ("2".to_string(), None));
+    }
+
+    #[test]
+    fn draw_with_detail_does_not_panic() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut v = RoomsView::new("orch".into());
+        v.rooms = LoadState::Loaded(sample());
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| v.draw(frame, frame.area())).unwrap();
     }
 }

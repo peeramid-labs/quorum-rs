@@ -834,7 +834,9 @@ mod tests {
             tags: vec!["team".into()],
             visibility: "public".into(),
             eligible_agent_count: 2,
+            eligible_agent_ids: vec!["a1".into(), "a2".into()],
             policy: policy.map(Into::into),
+            desired_agents: None,
         }
     }
 

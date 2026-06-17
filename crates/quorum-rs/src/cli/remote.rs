@@ -32,10 +32,19 @@ pub struct DiscoveredRoom {
     pub visibility: String,
     #[serde(default)]
     pub eligible_agent_count: usize,
+    /// Agent ids whose operator_tags intersect the room tags (capped server-side
+    /// at 20). The concrete agents that would serve this room.
+    #[serde(default)]
+    pub eligible_agent_ids: Vec<String>,
     /// Optional deliberation policy bound to the room (name or policy_id).
     /// When set, the room can be submitted to without choosing a policy.
     #[serde(default)]
     pub policy: Option<String>,
+    /// Target panel size of the bound policy (sum of role counts or static
+    /// roster length). `None` when no policy is bound or it is unregistered.
+    /// Compared against `eligible_agent_count` to show fill (e.g. `3/5`).
+    #[serde(default)]
+    pub desired_agents: Option<usize>,
 }
 
 // ── Response structs for status / trace commands ──────────────────────
