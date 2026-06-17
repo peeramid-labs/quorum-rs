@@ -4,7 +4,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
-use super::common::{ListState, render_error, render_key_hints, render_loading, truncate};
+use super::common::{
+    ListState, fill_cell, fill_status, render_error, render_key_hints, render_loading, truncate,
+};
 use super::{FetchRequest, View, ViewAction};
 use crate::cli::remote::DiscoveredRoom;
 use crate::cli::tui::event::{self, AppEvent, DataEvent};
@@ -67,6 +69,9 @@ impl CreateForm {
 pub struct RoomsView {
     orchestrator: String,
     rooms: LoadState<Vec<DiscoveredRoom>>,
+    /// Policy names available on the orchestrator, for the create-form
+    /// selector. Empty until `PoliciesLoaded` arrives.
+    policies: Vec<String>,
     list_state: ListState,
     mode: Mode,
     form: CreateForm,
@@ -82,6 +87,7 @@ impl RoomsView {
         Self {
             orchestrator,
             rooms: LoadState::NotLoaded,
+            policies: Vec::new(),
             list_state: ListState::new(0),
             mode: Mode::List,
             form: CreateForm::default(),
@@ -93,6 +99,27 @@ impl RoomsView {
         ViewAction::Fetch(FetchRequest::Rooms {
             orchestrator: self.orchestrator.clone(),
         })
+    }
+
+    fn fetch_policies(&self) -> ViewAction {
+        ViewAction::Fetch(FetchRequest::Policies {
+            orchestrator: self.orchestrator.clone(),
+            tag: None,
+        })
+    }
+
+    /// Cycle the form's bound policy through `["(none)", ..policy names]`.
+    /// `delta` is +1 (next) or -1 (prev). No-op when no policies are loaded.
+    fn cycle_policy(&mut self, delta: isize) {
+        let mut options = vec![String::new()];
+        options.extend(self.policies.iter().cloned());
+        let cur = options
+            .iter()
+            .position(|p| p == &self.form.policy)
+            .unwrap_or(0);
+        let n = options.len() as isize;
+        let next = ((cur as isize + delta).rem_euclid(n)) as usize;
+        self.form.policy = options[next].clone();
     }
 
     fn selected_room(&self) -> Option<&DiscoveredRoom> {
@@ -146,19 +173,19 @@ impl RoomsView {
                     1 => {
                         self.form.tags.pop();
                     }
-                    2 => {
-                        self.form.policy.pop();
-                    }
                     _ => {}
                 },
                 KeyCode::Char(c) => match self.form.field {
                     0 => self.form.id.push(c),
                     1 => self.form.tags.push(c),
-                    2 => self.form.policy.push(c),
-                    // Visibility field (3): space toggles.
+                    2 if c == ' ' => self.cycle_policy(1),
                     3 if c == ' ' => self.form.public = !self.form.public,
                     _ => {}
                 },
+                // Policy (2) and visibility (3) are selectors, not text:
+                // ←/→ cycle the choice.
+                KeyCode::Left if self.form.field == 2 => self.cycle_policy(-1),
+                KeyCode::Right if self.form.field == 2 => self.cycle_policy(1),
                 KeyCode::Left | KeyCode::Right if self.form.field == 3 => {
                     self.form.public = !self.form.public;
                 }
@@ -176,7 +203,7 @@ impl View for RoomsView {
 
     fn on_enter(&mut self) -> Vec<ViewAction> {
         self.rooms = LoadState::Loading;
-        vec![self.fetch()]
+        vec![self.fetch(), self.fetch_policies()]
     }
 
     fn update(&mut self, app_event: &AppEvent) -> Option<ViewAction> {
@@ -230,6 +257,13 @@ impl View for RoomsView {
             }) if *orchestrator == self.orchestrator => {
                 self.list_state.set_count(rooms.len());
                 self.rooms = LoadState::Loaded(rooms.clone());
+                None
+            }
+            AppEvent::Data(DataEvent::PoliciesLoaded {
+                orchestrator,
+                policies,
+            }) if *orchestrator == self.orchestrator => {
+                self.policies = policies.iter().map(|p| p.name.clone()).collect();
                 None
             }
             // A create/delete landed — close the form, clear the error,
@@ -328,7 +362,7 @@ impl View for RoomsView {
         let hints: Vec<(&str, &str)> = match self.mode {
             Mode::Create => vec![
                 ("Tab/↑↓", "Field"),
-                ("Space/←→", "Visibility"),
+                ("Space/←→", "Pick"),
                 ("Enter", "Create"),
                 ("Esc", "Cancel"),
             ],
@@ -362,18 +396,39 @@ impl RoomsView {
                 Span::styled(cursor, Style::default().fg(Color::Yellow)),
             ])
         };
+        let policy_active = self.form.field == 2;
+        let policy_value = if self.form.policy.is_empty() {
+            "(none)".to_string()
+        } else {
+            self.form.policy.clone()
+        };
+        let policy_value = if policy_active {
+            format!("‹ {policy_value} ›")
+        } else {
+            policy_value
+        };
+        let policy_label_style = if policy_active {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
         let lines = vec![
             field_line("id:", self.form.id.clone(), self.form.field == 0),
             field_line("tags:", self.form.tags.clone(), self.form.field == 1),
-            field_line("policy:", self.form.policy.clone(), self.form.field == 2),
+            Line::from(vec![
+                Span::styled(format!("{:<12}", "policy:"), policy_label_style),
+                Span::raw(policy_value),
+            ]),
             field_line(
                 "visibility:",
                 self.form.visibility().to_string(),
                 self.form.field == 3,
             ),
             Line::from(Span::styled(
-                "tags: comma-separated identities (no '*'); policy: optional, lets you submit \
-                 to the room; visibility: space/←→ to toggle",
+                "tags: comma-separated identities (no '*'); policy: space/←→ to pick (optional, \
+                 lets you submit to the room); visibility: space/←→ to toggle",
                 Style::default().fg(Color::DarkGray),
             )),
         ];
@@ -437,31 +492,6 @@ impl RoomsView {
                 .title(format!(" Rooms ({}) ", rooms.len())),
         );
         frame.render_widget(table, area);
-    }
-}
-
-/// Pure fill computation: returns the `eligible/desired` (or bare `eligible`)
-/// label and whether the panel is filled — `Some(true/false)` against a policy
-/// target, `None` when no policy is bound.
-fn fill_status(eligible: usize, desired: Option<usize>) -> (String, Option<bool>) {
-    match desired {
-        Some(d) => (format!("{eligible}/{d}"), Some(eligible >= d)),
-        None => (eligible.to_string(), None),
-    }
-}
-
-/// Panel fill indicator: `eligible/desired` with a ✓ when the room can field
-/// its panel, ✗ when short. When no policy is bound (`desired` is `None`) there
-/// is no target — show the bare eligible count.
-fn fill_cell(eligible: usize, desired: Option<usize>) -> Cell<'static> {
-    let (label, ok) = fill_status(eligible, desired);
-    match ok {
-        Some(ok) => {
-            let glyph = if ok { '✓' } else { '✗' };
-            let color = if ok { Color::Green } else { Color::Red };
-            Cell::from(format!("{label} {glyph}")).style(Style::default().fg(color))
-        }
-        None => Cell::from(label),
     }
 }
 
@@ -558,7 +588,7 @@ mod tests {
     fn on_enter_fetches_rooms() {
         let mut v = RoomsView::new("orch".into());
         let actions = v.on_enter();
-        assert_eq!(actions.len(), 1);
+        assert_eq!(actions.len(), 2);
         assert!(matches!(
             &actions[0],
             ViewAction::Fetch(FetchRequest::Rooms { orchestrator }) if orchestrator == "orch"
@@ -580,6 +610,7 @@ mod tests {
     fn n_opens_create_then_type_and_submit() {
         let mut v = RoomsView::new("orch".into());
         v.rooms = LoadState::Loaded(sample());
+        v.policies = vec!["noosphera:0v1".into()];
         v.update(&typ('n'));
         assert_eq!(v.mode, Mode::Create);
         // Type an id.
@@ -591,11 +622,9 @@ mod tests {
         for c in "pl:test:0v1".chars() {
             v.update(&typ(c));
         }
-        // Tab to policy, type a policy label.
+        // Tab to policy, cycle the selector to the only policy.
         v.update(&key(KeyCode::Tab));
-        for c in "noosphera:0v1".chars() {
-            v.update(&typ(c));
-        }
+        v.update(&typ(' '));
         // Tab to visibility, toggle to public.
         v.update(&key(KeyCode::Tab));
         v.update(&typ(' '));
@@ -724,6 +753,57 @@ mod tests {
     #[test]
     fn fill_status_no_target_when_no_policy() {
         assert_eq!(fill_status(2, None), ("2".to_string(), None));
+    }
+
+    #[test]
+    fn cycle_policy_walks_none_then_names_and_wraps() {
+        let mut v = RoomsView::new("orch".into());
+        v.policies = vec!["alpha".into(), "beta".into()];
+        assert_eq!(v.form.policy, "");
+        v.cycle_policy(1);
+        assert_eq!(v.form.policy, "alpha");
+        v.cycle_policy(1);
+        assert_eq!(v.form.policy, "beta");
+        v.cycle_policy(1); // wraps back to (none)
+        assert_eq!(v.form.policy, "");
+        v.cycle_policy(-1); // backwards from none → last
+        assert_eq!(v.form.policy, "beta");
+    }
+
+    #[test]
+    fn cycle_policy_noop_without_policies() {
+        let mut v = RoomsView::new("orch".into());
+        v.cycle_policy(1);
+        assert_eq!(v.form.policy, "");
+    }
+
+    #[test]
+    fn policies_loaded_populates_selector() {
+        use crate::cli::tui::event::PolicyInfo;
+        let mut v = RoomsView::new("orch".into());
+        v.update(&AppEvent::Data(DataEvent::PoliciesLoaded {
+            orchestrator: "orch".into(),
+            policies: vec![PolicyInfo {
+                policy_id: "id1".into(),
+                name: "alpha".into(),
+                tags: vec![],
+                max_rounds: 3,
+                effort: 0.7,
+                is_role_based: false,
+            }],
+        }));
+        assert_eq!(v.policies, vec!["alpha".to_string()]);
+    }
+
+    #[test]
+    fn on_enter_fetches_rooms_and_policies() {
+        let mut v = RoomsView::new("orch".into());
+        let actions = v.on_enter();
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(
+            &actions[1],
+            ViewAction::Fetch(FetchRequest::Policies { orchestrator, tag: None }) if orchestrator == "orch"
+        ));
     }
 
     #[test]

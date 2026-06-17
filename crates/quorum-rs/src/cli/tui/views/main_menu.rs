@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, Wrap};
 
-use super::common::{ListState, render_error, render_key_hints, truncate};
+use super::common::{ListState, fill_cell, render_error, render_key_hints, truncate};
 use super::{FetchRequest, View, ViewAction};
 use crate::cli::remote::DiscoveredRoom;
 use crate::cli::tui::event::{self, AppEvent, DataEvent};
@@ -340,7 +340,7 @@ impl MainMenuView {
             Cell::from("Room"),
             Cell::from("Policy"),
             Cell::from("Tags"),
-            Cell::from("Agents"),
+            Cell::from("Fill"),
         ])
         .style(
             Style::default()
@@ -368,7 +368,7 @@ impl MainMenuView {
                     Cell::from(truncate(&room.id, 24)),
                     Cell::from(truncate(&policy, 20)),
                     Cell::from(truncate(&room.tags.join(", "), 26)),
-                    Cell::from(room.eligible_agent_count.to_string()),
+                    fill_cell(room.eligible_agent_count, room.desired_agents),
                 ])
                 .style(style)
             })
