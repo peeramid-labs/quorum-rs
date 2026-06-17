@@ -24,10 +24,10 @@
 //!
 //! UX defaults:
 //!
-//! - Seed at `~/.nsed/agent.seed` (override with `--seed-out PATH`).
-//! - Creds at `~/.nsed/agent.creds` (override with `--creds-out PATH`).
-//! - Bearer token at `~/.nsed/operator.token` (override with
-//!   `--token-out PATH`).
+//! - All output files go to `~/.nsed/` (override the directory with
+//!   `--out-dir DIR`): `agent.seed`, `agent.creds`, `operator.token`,
+//!   and the `orchestrator` endpoint file. Which are written depends on
+//!   the code (agent vs operator vs unified).
 //! - Orchestrator URL defaults to `https://api.peeramid.xyz`; setting
 //!   `NSED_ENV=local` (or `dev`/`development`) flips it to
 //!   `http://localhost:8080`. `--url` or `$ORCH_URL` override.
@@ -67,46 +67,35 @@ pub fn default_orchestrator_url() -> String {
     }
 }
 
-/// Default seed file location. `~/.nsed/agent.seed`.
-fn default_seed_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    let mut p = PathBuf::from(home);
-    p.push(".nsed");
-    p.push("agent.seed");
-    Some(p)
+/// Output file names, written into the resolved output directory
+/// (`--out-dir DIR`, else `~/.nsed`). The seed is the raw `SU…` NKey;
+/// the creds blob embeds the NATS User JWT + seed; the token is the HTTP
+/// bearer; the endpoint file is written by [`crate::cli::endpoint`].
+const SEED_FILE: &str = "agent.seed";
+const CREDS_FILE: &str = "agent.creds";
+const TOKEN_FILE: &str = "operator.token";
+
+/// Resolve the directory all redeem outputs are written into:
+/// `--out-dir DIR` when given, otherwise `~/.nsed`.
+fn resolve_out_dir(out_dir: Option<&Path>) -> Result<PathBuf> {
+    match out_dir {
+        Some(d) => Ok(d.to_path_buf()),
+        None => crate::cli::endpoint::nsed_dir().ok_or_else(|| {
+            anyhow::anyhow!("Cannot determine ~/.nsed; pass --out-dir DIR explicitly.")
+        }),
+    }
 }
 
-/// Default operator bearer-token file location. `~/.nsed/operator.token`.
-/// Mode 0600 on Unix; one-line, no trailing whitespace, suitable for
-/// `Authorization: Bearer $(cat ~/.nsed/operator.token)`.
-fn default_token_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    let mut p = PathBuf::from(home);
-    p.push(".nsed");
-    p.push("operator.token");
-    Some(p)
-}
-
-/// Default creds file location. `~/.nsed/agent.creds`.
+/// Default creds file location. `~/.nsed/agent.creds`. Used by `serve`
+/// to locate creds written by a prior `quorum redeem`.
 pub fn default_creds_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    let mut p = PathBuf::from(home);
-    p.push(".nsed");
-    p.push("agent.creds");
-    Some(p)
+    crate::cli::endpoint::nsed_dir().map(|d| d.join(CREDS_FILE))
 }
 
-// Each argument maps to a distinct CLI flag (`--seed-out`,
-// `--creds-out`, `--token-out`, `--force`, `--seed-in`,
-// `--max-attempts`) — collapsing them into a struct would just
-// move the same arity into a builder.
-#[allow(clippy::too_many_arguments)]
 pub async fn run(
     code: &str,
     orchestrator_url: &str,
-    seed_out: Option<&Path>,
-    creds_out: Option<&Path>,
-    token_out: Option<&Path>,
+    out_dir: Option<&Path>,
     force: bool,
     seed_in: Option<&Path>,
     max_attempts: u32,
@@ -116,6 +105,7 @@ pub async fn run(
     // malformed seed file fails cleanly regardless of what the
     // invite code looks like.
     let keypair = load_or_generate_keypair(seed_in)?;
+    let dir = resolve_out_dir(out_dir)?;
 
     // Pick the right endpoint by looking at the code's audience pin.
     // Pre-#444 codes don't carry an `aud` — those went to
@@ -126,29 +116,10 @@ pub async fn run(
     let aud = invite_audience(code).context("invite code is not in JWT shape")?;
     match aud.as_deref() {
         Some(AUD_AGENT_REDEEM) => {
-            run_agent_redeem(
-                code,
-                orchestrator_url,
-                seed_out,
-                creds_out,
-                force,
-                keypair,
-                max_attempts,
-            )
-            .await
+            run_agent_redeem(code, orchestrator_url, &dir, force, keypair, max_attempts).await
         }
         Some(AUD_OPERATOR_REDEEM) | None => {
-            run_operator_redeem(
-                code,
-                orchestrator_url,
-                seed_out,
-                creds_out,
-                token_out,
-                force,
-                keypair,
-                max_attempts,
-            )
-            .await
+            run_operator_redeem(code, orchestrator_url, &dir, force, keypair, max_attempts).await
         }
         Some(other) => {
             anyhow::bail!(
@@ -163,67 +134,20 @@ pub async fn run(
 /// token and (for unified codes carrying the `agent` capability)
 /// a scoped NATS User JWT + creds. Used for invites minted via
 /// `/admin/api/invites` — the `/invite` admin page's output.
-#[allow(clippy::too_many_arguments)]
 async fn run_operator_redeem(
     code: &str,
     orchestrator_url: &str,
-    seed_out: Option<&Path>,
-    creds_out: Option<&Path>,
-    token_out: Option<&Path>,
+    dir: &Path,
     force: bool,
     keypair: nkeys::KeyPair,
     max_attempts: u32,
 ) -> Result<()> {
-    // Resolve all three output paths upfront and validate uniqueness
-    // BEFORE the orchestrator round-trip OR any file write. A typo
-    // like `--token-out=~/.nsed/agent.creds` would otherwise have
-    // the bearer-write clobber the NATS creds file (or vice versa)
-    // after a successful redeem — same foot-gun the existing
-    // `--seed-out`/`--creds-out` collision check guards against.
-    //
-    // Creds + seed paths are resolved even for chat-only redeems so
-    // the collision check runs regardless. They're only WRITTEN
-    // when the response carries `user_jwt` + `nats_url`.
-    let resolved_token = match token_out {
-        Some(p) => p.to_path_buf(),
-        None => default_token_path().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Cannot determine default token path — pass --token-out PATH explicitly."
-            )
-        })?,
-    };
-    let resolved_creds = match creds_out {
-        Some(p) => p.to_path_buf(),
-        None => default_creds_path().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Cannot determine default creds path — pass --creds-out PATH explicitly."
-            )
-        })?,
-    };
-    let resolved_seed = match seed_out {
-        Some(p) => p.to_path_buf(),
-        None => default_seed_path().ok_or_else(|| {
-            anyhow::anyhow!("Cannot determine default seed path — pass --seed-out PATH explicitly.")
-        })?,
-    };
-    for (a_label, a_path, b_label, b_path) in [
-        (
-            "--token-out",
-            &resolved_token,
-            "--creds-out",
-            &resolved_creds,
-        ),
-        ("--token-out", &resolved_token, "--seed-out", &resolved_seed),
-        ("--creds-out", &resolved_creds, "--seed-out", &resolved_seed),
-    ] {
-        if a_path == b_path {
-            anyhow::bail!(
-                "{a_label} and {b_label} resolve to the same path ({}). \
-                 Each file format is distinct; one would overwrite the other.",
-                a_path.display()
-            );
-        }
-    }
+    // Fixed file names within the output dir — distinct by construction,
+    // so no path-collision check is needed. Creds + seed are only WRITTEN
+    // when the response carries `user_jwt` + `nats_url` (unified codes).
+    let resolved_token = dir.join(TOKEN_FILE);
+    let resolved_creds = dir.join(CREDS_FILE);
+    let resolved_seed = dir.join(SEED_FILE);
     if resolved_token.exists() && !force {
         anyhow::bail!(
             "token file already exists at {}. Pass --force to overwrite (only do this \
@@ -338,41 +262,16 @@ async fn run_operator_redeem(
 
 /// Agent-code path: POSTs `/redeem-agent`, mints NATS creds only.
 /// Used for invites minted via `/admin/api/agent-invites`.
-#[allow(clippy::too_many_arguments)]
 async fn run_agent_redeem(
     code: &str,
     orchestrator_url: &str,
-    seed_out: Option<&Path>,
-    creds_out: Option<&Path>,
+    dir: &Path,
     force: bool,
     keypair: nkeys::KeyPair,
     max_attempts: u32,
 ) -> Result<()> {
-    let resolved_creds = match creds_out {
-        Some(p) => p.to_path_buf(),
-        None => default_creds_path().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Cannot determine default creds path — pass --creds-out PATH explicitly."
-            )
-        })?,
-    };
-    let resolved_seed = match seed_out {
-        Some(p) => p.to_path_buf(),
-        None => default_seed_path().ok_or_else(|| {
-            anyhow::anyhow!("Cannot determine default seed path — pass --seed-out PATH explicitly.")
-        })?,
-    };
-    // Catch the foot-gun where a typo sets `--seed-out` and
-    // `--creds-out` to the same path: the second write would
-    // overwrite the first and the operator would silently lose
-    // either the seed or the creds depending on order.
-    if resolved_creds == resolved_seed {
-        anyhow::bail!(
-            "--seed-out and --creds-out resolve to the same path ({}). The creds blob and \
-             the raw seed are different on-disk formats; one would overwrite the other.",
-            resolved_creds.display()
-        );
-    }
+    let resolved_creds = dir.join(CREDS_FILE);
+    let resolved_seed = dir.join(SEED_FILE);
     for (label, path) in [("creds", &resolved_creds), ("seed", &resolved_seed)] {
         if path.exists() && !force {
             anyhow::bail!(
@@ -660,9 +559,7 @@ mod tests {
         run(
             &agent_invite_code(),
             &mock_server.uri(),
-            Some(&seed_path),
-            Some(&creds_path),
-            None, // token_out
+            Some(tmp.path()),
             false,
             None,
             1,
@@ -707,9 +604,7 @@ mod tests {
         let err = run(
             &agent_invite_code(),
             &mock_server.uri(),
-            Some(&seed_path),
-            Some(&creds_path),
-            None, // token_out
+            Some(tmp.path()),
             false,
             None,
             1,
@@ -751,9 +646,7 @@ mod tests {
         let err = run(
             &agent_invite_code(),
             &mock_server.uri(),
-            Some(&seed_path),
-            Some(&creds_path),
-            None, // token_out
+            Some(tmp.path()),
             false,
             None,
             1,
@@ -804,9 +697,7 @@ mod tests {
         run(
             &agent_invite_code(),
             &mock_server.uri(),
-            Some(&seed_path),
-            Some(&creds_path),
-            None, // token_out
+            Some(tmp.path()),
             /* force = */ true,
             None,
             1,
@@ -823,94 +714,6 @@ mod tests {
                 path.display()
             );
         }
-    }
-
-    /// Coderabbit: a typo passing the SAME path to `--seed-out` and
-    /// `--creds-out` would silently overwrite one file with the
-    /// other (creds writes first, then seed clobbers it). Reject
-    /// upfront — no orchestrator round-trip, no partial state.
-    #[tokio::test]
-    async fn redeem_rejects_identical_seed_and_creds_paths() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let same = tmp.path().join("agent.both");
-        let err = run(
-            &agent_invite_code(),
-            "http://orchestrator.invalid",
-            Some(&same),
-            Some(&same),
-            None, // token_out
-            false,
-            None,
-            1,
-        )
-        .await
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("same path") || msg.contains("resolve to the same"),
-            "error must explain the collision; got: {msg}"
-        );
-        // Neither file must have been touched.
-        assert!(!same.exists());
-    }
-
-    /// Operator-redeem path has a third secret file (`--token-out`).
-    /// All three pairs must be checked for collision — token vs
-    /// creds, token vs seed, creds vs seed — before any write hits
-    /// the disk. Failure mode this guards against: a typo like
-    /// `--token-out=~/.nsed/agent.creds` would have the bearer
-    /// write clobber the NATS creds after a successful redeem,
-    /// silently losing one secret to recover the other.
-    #[tokio::test]
-    async fn redeem_operator_rejects_token_creds_path_collision() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let same = tmp.path().join("collide");
-        // Use a JWT-shaped operator code so dispatch routes to the
-        // operator path and the collision check fires. No HTTP
-        // mock needed — the collision check is upstream of the
-        // network call.
-        let err = run(
-            &operator_invite_code(),
-            "http://orchestrator.invalid",
-            Some(&tmp.path().join("agent.seed")),
-            Some(&same), // creds
-            Some(&same), // token — collides with creds
-            false,
-            None,
-            1,
-        )
-        .await
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("--token-out") && msg.contains("--creds-out"),
-            "error must name both colliding flags; got: {msg}"
-        );
-        assert!(!same.exists(), "no file may have been written");
-    }
-
-    #[tokio::test]
-    async fn redeem_operator_rejects_token_seed_path_collision() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let same = tmp.path().join("collide");
-        let err = run(
-            &operator_invite_code(),
-            "http://orchestrator.invalid",
-            Some(&same), // seed
-            Some(&tmp.path().join("agent.creds")),
-            Some(&same), // token — collides with seed
-            false,
-            None,
-            1,
-        )
-        .await
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("--token-out") && msg.contains("--seed-out"),
-            "error must name both colliding flags; got: {msg}"
-        );
-        assert!(!same.exists(), "no file may have been written");
     }
 
     /// `--seed-in` lets the operator pre-stage a seed and reuse the
@@ -941,13 +744,10 @@ mod tests {
         std::fs::write(&staged, &expected_seed).unwrap();
 
         let seed_path = tmp.path().join("agent.seed");
-        let creds_path = tmp.path().join("agent.creds");
         run(
             &agent_invite_code(),
             &mock_server.uri(),
-            Some(&seed_path),
-            Some(&creds_path),
-            None, // token_out
+            Some(tmp.path()),
             false,
             Some(&staged),
             1,
@@ -981,9 +781,7 @@ mod tests {
         let err = run(
             "code",
             "http://orchestrator.invalid",
-            Some(&tmp.path().join("agent.seed")),
-            Some(&tmp.path().join("agent.creds")),
-            None, // token_out
+            Some(tmp.path()),
             false,
             Some(&empty),
             1,
@@ -1008,9 +806,7 @@ mod tests {
         let err = run(
             "code",
             "http://orchestrator.invalid",
-            Some(&tmp.path().join("agent.seed")),
-            Some(&tmp.path().join("agent.creds")),
-            None, // token_out
+            Some(tmp.path()),
             false,
             Some(&bad),
             1,
@@ -1076,9 +872,7 @@ mod tests {
         run(
             &operator_invite_code(),
             &mock_server.uri(),
-            Some(&tmp.path().join("agent.seed")),
-            Some(&tmp.path().join("agent.creds")),
-            Some(&token_path),
+            Some(tmp.path()),
             false,
             None,
             1,
@@ -1117,9 +911,7 @@ mod tests {
         run(
             &agent_invite_code(),
             &mock_server.uri(),
-            Some(&tmp.path().join("agent.seed")),
-            Some(&tmp.path().join("agent.creds")),
-            Some(&tmp.path().join("operator.token")),
+            Some(tmp.path()),
             false,
             None,
             1,
@@ -1153,14 +945,11 @@ mod tests {
             .await;
 
         let tmp = tempfile::TempDir::new().unwrap();
-        let token_path = tmp.path().join("operator.token");
 
         run(
             &operator_invite_code(),
             &mock_server.uri(),
-            Some(&tmp.path().join("agent.seed")),
-            Some(&tmp.path().join("agent.creds")),
-            Some(&token_path),
+            Some(tmp.path()),
             false,
             None,
             1,
@@ -1168,6 +957,9 @@ mod tests {
         .await
         .expect("operator redeem must succeed");
 
+        // Token lands at <out-dir>/operator.token, endpoint beside it.
+        let token = std::fs::read_to_string(tmp.path().join("operator.token")).unwrap();
+        assert_eq!(token.trim(), "op-abc-123");
         let endpoint = std::fs::read_to_string(tmp.path().join("orchestrator")).unwrap();
         assert_eq!(endpoint.trim(), mock_server.uri().trim_end_matches('/'));
     }
@@ -1204,9 +996,7 @@ mod tests {
         run(
             &operator_invite_code(),
             &mock_server.uri(),
-            Some(&seed_path),
-            Some(&creds_path),
-            Some(&token_path),
+            Some(tmp.path()),
             false,
             None,
             1,
@@ -1267,9 +1057,7 @@ mod tests {
         run(
             &agent_code,
             &mock_server.uri(),
-            Some(&tmp.path().join("agent.seed")),
-            Some(&tmp.path().join("agent.creds")),
-            Some(&tmp.path().join("operator.token")),
+            Some(tmp.path()),
             false,
             None,
             1,
@@ -1294,9 +1082,7 @@ mod tests {
         let err = run(
             &unknown,
             "http://orchestrator.invalid",
-            Some(&tmp.path().join("agent.seed")),
-            Some(&tmp.path().join("agent.creds")),
-            Some(&tmp.path().join("operator.token")),
+            Some(tmp.path()),
             false,
             None,
             1,
@@ -1306,6 +1092,49 @@ mod tests {
         assert!(
             err.to_string().contains("unknown audience"),
             "must mention unknown audience: {err}"
+        );
+    }
+
+    /// With no `--out-dir`, all outputs default to `~/.nsed`. HOME-injected
+    /// (serialised on `home_env` so concurrent tests don't race the env);
+    /// the env override is held across the whole await.
+    #[tokio::test]
+    #[serial_test::serial(home_env)]
+    async fn redeem_defaults_out_dir_to_nsed_home() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/redeem"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "op-default-dir",
+                "name": "alice",
+            })))
+            .mount(&mock)
+            .await;
+
+        let home = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var_os("HOME");
+        // SAFETY: serialised via `serial_test::serial(home_env)`.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+        let res = run(&operator_invite_code(), &mock.uri(), None, false, None, 1).await;
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        res.expect("redeem must succeed");
+
+        let nsed = home.path().join(".nsed");
+        let token = std::fs::read_to_string(nsed.join("operator.token")).unwrap();
+        assert_eq!(token.trim(), "op-default-dir");
+        assert!(
+            nsed.join("orchestrator").exists(),
+            "endpoint must be persisted under the default ~/.nsed dir"
         );
     }
 }

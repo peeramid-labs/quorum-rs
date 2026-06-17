@@ -37,8 +37,7 @@ repo for these):
   <https://crates.io/crates/quorum-rs>.
 - An invite code from your admin AND NATS credentials for the
   orchestrator. `quorum redeem <code>` writes both to `~/.nsed/`
-  by default; pass `--token-out`, `--creds-out`, `--seed-out`
-  to put them elsewhere.
+  by default; pass `--out-dir DIR` to put them elsewhere.
 - An OpenAI-compatible LLM endpoint with an API key OR the
   `claude` CLI on `$PATH`.
 

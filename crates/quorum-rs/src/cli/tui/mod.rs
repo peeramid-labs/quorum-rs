@@ -34,7 +34,7 @@ use views::{FetchRequest, StatusLevel, View, ViewAction};
 
 /// Run the full interactive TUI starting at the main menu.
 pub async fn run_tui(config_path: &Path) -> ExitCode {
-    let config = match WorkspaceConfig::load(config_path) {
+    let config = match WorkspaceConfig::load_or_remote_default(config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error loading config: {e}");
@@ -55,7 +55,7 @@ pub async fn run_tui_with_task(
     _room: Option<&str>,
     _policy: Option<&str>,
 ) -> ExitCode {
-    let config = match WorkspaceConfig::load(config_path) {
+    let config = match WorkspaceConfig::load_or_remote_default(config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error loading config: {e}");
@@ -69,7 +69,7 @@ pub async fn run_tui_with_task(
 
 /// Run the TUI jumping directly to a job detail view.
 pub async fn run_tui_job(config_path: &Path, job_id: &str, orchestrator: &str) -> ExitCode {
-    let config = match WorkspaceConfig::load(config_path) {
+    let config = match WorkspaceConfig::load_or_remote_default(config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error loading config: {e}");

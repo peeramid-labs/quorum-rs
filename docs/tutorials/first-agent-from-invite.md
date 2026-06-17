@@ -124,18 +124,16 @@ Both `operator.token` and `agent.creds` represent the SAME
 operator identity. The orchestrator pins the same `username`
 (`alice` in the example) to both during redemption.
 
-> **Picking a different directory?** Pass explicit paths to
-> `quorum redeem`:
+> **Picking a different directory?** Point `quorum redeem` at it
+> with `--out-dir`:
 >
 > ```bash
-> quorum redeem eyJhbGc... \
->   --token-out  ./creds/api.token \
->   --creds-out  ./creds/nats.creds \
->   --seed-out   ./creds/nats.seed
+> quorum redeem eyJhbGc... --out-dir ./creds
+> # writes ./creds/{agent.seed,agent.creds,operator.token,orchestrator}
 > ```
 >
 > You'll then need to point `quorum serve` at the same files
-> with `--nats-creds ./creds/nats.creds` (Step 4) and export
+> with `--nats-creds ./creds/agent.creds` (Step 4) and export
 > the bearer manually when running client commands.
 
 > **What if the admin gave you a chat-only code?** You'll see "Redeemed
