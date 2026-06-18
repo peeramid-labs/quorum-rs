@@ -903,10 +903,17 @@ pub(super) fn render_agent_config(
 }
 
 /// Emit an agent's read/write file access, mapped to the knob its provider
-/// supports: Claude → `add_dirs` (+ `writable: true` when write dirs are
-/// granted); native-LLM → `builtin_tools: read_file` roots (write is not a
-/// native tool, so write dirs render as a note). Exec is handled separately
-/// via `working_dir`, so this is only called for non-exec providers.
+/// supports.
+///
+/// Claude separates the two mechanisms so read stays read-only:
+/// - read paths → `context_files`: inlined into the system prompt at session
+///   start (read-only, per-file — never in the writable tool scope).
+/// - write dirs → `add_dirs` + `writable: true`: the ONLY directories the
+///   Write/Edit tools can touch. A per-agent memories dir goes here.
+///
+/// native-LLM → `builtin_tools: read_file` roots (write is not a native tool,
+/// so write dirs render as a note). Exec is handled separately via
+/// `working_dir`, so this is only called for non-exec providers.
 fn render_agent_access(out: &mut String, agent: &AgentSlot, provider_type: &str) {
     if agent.read_paths.is_empty() && agent.write_dirs.is_empty() {
         return;
@@ -919,17 +926,24 @@ fn render_agent_access(out: &mut String, agent: &AgentSlot, provider_type: &str)
             .join(", ")
     };
     if provider_type == "claude" {
-        // Claude grants tool access per directory; read + write paths share
-        // the add_dirs list, and `writable` gates the Write/Edit tools.
-        let mut dirs: Vec<String> = Vec::new();
-        for p in agent.read_paths.iter().chain(agent.write_dirs.iter()) {
-            if !dirs.contains(p) {
-                dirs.push(p.clone());
-            }
+        if agent.read_paths.is_empty() && agent.write_dirs.is_empty() {
+            return;
         }
         writeln!(out, "    claude:").unwrap();
-        writeln!(out, "      add_dirs: [{}]", quote_list(&dirs)).unwrap();
+        // Read context is inlined read-only — keep it OUT of add_dirs so the
+        // write tools can never reach it.
+        if !agent.read_paths.is_empty() {
+            writeln!(
+                out,
+                "      context_files: [{}]",
+                quote_list(&agent.read_paths)
+            )
+            .unwrap();
+        }
+        // Writable dirs are the only thing in the tool scope, gated by
+        // `writable: true` (else mcp_agent disallows Write/Edit/NotebookEdit).
         if !agent.write_dirs.is_empty() {
+            writeln!(out, "      add_dirs: [{}]", quote_list(&agent.write_dirs)).unwrap();
             writeln!(out, "      writable: true").unwrap();
         }
     } else {

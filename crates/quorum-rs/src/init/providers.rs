@@ -318,11 +318,23 @@ pub(super) fn build_claude_exec_provider() -> Provider {
         input_price: Some(0.0),
         output_price: Some(0.0),
         provider_type: "claude".to_string(),
-        models: vec![ModelInfo {
-            name: "sonnet".to_string(),
-            input_price: Some(0.0),
-            output_price: Some(0.0),
-        }],
+        models: vec![
+            ModelInfo {
+                name: "sonnet".to_string(),
+                input_price: Some(0.0),
+                output_price: Some(0.0),
+            },
+            ModelInfo {
+                name: "opus".to_string(),
+                input_price: Some(0.0),
+                output_price: Some(0.0),
+            },
+            ModelInfo {
+                name: "haiku".to_string(),
+                input_price: Some(0.0),
+                output_price: Some(0.0),
+            },
+        ],
         engine: None,
     }
 }
