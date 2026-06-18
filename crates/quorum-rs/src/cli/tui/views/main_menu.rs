@@ -66,18 +66,27 @@ impl MainMenuView {
         }
     }
 
-    /// `true` when there are no local config rooms, so the screen shows
-    /// config-free remote rooms instead.
-    fn config_free(&self) -> bool {
-        self.rooms.is_empty()
+    /// `true` when there are no rooms to show at all — neither local config
+    /// rooms nor remote (orchestrator) ones.
+    fn is_empty(&self) -> bool {
+        self.rooms.is_empty() && self.remote_rooms.is_empty()
     }
 
-    /// Total rooms shown (local or, in config-free mode, remote).
+    /// Total selectable rooms: local config rooms first, then remote ones.
     fn shown_count(&self) -> usize {
-        if self.config_free() {
-            self.remote_rooms.len()
+        self.rooms.len() + self.remote_rooms.len()
+    }
+
+    /// Resolve the current selection to a local or remote room. The flat
+    /// selection index runs over local rooms first, then remote.
+    fn selected_kind(&self) -> Option<Sel> {
+        let sel = self.list_state.selected;
+        if sel < self.rooms.len() {
+            Some(Sel::Local(sel))
+        } else if sel < self.shown_count() {
+            Some(Sel::Remote(sel - self.rooms.len()))
         } else {
-            self.rooms.len()
+            None
         }
     }
 
@@ -92,10 +101,21 @@ impl MainMenuView {
         trimmed.parse::<f32>().ok().map(|v| v.clamp(0.0, 1.0))
     }
 
-    /// Get the currently selected room, if any.
+    /// The selected LOCAL room, if the selection lands in the local section.
+    /// Remote rooms have no local detail panel.
     fn selected_room(&self) -> Option<&(String, RoomConfig)> {
-        self.rooms.get(self.list_state.selected)
+        match self.selected_kind() {
+            Some(Sel::Local(i)) => self.rooms.get(i),
+            _ => None,
+        }
     }
+}
+
+/// Where the flat room selection points: a local config room or a remote one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sel {
+    Local(usize),
+    Remote(usize),
 }
 
 impl View for MainMenuView {
@@ -104,15 +124,11 @@ impl View for MainMenuView {
     }
 
     fn on_enter(&mut self) -> Vec<ViewAction> {
-        // Config-free: pull the rooms the operator can submit to from the
-        // orchestrator. Local-config users keep their nsed.yaml rooms.
-        if self.config_free() {
-            vec![ViewAction::Fetch(FetchRequest::Rooms {
-                orchestrator: self.orchestrator.clone(),
-            })]
-        } else {
-            Vec::new()
-        }
+        // Always pull remote rooms so the Remote section is populated
+        // alongside any local (nsed.yaml) rooms.
+        vec![ViewAction::Fetch(FetchRequest::Rooms {
+            orchestrator: self.orchestrator.clone(),
+        })]
     }
 
     fn update(&mut self, app_event: &AppEvent) -> Option<ViewAction> {
@@ -123,7 +139,7 @@ impl View for MainMenuView {
             && *orchestrator == self.orchestrator
         {
             self.remote_rooms = rooms.clone();
-            self.list_state.set_count(self.remote_rooms.len());
+            self.list_state.set_count(self.shown_count());
             return None;
         }
         let AppEvent::Terminal(event) = app_event else {
@@ -276,33 +292,52 @@ impl View for MainMenuView {
             frame.render_widget(threshold_paragraph, chunks[2]);
         }
 
-        // Rooms table + optional detail
-        if self.config_free() {
-            if self.remote_rooms.is_empty() {
-                render_error(
-                    frame,
-                    chunks[3],
-                    "No rooms yet — create one in Settings → Rooms (set a policy to submit here)",
-                );
-            } else {
-                self.draw_remote_table(frame, chunks[3]);
-            }
-        } else if self.detail_visible {
-            let h_chunks =
-                Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
-                    .split(chunks[3]);
-            self.draw_table(frame, h_chunks[0]);
-            if let Some((name, config)) = self.selected_room() {
-                draw_room_detail(
-                    frame,
-                    h_chunks[1],
-                    name,
-                    config,
-                    self.default_room.as_deref(),
-                );
-            }
+        // Rooms: Local (nsed.yaml) section above Remote (orchestrator).
+        if self.is_empty() {
+            render_error(
+                frame,
+                chunks[3],
+                "No rooms yet — create one in Settings → Rooms (set a policy to submit here)",
+            );
         } else {
-            self.draw_table(frame, chunks[3]);
+            let local_sel = match self.selected_kind() {
+                Some(Sel::Local(i)) => Some(i),
+                _ => None,
+            };
+            let remote_sel = match self.selected_kind() {
+                Some(Sel::Remote(i)) => Some(i),
+                _ => None,
+            };
+            // Split vertically only when both sections have content.
+            let (local_area, remote_area) = if self.rooms.is_empty() {
+                (None, Some(chunks[3]))
+            } else if self.remote_rooms.is_empty() {
+                (Some(chunks[3]), None)
+            } else {
+                let local_h = ((self.rooms.len() as u16 + 3).min(chunks[3].height / 2)).max(4);
+                let split = Layout::vertical([Constraint::Length(local_h), Constraint::Min(0)])
+                    .split(chunks[3]);
+                (Some(split[0]), Some(split[1]))
+            };
+            if let Some(la) = local_area {
+                // Detail panel only applies to a selected local room.
+                if self.detail_visible && local_sel.is_some() {
+                    let h = Layout::horizontal([
+                        Constraint::Percentage(45),
+                        Constraint::Percentage(55),
+                    ])
+                    .split(la);
+                    self.draw_table(frame, h[0], local_sel);
+                    if let Some((name, config)) = self.selected_room() {
+                        draw_room_detail(frame, h[1], name, config, self.default_room.as_deref());
+                    }
+                } else {
+                    self.draw_table(frame, la, local_sel);
+                }
+            }
+            if let Some(ra) = remote_area {
+                self.draw_remote_table(frame, ra, remote_sel);
+            }
         }
 
         // Key hints
@@ -332,10 +367,11 @@ impl View for MainMenuView {
 }
 
 impl MainMenuView {
-    /// Render the config-free remote-rooms table. A room with no policy
+    /// Render the remote (orchestrator) rooms table. A room with no policy
     /// shows `— (no policy)` so the operator knows it can't be submitted to
-    /// until one is set.
-    fn draw_remote_table(&self, frame: &mut Frame, area: Rect) {
+    /// until one is set. `selected_row` highlights the row when the union
+    /// selection points into this section.
+    fn draw_remote_table(&self, frame: &mut Frame, area: Rect, selected_row: Option<usize>) {
         let header = Row::new(vec![
             Cell::from("Room"),
             Cell::from("Policy"),
@@ -352,10 +388,9 @@ impl MainMenuView {
             .remote_rooms
             .iter()
             .enumerate()
-            .skip(self.list_state.scroll_offset)
             .take(visible.max(1))
             .map(|(i, room)| {
-                let style = if i == self.list_state.selected {
+                let style = if Some(i) == selected_row {
                     Style::default().add_modifier(Modifier::REVERSED)
                 } else {
                     Style::default()
@@ -388,7 +423,7 @@ impl MainMenuView {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .title(format!(
-                    " Rooms ({}) — Enter to deliberate ",
+                    " Remote (orchestrator) ({}) ",
                     self.remote_rooms.len()
                 )),
         );
@@ -413,57 +448,54 @@ impl MainMenuView {
             self.threshold_input_active = false;
             let effort_override = self.parsed_threshold();
 
-            // Config-free: submit to the selected remote room using the
-            // policy bound to it (resolved server-side at dispatch).
-            if self.config_free() {
-                let Some(room) = self.remote_rooms.get(self.list_state.selected) else {
-                    return Some(ViewAction::SetStatus(
-                        "No rooms available".into(),
-                        super::StatusLevel::Error,
-                    ));
-                };
-                let Some(policy) = room.policy.clone() else {
-                    return Some(ViewAction::SetStatus(
-                        format!(
-                            "Room '{}' has no policy bound — set one when creating it \
-                             (Settings → Rooms → New room → policy)",
-                            room.id
-                        ),
-                        super::StatusLevel::Error,
-                    ));
-                };
-                return Some(ViewAction::LaunchJob {
-                    orchestrator: self.orchestrator.clone(),
-                    task: self.task_text.clone(),
-                    room: Some(room.id.clone()),
-                    policy: Some(policy),
-                    effort_override,
-                });
-            }
-
-            if self.rooms.is_empty() || self.list_state.selected >= self.rooms.len() {
-                return Some(ViewAction::SetStatus(
+            return match self.selected_kind() {
+                // Remote room: submit using the policy bound to it (resolved
+                // server-side at dispatch).
+                Some(Sel::Remote(i)) => {
+                    let room = &self.remote_rooms[i];
+                    let Some(policy) = room.policy.clone() else {
+                        return Some(ViewAction::SetStatus(
+                            format!(
+                                "Room '{}' has no policy bound — set one when creating it \
+                                 (Settings → Rooms → New room → policy)",
+                                room.id
+                            ),
+                            super::StatusLevel::Error,
+                        ));
+                    };
+                    Some(ViewAction::LaunchJob {
+                        orchestrator: self.orchestrator.clone(),
+                        task: self.task_text.clone(),
+                        room: Some(room.id.clone()),
+                        policy: Some(policy),
+                        effort_override,
+                    })
+                }
+                // Local room: submit via the orchestrator pinned in nsed.yaml.
+                Some(Sel::Local(i)) => {
+                    let (room_name, room_config) = &self.rooms[i];
+                    let orchestrator = match &room_config.orchestrator {
+                        Some(o) => o.clone(),
+                        None => {
+                            return Some(ViewAction::SetStatus(
+                                format!("Room '{room_name}' has no orchestrator configured"),
+                                super::StatusLevel::Error,
+                            ));
+                        }
+                    };
+                    Some(ViewAction::LaunchJob {
+                        orchestrator,
+                        task: self.task_text.clone(),
+                        room: Some(room_name.clone()),
+                        policy: None,
+                        effort_override,
+                    })
+                }
+                None => Some(ViewAction::SetStatus(
                     "No rooms available".into(),
                     super::StatusLevel::Error,
-                ));
-            }
-            let (room_name, room_config) = &self.rooms[self.list_state.selected];
-            let orchestrator = match &room_config.orchestrator {
-                Some(o) => o.clone(),
-                None => {
-                    return Some(ViewAction::SetStatus(
-                        format!("Room '{room_name}' has no orchestrator configured"),
-                        super::StatusLevel::Error,
-                    ));
-                }
+                )),
             };
-            return Some(ViewAction::LaunchJob {
-                orchestrator,
-                task: self.task_text.clone(),
-                room: Some(room_name.clone()),
-                policy: None,
-                effort_override,
-            });
         }
         if let crossterm::event::Event::Key(key) = event
             && key.kind == crossterm::event::KeyEventKind::Press
@@ -490,7 +522,9 @@ impl MainMenuView {
         None
     }
 
-    fn draw_table(&mut self, frame: &mut Frame, area: Rect) {
+    /// Render the local (nsed.yaml) room table. `selected_row` is the row to
+    /// highlight when the union selection points into this section.
+    fn draw_table(&self, frame: &mut Frame, area: Rect, selected_row: Option<usize>) {
         let header = Row::new(vec![
             Cell::from(""),
             Cell::from("Room"),
@@ -503,17 +537,14 @@ impl MainMenuView {
                 .add_modifier(Modifier::BOLD),
         );
 
-        // Borders + header consume 3 rows; remainder is visible item rows.
         let visible_height = area.height.saturating_sub(3) as usize;
-        self.list_state.set_visible_height(visible_height);
         let rows: Vec<Row> = self
             .rooms
             .iter()
             .enumerate()
-            .skip(self.list_state.scroll_offset)
             .take(visible_height.max(1))
             .map(|(i, (name, config))| {
-                let style = if i == self.list_state.selected {
+                let style = if Some(i) == selected_row {
                     Style::default().add_modifier(Modifier::REVERSED)
                 } else {
                     Style::default()
@@ -542,10 +573,11 @@ impl MainMenuView {
             ],
         )
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            " Rooms ({}) — Select and deliberate ",
-            self.rooms.len()
-        )));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Local (nsed.yaml) ({}) ", self.rooms.len())),
+        );
 
         frame.render_widget(table, area);
     }
@@ -849,29 +881,41 @@ mod tests {
     }
 
     #[test]
-    fn config_free_when_no_local_rooms() {
+    fn is_empty_when_no_local_or_remote_rooms() {
         let view = MainMenuView::new(HashMap::new(), None, "orch".into());
-        assert!(view.config_free());
+        assert!(view.is_empty());
+        // Local rooms alone make it non-empty.
         let view = MainMenuView::new(sample_rooms(), None, "orch".into());
-        assert!(!view.config_free());
+        assert!(!view.is_empty());
     }
 
     #[test]
-    fn config_free_on_enter_fetches_rooms() {
+    fn on_enter_always_fetches_remote() {
+        // Both config-free and local-config views fetch remote so the
+        // Remote section populates alongside any local rooms.
         let mut view = MainMenuView::new(HashMap::new(), None, "orch".into());
-        let actions = view.on_enter();
         assert_eq!(
-            actions,
+            view.on_enter(),
             vec![ViewAction::Fetch(FetchRequest::Rooms {
                 orchestrator: "orch".into(),
             })]
         );
+        let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
+        assert_eq!(view.on_enter().len(), 1);
     }
 
     #[test]
-    fn local_config_on_enter_does_not_fetch() {
+    fn selection_spans_local_then_remote() {
+        // 2 local (sample_rooms: local, remote) + 1 remote = 3 selectable.
         let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
-        assert!(view.on_enter().is_empty());
+        view.update(&AppEvent::Data(DataEvent::RoomsLoaded {
+            orchestrator: "orch".into(),
+            rooms: vec![remote_room("rmt", Some("p"))],
+        }));
+        assert_eq!(view.shown_count(), 3);
+        assert_eq!(view.selected_kind(), Some(Sel::Local(0)));
+        view.list_state.selected = 2;
+        assert_eq!(view.selected_kind(), Some(Sel::Remote(0)));
     }
 
     #[test]

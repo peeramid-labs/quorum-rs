@@ -214,10 +214,13 @@ quorum tui                         # interactive TUI
 
 The TUI opens on a persistent tab bar — **Deliberate · Rooms · Agents ·
 Policies · Settings**. Press the number keys `1`–`5` or `Tab`/`Shift-Tab` to
-switch tabs (Settings holds Orchestrators + Config). The **Rooms** tab lists
-each room's bound policy, panel fill (`eligible/desired ✓`), tags, and the
-agents that would serve it; the create-room form picks the policy from a
-selector (`Space`/`←→`). A room whose eligible agents fall below its policy's
+switch tabs (Settings holds Orchestrators + Config). The **Rooms**,
+**Policies**, and **Deliberate** screens each split into a **Local
+(nsed.yaml)** section and a **Remote (orchestrator)** section, so rooms /
+policies you defined in the workspace file aren't confused with runtime ones.
+The **Rooms** tab lists each room's bound policy, panel fill (`eligible/desired
+✓`), tags, and the agents that would serve it; the create-room form picks the
+policy from a selector (`Space`/`←→`). A room whose eligible agents fall below its policy's
 target shows a red `✗` on both the Rooms and Deliberate screens — it can't
 start a deliberation until enough matching agents are online.
 

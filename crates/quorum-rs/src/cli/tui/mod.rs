@@ -347,12 +347,14 @@ fn create_view(view_id: &ViewId, app: &App) -> Box<dyn View> {
             remote_orch
                 .clone()
                 .unwrap_or_else(|| "(no remote orchestrator)".into()),
+            app.config.policies.clone(),
         )),
         ViewId::Agents => Box::new(AgentsView::new(
             remote_orch.unwrap_or_else(|| "(no remote orchestrator)".into()),
         )),
         ViewId::Rooms => Box::new(views::rooms::RoomsView::new(
             remote_orch.unwrap_or_else(|| "(no remote orchestrator)".into()),
+            app.config.rooms.clone(),
         )),
         ViewId::Orchestrators => Box::new(OrchestratorsView::new(app.config.orchestrators.clone())),
         ViewId::Settings => Box::new(SettingsView::from_config(

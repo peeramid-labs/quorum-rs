@@ -4,6 +4,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
+use std::collections::HashMap;
+
 use super::common::{
     ListState, fill_cell, fill_status, render_error, render_key_hints, render_loading, truncate,
 };
@@ -11,6 +13,7 @@ use super::{FetchRequest, View, ViewAction};
 use crate::cli::remote::DiscoveredRoom;
 use crate::cli::tui::event::{self, AppEvent, DataEvent};
 use crate::cli::tui::views::agents::LoadState;
+use crate::cli::workspace::RoomConfig;
 
 /// Which sub-mode the Rooms view is in.
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +72,9 @@ impl CreateForm {
 pub struct RoomsView {
     orchestrator: String,
     rooms: LoadState<Vec<DiscoveredRoom>>,
+    /// Rooms defined in the local workspace (nsed.yaml), shown as a separate
+    /// read-only section above the remote (orchestrator) list.
+    local_rooms: Vec<(String, RoomConfig)>,
     /// Policy names available on the orchestrator, for the create-form
     /// selector. Empty until `PoliciesLoaded` arrives.
     policies: Vec<String>,
@@ -83,10 +89,13 @@ pub struct RoomsView {
 
 impl RoomsView {
     /// Construct a Rooms view targeting the named remote `orchestrator`.
-    pub fn new(orchestrator: String) -> Self {
+    pub fn new(orchestrator: String, local_rooms: HashMap<String, RoomConfig>) -> Self {
+        let mut local: Vec<(String, RoomConfig)> = local_rooms.into_iter().collect();
+        local.sort_by(|a, b| a.0.cmp(&b.0));
         Self {
             orchestrator,
             rooms: LoadState::NotLoaded,
+            local_rooms: local,
             policies: Vec::new(),
             list_state: ListState::new(0),
             mode: Mode::List,
@@ -340,17 +349,33 @@ impl View for RoomsView {
             Mode::List => {}
         }
 
+        // Carve a top band for the local (nsed.yaml) section when present;
+        // the remote (orchestrator) list takes the rest.
+        let remote_area = if self.local_rooms.is_empty() {
+            chunks[2]
+        } else {
+            let local_h = ((self.local_rooms.len() as u16 + 3).min(chunks[2].height / 2)).max(4);
+            let split = Layout::vertical([Constraint::Length(local_h), Constraint::Min(0)])
+                .split(chunks[2]);
+            self.draw_local_section(frame, split[0]);
+            split[1]
+        };
+
         match &self.rooms {
             LoadState::NotLoaded | LoadState::Loading => {
-                render_loading(frame, chunks[2], "Loading rooms...");
+                render_loading(frame, remote_area, "Loading rooms...");
             }
-            LoadState::Error(e) => render_error(frame, chunks[2], e),
+            LoadState::Error(e) => render_error(frame, remote_area, e),
             LoadState::Loaded(rooms) => {
                 if rooms.is_empty() {
-                    render_error(frame, chunks[2], "No rooms — press 'n' to create one");
+                    render_error(
+                        frame,
+                        remote_area,
+                        "No remote rooms — press 'n' to create one",
+                    );
                 } else {
                     let split = Layout::horizontal([Constraint::Min(40), Constraint::Length(34)])
-                        .split(chunks[2]);
+                        .split(remote_area);
                     self.draw_table(frame, split[0], rooms);
                     if let Some(room) = rooms.get(self.list_state.selected) {
                         draw_room_detail(frame, split[1], room);
@@ -489,7 +514,51 @@ impl RoomsView {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Rooms ({}) ", rooms.len())),
+                .title(format!(" Remote (orchestrator) ({}) ", rooms.len())),
+        );
+        frame.render_widget(table, area);
+    }
+
+    /// Read-only table of rooms defined in the local workspace (nsed.yaml):
+    /// id, the policy they reference, and the orchestrator they pin (if any).
+    /// No fill — local config carries no live agent data.
+    fn draw_local_section(&self, frame: &mut Frame, area: Rect) {
+        let header = Row::new(vec![
+            Cell::from("Room"),
+            Cell::from("Policy"),
+            Cell::from("Orchestrator"),
+        ])
+        .style(Style::default().fg(Color::DarkGray));
+        let visible = area.height.saturating_sub(3) as usize;
+        let rows: Vec<Row> = self
+            .local_rooms
+            .iter()
+            .take(visible.max(1))
+            .map(|(name, cfg)| {
+                Row::new(vec![
+                    Cell::from(truncate(name, 24)),
+                    Cell::from(truncate(&cfg.policy, 20)),
+                    Cell::from(truncate(
+                        cfg.orchestrator.as_deref().unwrap_or("(default)"),
+                        20,
+                    )),
+                ])
+                .style(Style::default().fg(Color::DarkGray))
+            })
+            .collect();
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(26),
+                Constraint::Length(22),
+                Constraint::Min(18),
+            ],
+        )
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Local (nsed.yaml) ({}) ", self.local_rooms.len())),
         );
         frame.render_widget(table, area);
     }
@@ -586,7 +655,7 @@ mod tests {
 
     #[test]
     fn on_enter_fetches_rooms() {
-        let mut v = RoomsView::new("orch".into());
+        let mut v = RoomsView::new("orch".into(), HashMap::new());
         let actions = v.on_enter();
         assert_eq!(actions.len(), 2);
         assert!(matches!(
@@ -597,7 +666,7 @@ mod tests {
 
     #[test]
     fn rooms_loaded_populates() {
-        let mut v = RoomsView::new("orch".into());
+        let mut v = RoomsView::new("orch".into(), HashMap::new());
         v.update(&AppEvent::Data(DataEvent::RoomsLoaded {
             orchestrator: "orch".into(),
             rooms: sample(),
@@ -608,7 +677,7 @@ mod tests {
 
     #[test]
     fn n_opens_create_then_type_and_submit() {
-        let mut v = RoomsView::new("orch".into());
+        let mut v = RoomsView::new("orch".into(), HashMap::new());
         v.rooms = LoadState::Loaded(sample());
         v.policies = vec!["noosphera:0v1".into()];
         v.update(&typ('n'));
@@ -659,7 +728,7 @@ mod tests {
 
     #[test]
     fn create_empty_id_sets_error_not_submits() {
-        let mut v = RoomsView::new("orch".into());
+        let mut v = RoomsView::new("orch".into(), HashMap::new());
         v.mode = Mode::Create;
         let action = v.update(&key(KeyCode::Enter));
         assert!(action.is_none());
@@ -669,7 +738,7 @@ mod tests {
 
     #[test]
     fn fetch_error_sets_persistent_banner_and_keeps_form() {
-        let mut v = RoomsView::new("orch".into());
+        let mut v = RoomsView::new("orch".into(), HashMap::new());
         v.mode = Mode::Create;
         let action = v.update(&AppEvent::Data(DataEvent::FetchError {
             context: "rooms".into(),
@@ -682,7 +751,7 @@ mod tests {
 
     #[test]
     fn d_confirms_then_y_deletes() {
-        let mut v = RoomsView::new("orch".into());
+        let mut v = RoomsView::new("orch".into(), HashMap::new());
         v.rooms = LoadState::Loaded(sample());
         v.list_state.set_count(2);
         v.update(&typ('d'));
@@ -700,7 +769,7 @@ mod tests {
 
     #[test]
     fn confirm_delete_n_cancels() {
-        let mut v = RoomsView::new("orch".into());
+        let mut v = RoomsView::new("orch".into(), HashMap::new());
         v.mode = Mode::ConfirmDelete("x".into());
         let action = v.update(&typ('n'));
         assert!(action.is_none());
@@ -709,7 +778,7 @@ mod tests {
 
     #[test]
     fn mutation_triggers_refetch() {
-        let mut v = RoomsView::new("orch".into());
+        let mut v = RoomsView::new("orch".into(), HashMap::new());
         let action = v.update(&AppEvent::Data(DataEvent::RoomMutated {
             orchestrator: "orch".into(),
             action: "created".into(),
@@ -723,13 +792,13 @@ mod tests {
 
     #[test]
     fn escape_pops_from_list() {
-        let mut v = RoomsView::new("orch".into());
+        let mut v = RoomsView::new("orch".into(), HashMap::new());
         assert_eq!(v.update(&key(KeyCode::Esc)), Some(ViewAction::Pop));
     }
 
     #[test]
     fn escape_cancels_create_without_pop() {
-        let mut v = RoomsView::new("orch".into());
+        let mut v = RoomsView::new("orch".into(), HashMap::new());
         v.mode = Mode::Create;
         v.form.id = "abc".into();
         let action = v.update(&key(KeyCode::Esc));
@@ -757,7 +826,7 @@ mod tests {
 
     #[test]
     fn cycle_policy_walks_none_then_names_and_wraps() {
-        let mut v = RoomsView::new("orch".into());
+        let mut v = RoomsView::new("orch".into(), HashMap::new());
         v.policies = vec!["alpha".into(), "beta".into()];
         assert_eq!(v.form.policy, "");
         v.cycle_policy(1);
@@ -772,7 +841,7 @@ mod tests {
 
     #[test]
     fn cycle_policy_noop_without_policies() {
-        let mut v = RoomsView::new("orch".into());
+        let mut v = RoomsView::new("orch".into(), HashMap::new());
         v.cycle_policy(1);
         assert_eq!(v.form.policy, "");
     }
@@ -780,7 +849,7 @@ mod tests {
     #[test]
     fn policies_loaded_populates_selector() {
         use crate::cli::tui::event::PolicyInfo;
-        let mut v = RoomsView::new("orch".into());
+        let mut v = RoomsView::new("orch".into(), HashMap::new());
         v.update(&AppEvent::Data(DataEvent::PoliciesLoaded {
             orchestrator: "orch".into(),
             policies: vec![PolicyInfo {
@@ -797,7 +866,7 @@ mod tests {
 
     #[test]
     fn on_enter_fetches_rooms_and_policies() {
-        let mut v = RoomsView::new("orch".into());
+        let mut v = RoomsView::new("orch".into(), HashMap::new());
         let actions = v.on_enter();
         assert_eq!(actions.len(), 2);
         assert!(matches!(
@@ -811,7 +880,49 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
-        let mut v = RoomsView::new("orch".into());
+        let mut v = RoomsView::new("orch".into(), HashMap::new());
+        v.rooms = LoadState::Loaded(sample());
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| v.draw(frame, frame.area())).unwrap();
+    }
+
+    #[test]
+    fn new_sorts_local_rooms() {
+        let mut local = HashMap::new();
+        local.insert(
+            "zeta".to_string(),
+            RoomConfig {
+                policy: "p".into(),
+                orchestrator: None,
+            },
+        );
+        local.insert(
+            "alpha".to_string(),
+            RoomConfig {
+                policy: "p".into(),
+                orchestrator: Some("primary".into()),
+            },
+        );
+        let v = RoomsView::new("orch".into(), local);
+        assert_eq!(v.local_rooms[0].0, "alpha");
+        assert_eq!(v.local_rooms[1].0, "zeta");
+    }
+
+    #[test]
+    fn draw_with_local_section_does_not_panic() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut local = HashMap::new();
+        local.insert(
+            "epic-main".to_string(),
+            RoomConfig {
+                policy: "review".into(),
+                orchestrator: Some("primary".into()),
+            },
+        );
+        let mut v = RoomsView::new("orch".into(), local);
         v.rooms = LoadState::Loaded(sample());
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -8,10 +10,14 @@ use super::common::{ListState, render_error, render_key_hints, render_loading, t
 use super::{ConfigMutation, FetchRequest, View, ViewAction};
 use crate::cli::tui::event::{self, AppEvent, DataEvent, PolicyInfo};
 use crate::cli::tui::views::agents::LoadState;
+use crate::cli::workspace::PolicyConfig;
 
 /// Policies list view with tag filtering and inline detail panel.
 pub struct PoliciesView {
     orchestrator: String,
+    /// Policies defined in the local workspace (nsed.yaml), shown as a
+    /// separate read-only section above the remote (orchestrator) list.
+    local_policies: Vec<(String, PolicyConfig)>,
     policies: LoadState<Vec<PolicyInfo>>,
     list_state: ListState,
     filter_active: bool,
@@ -21,9 +27,14 @@ pub struct PoliciesView {
 }
 
 impl PoliciesView {
-    pub fn new(orchestrator: String) -> Self {
+    /// Build the policies view for `orchestrator`, with the workspace's local
+    /// (nsed.yaml) policies shown as a read-only section above the remote list.
+    pub fn new(orchestrator: String, local_policies: HashMap<String, PolicyConfig>) -> Self {
+        let mut local: Vec<(String, PolicyConfig)> = local_policies.into_iter().collect();
+        local.sort_by(|a, b| a.0.cmp(&b.0));
         Self {
             orchestrator,
+            local_policies: local,
             policies: LoadState::NotLoaded,
             list_state: ListState::new(0),
             filter_active: false,
@@ -183,32 +194,44 @@ impl View for PoliciesView {
             frame.render_widget(input, chunks[0]);
         }
 
-        // Policy list + optional detail
+        // Carve a top band for the local (nsed.yaml) section when present;
+        // the remote (orchestrator) list takes the rest.
+        let remote_area = if self.local_policies.is_empty() {
+            chunks[1]
+        } else {
+            let local_h = ((self.local_policies.len() as u16 + 3).min(chunks[1].height / 2)).max(4);
+            let split = Layout::vertical([Constraint::Length(local_h), Constraint::Min(0)])
+                .split(chunks[1]);
+            self.draw_local_section(frame, split[0]);
+            split[1]
+        };
+
+        // Policy list + optional detail (remote / orchestrator)
         match &self.policies {
             LoadState::NotLoaded | LoadState::Loading => {
-                render_loading(frame, chunks[1], "Loading policies...");
+                render_loading(frame, remote_area, "Loading policies...");
             }
             LoadState::Error(e) => {
-                render_error(frame, chunks[1], e);
+                render_error(frame, remote_area, e);
             }
             LoadState::Loaded(_) => {
-                let visible_height = chunks[1].height.saturating_sub(3) as usize;
+                let visible_height = remote_area.height.saturating_sub(3) as usize;
                 self.list_state.set_visible_height(visible_height);
                 let filtered = self.filtered_policies();
                 if filtered.is_empty() {
-                    render_error(frame, chunks[1], "No policies found");
+                    render_error(frame, remote_area, "No remote policies found");
                 } else if self.detail_visible {
                     let h_chunks = Layout::horizontal([
                         Constraint::Percentage(45),
                         Constraint::Percentage(55),
                     ])
-                    .split(chunks[1]);
+                    .split(remote_area);
                     self.draw_table(frame, h_chunks[0], &filtered);
                     if let Some(policy) = self.selected_policy() {
                         draw_policy_detail(frame, h_chunks[1], policy);
                     }
                 } else {
-                    self.draw_table(frame, chunks[1], &filtered);
+                    self.draw_table(frame, remote_area, &filtered);
                 }
             }
         }
@@ -319,9 +342,55 @@ impl PoliciesView {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Policies ({}) ", policies.len())),
+                .title(format!(" Remote (orchestrator) ({}) ", policies.len())),
         );
 
+        frame.render_widget(table, area);
+    }
+
+    /// Read-only table of policies defined in the local workspace (nsed.yaml).
+    fn draw_local_section(&self, frame: &mut Frame, area: Rect) {
+        let header = Row::new(vec![
+            Cell::from("Name"),
+            Cell::from("Max Rounds"),
+            Cell::from("Effort"),
+            Cell::from("Type"),
+        ])
+        .style(Style::default().fg(Color::DarkGray));
+        let visible = area.height.saturating_sub(3) as usize;
+        let rows: Vec<Row> = self
+            .local_policies
+            .iter()
+            .take(visible.max(1))
+            .map(|(name, cfg)| {
+                let kind = if cfg.roles.is_some() {
+                    "role-based"
+                } else {
+                    "static"
+                };
+                Row::new(vec![
+                    Cell::from(truncate(name, 25)),
+                    Cell::from(cfg.max_rounds.to_string()),
+                    Cell::from(format!("{:.2}", cfg.effort)),
+                    Cell::from(kind),
+                ])
+                .style(Style::default().fg(Color::DarkGray))
+            })
+            .collect();
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(27),
+                Constraint::Length(12),
+                Constraint::Length(11),
+                Constraint::Min(12),
+            ],
+        )
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " Local (nsed.yaml) ({}) ",
+            self.local_policies.len()
+        )));
         frame.render_widget(table, area);
     }
 }
@@ -423,7 +492,7 @@ mod tests {
 
     #[test]
     fn on_enter_triggers_fetch() {
-        let mut view = PoliciesView::new("orch".into());
+        let mut view = PoliciesView::new("orch".into(), HashMap::new());
         let actions = view.on_enter();
         assert_eq!(actions.len(), 1);
         assert!(matches!(
@@ -434,7 +503,7 @@ mod tests {
 
     #[test]
     fn policies_loaded() {
-        let mut view = PoliciesView::new("orch".into());
+        let mut view = PoliciesView::new("orch".into(), HashMap::new());
         let event = AppEvent::Data(DataEvent::PoliciesLoaded {
             orchestrator: "orch".into(),
             policies: sample_policies(),
@@ -446,7 +515,7 @@ mod tests {
 
     #[test]
     fn filter_by_tag() {
-        let mut view = PoliciesView::new("orch".into());
+        let mut view = PoliciesView::new("orch".into(), HashMap::new());
         view.policies = LoadState::Loaded(sample_policies());
         view.filter_text = "security".into();
 
@@ -457,7 +526,7 @@ mod tests {
 
     #[test]
     fn filter_by_name() {
-        let mut view = PoliciesView::new("orch".into());
+        let mut view = PoliciesView::new("orch".into(), HashMap::new());
         view.policies = LoadState::Loaded(sample_policies());
         view.filter_text = "brain".into();
 
@@ -468,7 +537,7 @@ mod tests {
 
     #[test]
     fn slash_activates_filter() {
-        let mut view = PoliciesView::new("orch".into());
+        let mut view = PoliciesView::new("orch".into(), HashMap::new());
         view.policies = LoadState::Loaded(sample_policies());
         view.update(&make_key(KeyCode::Char('/')));
         assert!(view.filter_active);
@@ -476,7 +545,7 @@ mod tests {
 
     #[test]
     fn enter_creates_room() {
-        let mut view = PoliciesView::new("orch".into());
+        let mut view = PoliciesView::new("orch".into(), HashMap::new());
         view.policies = LoadState::Loaded(sample_policies());
         view.list_state.set_count(2);
 
@@ -493,7 +562,7 @@ mod tests {
 
     #[test]
     fn d_opens_detail_panel() {
-        let mut view = PoliciesView::new("orch".into());
+        let mut view = PoliciesView::new("orch".into(), HashMap::new());
         view.policies = LoadState::Loaded(sample_policies());
         view.list_state.set_count(2);
 
@@ -504,7 +573,7 @@ mod tests {
 
     #[test]
     fn escape_in_detail_closes_detail() {
-        let mut view = PoliciesView::new("orch".into());
+        let mut view = PoliciesView::new("orch".into(), HashMap::new());
         view.policies = LoadState::Loaded(sample_policies());
         view.list_state.set_count(2);
         view.detail_visible = true;
@@ -516,7 +585,7 @@ mod tests {
 
     #[test]
     fn enter_in_detail_creates_room() {
-        let mut view = PoliciesView::new("orch".into());
+        let mut view = PoliciesView::new("orch".into(), HashMap::new());
         view.policies = LoadState::Loaded(sample_policies());
         view.list_state.set_count(2);
         view.detail_visible = true;
@@ -535,7 +604,7 @@ mod tests {
 
     #[test]
     fn navigation_works_in_detail_mode() {
-        let mut view = PoliciesView::new("orch".into());
+        let mut view = PoliciesView::new("orch".into(), HashMap::new());
         view.policies = LoadState::Loaded(sample_policies());
         view.list_state.set_count(2);
         view.detail_visible = true;
@@ -548,14 +617,14 @@ mod tests {
 
     #[test]
     fn escape_pops() {
-        let mut view = PoliciesView::new("orch".into());
+        let mut view = PoliciesView::new("orch".into(), HashMap::new());
         let action = view.update(&make_key(KeyCode::Esc));
         assert_eq!(action, Some(ViewAction::Pop));
     }
 
     #[test]
     fn fetch_error_transitions_to_error_state() {
-        let mut view = PoliciesView::new("orch".into());
+        let mut view = PoliciesView::new("orch".into(), HashMap::new());
         view.policies = LoadState::Loading;
 
         let event = AppEvent::Data(DataEvent::FetchError {
@@ -565,5 +634,44 @@ mod tests {
         let action = view.update(&event);
         assert!(action.is_none());
         assert!(matches!(view.policies, LoadState::Error(ref e) if e.contains("empty token")));
+    }
+
+    fn local_policy() -> PolicyConfig {
+        PolicyConfig {
+            agents: Some(vec!["a".into(), "b".into()]),
+            roles: None,
+            max_rounds: 3,
+            effort: 0.7,
+            sla: None,
+            capabilities: None,
+            tags: None,
+            mode: Default::default(),
+        }
+    }
+
+    #[test]
+    fn new_sorts_local_policies() {
+        let mut local = HashMap::new();
+        local.insert("zeta".to_string(), local_policy());
+        local.insert("alpha".to_string(), local_policy());
+        let v = PoliciesView::new("orch".into(), local);
+        assert_eq!(v.local_policies[0].0, "alpha");
+        assert_eq!(v.local_policies[1].0, "zeta");
+    }
+
+    #[test]
+    fn draw_with_local_section_does_not_panic() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut local = HashMap::new();
+        local.insert("epic".to_string(), local_policy());
+        let mut view = PoliciesView::new("orch".into(), local);
+        view.policies = LoadState::Loaded(vec![]);
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| view.draw(frame, frame.area()))
+            .unwrap();
     }
 }
