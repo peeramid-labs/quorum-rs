@@ -598,11 +598,15 @@ pub fn resolve_agent_names(agent_name_spec: &str, config: &AgentFleetConfig) -> 
     }
 }
 
-/// Expand `${VAR_NAME}` references in a string with environment variable values.
-/// Returns the raw string unchanged if it doesn't contain `${...}`.
+/// Resolve a config secret reference to its value. Supports two schemes:
+/// - `${VAR_NAME}` — read from the named environment variable.
+/// - `file:<path>` — read (and trim) from a file on disk. `quorum redeem`
+///   persists the operator bearer to `~/.nsed/operator.token`, so onboarding
+///   can reference it directly without exporting an env var.
 ///
-/// `field` names the config field being resolved (e.g. `"api_key"`,
-/// `"bearer_token"`) so the warning log points to the correct location.
+/// Any other value is returned unchanged (a literal). `field` names the config
+/// field being resolved (e.g. `"api_key"`, `"token"`) so warnings point to the
+/// right location.
 pub fn resolve_env_token(field: &str, raw: &str) -> String {
     if let Some(rest) = raw.strip_prefix("${") {
         if let Some(var_name) = rest.strip_suffix('}') {
@@ -615,6 +619,20 @@ pub fn resolve_env_token(field: &str, raw: &str) -> String {
                 String::new()
             });
         }
+    }
+    if let Some(path) = raw.strip_prefix("file:") {
+        return std::fs::read_to_string(path)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "Failed to read {} from file {} ({}) (referenced in {})",
+                    field,
+                    path,
+                    e,
+                    field,
+                );
+                String::new()
+            });
     }
     raw.to_string()
 }
@@ -1302,6 +1320,25 @@ agents:
     #[test]
     fn test_resolve_env_token_empty_braces() {
         assert_eq!(resolve_env_token("test", "${}"), "");
+    }
+
+    #[test]
+    fn test_resolve_env_token_file_scheme_reads_and_trims() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operator.token");
+        std::fs::write(&path, "  bearer-xyz\n").unwrap();
+        assert_eq!(
+            resolve_env_token("token", &format!("file:{}", path.display())),
+            "bearer-xyz"
+        );
+    }
+
+    #[test]
+    fn test_resolve_env_token_file_missing_is_empty() {
+        assert_eq!(
+            resolve_env_token("token", "file:/no/such/operator.token"),
+            ""
+        );
     }
 
     // ─── derive_orch_id ─────────────────────────────────────────────────

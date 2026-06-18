@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use inquire::{Confirm, MultiSelect, Select, Text};
+use inquire::{Confirm, Select, Text};
 
 use super::ask;
 use super::presets::{AGENT_PRESETS, AgentSlot, is_tested_model};
@@ -530,6 +530,69 @@ fn split_paths(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Suggest a default agent name from a template, de-duplicated against names
+/// already in use (lower-cased; numeric suffix on clash).
+fn suggest_agent_name(template: Option<&str>, used: &std::collections::HashSet<String>) -> String {
+    let base = template
+        .map(|t| t.to_ascii_lowercase())
+        .unwrap_or_else(|| "agent".to_string());
+    if !used.contains(&base) {
+        return base;
+    }
+    let mut i = 2;
+    loop {
+        let candidate = format!("{base}-{i}");
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+        i += 1;
+    }
+}
+
+/// Validate an agent name: non-empty, ASCII alphanumeric + `-` `_` `.`.
+/// Returns the trimmed name when valid.
+fn sanitize_agent_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+/// Per-agent default writable memories directory (relative to the workspace).
+fn default_memories_dir(name: &str) -> String {
+    format!("./.nsed/memories/{name}")
+}
+
+/// Starter content for an agent-maintained `memories.md`.
+fn memories_starter(name: &str) -> String {
+    format!(
+        "# Memories — {name}\n\n\
+         Durable notes this agent maintains across deliberations. The agent may\n\
+         append facts, decisions, and context it wants to recall next time.\n\
+         Keep entries concise; prune what's stale.\n"
+    )
+}
+
+/// Create `<dir>/memories.md` with starter content. Returns `Ok(true)` when a
+/// new file was written, `Ok(false)` when one already existed (left untouched).
+fn seed_memories_md(dir: &std::path::Path, name: &str) -> std::io::Result<bool> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join("memories.md");
+    if path.exists() {
+        return Ok(false);
+    }
+    std::fs::write(&path, memories_starter(name))?;
+    Ok(true)
+}
+
 pub(super) fn wizard_agents(
     providers: &[Provider],
     exec_tools: &[DetectedTool],
@@ -538,46 +601,68 @@ pub(super) fn wizard_agents(
     let rc = brand::render_config();
 
     let model_options = build_model_options(providers);
-
-    // Build described persona options grouped by ensemble.
-    let options = build_persona_options();
-    // Default: select the first 3 (General ensemble: DEFAULT, REASON, CREATE)
-    let defaults: Vec<usize> = (0..3.min(AGENT_PRESETS.len())).collect();
-    let Some(selected) = ask(MultiSelect::new("Select agent personas:", options.clone())
-        .with_default(&defaults)
-        .with_help_message("Space = toggle, Enter = confirm  ·  ✓ = integration-tested model")
-        .with_render_config(rc)
-        .prompt())?
-    else {
-        return Ok(None);
-    };
-
-    // Map selected display strings back to preset names.
-    let selected_names = resolve_selected_names(&selected, &options);
-
-    if selected_names.is_empty() {
-        brand::warn("No agents selected — using DEFAULT.");
+    if model_options.is_empty() {
+        brand::warn("No models discovered — using a single DEFAULT agent.");
         if let Some(slot) = build_fallback_agent(providers) {
-            if slot.model_name.is_empty() {
-                brand::warn(
-                    "No models discovered — set model_name in config/agent.yml after init.",
-                );
-            }
+            brand::warn("Set model_name in config/agent.yml after init.");
             return Ok(Some(vec![slot]));
         }
         brand::warn("No providers configured — cannot create fallback agent.");
         return Ok(Some(Vec::new()));
     }
-
-    // For each agent, pick a model (provider follows automatically)
     let display_options: Vec<String> = model_options.iter().map(|(d, ..)| d.clone()).collect();
-    let mut agents = Vec::new();
-    for (i, name) in selected_names.iter().enumerate() {
+
+    // Personas are starting templates: every agent picks one, then gets its
+    // own name, capability tags, and file access. Loop to add as many as you
+    // want — deliberation wants 2+ agents, ideally with diverse models.
+    let template_options = build_persona_options();
+
+    let mut agents: Vec<AgentSlot> = Vec::new();
+    let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        let n = agents.len() + 1;
+
+        // 1. Template (persona seed: system prompt + default tags)
+        let Some(tmpl) = ask(Select::new(
+            &format!("Agent {n} — start from template:"),
+            template_options.clone(),
+        )
+        .with_help_message("Rename and retag it below — the template is just a starting point.")
+        .with_render_config(rc)
+        .prompt())?
+        else {
+            return Ok(None);
+        };
+        let template_name = resolve_selected_names(&[tmpl], &template_options)
+            .into_iter()
+            .next();
+
+        // 2. Name (unique)
+        let default_name = suggest_agent_name(template_name.as_deref(), &used_names);
+        let name = loop {
+            let Some(raw) = ask(Text::new(&format!("Agent {n} — name:"))
+                .with_default(&default_name)
+                .with_help_message("Unique. ASCII letters, digits, -, _, .")
+                .with_render_config(rc)
+                .prompt())?
+            else {
+                return Ok(None);
+            };
+            match sanitize_agent_name(&raw) {
+                None => brand::warn("Invalid name — ASCII letters, digits, -, _, . only."),
+                Some(valid) if used_names.contains(&valid) => {
+                    brand::warn(&format!("'{valid}' already used — pick another."))
+                }
+                Some(valid) => break valid,
+            }
+        };
+
+        // 3. Model (provider follows automatically)
         let Some(choice) = ask(Select::new(
             &format!("Model for {name}:"),
             display_options.clone(),
         )
-        .with_starting_cursor(i % model_options.len())
+        .with_starting_cursor((n - 1) % model_options.len())
         .with_help_message("✓ = integration-tested  ·  prices: input/output $/Mtok")
         .with_render_config(rc)
         .prompt())?
@@ -585,9 +670,10 @@ pub(super) fn wizard_agents(
             return Ok(None);
         };
 
-        // Find the matching entry
-        // TODO(slop): `.unwrap()` / `.expect()` outside tests — propagate the error with `?` or handle it
-        let entry = model_options.iter().find(|(d, ..)| *d == choice).unwrap();
+        let Some(entry) = model_options.iter().find(|(d, ..)| *d == choice) else {
+            brand::warn("Internal error: model choice not found.");
+            return Ok(None);
+        };
         let provider_id = entry.1.clone();
         let mut model_name = entry.2.clone();
         let input_price = entry.3;
@@ -611,142 +697,162 @@ pub(super) fn wizard_agents(
             };
         }
 
-        let exec_command = if let Some(p) = providers
+        let provider_type = providers
             .iter()
-            .find(|p| p.id == provider_id && p.provider_type == "exec")
-        {
-            if p.id == "claude_cli" {
-                // Claude CLI provider — pick model + optional
-                // context dirs/files, then assemble the exec
-                // command. Operators wanting the rich `claude:`
-                // YAML block (subagents, per-tool permissions)
-                // edit the file by hand after init.
-                let model_opts = vec!["sonnet", "opus", "haiku"];
-                let Some(model) = ask(Select::new("Claude model:", model_opts)
-                    .with_help_message(
-                        "haiku = cheap+fast, sonnet = balanced (default), opus = strongest",
-                    )
-                    .with_render_config(rc)
-                    .prompt())?
+            .find(|p| p.id == provider_id)
+            .map(|p| p.provider_type.as_str())
+            .unwrap_or("openai");
+
+        // apply_preset keys on the slot name, so construct with the TEMPLATE
+        // name to inherit its persona + tags, then rename to the user's choice.
+        let mut slot = AgentSlot::new(
+            template_name.clone().unwrap_or_else(|| name.clone()),
+            provider_id.clone(),
+            model_name,
+            input_price,
+            output_price,
+        );
+        slot.apply_preset();
+        slot.name = name.clone();
+
+        // 4. Capability tags (prefilled from template, editable). Rooms and
+        //    policies schedule agents by matching these.
+        let tag_default = slot.capability_tags.join(", ");
+        let Some(tags_str) = ask(Text::new(&format!("Capability tags for {name}:"))
+            .with_default(&tag_default)
+            .with_help_message(
+                "Comma-separated. Rooms/policies target these, e.g. general, planning",
+            )
+            .with_render_config(rc)
+            .prompt())?
+        else {
+            return Ok(None);
+        };
+        slot.capability_tags = split_paths(&tags_str);
+
+        // 5. File access — modelled to each provider's real mechanism.
+        match provider_type {
+            "exec" => {
+                let default_cmd = if exec_tools.iter().any(|t| t.name == "python3") {
+                    "python3 my_agent.py"
+                } else {
+                    "bash agent.sh"
+                };
+                let parts: Vec<String> = loop {
+                    let Some(cmd_str) = ask(Text::new(&format!("Exec command for {name}:"))
+                        .with_default(default_cmd)
+                        .with_help_message("Shell-style command, e.g. \"python3 agent.py\"")
+                        .with_render_config(rc)
+                        .prompt())?
+                    else {
+                        return Ok(None);
+                    };
+                    match split_shell_command(&cmd_str) {
+                        Ok(p) if !p.is_empty() => break p,
+                        Ok(_) => brand::warn("Command cannot be empty — enter a runnable command."),
+                        Err(e) => brand::warn(&format!("Invalid command — {e}")),
+                    }
+                };
+                slot.exec_command = Some(parts);
+
+                let Some(wd) = ask(Text::new(&format!(
+                    "Working directory for {name} (optional):"
+                ))
+                .with_default("")
+                .with_help_message("Subprocess runs here; also its read/write root.")
+                .with_render_config(rc)
+                .prompt())?
                 else {
                     return Ok(None);
                 };
-
-                let Some(ctx_paths_str) = ask(Text::new(&format!(
-                    "Context paths for {name} (comma-separated, optional):"
+                slot.write_dirs = split_paths(&wd);
+            }
+            "claude" => {
+                // Read context → context_files: inlined, read-only, per-file.
+                let Some(ctx) = ask(Text::new(&format!(
+                    "Context files for {name} — read-only, inlined (comma-separated, optional):"
                 ))
                 .with_default("")
                 .with_help_message(
-                    "Files or dirs claude reads as additional context (--add-dir). \
-                     Example: ./docs, ./README.md",
+                    "Read as context, never writable. Example: ./README.md, ./docs/spec.md",
                 )
                 .with_render_config(rc)
                 .prompt())?
                 else {
                     return Ok(None);
                 };
-                let context_paths: Vec<String> = ctx_paths_str
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+                slot.read_paths = split_paths(&ctx);
 
-                let mut parts: Vec<String> = vec![
-                    "claude".into(),
-                    "-p".into(),
-                    "--output-format".into(),
-                    "json".into(),
-                    "--model".into(),
-                    model.into(),
-                    "--verbose".into(),
-                ];
-                for path in &context_paths {
-                    parts.push("--add-dir".into());
-                    parts.push(path.clone());
-                }
-                Some(parts)
-            } else {
-                // Generic exec provider — prompt for command
-                let default_cmd = if exec_tools.iter().any(|t| t.name == "python3") {
-                    "python3 my_agent.py"
-                } else {
-                    "bash agent.sh"
+                // Writable scope → add_dirs + writable:true. Each agent manages
+                // its OWN memories dir here (default suggested per name).
+                let mem_default = default_memories_dir(&name);
+                let Some(wr) = ask(Text::new(&format!(
+                    "Writable dirs for {name} — agent creates/edits files here (comma-separated):"
+                ))
+                .with_default(&mem_default)
+                .with_help_message(
+                    "Each agent manages its own memories here. Blank = read-only agent.",
+                )
+                .with_render_config(rc)
+                .prompt())?
+                else {
+                    return Ok(None);
                 };
-                // Re-prompt locally until the operator supplies a
-                // non-empty, properly-quoted command. Previous
-                // fallback returned a phony `["echo", "hello"]`
-                // which silently shipped a useless agent.
-                let parts: Vec<String> = loop {
-                    let Some(cmd_str) = ask(Text::new(&format!("Exec command for {name}:"))
-                        .with_default(default_cmd)
-                        .with_help_message(
-                            "Shell-style command, e.g. \"python3 agent.py\" or \"claude -p --output-format json\"",
-                        )
-                        .with_render_config(rc)
-                        .prompt())?
+                slot.write_dirs = split_paths(&wr);
+
+                // Offer to seed a starter memories.md in each writable dir.
+                for dir in &slot.write_dirs {
+                    let Some(seed) =
+                        ask(Confirm::new(&format!("Seed {dir}/memories.md for {name}?"))
+                            .with_default(true)
+                            .with_render_config(rc)
+                            .prompt())?
                     else {
                         return Ok(None);
                     };
-                    let parts = match split_shell_command(&cmd_str) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            brand::warn(&format!("Invalid command — {e}"));
-                            continue;
+                    if seed {
+                        match seed_memories_md(std::path::Path::new(dir), &name) {
+                            Ok(true) => brand::success(&format!("Wrote {dir}/memories.md")),
+                            Ok(false) => {
+                                brand::info(&format!("{dir}/memories.md exists — left as-is"))
+                            }
+                            Err(e) => {
+                                brand::warn(&format!("Could not seed {dir}/memories.md: {e}"))
+                            }
                         }
-                    };
-                    if parts.is_empty() {
-                        brand::warn("Command cannot be empty — please enter a runnable command.");
-                        continue;
                     }
-                    break parts;
-                };
-                Some(parts)
+                }
             }
-        } else {
-            None
-        };
-
-        let mut slot = AgentSlot::new(
-            name.clone(),
-            provider_id,
-            model_name,
-            input_price,
-            output_price,
-        );
-        slot.exec_command = exec_command;
-        slot.apply_preset();
-
-        // claude_cli already collected context dirs via --add-dir above.
-        if slot.provider_id != "claude_cli" {
-            let Some(read_str) = ask(Text::new(&format!(
-                "Read access for {name} — files/dirs for context (comma-separated, optional):"
-            ))
-            .with_default("")
-            .with_help_message("Granted to the agent's read tool. Example: ./docs, ./src/api.rs")
-            .with_render_config(rc)
-            .prompt())?
-            else {
-                return Ok(None);
-            };
-            slot.read_paths = split_paths(&read_str);
-
-            let Some(write_str) = ask(Text::new(&format!(
-                "Write access for {name} — directories to manage (comma-separated, optional):"
-            ))
-            .with_default("")
-            .with_help_message(
-                "Claude agents get write tools; exec agents use the first as working_dir; \
-                 native LLMs have no write tool (rendered as a note).",
-            )
-            .with_render_config(rc)
-            .prompt())?
-            else {
-                return Ok(None);
-            };
-            slot.write_dirs = split_paths(&write_str);
+            _ => {
+                // Native LLM: read roots via builtin_tools read_file; no write tool.
+                let Some(rd) = ask(Text::new(&format!(
+                    "Read access for {name} — files/dirs for context (comma-separated, optional):"
+                ))
+                .with_default("")
+                .with_help_message("Granted to the agent's read_file tool. Example: ./docs, ./src")
+                .with_render_config(rc)
+                .prompt())?
+                else {
+                    return Ok(None);
+                };
+                slot.read_paths = split_paths(&rd);
+            }
         }
 
+        used_names.insert(name);
         agents.push(slot);
+
+        let Some(more) = ask(Confirm::new("Add another agent?")
+            .with_default(agents.len() < 2)
+            .with_help_message("Deliberation needs 2+ agents; 3+ with diverse models is best.")
+            .with_render_config(rc)
+            .prompt())?
+        else {
+            return Ok(None);
+        };
+        if !more {
+            break;
+        }
     }
 
     if check_model_diversity(&agents) {
@@ -761,7 +867,57 @@ pub(super) fn wizard_agents(
 
 #[cfg(test)]
 mod tests {
-    use super::{split_paths, split_shell_command};
+    use super::{
+        default_memories_dir, memories_starter, sanitize_agent_name, seed_memories_md, split_paths,
+        split_shell_command, suggest_agent_name,
+    };
+    use std::collections::HashSet;
+
+    #[test]
+    fn suggest_agent_name_lowercases_template_and_dedupes() {
+        let mut used = HashSet::new();
+        assert_eq!(suggest_agent_name(Some("DEFAULT"), &used), "default");
+        used.insert("default".to_string());
+        assert_eq!(suggest_agent_name(Some("DEFAULT"), &used), "default-2");
+        used.insert("default-2".to_string());
+        assert_eq!(suggest_agent_name(Some("DEFAULT"), &used), "default-3");
+        assert_eq!(suggest_agent_name(None, &used), "agent");
+    }
+
+    #[test]
+    fn sanitize_agent_name_accepts_valid_rejects_bad() {
+        assert_eq!(
+            sanitize_agent_name("  planner_1.v2-x "),
+            Some("planner_1.v2-x".to_string())
+        );
+        assert_eq!(sanitize_agent_name(""), None);
+        assert_eq!(sanitize_agent_name("   "), None);
+        assert_eq!(sanitize_agent_name("bad name"), None);
+        assert_eq!(sanitize_agent_name("has:colon"), None);
+    }
+
+    #[test]
+    fn default_memories_dir_is_per_agent() {
+        assert_eq!(default_memories_dir("planner"), "./.nsed/memories/planner");
+        assert_eq!(default_memories_dir("scribe"), "./.nsed/memories/scribe");
+    }
+
+    #[test]
+    fn seed_memories_md_writes_then_preserves() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("planner");
+        // first call writes a new file
+        assert!(seed_memories_md(&target, "planner").unwrap());
+        let path = target.join("memories.md");
+        assert!(path.exists());
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("# Memories — planner"));
+        assert_eq!(body, memories_starter("planner"));
+        // second call leaves the existing file untouched
+        std::fs::write(&path, "user edits").unwrap();
+        assert!(!seed_memories_md(&target, "planner").unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "user edits");
+    }
 
     #[test]
     fn split_paths_trims_and_drops_empties() {

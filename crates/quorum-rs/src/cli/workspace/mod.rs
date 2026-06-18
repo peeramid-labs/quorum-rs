@@ -362,6 +362,19 @@ pub enum ConfigError {
     ConfigFree(String),
 }
 
+impl ConfigError {
+    /// True for provisioning shortfalls — a policy that doesn't yet have
+    /// enough agents to start. These are real, fixable states a management
+    /// view should display (as a red fill indicator) rather than reject at
+    /// load time, unlike structural errors (parse, unknown refs).
+    pub fn is_provisioning(&self) -> bool {
+        matches!(
+            self,
+            ConfigError::TooFewAgents { .. } | ConfigError::TooFewRoleAgents { .. }
+        )
+    }
+}
+
 /// Human-readable name for a `PolicyMode` used in validation error
 /// messages. Kept as a simple free function rather than an `impl
 /// Display` on the enum to avoid pulling the whole `PolicyMode` import
@@ -431,6 +444,25 @@ impl WorkspaceConfig {
             Self::load(path)
         } else {
             crate::cli::endpoint::remote_workspace().map_err(ConfigError::ConfigFree)
+        }
+    }
+
+    /// Load for management views (the TUI). Same as
+    /// [`Self::load_or_remote_default`], but treats provisioning shortfalls
+    /// (too-few-agents) as non-fatal: an under-provisioned policy is a real
+    /// state the UI surfaces as a red fill indicator, not a reason to refuse
+    /// to open. Structural errors (parse, unknown refs, missing address) still
+    /// fail.
+    pub fn load_or_remote_default_for_view(path: &Path) -> Result<Self, ConfigError> {
+        if !path.exists() {
+            return crate::cli::endpoint::remote_workspace().map_err(ConfigError::ConfigFree);
+        }
+        let contents = std::fs::read_to_string(path)?;
+        let config: Self = serde_yaml::from_str(&contents)?;
+        match config.validate() {
+            Ok(()) => Ok(config),
+            Err(e) if e.is_provisioning() => Ok(config),
+            Err(e) => Err(e),
         }
     }
 

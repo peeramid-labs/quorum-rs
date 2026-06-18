@@ -7700,26 +7700,39 @@ fn render_agent_access_native_write_emits_note_not_tool() {
 }
 
 #[test]
-fn render_agent_access_claude_read_only_emits_add_dirs_no_writable() {
+fn render_agent_access_claude_read_only_emits_context_files_no_writable() {
+    // Read paths → context_files (inlined, read-only). NOT add_dirs, so the
+    // write tools can never reach them; no writable flag.
     let cfg = render_agent_config(
         "http://nsed:8080",
         &provider_of_type("claude"),
         &[access_agent(&["docs/"], &[])],
     );
     assert!(cfg.contains("    claude:"));
-    assert!(cfg.contains("      add_dirs: [\"docs/\"]"));
+    assert!(cfg.contains("      context_files: [\"docs/\"]"));
+    assert!(
+        !cfg.contains("add_dirs:"),
+        "read context must not be writable scope, got:\n{cfg}"
+    );
     assert!(!cfg.contains("writable: true"));
 }
 
 #[test]
-fn render_agent_access_claude_write_emits_writable_and_merges_dirs() {
+fn render_agent_access_claude_write_separates_context_from_add_dirs() {
+    // Read → context_files (RO); write dirs → add_dirs + writable. The two
+    // stay separate so the read path is never in the writable scope.
     let cfg = render_agent_config(
         "http://nsed:8080",
         &provider_of_type("claude"),
         &[access_agent(&["docs/"], &["./src"])],
     );
-    assert!(cfg.contains("      add_dirs: [\"docs/\", \"./src\"]"));
+    assert!(cfg.contains("      context_files: [\"docs/\"]"));
+    assert!(cfg.contains("      add_dirs: [\"./src\"]"));
     assert!(cfg.contains("      writable: true"));
+    assert!(
+        !cfg.contains("add_dirs: [\"docs/\""),
+        "read path must not leak into add_dirs, got:\n{cfg}"
+    );
 }
 
 #[test]

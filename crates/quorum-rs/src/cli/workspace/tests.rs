@@ -1166,6 +1166,89 @@ rooms:
     }
 
     #[test]
+    fn for_view_tolerates_underprovisioned_policy() {
+        // A deliberation policy needs 2 agents; this has 1. Strict load fails,
+        // but the TUI loader opens anyway so the UI can show the shortfall.
+        let yaml = r#"
+policies:
+  default:
+    agents: ["solo"]
+    max_rounds: 3
+orchestrators:
+  primary:
+    mode: remote
+    address: "https://api.peeramid.xyz"
+    token: "${TOK}"
+rooms:
+  demo:
+    policy: default
+    orchestrator: primary
+"#;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+
+        let strict = WorkspaceConfig::load(tmp.path()).unwrap_err();
+        assert!(
+            strict.is_provisioning(),
+            "expected provisioning error, got: {strict}"
+        );
+
+        let config = WorkspaceConfig::load_or_remote_default_for_view(tmp.path()).unwrap();
+        assert!(config.policies.contains_key("default"));
+    }
+
+    #[test]
+    fn for_view_still_rejects_structural_errors() {
+        // Unknown policy reference is structural, not provisioning — the view
+        // loader must still reject it.
+        let yaml = r#"
+policies:
+  p:
+    agents: ["a", "b"]
+orchestrators:
+  primary:
+    mode: embedded
+rooms:
+  r:
+    policy: does_not_exist
+    orchestrator: primary
+"#;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+        let err = WorkspaceConfig::load_or_remote_default_for_view(tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::UnknownPolicy { .. }),
+            "expected UnknownPolicy, got: {err}"
+        );
+    }
+
+    #[test]
+    fn is_provisioning_classifies_agent_shortfalls() {
+        assert!(
+            ConfigError::TooFewAgents {
+                policy: "p".into(),
+                count: 1,
+                min: 2,
+                mode: "deliberation",
+            }
+            .is_provisioning()
+        );
+        assert!(
+            ConfigError::TooFewRoleAgents {
+                policy: "p".into(),
+                count: 1,
+                min: 2,
+                mode: "deliberation",
+            }
+            .is_provisioning()
+        );
+        assert!(
+            !ConfigError::NoPolicies.is_provisioning(),
+            "structural errors must not be classed as provisioning"
+        );
+    }
+
+    #[test]
     fn load_invalid_yaml_errors() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(b"not: [valid: yaml: {{").unwrap();
