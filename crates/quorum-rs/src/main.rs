@@ -182,9 +182,12 @@ enum Commands {
 
         /// Invite code (JWT) for single-command onboarding. When set,
         /// `init` first redeems the code — writing creds/token/endpoint
-        /// like `quorum redeem` — then scaffolds the matching config:
-        /// `agent.yml` for an agent code, `nsed.yaml` for an operator
-        /// code. Skips the interactive wizard.
+        /// like `quorum redeem` — then scaffolds BOTH configs in one go:
+        /// `nsed.yaml` (for `quorum run`/`status`/`tui`) AND `agent.yml`
+        /// (for `quorum serve`), so there's no need to think about
+        /// `--agent-fleet`. On a TTY the agent personas/providers are
+        /// gathered interactively; `--non-interactive` (or no TTY) writes
+        /// a static fleet template instead.
         #[arg(long, value_name = "CODE")]
         invite: Option<String>,
 
@@ -490,17 +493,17 @@ async fn main() -> ExitCode {
                 } else {
                     std::path::PathBuf::from("agent.yml")
                 };
-                return commands::init::run_onboard(
+                return commands::init::run_onboard(commands::init::OnboardSpec {
                     code,
                     orchestrator_url,
-                    out_dir.as_deref(),
-                    &client_target,
-                    &fleet_target,
+                    out_dir: out_dir.as_deref(),
+                    client_target: &client_target,
+                    fleet_target: &fleet_target,
                     room,
-                    token_env,
                     agents,
+                    non_interactive,
                     force,
-                )
+                })
                 .await;
             }
             // Decide between the interactive wizard and the
@@ -541,10 +544,12 @@ async fn main() -> ExitCode {
             } else {
                 commands::init::run(
                     &cli.config_path(),
-                    orchestrator_url,
-                    room,
-                    token_env,
-                    agents,
+                    &commands::init::WorkspaceSpec {
+                        orchestrator_url,
+                        room,
+                        token_ref: &format!("${{{token_env}}}"),
+                        agents,
+                    },
                     force,
                 )
             }

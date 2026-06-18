@@ -10,7 +10,7 @@
 //! resulting file immediately.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// Default orchestrator URL when `--orchestrator-url` is omitted.
@@ -23,22 +23,30 @@ pub const DEFAULT_ROOM: &str = "demo";
 /// bearer token when `--token-env` is omitted.
 pub const DEFAULT_TOKEN_ENV: &str = "QUORUM_DEMO_TOKEN";
 
-/// Build the workspace yaml body. Pure string-templating — no
-/// filesystem side effects — so tests can pin the exact output.
+/// Inputs for the generated `nsed.yaml` workspace template. Named fields so the
+/// several same-typed string args can't be transposed by callers.
+pub struct WorkspaceSpec<'a> {
+    pub orchestrator_url: &'a str,
+    pub room: &'a str,
+    /// Token reference embedded verbatim: `${ENV}` (generic one-shot),
+    /// `file:<path>` (invite onboarding — points at the redeemed
+    /// `operator.token`), or a literal. Resolved at runtime by
+    /// [`crate::config::resolve_env_token`].
+    pub token_ref: &'a str,
+    pub agents: &'a [String],
+}
+
+/// Build the workspace yaml body. Pure string-templating — no filesystem side
+/// effects — so tests can pin the exact output.
 ///
-/// `agents` is the comma/space-separated list of agent names that the
-/// `default` policy will dispatch to. The orchestrator rejects a
-/// policy with neither `agents` nor `roles` set, so callers that
-/// don't yet know which agents to dispatch to can either supply an
-/// empty `agents` list here (and edit the file before running) or
-/// keep the placeholder agent — `quorum run` will surface a clear
-/// error in either case.
-pub fn render_workspace_yaml(
-    orchestrator_url: &str,
-    room: &str,
-    token_env: &str,
-    agents: &[String],
-) -> String {
+/// An empty `agents` list emits an editable `agents: []` placeholder; the
+/// orchestrator rejects a policy with neither `agents` nor `roles`, so `quorum
+/// run` surfaces a clear error until the user fills it in.
+pub fn render_workspace(spec: &WorkspaceSpec<'_>) -> String {
+    let orchestrator_url = spec.orchestrator_url;
+    let room = spec.room;
+    let token_ref = spec.token_ref;
+    let agents = spec.agents;
     let agents_yaml = if agents.is_empty() {
         // Emit a commented-out placeholder so the user sees where to
         // put their agent names. Leave `agents:` empty so the file
@@ -61,17 +69,17 @@ pub fn render_workspace_yaml(
 # one room. Edit freely — the file format matches the schema documented
 # at https://docs.rs/quorum-cli (WorkspaceConfig).
 #
-# To run a deliberation:
-#     export {token_env}=<your bearer token>
+# To run a deliberation (export the bearer first if `token` above is an
+# ${{ENV}} reference; a file: reference needs no export):
 #     quorum run --room {room} "<your topic>"
 
 orchestrators:
   primary:
     mode: remote
     address: "{orchestrator_url}"
-    # Bearer token resolves from the env var at runtime. Never commit
-    # the raw secret here.
-    token: "${{{token_env}}}"
+    # Bearer token resolved at runtime — an env var (${{VAR}}) or a
+    # file (file:/path). Never commit the raw secret here.
+    token: "{token_ref}"
 
 policies:
   default:
@@ -89,16 +97,11 @@ default_room: {room}
 }
 
 /// Drop a `nsed.yaml` (or whatever path was passed via `--config`) at
-/// `target`. Fails (with a non-zero `ExitCode`) if the file already
-/// exists and `force` is false.
-pub fn run(
-    target: &Path,
-    orchestrator_url: &str,
-    room: &str,
-    token_env: &str,
-    agents: &[String],
-    force: bool,
-) -> ExitCode {
+/// `target` from `spec`. Fails (non-zero `ExitCode`) if the file already
+/// exists and `force` is false. The "next steps" hint includes an `export`
+/// line only when the token is an `${ENV}` reference (a `file:` ref needs no
+/// export).
+pub fn run(target: &Path, spec: &WorkspaceSpec<'_>, force: bool) -> ExitCode {
     if target.exists() && !force {
         eprintln!(
             "error: {} already exists. Re-run with --force to overwrite.",
@@ -107,15 +110,14 @@ pub fn run(
         return ExitCode::FAILURE;
     }
 
-    let body = render_workspace_yaml(orchestrator_url, room, token_env, agents);
+    let body = render_workspace(spec);
 
-    if let Some(parent) = target.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                eprintln!("error: failed to create parent directory {parent:?}: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
+    if let Some(parent) = target.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        eprintln!("error: failed to create parent directory {parent:?}: {e}");
+        return ExitCode::FAILURE;
     }
 
     if let Err(e) = fs::write(target, &body) {
@@ -123,14 +125,32 @@ pub fn run(
         return ExitCode::FAILURE;
     }
 
+    let export_hint = spec
+        .token_ref
+        .strip_prefix("${")
+        .and_then(|s| s.strip_suffix('}'))
+        .map(|env| format!("  export {env}=<your bearer token>\n"))
+        .unwrap_or_default();
     println!(
-        "Wrote workspace config to {}\n\nNext steps:\n  export {}=<your bearer token>\n  quorum run --room {} \"<your topic>\"",
+        "Wrote workspace config to {}\n\nNext steps:\n{export_hint}  quorum run --room {} \"<your topic>\"",
         target.display(),
-        token_env,
-        room,
+        spec.room,
     );
 
     ExitCode::SUCCESS
+}
+
+/// Build the `file:<path>` token reference for an onboarded workspace, pointing
+/// at the `operator.token` that `quorum redeem` just wrote into `out_dir`
+/// (default `~/.nsed`). Absolute, so the workspace authenticates from any cwd.
+fn token_ref_for_onboard(out_dir: Option<&Path>) -> String {
+    let dir = out_dir
+        .map(Path::to_path_buf)
+        .or_else(crate::cli::endpoint::nsed_dir)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let path = dir.join("operator.token");
+    let abs = std::fs::canonicalize(&path).unwrap_or(path);
+    format!("file:{}", abs.display())
 }
 
 /// Reject agent names that would break YAML when interpolated raw
@@ -268,51 +288,107 @@ pub fn run_agent_fleet(target: &Path, agents: &[String], force: bool) -> ExitCod
 /// `quorum redeem`'s own default so onboarding is equally resilient.
 const ONBOARD_REDEEM_MAX_ATTEMPTS: u32 = 5;
 
-/// Which workspace config `init --invite` scaffolds, chosen by the invite
-/// code's audience: an agent code onboards a worker (`agent.yml`, for `quorum
-/// serve`); anything else (operator / chat / legacy / unrecognised) onboards a
-/// client (`nsed.yaml`, for `quorum run`/`status`/`tui`).
-#[derive(Debug, PartialEq, Eq)]
-pub enum OnboardConfig {
-    Client,
-    Fleet,
+/// Write a pre-rendered fleet (`agent.yml`) body to `target`, honoring
+/// `force` and creating parent dirs. Shares the overwrite/IO contract
+/// with [`run_agent_fleet`] but takes an already-rendered body (from the
+/// interactive agent setup) instead of the static template.
+fn write_fleet_body(target: &Path, body: &str, force: bool) -> ExitCode {
+    if target.exists() && !force {
+        eprintln!(
+            "error: {} already exists. Re-run with --force to overwrite.",
+            target.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    if let Some(parent) = target.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        eprintln!("error: failed to create parent directory {parent:?}: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    if let Err(e) = fs::write(target, body) {
+        eprintln!("error: failed to write {}: {e}", target.display());
+        return ExitCode::FAILURE;
+    }
+
+    println!("Wrote agent fleet config to {}", target.display());
+    ExitCode::SUCCESS
 }
 
-/// Map an invite code to the config it should scaffold. Unknown / malformed
-/// codes fall back to `Client` — the redeem step that follows surfaces the
-/// real "invalid code" error, so we don't need to reject here.
-pub fn onboard_config_for_code(code: &str) -> OnboardConfig {
-    match crate::nats_utils::invite_audience(code)
-        .ok()
-        .flatten()
-        .as_deref()
-    {
-        Some(crate::nats_utils::AUD_AGENT_REDEEM) => OnboardConfig::Fleet,
-        _ => OnboardConfig::Client,
+/// Scaffold BOTH the workspace config (`nsed.yaml`, for `quorum
+/// run`/`status`/`tui`) and the fleet config (`agent.yml`, for `quorum
+/// serve`) after an invite redeem. The orchestrator endpoint + token are
+/// already known from the redeem, so the workspace file is templated
+/// directly — no re-prompt.
+///
+/// `interactive` gates only the `agent.yml` step: when true the agent
+/// personas / providers / file-access are gathered interactively
+/// ([`crate::init::run_agent_setup`]); when false a static fleet template
+/// is written so CI/Docker onboarding stays non-interactive.
+async fn scaffold_after_redeem(
+    client_target: &Path,
+    fleet_target: &Path,
+    spec: &WorkspaceSpec<'_>,
+    force: bool,
+    interactive: bool,
+) -> ExitCode {
+    let workspace = run(client_target, spec, force);
+    if workspace != ExitCode::SUCCESS {
+        return workspace;
+    }
+
+    if !interactive {
+        return run_agent_fleet(fleet_target, spec.agents, force);
+    }
+
+    match crate::init::run_agent_setup(spec.orchestrator_url).await {
+        Ok(Some(result)) if !result.agent_config_yaml.is_empty() => {
+            write_fleet_body(fleet_target, &result.agent_config_yaml, force)
+        }
+        // User skipped agent setup, or it produced no config — fall back to
+        // the static template so `agent.yml` always exists.
+        Ok(_) => run_agent_fleet(fleet_target, spec.agents, force),
+        Err(e) => {
+            eprintln!("error: agent setup failed: {e:#}");
+            ExitCode::FAILURE
+        }
     }
 }
 
+/// Arguments for [`run_onboard`]. A named struct so the wide CLI-dispatch call
+/// site (in `main`) reads clearly and can't transpose the path/string args.
+pub struct OnboardSpec<'a> {
+    /// Invite code (JWT) to redeem.
+    pub code: &'a str,
+    pub orchestrator_url: &'a str,
+    /// Where redeem writes creds/token/endpoint (default `~/.nsed`).
+    pub out_dir: Option<&'a Path>,
+    /// Path for the generated `nsed.yaml`.
+    pub client_target: &'a Path,
+    /// Path for the generated `agent.yml`.
+    pub fleet_target: &'a Path,
+    pub room: &'a str,
+    pub agents: &'a [String],
+    pub non_interactive: bool,
+    pub force: bool,
+}
+
 /// `quorum init --invite <code>` — single-command onboarding. Redeems the
-/// invite (writing creds/token/endpoint via the same path as `quorum redeem`),
-/// then scaffolds the matching workspace config: `agent.yml` for an agent
-/// code, `nsed.yaml` for an operator code.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_onboard(
-    code: &str,
-    orchestrator_url: &str,
-    out_dir: Option<&Path>,
-    client_target: &Path,
-    fleet_target: &Path,
-    room: &str,
-    token_env: &str,
-    agents: &[String],
-    force: bool,
-) -> ExitCode {
+/// invite (writing creds/token/endpoint via the same path as `quorum
+/// redeem`), then scaffolds BOTH `nsed.yaml` and `agent.yml` so the
+/// operator can immediately `quorum run` AND `quorum serve` without
+/// touching `--agent-fleet`. On a TTY the agent personas are gathered
+/// interactively; with `--non-interactive` (or no TTY) a static fleet
+/// template is written.
+pub async fn run_onboard(spec: OnboardSpec<'_>) -> ExitCode {
     if let Err(e) = crate::cli::commands::redeem::run(
-        code,
-        orchestrator_url,
-        out_dir,
-        force,
+        spec.code,
+        spec.orchestrator_url,
+        spec.out_dir,
+        spec.force,
         None,
         ONBOARD_REDEEM_MAX_ATTEMPTS,
     )
@@ -322,18 +398,25 @@ pub async fn run_onboard(
         return ExitCode::FAILURE;
     }
 
-    println!("\nScaffolding workspace config…\n");
-    match onboard_config_for_code(code) {
-        OnboardConfig::Fleet => run_agent_fleet(fleet_target, agents, force),
-        OnboardConfig::Client => run(
-            client_target,
-            orchestrator_url,
-            room,
-            token_env,
-            agents,
-            force,
-        ),
-    }
+    println!("\nScaffolding workspace + agent config…\n");
+    // Point the workspace at the bearer redeem just persisted, so `quorum
+    // run`/`tui` authenticate with no manual `export`.
+    let token_ref = token_ref_for_onboard(spec.out_dir);
+    let workspace = WorkspaceSpec {
+        orchestrator_url: spec.orchestrator_url,
+        room: spec.room,
+        token_ref: &token_ref,
+        agents: spec.agents,
+    };
+    let interactive = !spec.non_interactive && std::io::IsTerminal::is_terminal(&std::io::stdin());
+    scaffold_after_redeem(
+        spec.client_target,
+        spec.fleet_target,
+        &workspace,
+        spec.force,
+        interactive,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -341,35 +424,135 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// Build a JWT-shaped code whose payload carries `aud`. Signature is a
-    /// throwaway — `invite_audience` reads the audience without verifying.
-    fn code_with_aud(aud: &str) -> String {
-        use base64::Engine;
-        let payload = serde_json::json!({ "aud": aud }).to_string();
-        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
-        format!("eyJhbGciOiJFUzI1NiJ9.{b64}.sig")
+    /// Build a [`WorkspaceSpec`] for tests.
+    fn ws<'a>(
+        orchestrator_url: &'a str,
+        room: &'a str,
+        token_ref: &'a str,
+        agents: &'a [String],
+    ) -> WorkspaceSpec<'a> {
+        WorkspaceSpec {
+            orchestrator_url,
+            room,
+            token_ref,
+            agents,
+        }
     }
 
-    #[test]
-    fn onboard_config_agent_code_is_fleet() {
-        let code = code_with_aud("nsed-agent-redeem");
-        assert_eq!(onboard_config_for_code(&code), OnboardConfig::Fleet);
-    }
+    // ── --invite onboarding: scaffold BOTH nsed.yaml + agent.yml ──────
 
-    #[test]
-    fn onboard_config_operator_code_is_client() {
-        let code = code_with_aud("nsed-operator-redeem");
-        assert_eq!(onboard_config_for_code(&code), OnboardConfig::Client);
-    }
-
-    #[test]
-    fn onboard_config_unknown_or_malformed_is_client() {
-        assert_eq!(
-            onboard_config_for_code(&code_with_aud("something-else")),
-            OnboardConfig::Client
+    #[tokio::test]
+    async fn scaffold_non_interactive_writes_both_configs() {
+        let dir = tempdir().unwrap();
+        let nsed = dir.path().join("nsed.yaml");
+        let fleet = dir.path().join("agent.yml");
+        let exit = scaffold_after_redeem(
+            &nsed,
+            &fleet,
+            &ws(
+                DEFAULT_ORCHESTRATOR_URL,
+                DEFAULT_ROOM,
+                "file:/tmp/operator.token",
+                &[],
+            ),
+            false,
+            false, // non-interactive → static fleet template
+        )
+        .await;
+        assert_eq!(exit, ExitCode::SUCCESS);
+        assert!(nsed.exists(), "nsed.yaml must be written");
+        assert!(fleet.exists(), "agent.yml must be written");
+        let nsed_body = fs::read_to_string(&nsed).unwrap();
+        assert!(nsed_body.contains("orchestrators:"));
+        assert!(
+            nsed_body.contains("token: \"file:/tmp/operator.token\""),
+            "workspace must reference the redeemed token file, got:\n{nsed_body}"
         );
-        // Not JWT-shaped → invite_audience errs → defaults to Client.
-        assert_eq!(onboard_config_for_code("not-a-jwt"), OnboardConfig::Client);
+        assert!(fs::read_to_string(&fleet).unwrap().contains("providers:"));
+    }
+
+    #[tokio::test]
+    async fn scaffold_aborts_before_fleet_when_workspace_step_fails() {
+        let dir = tempdir().unwrap();
+        let nsed = dir.path().join("nsed.yaml");
+        let fleet = dir.path().join("agent.yml");
+        fs::write(&nsed, "existing").unwrap();
+        let exit = scaffold_after_redeem(
+            &nsed,
+            &fleet,
+            &ws(
+                DEFAULT_ORCHESTRATOR_URL,
+                DEFAULT_ROOM,
+                "file:/tmp/operator.token",
+                &[],
+            ),
+            false, // no force → nsed.yaml write refused
+            false,
+        )
+        .await;
+        assert_eq!(exit, ExitCode::FAILURE);
+        assert_eq!(fs::read_to_string(&nsed).unwrap(), "existing");
+        assert!(
+            !fleet.exists(),
+            "must not write agent.yml once the workspace step fails"
+        );
+    }
+
+    #[test]
+    fn render_workspace_embeds_file_token_ref_verbatim() {
+        let yaml = render_workspace(&ws(
+            "https://example.test",
+            "demo",
+            "file:/home/u/.nsed/operator.token",
+            &[],
+        ));
+        assert!(
+            yaml.contains("token: \"file:/home/u/.nsed/operator.token\""),
+            "file token ref must be embedded verbatim, got:\n{yaml}"
+        );
+        assert!(!yaml.contains("${file:"));
+    }
+
+    #[test]
+    fn render_workspace_embeds_env_token_ref() {
+        let yaml = render_workspace(&ws("https://example.test", "demo", "${MY_TOKEN}", &[]));
+        assert!(yaml.contains("token: \"${MY_TOKEN}\""));
+    }
+
+    #[test]
+    fn token_ref_for_onboard_points_at_operator_token_in_out_dir() {
+        let dir = tempdir().unwrap();
+        // canonicalize requires the file to exist (redeem writes it first).
+        fs::write(dir.path().join("operator.token"), "bearer\n").unwrap();
+        let token_ref = token_ref_for_onboard(Some(dir.path()));
+        assert!(token_ref.starts_with("file:"));
+        assert!(
+            token_ref.ends_with("operator.token"),
+            "must point at operator.token, got: {token_ref}"
+        );
+        // The referenced path resolves to the real bearer.
+        let path = token_ref.strip_prefix("file:").unwrap();
+        assert_eq!(
+            crate::config::resolve_env_token("token", &format!("file:{path}")),
+            "bearer"
+        );
+    }
+
+    #[test]
+    fn write_fleet_body_writes_creates_parents_and_respects_force() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("nested/agent.yml");
+        assert_eq!(
+            write_fleet_body(&target, "providers: {}\n", false),
+            ExitCode::SUCCESS
+        );
+        assert!(target.exists());
+        // refuse overwrite without force
+        assert_eq!(write_fleet_body(&target, "new", false), ExitCode::FAILURE);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "providers: {}\n");
+        // force overwrites
+        assert_eq!(write_fleet_body(&target, "new", true), ExitCode::SUCCESS);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
     }
 
     fn agents(names: &[&str]) -> Vec<String> {
@@ -378,7 +561,7 @@ mod tests {
 
     #[test]
     fn renders_with_provided_inputs() {
-        let yaml = render_workspace_yaml("https://example.test", "myroom", "MY_TOKEN", &[]);
+        let yaml = render_workspace(&ws("https://example.test", "myroom", "${MY_TOKEN}", &[]));
         assert!(yaml.contains(r#"address: "https://example.test""#));
         assert!(yaml.contains("token: \"${MY_TOKEN}\""));
         assert!(yaml.contains("\n  myroom:\n    policy: default"));
@@ -387,12 +570,12 @@ mod tests {
 
     #[test]
     fn renders_with_defaults() {
-        let yaml = render_workspace_yaml(
+        let yaml = render_workspace(&ws(
             DEFAULT_ORCHESTRATOR_URL,
             DEFAULT_ROOM,
-            DEFAULT_TOKEN_ENV,
+            "${QUORUM_DEMO_TOKEN}",
             &[],
-        );
+        ));
         assert!(yaml.contains("https://api.peeramid.xyz"));
         assert!(yaml.contains("${QUORUM_DEMO_TOKEN}"));
         assert!(yaml.contains("\n  demo:\n    policy: default"));
@@ -401,12 +584,12 @@ mod tests {
 
     #[test]
     fn rendered_output_parses_as_yaml() {
-        let yaml = render_workspace_yaml(
+        let yaml = render_workspace(&ws(
             DEFAULT_ORCHESTRATOR_URL,
             DEFAULT_ROOM,
-            DEFAULT_TOKEN_ENV,
+            "${QUORUM_DEMO_TOKEN}",
             &agents(&["CortexA", "CortexB"]),
-        );
+        ));
         let parsed: serde_yaml::Value =
             serde_yaml::from_str(&yaml).expect("rendered yaml must round-trip through serde");
         assert!(parsed["orchestrators"]["primary"]["address"].is_string());
@@ -424,8 +607,12 @@ mod tests {
 
     #[test]
     fn renders_with_named_agents() {
-        let yaml =
-            render_workspace_yaml("https://example.test", "demo", "TOK", &agents(&["A", "B"]));
+        let yaml = render_workspace(&ws(
+            "https://example.test",
+            "demo",
+            "${TOK}",
+            &agents(&["A", "B"]),
+        ));
         assert!(
             yaml.contains(r#"agents: ["A", "B"]"#),
             "agents list must appear in the rendered policy"
@@ -434,7 +621,7 @@ mod tests {
 
     #[test]
     fn empty_agents_emits_editable_placeholder() {
-        let yaml = render_workspace_yaml("https://example.test", "demo", "TOK", &[]);
+        let yaml = render_workspace(&ws("https://example.test", "demo", "${TOK}", &[]));
         assert!(
             yaml.contains("agents: []"),
             "empty agents must still emit a parseable agents: [] line so the file round-trips through serde"
@@ -451,10 +638,12 @@ mod tests {
         let target = dir.path().join("nsed.yaml");
         let exit = run(
             &target,
-            DEFAULT_ORCHESTRATOR_URL,
-            DEFAULT_ROOM,
-            DEFAULT_TOKEN_ENV,
-            &[],
+            &ws(
+                DEFAULT_ORCHESTRATOR_URL,
+                DEFAULT_ROOM,
+                "${QUORUM_DEMO_TOKEN}",
+                &[],
+            ),
             false,
         );
         assert_eq!(exit, ExitCode::SUCCESS);
@@ -469,10 +658,12 @@ mod tests {
         fs::write(&target, "existing content").unwrap();
         let exit = run(
             &target,
-            DEFAULT_ORCHESTRATOR_URL,
-            DEFAULT_ROOM,
-            DEFAULT_TOKEN_ENV,
-            &[],
+            &ws(
+                DEFAULT_ORCHESTRATOR_URL,
+                DEFAULT_ROOM,
+                "${QUORUM_DEMO_TOKEN}",
+                &[],
+            ),
             false,
         );
         assert_eq!(exit, ExitCode::FAILURE);
@@ -487,10 +678,12 @@ mod tests {
         fs::write(&target, "existing content").unwrap();
         let exit = run(
             &target,
-            DEFAULT_ORCHESTRATOR_URL,
-            DEFAULT_ROOM,
-            DEFAULT_TOKEN_ENV,
-            &[],
+            &ws(
+                DEFAULT_ORCHESTRATOR_URL,
+                DEFAULT_ROOM,
+                "${QUORUM_DEMO_TOKEN}",
+                &[],
+            ),
             true,
         );
         assert_eq!(exit, ExitCode::SUCCESS);
@@ -505,10 +698,12 @@ mod tests {
         let target = dir.path().join("nested/path/nsed.yaml");
         let exit = run(
             &target,
-            DEFAULT_ORCHESTRATOR_URL,
-            DEFAULT_ROOM,
-            DEFAULT_TOKEN_ENV,
-            &[],
+            &ws(
+                DEFAULT_ORCHESTRATOR_URL,
+                DEFAULT_ROOM,
+                "${QUORUM_DEMO_TOKEN}",
+                &[],
+            ),
             false,
         );
         assert_eq!(exit, ExitCode::SUCCESS);
@@ -517,7 +712,7 @@ mod tests {
 
     #[test]
     fn rendered_output_uses_provided_token_env() {
-        let yaml = render_workspace_yaml("https://example.test", "demo", "CUSTOM_TOK", &[]);
+        let yaml = render_workspace(&ws("https://example.test", "demo", "${CUSTOM_TOK}", &[]));
         assert!(yaml.contains("${CUSTOM_TOK}"));
         assert!(!yaml.contains("${QUORUM_DEMO_TOKEN}"));
     }
