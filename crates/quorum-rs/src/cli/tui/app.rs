@@ -150,10 +150,39 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn reload_config_missing_file() {
+        // A missing config falls back to remote_workspace(), which reads
+        // ~/.nsed. Point $HOME at an empty dir (and clear the endpoint env) so
+        // the fallback finds nothing and reload errors — independent of the dev
+        // machine's real ~/.nsed (which `quorum redeem` may have populated).
+        let home = tempfile::TempDir::new().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        let prev_env = std::env::var_os("QUORUM_ORCHESTRATOR");
+        // SAFETY: serialised via serial_test on the `home_env` group, so no
+        // other test mutates these vars during this window.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::remove_var("QUORUM_ORCHESTRATOR");
+        }
+
         let mut app = App::new(minimal_config(), PathBuf::from("/nonexistent/nsed.yaml"));
         let result = app.reload_config();
-        assert!(result.is_err());
+
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            if let Some(v) = prev_env {
+                std::env::set_var("QUORUM_ORCHESTRATOR", v);
+            }
+        }
+
+        assert!(
+            result.is_err(),
+            "missing config + empty ~/.nsed must error, got: {result:?}"
+        );
     }
 
     #[test]
