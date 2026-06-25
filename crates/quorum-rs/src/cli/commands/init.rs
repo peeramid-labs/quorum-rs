@@ -140,6 +140,24 @@ pub fn run(target: &Path, spec: &WorkspaceSpec<'_>, force: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Verify `target`'s directory is writable by creating and removing a probe
+/// file. Used to pre-flight onboarding BEFORE redeem consumes the single-use
+/// invite, so a non-writable cwd (e.g. running from `/`) fails fast instead of
+/// burning the invite with nothing scaffolded.
+fn preflight_writable(target: &Path) -> Result<(), String> {
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !parent.exists() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let probe = parent.join(".nsed-write-probe");
+    std::fs::write(&probe, b"").map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
 /// Build the `file:<path>` token reference for an onboarded workspace, pointing
 /// at the `operator.token` that `quorum redeem` just wrote into `out_dir`
 /// (default `~/.nsed`). Absolute, so the workspace authenticates from any cwd.
@@ -384,6 +402,21 @@ pub struct OnboardSpec<'a> {
 /// interactively; with `--non-interactive` (or no TTY) a static fleet
 /// template is written.
 pub async fn run_onboard(spec: OnboardSpec<'_>) -> ExitCode {
+    // Redeem consumes a single-use invite, so confirm we can write the
+    // scaffolded configs BEFORE burning it — otherwise a non-writable cwd
+    // (e.g. running from `/`) spends the invite with nothing to show.
+    for target in [spec.client_target, spec.fleet_target] {
+        if let Err(e) = preflight_writable(target) {
+            eprintln!(
+                "error: cannot write {} ({e}).\n       \
+                 cd to a writable directory (e.g. your home), or pass --config <path>, then re-run.\n       \
+                 Your invite has NOT been redeemed yet.",
+                target.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
     if let Err(e) = crate::cli::commands::redeem::run(
         spec.code,
         spec.orchestrator_url,
@@ -536,6 +569,27 @@ mod tests {
             crate::config::resolve_env_token("token", &format!("file:{path}")),
             "bearer"
         );
+    }
+
+    #[test]
+    fn preflight_writable_ok_for_writable_dir_and_creates_missing_parent() {
+        let dir = tempdir().unwrap();
+        // existing writable dir
+        assert!(preflight_writable(&dir.path().join("nsed.yaml")).is_ok());
+        // missing nested parent is created
+        assert!(preflight_writable(&dir.path().join("nested/deep/nsed.yaml")).is_ok());
+        assert!(dir.path().join("nested/deep").exists());
+        // probe must not leave a file behind
+        assert!(!dir.path().join(".nsed-write-probe").exists());
+    }
+
+    #[test]
+    fn preflight_writable_errs_when_parent_is_a_file() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        fs::write(&file, "x").unwrap();
+        // parent of the target is a regular file → cannot write there
+        assert!(preflight_writable(&file.join("nsed.yaml")).is_err());
     }
 
     #[test]
