@@ -512,16 +512,30 @@ impl WorkspaceConfig {
         })
     }
 
+    /// True when `room` dispatches to a remote orchestrator — its policy is
+    /// resolved server-side, so the local workspace needn't define it.
+    fn room_is_remote(&self, room: &RoomConfig) -> bool {
+        room.orchestrator
+            .as_ref()
+            .and_then(|name| self.orchestrators.get(name))
+            .map(|orch| orch.mode == Some(OrchestratorMode::Remote))
+            .unwrap_or(false)
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         // Minimal config: at least agents or (orchestrators + policies + rooms)
         let has_rooms = !self.rooms.is_empty();
 
-        // When rooms are defined, require full routing config
+        // When rooms are defined, require full routing config. Local policies
+        // are only needed for rooms dispatched locally — a room bound to a
+        // remote orchestrator resolves its policy server-side, so "use only my
+        // remote settings" is a valid policy-free workspace.
         if has_rooms {
             if self.orchestrators.is_empty() {
                 return Err(ConfigError::NoOrchestrators);
             }
-            if self.policies.is_empty() {
+            let needs_local_policy = self.rooms.values().any(|r| !self.room_is_remote(r));
+            if needs_local_policy && self.policies.is_empty() {
                 return Err(ConfigError::NoPolicies);
             }
         }
@@ -545,18 +559,20 @@ impl WorkspaceConfig {
 
         // Validate rooms
         for (room_name, room) in &self.rooms {
-            if !self.policies.contains_key(&room.policy) {
-                return Err(ConfigError::UnknownPolicy {
-                    room: room_name.clone(),
-                    policy: room.policy.clone(),
-                });
-            }
             if let Some(ref orch) = room.orchestrator
                 && !self.orchestrators.contains_key(orch)
             {
                 return Err(ConfigError::UnknownOrchestrator {
                     room: room_name.clone(),
                     orchestrator: orch.clone(),
+                });
+            }
+            // A remote-dispatched room's policy is an orchestrator-side id, not
+            // a local definition — skip the local-policy existence check.
+            if !self.room_is_remote(room) && !self.policies.contains_key(&room.policy) {
+                return Err(ConfigError::UnknownPolicy {
+                    room: room_name.clone(),
+                    policy: room.policy.clone(),
                 });
             }
         }

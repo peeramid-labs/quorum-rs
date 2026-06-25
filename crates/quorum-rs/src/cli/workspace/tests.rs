@@ -1223,6 +1223,68 @@ rooms:
     }
 
     #[test]
+    fn remote_only_rooms_need_no_local_policies() {
+        // "Use only my remote settings": rooms wired to remote orchestrator
+        // policies, zero local policies — must validate.
+        let yaml = r#"
+orchestrators:
+  remote:
+    mode: remote
+    address: "https://api.peeramid.xyz"
+    token: "file:/tmp/operator.token"
+rooms:
+  noosphera:
+    policy: e032e9397994c33c6cd9bba808e53c8be889d5d50abb7198d4e8ee124e1158ff
+    orchestrator: remote
+"#;
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.policies.is_empty());
+        assert!(
+            config.validate().is_ok(),
+            "remote-policy rooms must validate without local policies: {:?}",
+            config.validate()
+        );
+    }
+
+    #[test]
+    fn local_room_without_policies_still_errors() {
+        // An embedded (local) orchestrator room resolves its policy locally,
+        // so a policy-free workspace is still invalid for it.
+        let yaml = r#"
+orchestrators:
+  local:
+    mode: embedded
+rooms:
+  r:
+    policy: p
+    orchestrator: local
+"#;
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(config.validate(), Err(ConfigError::NoPolicies)));
+    }
+
+    #[test]
+    fn local_room_with_unknown_policy_still_errors() {
+        let yaml = r#"
+policies:
+  p:
+    agents: ["a", "b"]
+orchestrators:
+  local:
+    mode: embedded
+rooms:
+  r:
+    policy: missing
+    orchestrator: local
+"#;
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::UnknownPolicy { .. })
+        ));
+    }
+
+    #[test]
     fn is_provisioning_classifies_agent_shortfalls() {
         assert!(
             ConfigError::TooFewAgents {
