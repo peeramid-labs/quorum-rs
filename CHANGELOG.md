@@ -12,14 +12,3 @@ The release-prepare workflow prepends new sections automatically via
 `git-cliff`. Edit `cliff.toml` to tune the generated content.
 
 <!-- new sections inserted above this line by release-prepare -->
-
-## [quorum-rs-v0.7.0] - 2026-06-25
-
-### 🚀 Features
-
-- *(init)* Redesign interactive agent setup
-- *(init)* --invite scaffolds both nsed.yaml + agent.yml, wires token from redeemed file
-
-### 🐛 Bug Fixes
-
-- *(tui)* Tolerate under-provisioned local policies on config load
