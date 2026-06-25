@@ -142,6 +142,15 @@ impl View for MainMenuView {
             self.list_state.set_count(self.shown_count());
             return None;
         }
+        // Surface fetch/submit failures instead of silently swallowing them —
+        // an empty remote list or a reset-to-list after submit otherwise looks
+        // like nothing happened.
+        if let AppEvent::Data(DataEvent::FetchError { context, error }) = app_event {
+            return Some(ViewAction::SetStatus(
+                format!("{context} failed: {error}"),
+                super::StatusLevel::Error,
+            ));
+        }
         let AppEvent::Terminal(event) = app_event else {
             return None;
         };
@@ -916,6 +925,21 @@ mod tests {
         assert_eq!(view.selected_kind(), Some(Sel::Local(0)));
         view.list_state.selected = 2;
         assert_eq!(view.selected_kind(), Some(Sel::Remote(0)));
+    }
+
+    #[test]
+    fn fetch_error_surfaces_as_status() {
+        let mut view = MainMenuView::new(HashMap::new(), None, "orch".into());
+        let action = view.update(&AppEvent::Data(DataEvent::FetchError {
+            context: "rooms".into(),
+            error: "boom".into(),
+        }));
+        match action {
+            Some(ViewAction::SetStatus(msg, super::super::StatusLevel::Error)) => {
+                assert!(msg.contains("rooms") && msg.contains("boom"), "{msg}");
+            }
+            other => panic!("expected SetStatus error, got {other:?}"),
+        }
     }
 
     #[test]

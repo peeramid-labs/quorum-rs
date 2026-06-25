@@ -503,21 +503,33 @@ fn handle_action(
                     return;
                 }
             };
-            // Config-free: a remote room carries a policy *label*, not a
-            // local PolicyConfig. Resolve it against the orchestrator's
-            // /policies and submit directly (the launcher sets this).
-            if let Some(policy_label) = policy
-                && !app.config.rooms.contains_key(&room_name)
+            // Resolve the policy label: explicit (remote room) or the local
+            // room's bound policy. A label that isn't a LOCAL PolicyConfig is
+            // an orchestrator-side policy (id or name) — dispatch it directly
+            // via /policies. This covers remote rooms AND local rooms wired to
+            // a remote orchestrator policy (the wizard's "remote policy as
+            // room"), which previously failed with "Policy not found".
+            let policy_label = policy
+                .clone()
+                .or_else(|| app.config.rooms.get(&room_name).map(|r| r.policy.clone()));
+            if let Some(label) = policy_label
+                && !app.config.policies.contains_key(&label)
             {
-                match build_remote(app, orchestrator) {
+                let orch = app
+                    .config
+                    .rooms
+                    .get(&room_name)
+                    .and_then(|r| r.orchestrator.clone())
+                    .unwrap_or_else(|| orchestrator.clone());
+                match build_remote(app, &orch) {
                     Ok(remote) => {
                         app.status_message =
                             Some((format!("Submitting to {room_name}…"), StatusLevel::Info));
                         tui_client.submit_with_remote_policy(
                             remote,
-                            orchestrator.clone(),
+                            orch,
                             room_name,
-                            policy_label.clone(),
+                            label,
                             task.clone(),
                             *effort_override,
                         );
@@ -870,17 +882,20 @@ mod tests {
         assert!(msg.contains("not found"), "{msg}");
     }
 
-    #[test]
-    fn launch_job_missing_policy_sets_error() {
+    #[tokio::test]
+    async fn launch_job_local_room_with_remote_policy_routes_to_remote_submit() {
         let (data_tx, _) = mpsc::unbounded_channel();
         let (client_tx, _) = mpsc::unbounded_channel();
         let mut client = TuiClient::new(client_tx);
         let mut app = test_app_with_room();
-        // Override room to reference a nonexistent policy
+        // A local room whose policy is NOT a local PolicyConfig (e.g. an
+        // orchestrator-side policy id the wizard wired as a room). This must
+        // dispatch server-side, not fail with a local "Policy not found" — the
+        // orchestrator resolves the id/name (and reports a real miss async).
         app.config.rooms.insert(
-            "bad-room".into(),
+            "remote-policy-room".into(),
             RoomConfig {
-                policy: "nonexistent".into(),
+                policy: "noosphera:0v1".into(),
                 orchestrator: Some("prod".into()),
             },
         );
@@ -892,16 +907,19 @@ mod tests {
             &ViewAction::LaunchJob {
                 orchestrator: "prod".into(),
                 task: "do something".into(),
-                room: Some("bad-room".into()),
+                room: Some("remote-policy-room".into()),
                 policy: None,
                 effort_override: None,
             },
             Path::new("/tmp/test.yaml"),
         );
 
+        // Synchronously we only see the "submitting" notice; any failure to
+        // resolve the policy arrives later as a FetchError (surfaced by the
+        // view), not a local validation error.
         let (msg, level) = app.status_message.unwrap();
-        assert_eq!(level, StatusLevel::Error);
-        assert!(msg.contains("Policy") && msg.contains("not found"), "{msg}");
+        assert_eq!(level, StatusLevel::Info, "{msg}");
+        assert!(msg.contains("Submitting"), "{msg}");
     }
 
     #[tokio::test]
