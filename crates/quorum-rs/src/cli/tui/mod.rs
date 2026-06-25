@@ -40,9 +40,8 @@ use views::{FetchRequest, StatusLevel, View, ViewAction};
 /// Top-level tabs shown in the persistent shell tab bar. The active tab's
 /// view is the navigation-stack root; sub-views (e.g. JobDetail) push on top
 /// and hide the bar until popped.
-const TOP_TABS: [(&str, ViewId); 5] = [
-    ("Deliberate", ViewId::MainMenu),
-    ("Rooms", ViewId::Rooms),
+const TOP_TABS: [(&str, ViewId); 4] = [
+    ("Room", ViewId::MainMenu),
     ("Agents", ViewId::Agents),
     ("Policies", ViewId::Policies),
     ("Settings", ViewId::SettingsMenu),
@@ -1028,17 +1027,17 @@ mod tests {
     fn tab_switch_digits_jump_to_index() {
         use crossterm::event::KeyCode;
         assert_eq!(tab_switch_target(&key(KeyCode::Char('1')), 3), Some(0));
-        assert_eq!(tab_switch_target(&key(KeyCode::Char('5')), 0), Some(4));
-        // Out-of-range digit is not a tab.
-        assert_eq!(tab_switch_target(&key(KeyCode::Char('6')), 0), None);
+        assert_eq!(tab_switch_target(&key(KeyCode::Char('4')), 0), Some(3));
+        // Out-of-range digit (only 4 tabs now) is not a tab.
+        assert_eq!(tab_switch_target(&key(KeyCode::Char('5')), 0), None);
     }
 
     #[test]
     fn tab_switch_tab_and_backtab_cycle() {
         use crossterm::event::KeyCode;
-        assert_eq!(tab_switch_target(&key(KeyCode::Tab), 4), Some(0));
+        assert_eq!(tab_switch_target(&key(KeyCode::Tab), 3), Some(0));
         assert_eq!(tab_switch_target(&key(KeyCode::Tab), 0), Some(1));
-        assert_eq!(tab_switch_target(&key(KeyCode::BackTab), 0), Some(4));
+        assert_eq!(tab_switch_target(&key(KeyCode::BackTab), 0), Some(3));
     }
 
     #[test]
@@ -1049,8 +1048,11 @@ mod tests {
     }
 
     #[test]
-    fn top_tabs_first_is_deliberate_root() {
+    fn top_tabs_first_is_room_root() {
         assert_eq!(TOP_TABS[0].1, ViewId::MainMenu);
-        assert_eq!(TOP_TABS.len(), 5);
+        assert_eq!(TOP_TABS[0].0, "Room");
+        assert_eq!(TOP_TABS.len(), 4);
+        // The old standalone Rooms tab is folded into the Room tab.
+        assert!(!TOP_TABS.iter().any(|(_, v)| *v == ViewId::Rooms));
     }
 }

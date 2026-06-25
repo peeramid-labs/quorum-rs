@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, 
 use super::common::{ListState, fill_cell, render_error, render_key_hints, truncate};
 use super::{FetchRequest, View, ViewAction};
 use crate::cli::remote::DiscoveredRoom;
-use crate::cli::tui::event::{self, AppEvent, DataEvent};
+use crate::cli::tui::event::{self, AppEvent, DataEvent, PolicyInfo};
 use crate::cli::workspace::RoomConfig;
 
 /// Main menu — rooms table as the primary screen.
@@ -22,6 +22,10 @@ pub struct MainMenuView {
     /// `nsed.yaml` rooms are configured. A room carrying a `policy` is
     /// submittable directly from this screen.
     remote_rooms: Vec<DiscoveredRoom>,
+    /// Policies discovered from the orchestrator (`GET /policies`), used to
+    /// render a room's bound policy by its human NAME instead of the raw
+    /// policy id (a long hex hash) that nsed.yaml / the wizard stores.
+    remote_policies: Vec<PolicyInfo>,
     /// Orchestrator name to fetch remote rooms / submit against in
     /// config-free mode (the synthetic `"default"`).
     orchestrator: String,
@@ -56,6 +60,7 @@ impl MainMenuView {
             rooms: sorted,
             default_room,
             remote_rooms: Vec::new(),
+            remote_policies: Vec::new(),
             orchestrator,
             list_state: ListState::new(count),
             task_input_active: false,
@@ -101,6 +106,17 @@ impl MainMenuView {
         trimmed.parse::<f32>().ok().map(|v| v.clamp(0.0, 1.0))
     }
 
+    /// Render a room's bound policy for display: resolve a policy id to its
+    /// human name via the discovered policies; pass a name through unchanged;
+    /// fall back to the raw value when policies haven't loaded or don't match.
+    fn policy_label(&self, policy: &str) -> String {
+        self.remote_policies
+            .iter()
+            .find(|p| p.policy_id == policy || p.name == policy)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| policy.to_string())
+    }
+
     /// The selected LOCAL room, if the selection lands in the local section.
     /// Remote rooms have no local detail panel.
     fn selected_room(&self) -> Option<&(String, RoomConfig)> {
@@ -124,11 +140,17 @@ impl View for MainMenuView {
     }
 
     fn on_enter(&mut self) -> Vec<ViewAction> {
-        // Always pull remote rooms so the Remote section is populated
-        // alongside any local (nsed.yaml) rooms.
-        vec![ViewAction::Fetch(FetchRequest::Rooms {
-            orchestrator: self.orchestrator.clone(),
-        })]
+        // Pull remote rooms (Remote section) AND policies (to render a room's
+        // bound policy by name instead of its raw id).
+        vec![
+            ViewAction::Fetch(FetchRequest::Rooms {
+                orchestrator: self.orchestrator.clone(),
+            }),
+            ViewAction::Fetch(FetchRequest::Policies {
+                orchestrator: self.orchestrator.clone(),
+                tag: None,
+            }),
+        ]
     }
 
     fn update(&mut self, app_event: &AppEvent) -> Option<ViewAction> {
@@ -140,6 +162,15 @@ impl View for MainMenuView {
         {
             self.remote_rooms = rooms.clone();
             self.list_state.set_count(self.shown_count());
+            return None;
+        }
+        if let AppEvent::Data(DataEvent::PoliciesLoaded {
+            orchestrator,
+            policies,
+        }) = app_event
+            && *orchestrator == self.orchestrator
+        {
+            self.remote_policies = policies.clone();
             return None;
         }
         // Surface fetch/submit failures instead of silently swallowing them —
@@ -183,6 +214,11 @@ impl View for MainMenuView {
         // Normal mode
         if event::is_key(event, 'q') || event::is_escape(event) {
             return Some(ViewAction::Quit);
+        }
+        // `n` opens room admin (create / delete) — folded in from the old
+        // Rooms tab so the top bar stays a single Room tab.
+        if event::is_key(event, 'n') {
+            return Some(ViewAction::Push(super::ViewId::Rooms));
         }
         if event::is_up(event) {
             self.list_state.up();
@@ -405,7 +441,7 @@ impl MainMenuView {
                     Style::default()
                 };
                 let policy = match room.policy.as_deref() {
-                    Some(p) => p.to_string(),
+                    Some(p) => self.policy_label(p),
                     None => "— (no policy)".to_string(),
                 };
                 Row::new(vec![
@@ -565,7 +601,7 @@ impl MainMenuView {
                 Row::new(vec![
                     Cell::from(Span::styled(marker, Style::default().fg(Color::Yellow))),
                     Cell::from(name.as_str()),
-                    Cell::from(truncate(&config.policy, 25)),
+                    Cell::from(truncate(&self.policy_label(&config.policy), 25)),
                     Cell::from(config.orchestrator.as_deref().unwrap_or("default")),
                 ])
                 .style(style)
@@ -900,17 +936,23 @@ mod tests {
 
     #[test]
     fn on_enter_always_fetches_remote() {
-        // Both config-free and local-config views fetch remote so the
-        // Remote section populates alongside any local rooms.
+        // Both config-free and local-config views fetch remote rooms AND
+        // policies (the latter to resolve a room's policy id to its name).
         let mut view = MainMenuView::new(HashMap::new(), None, "orch".into());
         assert_eq!(
             view.on_enter(),
-            vec![ViewAction::Fetch(FetchRequest::Rooms {
-                orchestrator: "orch".into(),
-            })]
+            vec![
+                ViewAction::Fetch(FetchRequest::Rooms {
+                    orchestrator: "orch".into(),
+                }),
+                ViewAction::Fetch(FetchRequest::Policies {
+                    orchestrator: "orch".into(),
+                    tag: None,
+                }),
+            ]
         );
         let mut view = MainMenuView::new(sample_rooms(), None, "orch".into());
-        assert_eq!(view.on_enter().len(), 1);
+        assert_eq!(view.on_enter().len(), 2);
     }
 
     #[test]
@@ -940,6 +982,26 @@ mod tests {
             }
             other => panic!("expected SetStatus error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn policy_label_resolves_id_to_name() {
+        let mut view = MainMenuView::new(HashMap::new(), None, "orch".into());
+        view.update(&AppEvent::Data(DataEvent::PoliciesLoaded {
+            orchestrator: "orch".into(),
+            policies: vec![PolicyInfo {
+                policy_id: "e032deadbeef".into(),
+                name: "noosphera:0v1".into(),
+                tags: vec![],
+                max_rounds: 3,
+                effort: 0.7,
+                is_role_based: false,
+            }],
+        }));
+        // id resolves to name; a name passes through; unknown falls back to raw.
+        assert_eq!(view.policy_label("e032deadbeef"), "noosphera:0v1");
+        assert_eq!(view.policy_label("noosphera:0v1"), "noosphera:0v1");
+        assert_eq!(view.policy_label("nope"), "nope");
     }
 
     #[test]
