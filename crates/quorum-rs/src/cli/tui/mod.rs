@@ -18,8 +18,8 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Tabs};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 use tokio::sync::mpsc;
 
 use crate::cli::remote::RemoteOrchestrator;
@@ -207,14 +207,38 @@ async fn setup_and_run(
     loop {
         terminal.draw(|frame| {
             let area = frame.area();
+            // Reserve a 1-line status bar at the bottom whenever there's a
+            // message. Status (errors, "Submitting…", "Job submitted", config
+            // errors) was set on `app.status_message` but never drawn — views
+            // have no access to it — so the TUI failed silently. Render it here.
+            let (body, status_area) = if app.status_message.is_some() {
+                let c = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+                (c[0], Some(c[1]))
+            } else {
+                (area, None)
+            };
             // Tab bar only at a tab root; a pushed sub-view gets the full area.
             if app.view_stack.len() == 1 {
                 let chunks =
-                    Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
+                    Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(body);
                 render_tab_bar(frame, chunks[0], app.active_tab);
                 current_view.draw(frame, chunks[1]);
             } else {
-                current_view.draw(frame, area);
+                current_view.draw(frame, body);
+            }
+            if let (Some(rect), Some((msg, level))) = (status_area, app.status_message.as_ref()) {
+                let color = match level {
+                    StatusLevel::Error => Color::Red,
+                    StatusLevel::Success => Color::Green,
+                    StatusLevel::Info => Color::Yellow,
+                };
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        format!(" {msg}"),
+                        Style::default().fg(color),
+                    ))),
+                    rect,
+                );
             }
         })?;
 
