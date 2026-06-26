@@ -1125,7 +1125,7 @@ async fn wizard_remote_orchestrator()
             (token, None)
         };
 
-    let orch = OrchestratorConfig {
+    let mut orch = OrchestratorConfig {
         mode: Some(OrchestratorMode::Remote),
         address: Some(address.clone()),
         token: Some(token_raw.clone()),
@@ -1148,6 +1148,19 @@ async fn wizard_remote_orchestrator()
                 match client.health().await {
                     Ok(h) => eprintln!("  ✓ Health: {} (NATS: {})", h.status, h.nats_connection),
                     Err(e) => eprintln!("  ✗ Health check failed: {e}"),
+                }
+                // Capture the orchestrator's NATS URL when redeem didn't supply
+                // one (e.g. the "use existing token" path) so the generated
+                // agent.yml carries a telemetry endpoint and `quorum serve`
+                // needs no --nats-url.
+                if orch.nats_url.is_none() {
+                    match client.runtime_nats().await {
+                        Ok(u) => {
+                            eprintln!("  ✓ NATS URL : {u}");
+                            orch.nats_url = Some(u);
+                        }
+                        Err(e) => eprintln!("  ✗ NATS URL lookup failed: {e}"),
+                    }
                 }
                 match client.agents().await {
                     Ok(a) => {

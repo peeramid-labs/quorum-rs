@@ -18,8 +18,8 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Tabs};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 use tokio::sync::mpsc;
 
 use crate::cli::remote::RemoteOrchestrator;
@@ -40,9 +40,8 @@ use views::{FetchRequest, StatusLevel, View, ViewAction};
 /// Top-level tabs shown in the persistent shell tab bar. The active tab's
 /// view is the navigation-stack root; sub-views (e.g. JobDetail) push on top
 /// and hide the bar until popped.
-const TOP_TABS: [(&str, ViewId); 5] = [
-    ("Deliberate", ViewId::MainMenu),
-    ("Rooms", ViewId::Rooms),
+const TOP_TABS: [(&str, ViewId); 4] = [
+    ("Room", ViewId::MainMenu),
     ("Agents", ViewId::Agents),
     ("Policies", ViewId::Policies),
     ("Settings", ViewId::SettingsMenu),
@@ -208,14 +207,38 @@ async fn setup_and_run(
     loop {
         terminal.draw(|frame| {
             let area = frame.area();
+            // Reserve a 1-line status bar at the bottom whenever there's a
+            // message. Status (errors, "Submitting…", "Job submitted", config
+            // errors) was set on `app.status_message` but never drawn — views
+            // have no access to it — so the TUI failed silently. Render it here.
+            let (body, status_area) = if app.status_message.is_some() {
+                let c = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+                (c[0], Some(c[1]))
+            } else {
+                (area, None)
+            };
             // Tab bar only at a tab root; a pushed sub-view gets the full area.
             if app.view_stack.len() == 1 {
                 let chunks =
-                    Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
+                    Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(body);
                 render_tab_bar(frame, chunks[0], app.active_tab);
                 current_view.draw(frame, chunks[1]);
             } else {
-                current_view.draw(frame, area);
+                current_view.draw(frame, body);
+            }
+            if let (Some(rect), Some((msg, level))) = (status_area, app.status_message.as_ref()) {
+                let color = match level {
+                    StatusLevel::Error => Color::Red,
+                    StatusLevel::Success => Color::Green,
+                    StatusLevel::Info => Color::Yellow,
+                };
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        format!(" {msg}"),
+                        Style::default().fg(color),
+                    ))),
+                    rect,
+                );
             }
         })?;
 
@@ -503,21 +526,33 @@ fn handle_action(
                     return;
                 }
             };
-            // Config-free: a remote room carries a policy *label*, not a
-            // local PolicyConfig. Resolve it against the orchestrator's
-            // /policies and submit directly (the launcher sets this).
-            if let Some(policy_label) = policy
-                && !app.config.rooms.contains_key(&room_name)
+            // Resolve the policy label: explicit (remote room) or the local
+            // room's bound policy. A label that isn't a LOCAL PolicyConfig is
+            // an orchestrator-side policy (id or name) — dispatch it directly
+            // via /policies. This covers remote rooms AND local rooms wired to
+            // a remote orchestrator policy (the wizard's "remote policy as
+            // room"), which previously failed with "Policy not found".
+            let policy_label = policy
+                .clone()
+                .or_else(|| app.config.rooms.get(&room_name).map(|r| r.policy.clone()));
+            if let Some(label) = policy_label
+                && !app.config.policies.contains_key(&label)
             {
-                match build_remote(app, orchestrator) {
+                let orch = app
+                    .config
+                    .rooms
+                    .get(&room_name)
+                    .and_then(|r| r.orchestrator.clone())
+                    .unwrap_or_else(|| orchestrator.clone());
+                match build_remote(app, &orch) {
                     Ok(remote) => {
                         app.status_message =
                             Some((format!("Submitting to {room_name}…"), StatusLevel::Info));
                         tui_client.submit_with_remote_policy(
                             remote,
-                            orchestrator.clone(),
+                            orch,
                             room_name,
-                            policy_label.clone(),
+                            label,
                             task.clone(),
                             *effort_override,
                         );
@@ -870,17 +905,20 @@ mod tests {
         assert!(msg.contains("not found"), "{msg}");
     }
 
-    #[test]
-    fn launch_job_missing_policy_sets_error() {
+    #[tokio::test]
+    async fn launch_job_local_room_with_remote_policy_routes_to_remote_submit() {
         let (data_tx, _) = mpsc::unbounded_channel();
         let (client_tx, _) = mpsc::unbounded_channel();
         let mut client = TuiClient::new(client_tx);
         let mut app = test_app_with_room();
-        // Override room to reference a nonexistent policy
+        // A local room whose policy is NOT a local PolicyConfig (e.g. an
+        // orchestrator-side policy id the wizard wired as a room). This must
+        // dispatch server-side, not fail with a local "Policy not found" — the
+        // orchestrator resolves the id/name (and reports a real miss async).
         app.config.rooms.insert(
-            "bad-room".into(),
+            "remote-policy-room".into(),
             RoomConfig {
-                policy: "nonexistent".into(),
+                policy: "noosphera:0v1".into(),
                 orchestrator: Some("prod".into()),
             },
         );
@@ -892,16 +930,19 @@ mod tests {
             &ViewAction::LaunchJob {
                 orchestrator: "prod".into(),
                 task: "do something".into(),
-                room: Some("bad-room".into()),
+                room: Some("remote-policy-room".into()),
                 policy: None,
                 effort_override: None,
             },
             Path::new("/tmp/test.yaml"),
         );
 
+        // Synchronously we only see the "submitting" notice; any failure to
+        // resolve the policy arrives later as a FetchError (surfaced by the
+        // view), not a local validation error.
         let (msg, level) = app.status_message.unwrap();
-        assert_eq!(level, StatusLevel::Error);
-        assert!(msg.contains("Policy") && msg.contains("not found"), "{msg}");
+        assert_eq!(level, StatusLevel::Info, "{msg}");
+        assert!(msg.contains("Submitting"), "{msg}");
     }
 
     #[tokio::test]
@@ -1010,17 +1051,17 @@ mod tests {
     fn tab_switch_digits_jump_to_index() {
         use crossterm::event::KeyCode;
         assert_eq!(tab_switch_target(&key(KeyCode::Char('1')), 3), Some(0));
-        assert_eq!(tab_switch_target(&key(KeyCode::Char('5')), 0), Some(4));
-        // Out-of-range digit is not a tab.
-        assert_eq!(tab_switch_target(&key(KeyCode::Char('6')), 0), None);
+        assert_eq!(tab_switch_target(&key(KeyCode::Char('4')), 0), Some(3));
+        // Out-of-range digit (only 4 tabs now) is not a tab.
+        assert_eq!(tab_switch_target(&key(KeyCode::Char('5')), 0), None);
     }
 
     #[test]
     fn tab_switch_tab_and_backtab_cycle() {
         use crossterm::event::KeyCode;
-        assert_eq!(tab_switch_target(&key(KeyCode::Tab), 4), Some(0));
+        assert_eq!(tab_switch_target(&key(KeyCode::Tab), 3), Some(0));
         assert_eq!(tab_switch_target(&key(KeyCode::Tab), 0), Some(1));
-        assert_eq!(tab_switch_target(&key(KeyCode::BackTab), 0), Some(4));
+        assert_eq!(tab_switch_target(&key(KeyCode::BackTab), 0), Some(3));
     }
 
     #[test]
@@ -1031,8 +1072,11 @@ mod tests {
     }
 
     #[test]
-    fn top_tabs_first_is_deliberate_root() {
+    fn top_tabs_first_is_room_root() {
         assert_eq!(TOP_TABS[0].1, ViewId::MainMenu);
-        assert_eq!(TOP_TABS.len(), 5);
+        assert_eq!(TOP_TABS[0].0, "Room");
+        assert_eq!(TOP_TABS.len(), 4);
+        // The old standalone Rooms tab is folded into the Room tab.
+        assert!(!TOP_TABS.iter().any(|(_, v)| *v == ViewId::Rooms));
     }
 }

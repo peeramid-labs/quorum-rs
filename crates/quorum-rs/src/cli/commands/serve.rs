@@ -16,12 +16,14 @@
 //! ## NATS URL resolution
 //!
 //! 1. `--nats-url <URL>` — explicit operator override.
-//! 2. Workspace config (`nsed.yaml`) → resolve the room → look up the
+//! 2. The fleet config's `telemetry.endpoints[].nats_url` — `quorum init`
+//!    writes the orchestrator's NATS URL there at redeem time precisely so
+//!    `quorum serve` connects with no flags and no workspace (a policy-free,
+//!    room-free, or absent `nsed.yaml`).
+//! 3. Workspace config (`nsed.yaml`) → resolve the room → look up the
 //!    orchestrator entry → `mode: embedded` reads `nats_url`
 //!    directly; `mode: remote` calls `GET /api/runtime/nats`.
-//! 3. Hard error otherwise. **No localhost fallback. No silent
-//!    fallback through `agent.yml.telemetry.endpoints[]` (that field
-//!    is an observability sink, not a connection target).**
+//! 4. Hard error otherwise. **No localhost fallback.**
 //!
 //! The error path names the workspace path tried, the room resolved,
 //! and the orchestrator address — so an operator can fix the missing
@@ -38,7 +40,7 @@ use std::path::{Path, PathBuf};
 /// `quorum init` writes and the layout `nsed serve` consumes in the
 /// parent repo. If `--config` isn't passed, the CLI walks this list
 /// and uses the first match.
-const DEFAULT_FLEET_PATHS: &[&str] = &["agent.yml", "config/default.yml"];
+const DEFAULT_FLEET_PATHS: &[&str] = &["agent.yml", "config/agent.yml", "config/default.yml"];
 
 /// Default operator creds-file location written by `quorum redeem`.
 fn default_creds_path() -> Option<PathBuf> {
@@ -93,6 +95,7 @@ fn resolve_nats_auth(creds_arg: Option<&Path>) -> Option<NatsAuth> {
 
 async fn resolve_nats_url(
     nats_url_flag: Option<&str>,
+    fleet_nats_url: Option<&str>,
     workspace_path: &Path,
     room_flag: Option<&str>,
 ) -> Result<String> {
@@ -100,9 +103,18 @@ async fn resolve_nats_url(
         return Ok(u.to_string());
     }
 
+    // The fleet config's telemetry endpoint carries the NATS URL `quorum
+    // init` captured at redeem time — prefer it so `quorum serve` needs no
+    // --nats-url and no loadable workspace (e.g. a policy-free, room-free
+    // workspace, or none at all).
+    if let Some(u) = fleet_nats_url {
+        return Ok(u.to_string());
+    }
+
     let workspace = WorkspaceConfig::load(workspace_path).with_context(|| {
         format!(
-            "no --nats-url passed and workspace config not loadable at {}",
+            "no --nats-url passed, no telemetry NATS URL in the fleet config, and workspace \
+             config not loadable at {}",
             workspace_path.display()
         )
     })?;
@@ -200,7 +212,13 @@ pub async fn run(
     let fleet = crate::config::load_config(&config_path)
         .with_context(|| format!("failed to load fleet config at {}", config_path.display()))?;
 
-    let resolved_nats_url = resolve_nats_url(nats_url, workspace_path, room).await?;
+    let fleet_nats_url = fleet
+        .telemetry
+        .endpoints
+        .iter()
+        .find_map(|e| e.nats_url.as_deref());
+    let resolved_nats_url =
+        resolve_nats_url(nats_url, fleet_nats_url, workspace_path, room).await?;
     tracing::info!(nats_url = %resolved_nats_url, "resolved NATS URL");
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -326,9 +344,38 @@ mod tests {
     async fn resolve_nats_url_explicit_flag_wins() {
         let tmp = TempDir::new().unwrap();
         let missing_ws = tmp.path().join("nsed.yaml");
-        let resolved = resolve_nats_url(Some("nats://explicit:4222"), &missing_ws, None)
+        let resolved = resolve_nats_url(Some("nats://explicit:4222"), None, &missing_ws, None)
             .await
             .expect("explicit URL must short-circuit workspace lookup");
+        assert_eq!(resolved, "nats://explicit:4222");
+    }
+
+    /// Fleet telemetry NATS URL is used when no flag is passed — without
+    /// touching the workspace (so a missing/room-free workspace is fine).
+    #[tokio::test]
+    async fn resolve_nats_url_fleet_telemetry_used_before_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let missing_ws = tmp.path().join("nsed.yaml");
+        let resolved =
+            resolve_nats_url(None, Some("nats://from-telemetry:4222"), &missing_ws, None)
+                .await
+                .expect("fleet telemetry URL must be used without a loadable workspace");
+        assert_eq!(resolved, "nats://from-telemetry:4222");
+    }
+
+    /// Explicit flag still wins over fleet telemetry.
+    #[tokio::test]
+    async fn resolve_nats_url_flag_beats_fleet_telemetry() {
+        let tmp = TempDir::new().unwrap();
+        let missing_ws = tmp.path().join("nsed.yaml");
+        let resolved = resolve_nats_url(
+            Some("nats://explicit:4222"),
+            Some("nats://from-telemetry:4222"),
+            &missing_ws,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(resolved, "nats://explicit:4222");
     }
 
@@ -338,7 +385,9 @@ mod tests {
     async fn resolve_nats_url_fails_loud_when_workspace_missing() {
         let tmp = TempDir::new().unwrap();
         let missing_ws = tmp.path().join("nsed.yaml");
-        let err = resolve_nats_url(None, &missing_ws, None).await.unwrap_err();
+        let err = resolve_nats_url(None, None, &missing_ws, None)
+            .await
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("nsed.yaml") && msg.contains("--nats-url"),
@@ -375,7 +424,7 @@ default_room: main
 "#,
         )
         .unwrap();
-        let resolved = resolve_nats_url(None, &ws_path, None).await.unwrap();
+        let resolved = resolve_nats_url(None, None, &ws_path, None).await.unwrap();
         assert_eq!(resolved, "nats://embedded-host:4222");
     }
 }
