@@ -229,6 +229,23 @@ from your `agent.yml`. If an agent is missing, check the `serve`
 logs — `RUST_LOG=info quorum serve …` shows per-agent startup +
 any failures during build.
 
+### Registration self-check
+
+~20s after boot (once the first heartbeats have landed), `serve`
+reads back `GET /agents` and logs a verdict per agent. The heartbeat
+is fire-and-forget, so without this read-back a server-side drop or a
+blank operator never reaches the agent process. Watch for:
+
+| Log | Meaning | Fix |
+|---|---|---|
+| `ERROR … NOT visible at orchestrator` | heartbeat dropped — the agent has no operator link (orchestrator invariant) or isn't registered. Receives no jobs. | re-redeem the agent code with `operator_name` set |
+| `WARN … operator is \`local\`` | the agent code was minted without `operator_name` → no grants/tags → fails grant-based eligibility | re-mint + redeem with `operator_name` |
+| `WARN … operator set but has no tags` | the operator has no identity tags | add tags to the operator |
+| `INFO … registered and attributed` | healthy | — |
+
+The self-check runs only when the orchestrator is a reachable remote
+(workspace `mode: remote`); it's a diagnostic and never blocks serving.
+
 ## Common issues
 
 | Symptom | Likely cause |

@@ -29,12 +29,119 @@
 //! and the orchestrator address — so an operator can fix the missing
 //! config without guessing.
 
-use crate::cli::remote::{RemoteError, RemoteOrchestrator};
+use crate::cli::remote::{AgentInfo, RemoteError, RemoteOrchestrator};
 use crate::cli::workspace::{OrchestratorMode, WorkspaceConfig};
 use crate::nats_utils::NatsAuth;
 use crate::serve::{ServeOptions, serve_fleet};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+
+/// Delay before the post-boot registration self-check fires. Long enough
+/// for the first heartbeat (~15s interval) to reach the orchestrator and
+/// be processed, so a healthy agent isn't flagged as merely not-yet-seen.
+const SELFCHECK_DELAY_SECS: u64 = 20;
+
+/// Verdict of comparing a locally-configured agent against what the
+/// orchestrator actually reports at `GET /agents`. Surfaces the silent
+/// attribution failures an agent can't otherwise observe: the heartbeat
+/// is fire-and-forget, so a server-side drop or a blank operator never
+/// reaches `quorum serve` without this explicit read-back.
+#[derive(Debug, PartialEq, Eq)]
+enum RegVerdict {
+    /// Visible, attributed to a real operator with at least one tag.
+    Ok,
+    /// Not in `GET /agents` — heartbeat dropped (no operator link, the
+    /// orchestrator invariant) or not registered yet. Receives no jobs.
+    Dropped,
+    /// Registered but `operator` is empty/null — fails grant-based eligibility.
+    Unattributed,
+    /// `operator == "local"` — the agent code was minted without an
+    /// `operator_name`, so redeem used the `local` fallback. No grants/tags.
+    LocalFallback,
+    /// Operator set but has no tags — fails grant-based room eligibility.
+    NoOperatorTags,
+}
+
+/// Pure comparison of a configured agent id against the orchestrator's
+/// reported agent list. Network-free so it can be unit-tested.
+fn evaluate_registration(agent_id: &str, agents: &[AgentInfo]) -> RegVerdict {
+    let Some(a) = agents.iter().find(|a| a.agent_id == agent_id) else {
+        return RegVerdict::Dropped;
+    };
+    match a.operator.as_deref() {
+        None | Some("") => RegVerdict::Unattributed,
+        Some("local") => RegVerdict::LocalFallback,
+        Some(_) if a.operator_tags.is_empty() => RegVerdict::NoOperatorTags,
+        Some(_) => RegVerdict::Ok,
+    }
+}
+
+/// Query the orchestrator and log a verdict per configured agent. Errors /
+/// warnings here are the agent-side surfacing of attribution failures the
+/// fire-and-forget heartbeat hides. Best-effort: a failed query is logged
+/// and skipped, never fatal.
+async fn run_registration_selfcheck(orch: &RemoteOrchestrator, agent_ids: &[String]) {
+    let agents = match orch.agents().await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(error = %e, "registration self-check skipped: GET /agents failed");
+            return;
+        }
+    };
+    for id in agent_ids {
+        match evaluate_registration(id, &agents) {
+            RegVerdict::Ok => {
+                tracing::info!(agent_id = %id, "registered and attributed at orchestrator")
+            }
+            RegVerdict::Dropped => tracing::error!(
+                agent_id = %id,
+                "NOT visible at orchestrator after {SELFCHECK_DELAY_SECS}s — heartbeat dropped \
+                 (no operator link) or not registered. This agent will receive no jobs. \
+                 Re-redeem the agent code with operator_name set."
+            ),
+            RegVerdict::Unattributed => tracing::error!(
+                agent_id = %id,
+                "registered but has NO operator at orchestrator — will fail grant-based \
+                 eligibility and receive no jobs"
+            ),
+            RegVerdict::LocalFallback => tracing::warn!(
+                agent_id = %id,
+                "operator is `local` at orchestrator — the agent code was minted without \
+                 operator_name, so it has no grants/tags and will fail eligibility. \
+                 Re-mint + redeem the agent code with operator_name set."
+            ),
+            RegVerdict::NoOperatorTags => tracing::warn!(
+                agent_id = %id,
+                "operator set but has no tags at orchestrator — will fail grant-based \
+                 room eligibility"
+            ),
+        }
+    }
+}
+
+/// Best-effort build of an HTTP orchestrator client from the workspace +
+/// room, for the post-boot self-check. Returns `None` (logging at debug)
+/// whenever the orchestrator isn't a reachable remote — embedded mode, a
+/// `--nats-url` run with no workspace, or any missing field. The
+/// self-check is a diagnostic, never a hard dependency.
+fn try_build_orchestrator_client(
+    workspace_path: &Path,
+    room_flag: Option<&str>,
+) -> Option<RemoteOrchestrator> {
+    let workspace = WorkspaceConfig::load(workspace_path).ok()?;
+    let (_room_name, room) = workspace.resolve_room(room_flag).ok()?;
+    let orch_name = room.orchestrator.as_deref()?;
+    let orch = workspace.orchestrators.get(orch_name)?;
+    match orch.mode.as_ref() {
+        Some(OrchestratorMode::Remote) | None => {
+            let address = orch.address.as_deref()?;
+            let token_raw = orch.token.as_deref()?;
+            let token = crate::config::resolve_env_token("token", token_raw);
+            RemoteOrchestrator::new(address, &token).ok()
+        }
+        Some(OrchestratorMode::Embedded) => None,
+    }
+}
 
 /// Default fleet-config search order — keep aligned with the layout
 /// `quorum init` writes and the layout `nsed serve` consumes in the
@@ -238,6 +345,29 @@ pub async fn run(
         registry: None,
     };
 
+    // Post-boot registration self-check: a heartbeat is fire-and-forget, so a
+    // server-side drop (no operator link → orchestrator invariant) or a blank
+    // operator never reaches this process. Read it back from `GET /agents`
+    // once heartbeats have had time to land, and log a per-agent verdict.
+    // Best-effort: only runs when the orchestrator is a reachable remote.
+    if let Some(orch) = try_build_orchestrator_client(workspace_path, room) {
+        let selected: Vec<String> = fleet
+            .agents
+            .iter()
+            .filter(|a| agent_filter.is_none_or(|f| f.iter().any(|n| n == &a.name)))
+            .map(|a| a.name.clone())
+            .collect();
+        let cancel_sc = cancel.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(SELFCHECK_DELAY_SECS)) => {
+                    run_registration_selfcheck(&orch, &selected).await;
+                }
+                _ = cancel_sc.cancelled() => {}
+            }
+        });
+    }
+
     // Race the runner against a shutdown signal. On signal we
     // call `cancel.cancel()` — that signals the runner to abort
     // every worker BEFORE the select! finishes dropping the
@@ -426,5 +556,59 @@ default_room: main
         .unwrap();
         let resolved = resolve_nats_url(None, None, &ws_path, None).await.unwrap();
         assert_eq!(resolved, "nats://embedded-host:4222");
+    }
+
+    fn agent_info(id: &str, operator: Option<&str>, tags: &[&str]) -> AgentInfo {
+        AgentInfo {
+            agent_id: id.to_string(),
+            operator: operator.map(String::from),
+            operator_tags: tags.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn selfcheck_ok_when_operator_and_tags_present() {
+        let agents = vec![agent_info(
+            "justindgx",
+            Some("dgx-spark-justin"),
+            &["noosphera:x"],
+        )];
+        assert_eq!(evaluate_registration("justindgx", &agents), RegVerdict::Ok);
+    }
+
+    #[test]
+    fn selfcheck_dropped_when_absent_from_orchestrator() {
+        let agents = vec![agent_info("other", Some("op"), &["t"])];
+        assert_eq!(
+            evaluate_registration("justindgx", &agents),
+            RegVerdict::Dropped
+        );
+    }
+
+    #[test]
+    fn selfcheck_unattributed_when_operator_missing_or_empty() {
+        let none = vec![agent_info("a", None, &[])];
+        assert_eq!(evaluate_registration("a", &none), RegVerdict::Unattributed);
+        let empty = vec![agent_info("a", Some(""), &[])];
+        assert_eq!(evaluate_registration("a", &empty), RegVerdict::Unattributed);
+    }
+
+    #[test]
+    fn selfcheck_local_fallback_when_operator_is_local() {
+        let agents = vec![agent_info("a", Some("local"), &[])];
+        assert_eq!(
+            evaluate_registration("a", &agents),
+            RegVerdict::LocalFallback
+        );
+    }
+
+    #[test]
+    fn selfcheck_no_tags_when_operator_set_but_tagless() {
+        let agents = vec![agent_info("a", Some("real-op"), &[])];
+        assert_eq!(
+            evaluate_registration("a", &agents),
+            RegVerdict::NoOperatorTags
+        );
     }
 }
