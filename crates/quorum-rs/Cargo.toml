@@ -1,6 +1,6 @@
 [package]
 name = "quorum-rs"
-version = "0.6.0"
+version = "0.7.0-rc.14"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0 OR MIT"
@@ -52,8 +52,8 @@ fs4 = "0.13"
 futures = "0.3.31"
 hex = { version = "0.4", optional = true }
 nkeys = "0.4"
-quorum-crypto-core = { version = "0.6.0", path = "../quorum-crypto-core", optional = true }
-llm-repair = { version = "0.6.0", path = "../llm-repair" }
+quorum-crypto-core = { version = "0.7.0-rc.14", path = "../quorum-crypto-core", optional = true }
+llm-repair = { version = "0.7.0-rc.14", path = "../llm-repair" }
 regex = "1.12.2"
 openai-harmony = "0.0.8"
 libc = "0.2"
