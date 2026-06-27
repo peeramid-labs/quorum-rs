@@ -336,44 +336,56 @@ fn write_fleet_body(target: &Path, body: &str, force: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Scaffold BOTH the workspace config (`nsed.yaml`, for `quorum
-/// run`/`status`/`tui`) and the fleet config (`agent.yml`, for `quorum
-/// serve`) after an invite redeem. The orchestrator endpoint + token are
-/// already known from the redeem, so the workspace file is templated
-/// directly — no re-prompt.
+/// Extract the fleet half (LLM providers + agents) of a rendered `agent.yml`,
+/// dropping its `orchestrators:` list. The unified `quorum.yml` carries a single
+/// workspace `orchestrators:` map, so keeping the fleet's list too would be a
+/// duplicate top-level YAML key and break parsing. The providers section header
+/// is a stable split point.
+fn fleet_sections_of(agent_yaml: &str) -> &str {
+    match agent_yaml.find("# LLM Providers") {
+        Some(idx) => {
+            let start = agent_yaml[..idx].rfind("# ====").unwrap_or(idx);
+            &agent_yaml[start..]
+        }
+        None => agent_yaml,
+    }
+}
+
+/// Scaffold a SINGLE unified `quorum.yml` after an invite redeem: workspace
+/// (orchestrators/rooms/policies, with the operator token serve registers
+/// agents under) AND the fleet (providers/agents) in one file. No more
+/// `nsed.yaml` + `agent.yml` split — every command reads this one file.
 ///
-/// `interactive` gates only the `agent.yml` step: when true the agent
-/// personas / providers / file-access are gathered interactively
-/// ([`crate::init::run_agent_setup`]); when false a static fleet template
-/// is written so CI/Docker onboarding stays non-interactive.
+/// `interactive` gates only the fleet half: when true the agent personas /
+/// providers / file-access are gathered interactively
+/// ([`crate::init::run_agent_setup`]); when false a static fleet template is
+/// used so CI/Docker onboarding stays non-interactive.
 async fn scaffold_after_redeem(
-    client_target: &Path,
-    fleet_target: &Path,
+    target: &Path,
     spec: &WorkspaceSpec<'_>,
     force: bool,
     interactive: bool,
 ) -> ExitCode {
-    let workspace = run(client_target, spec, force);
-    if workspace != ExitCode::SUCCESS {
-        return workspace;
-    }
-
-    if !interactive {
-        return run_agent_fleet(fleet_target, spec.agents, force);
-    }
-
-    match crate::init::run_agent_setup(spec.orchestrator_url, spec.token_ref).await {
-        Ok(Some(result)) if !result.agent_config_yaml.is_empty() => {
-            write_fleet_body(fleet_target, &result.agent_config_yaml, force)
+    let fleet_yaml = if interactive {
+        match crate::init::run_agent_setup(spec.orchestrator_url, spec.token_ref).await {
+            Ok(Some(result)) if !result.agent_config_yaml.is_empty() => result.agent_config_yaml,
+            // User skipped, or it produced nothing — fall back to the static template.
+            Ok(_) => render_fleet_yaml(spec.agents),
+            Err(e) => {
+                eprintln!("error: agent setup failed: {e:#}");
+                return ExitCode::FAILURE;
+            }
         }
-        // User skipped agent setup, or it produced no config — fall back to
-        // the static template so `agent.yml` always exists.
-        Ok(_) => run_agent_fleet(fleet_target, spec.agents, force),
-        Err(e) => {
-            eprintln!("error: agent setup failed: {e:#}");
-            ExitCode::FAILURE
-        }
-    }
+    } else {
+        render_fleet_yaml(spec.agents)
+    };
+
+    let quorum_yaml = format!(
+        "{}\n{}",
+        render_workspace(spec),
+        fleet_sections_of(&fleet_yaml)
+    );
+    write_fleet_body(target, &quorum_yaml, force)
 }
 
 /// Arguments for [`run_onboard`]. A named struct so the wide CLI-dispatch call
@@ -384,10 +396,8 @@ pub struct OnboardSpec<'a> {
     pub orchestrator_url: &'a str,
     /// Where redeem writes creds/token/endpoint (default `~/.nsed`).
     pub out_dir: Option<&'a Path>,
-    /// Path for the generated `nsed.yaml`.
-    pub client_target: &'a Path,
-    /// Path for the generated `agent.yml`.
-    pub fleet_target: &'a Path,
+    /// Path for the generated unified `quorum.yml`.
+    pub target: &'a Path,
     pub room: &'a str,
     pub agents: &'a [String],
     pub non_interactive: bool,
@@ -395,26 +405,24 @@ pub struct OnboardSpec<'a> {
 }
 
 /// `quorum init --invite <code>` — single-command onboarding. Redeems the
-/// invite (writing creds/token/endpoint via the same path as `quorum
-/// redeem`), then scaffolds BOTH `nsed.yaml` and `agent.yml` so the
-/// operator can immediately `quorum run` AND `quorum serve` without
-/// touching `--agent-fleet`. On a TTY the agent personas are gathered
-/// interactively; with `--non-interactive` (or no TTY) a static fleet
-/// template is written.
+/// invite (writing creds/token/endpoint via the same path as `quorum redeem`),
+/// then scaffolds ONE unified `quorum.yml` (workspace + agent fleet) so the
+/// operator can immediately `quorum run` AND `quorum serve` from the same file
+/// — no "which yml" choice. On a TTY the agent personas are gathered
+/// interactively; with `--non-interactive` (or no TTY) a static fleet template
+/// is used.
 pub async fn run_onboard(spec: OnboardSpec<'_>) -> ExitCode {
     // Redeem consumes a single-use invite, so confirm we can write the
     // scaffolded configs BEFORE burning it — otherwise a non-writable cwd
     // (e.g. running from `/`) spends the invite with nothing to show.
-    for target in [spec.client_target, spec.fleet_target] {
-        if let Err(e) = preflight_writable(target) {
-            eprintln!(
-                "error: cannot write {} ({e}).\n       \
-                 cd to a writable directory (e.g. your home), or pass --config <path>, then re-run.\n       \
-                 Your invite has NOT been redeemed yet.",
-                target.display()
-            );
-            return ExitCode::FAILURE;
-        }
+    if let Err(e) = preflight_writable(spec.target) {
+        eprintln!(
+            "error: cannot write {} ({e}).\n       \
+             cd to a writable directory (e.g. your home), or pass --config <path>, then re-run.\n       \
+             Your invite has NOT been redeemed yet.",
+            spec.target.display()
+        );
+        return ExitCode::FAILURE;
     }
 
     if let Err(e) = crate::cli::commands::redeem::run(
@@ -431,7 +439,7 @@ pub async fn run_onboard(spec: OnboardSpec<'_>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    println!("\nScaffolding workspace + agent config…\n");
+    println!("\nScaffolding quorum.yml (workspace + agents)…\n");
     // Point the workspace at the bearer redeem just persisted, so `quorum
     // run`/`tui` authenticate with no manual `export`.
     let token_ref = token_ref_for_onboard(spec.out_dir);
@@ -442,14 +450,7 @@ pub async fn run_onboard(spec: OnboardSpec<'_>) -> ExitCode {
         agents: spec.agents,
     };
     let interactive = !spec.non_interactive && std::io::IsTerminal::is_terminal(&std::io::stdin());
-    scaffold_after_redeem(
-        spec.client_target,
-        spec.fleet_target,
-        &workspace,
-        spec.force,
-        interactive,
-    )
-    .await
+    scaffold_after_redeem(spec.target, &workspace, spec.force, interactive).await
 }
 
 #[cfg(test)]
@@ -475,13 +476,11 @@ mod tests {
     // ── --invite onboarding: scaffold BOTH nsed.yaml + agent.yml ──────
 
     #[tokio::test]
-    async fn scaffold_non_interactive_writes_both_configs() {
+    async fn scaffold_writes_single_unified_quorum_yml() {
         let dir = tempdir().unwrap();
-        let nsed = dir.path().join("nsed.yaml");
-        let fleet = dir.path().join("agent.yml");
+        let target = dir.path().join("quorum.yml");
         let exit = scaffold_after_redeem(
-            &nsed,
-            &fleet,
+            &target,
             &ws(
                 DEFAULT_ORCHESTRATOR_URL,
                 DEFAULT_ROOM,
@@ -493,42 +492,43 @@ mod tests {
         )
         .await;
         assert_eq!(exit, ExitCode::SUCCESS);
-        assert!(nsed.exists(), "nsed.yaml must be written");
-        assert!(fleet.exists(), "agent.yml must be written");
-        let nsed_body = fs::read_to_string(&nsed).unwrap();
-        assert!(nsed_body.contains("orchestrators:"));
+        assert!(target.exists(), "quorum.yml must be written");
+        let body = fs::read_to_string(&target).unwrap();
+        assert!(body.contains("orchestrators:"));
         assert!(
-            nsed_body.contains("token: \"file:/tmp/operator.token\""),
-            "workspace must reference the redeemed token file, got:\n{nsed_body}"
+            body.contains("token: \"file:/tmp/operator.token\""),
+            "workspace must reference the redeemed token file, got:\n{body}"
         );
-        assert!(fs::read_to_string(&fleet).unwrap().contains("providers:"));
+        assert!(
+            body.contains("providers:"),
+            "fleet providers must be present"
+        );
+        // The fleet's `orchestrators:` LIST must be stripped — only the
+        // workspace map remains, so the file parses as one QuorumConfig.
+        let parsed: crate::cli::workspace::QuorumConfig =
+            serde_yaml::from_str(&body).expect("unified file must parse as QuorumConfig");
+        assert!(parsed.orchestrators.contains_key("primary"));
     }
 
     #[tokio::test]
-    async fn scaffold_aborts_before_fleet_when_workspace_step_fails() {
+    async fn scaffold_refuses_to_overwrite_existing_without_force() {
         let dir = tempdir().unwrap();
-        let nsed = dir.path().join("nsed.yaml");
-        let fleet = dir.path().join("agent.yml");
-        fs::write(&nsed, "existing").unwrap();
+        let target = dir.path().join("quorum.yml");
+        fs::write(&target, "existing").unwrap();
         let exit = scaffold_after_redeem(
-            &nsed,
-            &fleet,
+            &target,
             &ws(
                 DEFAULT_ORCHESTRATOR_URL,
                 DEFAULT_ROOM,
                 "file:/tmp/operator.token",
                 &[],
             ),
-            false, // no force → nsed.yaml write refused
+            false, // no force → write refused
             false,
         )
         .await;
         assert_eq!(exit, ExitCode::FAILURE);
-        assert_eq!(fs::read_to_string(&nsed).unwrap(), "existing");
-        assert!(
-            !fleet.exists(),
-            "must not write agent.yml once the workspace step fails"
-        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "existing");
     }
 
     #[test]

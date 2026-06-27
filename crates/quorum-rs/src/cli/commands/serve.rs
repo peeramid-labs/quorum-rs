@@ -30,7 +30,7 @@
 //! config without guessing.
 
 use crate::cli::remote::{AgentInfo, RemoteError, RemoteOrchestrator};
-use crate::cli::workspace::{OrchestratorMode, WorkspaceConfig};
+use crate::cli::workspace::{OrchestratorMode, QuorumConfig};
 use crate::nats_utils::NatsAuth;
 use crate::serve::{ServeOptions, serve_fleet};
 use anyhow::{Context, Result};
@@ -128,7 +128,7 @@ fn try_build_orchestrator_client(
     workspace_path: &Path,
     room_flag: Option<&str>,
 ) -> Option<RemoteOrchestrator> {
-    let workspace = WorkspaceConfig::load(workspace_path).ok()?;
+    let workspace = QuorumConfig::load_workspace(workspace_path).ok()?;
     let (_room_name, room) = workspace.resolve_room(room_flag).ok()?;
     let orch_name = room.orchestrator.as_deref()?;
     let orch = workspace.orchestrators.get(orch_name)?;
@@ -152,7 +152,7 @@ fn resolve_remote_orchestrator(
     workspace_path: &Path,
     room_flag: Option<&str>,
 ) -> Option<(String, String)> {
-    let workspace = WorkspaceConfig::load(workspace_path).ok()?;
+    let workspace = QuorumConfig::load_workspace(workspace_path).ok()?;
     let (_room_name, room) = workspace.resolve_room(room_flag).ok()?;
     let orch_name = room.orchestrator.as_deref()?;
     let orch = workspace.orchestrators.get(orch_name)?;
@@ -229,7 +229,24 @@ async fn register_fleet_agents(
 /// `quorum init` writes and the layout `nsed serve` consumes in the
 /// parent repo. If `--config` isn't passed, the CLI walks this list
 /// and uses the first match.
-const DEFAULT_FLEET_PATHS: &[&str] = &["agent.yml", "config/agent.yml", "config/default.yml"];
+const DEFAULT_FLEET_PATHS: &[&str] = &[
+    "quorum.yml",
+    "quorum.yaml",
+    "agent.yml",
+    "config/agent.yml",
+    "config/default.yml",
+];
+
+/// Load the agent fleet from `path`, accepting EITHER a unified `quorum.yml`
+/// (workspace + fleet in one file) or a legacy `agent.yml`. The unified parse
+/// is tried first; a legacy `agent.yml` (whose `orchestrators:` is a list, not
+/// a map) fails it and falls through to [`crate::config::load_config`].
+fn load_fleet_unified(path: &Path) -> Result<crate::config::AgentFleetConfig> {
+    match QuorumConfig::load(path) {
+        Ok(q) => Ok(q.to_fleet()),
+        Err(_) => crate::config::load_config(path),
+    }
+}
 
 /// Default operator creds-file location written by `quorum redeem`.
 fn default_creds_path() -> Option<PathBuf> {
@@ -300,7 +317,7 @@ async fn resolve_nats_url(
         return Ok(u.to_string());
     }
 
-    let workspace = WorkspaceConfig::load(workspace_path).with_context(|| {
+    let workspace = QuorumConfig::load_workspace(workspace_path).with_context(|| {
         format!(
             "no --nats-url passed, no telemetry NATS URL in the fleet config, and workspace \
              config not loadable at {}",
@@ -398,8 +415,18 @@ pub async fn run(
     }
 
     let config_path = resolve_config_path(config)?;
-    let fleet = crate::config::load_config(&config_path)
+    // Unified single-file (`quorum.yml`) carries BOTH the fleet and the
+    // workspace. When `config_path` is unified, it doubles as the workspace so
+    // operators never pass two files; otherwise the legacy split applies
+    // (agent.yml fleet + nsed.yaml workspace).
+    let is_unified = QuorumConfig::load(&config_path).is_ok();
+    let fleet = load_fleet_unified(&config_path)
         .with_context(|| format!("failed to load fleet config at {}", config_path.display()))?;
+    let effective_workspace: &Path = if is_unified {
+        config_path.as_path()
+    } else {
+        workspace_path
+    };
 
     let fleet_nats_url = fleet
         .telemetry
@@ -407,7 +434,7 @@ pub async fn run(
         .iter()
         .find_map(|e| e.nats_url.as_deref());
     let resolved_nats_url =
-        resolve_nats_url(nats_url, fleet_nats_url, workspace_path, room).await?;
+        resolve_nats_url(nats_url, fleet_nats_url, effective_workspace, room).await?;
     tracing::info!(nats_url = %resolved_nats_url, "resolved NATS URL");
 
     // Auto-register each agent under the operator token so operator≠agent
@@ -415,7 +442,7 @@ pub async fn run(
     // the agent→operator link server-side, every boot. Only runs against a
     // remote orchestrator with a resolvable operator token; otherwise serve
     // falls back to the shared `--nats-creds` connection (existing behaviour).
-    let agent_auth = match resolve_remote_orchestrator(workspace_path, room) {
+    let agent_auth = match resolve_remote_orchestrator(effective_workspace, room) {
         Some((orch_url, bearer)) => {
             register_fleet_agents(&orch_url, &bearer, &fleet, agent_filter).await
         }
@@ -445,7 +472,7 @@ pub async fn run(
     // operator never reaches this process. Read it back from `GET /agents`
     // once heartbeats have had time to land, and log a per-agent verdict.
     // Best-effort: only runs when the orchestrator is a reachable remote.
-    if let Some(orch) = try_build_orchestrator_client(workspace_path, room) {
+    if let Some(orch) = try_build_orchestrator_client(effective_workspace, room) {
         let selected: Vec<String> = fleet
             .agents
             .iter()
@@ -714,6 +741,58 @@ default_room: main
         .unwrap();
         // Loads cleanly; None specifically because the orchestrator is embedded.
         assert!(resolve_remote_orchestrator(&ws_path, None).is_none());
+    }
+
+    #[test]
+    fn load_fleet_unified_reads_quorum_yml_and_legacy_agent_yml() {
+        let tmpdir = TempDir::new().unwrap();
+        // Unified quorum.yml: workspace + fleet in one file.
+        let q = tmpdir.path().join("quorum.yml");
+        std::fs::write(
+            &q,
+            r#"
+orchestrators:
+  prod: { mode: remote, address: "https://x", token: "t" }
+policies:
+  default: { agents: [a, b] }
+rooms:
+  main: { policy: default, orchestrator: prod }
+default_room: main
+providers:
+  openai: { type: openai, api_key: "${K}" }
+agents:
+  - name: justindgx
+    provider_id: openai
+    model_name: gpt-4o
+"#,
+        )
+        .unwrap();
+        let fleet = load_fleet_unified(&q).expect("unified fleet");
+        assert_eq!(fleet.agents.len(), 1);
+        assert_eq!(fleet.agents[0].name, "justindgx");
+        assert!(fleet.providers.contains_key("openai"));
+
+        // Legacy agent.yml: orchestrators is a LIST → unified parse fails →
+        // falls back to load_config.
+        let a = tmpdir.path().join("agent.yml");
+        std::fs::write(
+            &a,
+            r#"
+providers:
+  openai: { type: openai, api_key: "${K}" }
+agents:
+  - name: legacy-bot
+    provider_id: openai
+    model_name: gpt-4o
+orchestrators:
+  - url: "https://x"
+    bearer_token: "t"
+"#,
+        )
+        .unwrap();
+        let fleet = load_fleet_unified(&a).expect("legacy fleet");
+        assert_eq!(fleet.agents.len(), 1);
+        assert_eq!(fleet.agents[0].name, "legacy-bot");
     }
 
     #[tokio::test]

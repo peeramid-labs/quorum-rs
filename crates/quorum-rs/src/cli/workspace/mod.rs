@@ -38,6 +38,91 @@ pub struct AgentsConfig {
     pub dashboard_port: Option<u16>,
 }
 
+/// Unified single-file config (`quorum.yml`): workspace (orchestrators / rooms /
+/// policies) AND the agent fleet (providers / agents) in one place, so every
+/// command reads the same file and operators never pick "which yml to serve".
+///
+/// Splits cleanly into the two existing views via [`Self::to_workspace`] and
+/// [`Self::to_fleet`], so downstream code (run / tui / serve) is unchanged.
+/// Legacy split configs (`nsed.yaml` + `agent.yml`) keep working through their
+/// own loaders.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct QuorumConfig {
+    #[serde(default)]
+    pub policies: HashMap<String, PolicyConfig>,
+    #[serde(default)]
+    pub orchestrators: HashMap<String, OrchestratorConfig>,
+    #[serde(default)]
+    pub rooms: HashMap<String, RoomConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_room: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared: Option<Vec<ContextRef>>,
+    /// Fleet: LLM/exec/mcp providers, keyed by id.
+    #[serde(default)]
+    pub providers: HashMap<String, crate::config::ProviderEntry>,
+    /// Fleet: the agents this host runs (`quorum serve`).
+    #[serde(default)]
+    pub agents: Vec<crate::agents::config::AgentConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_sla_secs: Option<u64>,
+    #[serde(default)]
+    pub telemetry: crate::telemetry::TelemetryConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dashboard_port: Option<u16>,
+}
+
+impl QuorumConfig {
+    /// Parse a unified `quorum.yml` and validate its workspace half (policy
+    /// agent-count rules etc.), mirroring [`WorkspaceConfig::load`].
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let contents = std::fs::read_to_string(path)?;
+        let config: Self = serde_yaml::from_str(&contents)?;
+        config.to_workspace().validate()?;
+        Ok(config)
+    }
+
+    /// Load `path` and return the workspace view. Accepts EITHER a unified
+    /// `quorum.yml` or a legacy `nsed.yaml` — the unified parse is tried first;
+    /// a legacy `nsed.yaml` (whose `agents:` is a `config_file` pointer, not a
+    /// list) fails the unified parse and falls through to [`WorkspaceConfig::load`].
+    /// This lets `run` / `tui` / serve read one file with no format flag.
+    pub fn load_workspace(path: &Path) -> Result<WorkspaceConfig, ConfigError> {
+        match Self::load(path) {
+            Ok(q) => Ok(q.to_workspace()),
+            Err(_) => WorkspaceConfig::load(path),
+        }
+    }
+
+    /// Workspace view — orchestrators / rooms / policies for `run` / `tui` /
+    /// serve's operator-token resolution. The fleet lives inline here, so the
+    /// `agents` pointer is unused (set only to carry `dashboard_port`).
+    pub fn to_workspace(&self) -> WorkspaceConfig {
+        WorkspaceConfig {
+            policies: self.policies.clone(),
+            orchestrators: self.orchestrators.clone(),
+            rooms: self.rooms.clone(),
+            shared: self.shared.clone(),
+            default_room: self.default_room.clone(),
+            agents: None,
+        }
+    }
+
+    /// Fleet view — providers + agents for `quorum serve`. Orchestrators are
+    /// resolved from the workspace view, so the fleet's per-agent orchestrator
+    /// list is left empty here.
+    pub fn to_fleet(&self) -> crate::config::AgentFleetConfig {
+        crate::config::AgentFleetConfig {
+            providers: self.providers.clone(),
+            agents: self.agents.clone(),
+            orchestrators: Vec::new(),
+            response_sla_secs: self.response_sla_secs,
+            telemetry: self.telemetry.clone(),
+            dashboard_port: self.dashboard_port,
+        }
+    }
+}
+
 /// Execution mode for a policy.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -441,7 +526,8 @@ impl WorkspaceConfig {
     /// `quorum redeem` → `quorum run`/`status`/`rooms` just work.
     pub fn load_or_remote_default(path: &Path) -> Result<Self, ConfigError> {
         if path.exists() {
-            Self::load(path)
+            // Accepts a unified `quorum.yml` or a legacy `nsed.yaml`.
+            QuorumConfig::load_workspace(path)
         } else {
             crate::cli::endpoint::remote_workspace().map_err(ConfigError::ConfigFree)
         }
@@ -458,7 +544,13 @@ impl WorkspaceConfig {
             return crate::cli::endpoint::remote_workspace().map_err(ConfigError::ConfigFree);
         }
         let contents = std::fs::read_to_string(path)?;
-        let config: Self = serde_yaml::from_str(&contents)?;
+        // Unified `quorum.yml` first; a legacy `nsed.yaml` (whose `agents:` is a
+        // `config_file` pointer, not a list) fails the unified parse and falls
+        // through to the workspace parse.
+        let config: Self = match serde_yaml::from_str::<QuorumConfig>(&contents) {
+            Ok(q) => q.to_workspace(),
+            Err(_) => serde_yaml::from_str::<Self>(&contents)?,
+        };
         match config.validate() {
             Ok(()) => Ok(config),
             Err(e) if e.is_provisioning() => Ok(config),

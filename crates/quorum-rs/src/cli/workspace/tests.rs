@@ -1,4 +1,73 @@
 #[cfg(test)]
+mod unified {
+    use crate::cli::workspace::*;
+
+    fn unified_yaml() -> &'static str {
+        r#"
+orchestrators:
+  prod:
+    mode: remote
+    address: "https://api.example.com"
+    token: "file:~/.nsed/operator.token"
+policies:
+  default:
+    agents: [justindgx, justindgy]
+rooms:
+  main:
+    policy: default
+    orchestrator: prod
+default_room: main
+providers:
+  openai:
+    type: openai
+    api_key: "${OPENAI_API_KEY}"
+agents:
+  - name: justindgx
+    provider_id: openai
+    model_name: gpt-4o
+dashboard_port: 8080
+"#
+    }
+
+    #[test]
+    fn unified_splits_into_workspace_and_fleet_views() {
+        let cfg: QuorumConfig = serde_yaml::from_str(unified_yaml()).expect("parse");
+
+        let ws = cfg.to_workspace();
+        let (room_name, room) = ws.resolve_room(None).expect("room resolves");
+        assert_eq!(room_name, "main");
+        assert_eq!(room.orchestrator.as_deref(), Some("prod"));
+        assert!(ws.orchestrators.contains_key("prod"));
+
+        let fleet = cfg.to_fleet();
+        assert!(fleet.providers.contains_key("openai"));
+        assert_eq!(fleet.agents.len(), 1);
+        assert_eq!(fleet.agents[0].name, "justindgx");
+        assert_eq!(fleet.dashboard_port, Some(8080));
+    }
+
+    #[test]
+    fn unified_load_validates_workspace_policy_rules() {
+        let bad = r#"
+policies:
+  default:
+    agents: [solo]
+rooms:
+  main: { policy: default }
+default_room: main
+agents: []
+"#;
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let p = tmpdir.path().join("quorum.yml");
+        std::fs::write(&p, bad).unwrap();
+        assert!(
+            QuorumConfig::load(&p).is_err(),
+            "too-few-agents must fail load"
+        );
+    }
+}
+
+#[cfg(test)]
 mod parsing {
     use crate::cli::workspace::*;
 
