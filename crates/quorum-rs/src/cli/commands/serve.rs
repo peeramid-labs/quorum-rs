@@ -143,6 +143,88 @@ fn try_build_orchestrator_client(
     }
 }
 
+/// Resolve `(orchestrator HTTP url, operator bearer token)` from the workspace
+/// for a remote orchestrator. The token is the workspace orchestrator entry's
+/// `token` (the operator token from `quorum redeem`/`init --invite`), which
+/// carries `manage_agents` and is what attributes agents to the operator.
+/// `None` for embedded / no-workspace / missing-field runs.
+fn resolve_remote_orchestrator(
+    workspace_path: &Path,
+    room_flag: Option<&str>,
+) -> Option<(String, String)> {
+    let workspace = WorkspaceConfig::load(workspace_path).ok()?;
+    let (_room_name, room) = workspace.resolve_room(room_flag).ok()?;
+    let orch_name = room.orchestrator.as_deref()?;
+    let orch = workspace.orchestrators.get(orch_name)?;
+    match orch.mode.as_ref() {
+        Some(OrchestratorMode::Remote) | None => {
+            let address = orch.address.as_deref()?.to_string();
+            let token = crate::config::resolve_env_token("token", orch.token.as_deref()?);
+            Some((address, token))
+        }
+        Some(OrchestratorMode::Embedded) => None,
+    }
+}
+
+/// Register every fleet agent with the orchestrator under the operator bearer.
+///
+/// This is what makes operator≠agent work with no manual step: the operator
+/// token (`manage_agents`) registers each differently-named agent via
+/// `/credentials/register`, which mints per-agent scoped NATS creds AND records
+/// `set_agent_operator(agent_id, operator)` server-side. Runs every boot
+/// (idempotent). Returns a map of agent name → its registered connection;
+/// agents missing from the map fall back to the shared connection.
+async fn register_fleet_agents(
+    orch_url: &str,
+    bearer: &str,
+    fleet: &crate::config::AgentFleetConfig,
+    agent_filter: Option<&[String]>,
+) -> std::collections::HashMap<String, crate::serve::AgentConn> {
+    let mut map = std::collections::HashMap::new();
+    let names: Vec<String> = fleet
+        .agents
+        .iter()
+        .filter(|a| agent_filter.is_none_or(|f| f.iter().any(|n| n == &a.name)))
+        .map(|a| a.name.clone())
+        .collect();
+    if bearer.trim().is_empty() {
+        tracing::error!(
+            "no operator token resolved for agent registration — agents will be unattributed \
+             and DROPPED by the orchestrator. Set the orchestrator `token` in your workspace \
+             (the operator token from `quorum redeem` / `init --invite`)."
+        );
+        return map;
+    }
+    for name in names {
+        match crate::nats_utils::register_with_orchestrator_with_retry(orch_url, &name, bearer, 5)
+            .await
+        {
+            Ok(reg) => {
+                tracing::info!(agent = %name, "registered + attributed under operator");
+                map.insert(
+                    name,
+                    crate::serve::AgentConn {
+                        nats_url: reg.nats_url,
+                        nats_auth: Some(NatsAuth {
+                            inline_creds: Some(reg.creds),
+                            ..Default::default()
+                        }),
+                    },
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    agent = %name,
+                    error = %e,
+                    "agent registration FAILED — this agent will be unattributed and DROPPED. \
+                     Check the operator token carries the `manage_agents` role."
+                );
+            }
+        }
+    }
+    map
+}
+
 /// Default fleet-config search order — keep aligned with the layout
 /// `quorum init` writes and the layout `nsed serve` consumes in the
 /// parent repo. If `--config` isn't passed, the CLI walks this list
@@ -328,10 +410,23 @@ pub async fn run(
         resolve_nats_url(nats_url, fleet_nats_url, workspace_path, room).await?;
     tracing::info!(nats_url = %resolved_nats_url, "resolved NATS URL");
 
+    // Auto-register each agent under the operator token so operator≠agent
+    // works with no manual step: this mints per-agent scoped creds AND records
+    // the agent→operator link server-side, every boot. Only runs against a
+    // remote orchestrator with a resolvable operator token; otherwise serve
+    // falls back to the shared `--nats-creds` connection (existing behaviour).
+    let agent_auth = match resolve_remote_orchestrator(workspace_path, room) {
+        Some((orch_url, bearer)) => {
+            register_fleet_agents(&orch_url, &bearer, &fleet, agent_filter).await
+        }
+        None => std::collections::HashMap::new(),
+    };
+
     let cancel = tokio_util::sync::CancellationToken::new();
 
     let opts = ServeOptions {
         nats_url: resolved_nats_url,
+        agent_auth,
         nats_auth: resolve_nats_auth(nats_creds),
         agent_filter: agent_filter.map(|v| v.to_vec()),
         stream_name: stream_name
@@ -565,6 +660,69 @@ default_room: main
             operator_tags: tags.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn resolve_remote_orchestrator_returns_address_and_token() {
+        let tmpdir = TempDir::new().unwrap();
+        let ws_path = tmpdir.path().join("nsed.yaml");
+        std::fs::write(
+            &ws_path,
+            r#"
+orchestrators:
+  prod:
+    mode: remote
+    address: "https://api.example.com"
+    token: "op-bearer-xyz"
+policies:
+  default:
+    agents: [justindgx, justindgy]
+rooms:
+  main:
+    policy: default
+    orchestrator: prod
+default_room: main
+"#,
+        )
+        .unwrap();
+        let (url, token) = resolve_remote_orchestrator(&ws_path, None).expect("remote resolves");
+        assert_eq!(url, "https://api.example.com");
+        assert_eq!(token, "op-bearer-xyz");
+    }
+
+    #[test]
+    fn resolve_remote_orchestrator_none_for_embedded() {
+        let tmpdir = TempDir::new().unwrap();
+        let ws_path = tmpdir.path().join("nsed.yaml");
+        std::fs::write(
+            &ws_path,
+            r#"
+orchestrators:
+  local:
+    mode: embedded
+    nats_url: "nats://x:4222"
+policies:
+  default:
+    agents: [a, b]
+rooms:
+  main:
+    policy: default
+    orchestrator: local
+default_room: main
+"#,
+        )
+        .unwrap();
+        // Loads cleanly; None specifically because the orchestrator is embedded.
+        assert!(resolve_remote_orchestrator(&ws_path, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn register_fleet_agents_empty_bearer_returns_empty_no_network() {
+        // Empty operator token → no registration attempted (would 403); the map
+        // is empty and the agents fall back to the shared connection. No network.
+        let fleet: crate::config::AgentFleetConfig = serde_yaml::from_str("agents: []\n").unwrap();
+        let map = register_fleet_agents("https://unused.example", "", &fleet, None).await;
+        assert!(map.is_empty());
     }
 
     #[test]
