@@ -673,7 +673,12 @@ fn write_files_creates_config_directory() {
 fn render_agent_config_has_orchestrator_and_agents() {
     let providers = sample_providers();
     let agents = sample_agents();
-    let cfg = render_agent_config("http://nsed:8080", &providers, &agents);
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &agents,
+    );
 
     assert!(cfg.contains("orchestrators:"));
     assert!(cfg.contains("url: \"http://nsed:8080\""));
@@ -693,10 +698,38 @@ fn render_agent_config_has_orchestrator_and_agents() {
 }
 
 #[test]
+fn render_agent_config_emits_given_bearer_ref() {
+    // The onboard path passes a file: ref to the operator token redeem wrote,
+    // not the dangling ${NSED_BEARER_TOKEN}. Whatever ref is passed must land
+    // verbatim in the orchestrator entry's bearer_token.
+    let providers = sample_providers();
+    let agents = sample_agents();
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        "file:~/.nsed/operator.token",
+        &providers,
+        &agents,
+    );
+    assert!(
+        cfg.contains("bearer_token: \"file:~/.nsed/operator.token\""),
+        "bearer_ref must be emitted verbatim, got:\n{cfg}"
+    );
+    assert!(
+        !cfg.contains("bearer_token: \"${NSED_BEARER_TOKEN}\""),
+        "must not also emit the dangling env-var ref"
+    );
+}
+
+#[test]
 fn render_agent_config_has_provider_types() {
     let providers = sample_providers();
     let agents = sample_agents();
-    let cfg = render_agent_config("http://localhost:8080", &providers, &agents);
+    let cfg = render_agent_config(
+        "http://localhost:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &agents,
+    );
 
     // Remote providers should have env-var api_key reference
     assert!(cfg.contains("api_key: \"${TOGETHER_AI_API_KEY}\""));
@@ -708,7 +741,12 @@ fn render_agent_config_has_provider_types() {
 fn render_agent_config_includes_pricing() {
     let providers = sample_providers();
     let agents = sample_agents();
-    let cfg = render_agent_config("http://localhost:8080", &providers, &agents);
+    let cfg = render_agent_config(
+        "http://localhost:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &agents,
+    );
 
     assert!(cfg.contains("input_price_per_mtok: 0.90"));
     assert!(cfg.contains("output_price_per_mtok: 0.90"));
@@ -718,7 +756,12 @@ fn render_agent_config_includes_pricing() {
 fn render_agent_config_has_all_strategy_fields() {
     let providers = sample_providers();
     let agents = sample_agents();
-    let cfg = render_agent_config("http://localhost:8080", &providers, &agents);
+    let cfg = render_agent_config(
+        "http://localhost:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &agents,
+    );
 
     // Preset agents get persona from PRESET_CONFIGS (agent section).
     // DEFAULT prefix + VERIFY prefix — both in the trimmed General set.
@@ -1268,7 +1311,12 @@ fn render_agent_config_none_pricing_omits_price_lines() {
         None, // no output pricing
     );
     agent.apply_preset();
-    let cfg = render_agent_config("http://nsed:8080", &providers, &[agent]);
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &[agent],
+    );
 
     // When pricing is None, should NOT emit input_price_per_mtok or output_price_per_mtok
     assert!(
@@ -1308,7 +1356,12 @@ fn render_agent_config_strategy_flags_some_true() {
     agent.json_mode = Some(true);
     agent.disable_native_tools = Some(true);
     agent.scratchpad_limit = Some(5000);
-    let cfg = render_agent_config("http://nsed:8080", &providers, &[agent]);
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &[agent],
+    );
 
     // Active (uncommented) values
     assert!(cfg.contains("    use_streaming: true"));
@@ -1347,7 +1400,12 @@ fn render_agent_config_strategy_flags_some_false() {
     agent.json_mode = Some(false);
     agent.disable_native_tools = Some(false);
     agent.scratchpad_limit = Some(0);
-    let cfg = render_agent_config("http://nsed:8080", &providers, &[agent]);
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &[agent],
+    );
 
     assert!(cfg.contains("    use_streaming: false"));
     assert!(cfg.contains("    merge_system_prompt: false"));
@@ -1377,7 +1435,12 @@ fn render_agent_config_engine_override() {
         None,
         None,
     );
-    let cfg = render_agent_config("http://nsed:8080", &providers, &[agent]);
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &[agent],
+    );
 
     assert!(
         cfg.contains("engine: \"harmony\""),
@@ -1405,7 +1468,12 @@ fn render_agent_config_no_persona_emits_comment() {
         None,
         None,
     );
-    let cfg = render_agent_config("http://nsed:8080", &providers, &[agent]);
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &[agent],
+    );
 
     assert!(
         cfg.contains("# persona: \"You are a helpful AI assistant.\""),
@@ -1432,7 +1500,12 @@ fn render_agent_config_no_context_window_emits_model_block() {
         None,
         None,
     );
-    let cfg = render_agent_config("http://nsed:8080", &providers, &[agent]);
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &[agent],
+    );
 
     // Model block is emitted under the provider; context_window absent when None
     assert!(cfg.contains("      model-x:"));
@@ -1461,7 +1534,12 @@ fn render_agent_config_simulated_provider_section() {
         Some(0.0),
         Some(0.0),
     );
-    let cfg = render_agent_config("http://nsed:8080", &providers, &[agent]);
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &[agent],
+    );
 
     // Simulated providers: latency_ms, concurrency but no api_key or qps
     assert!(cfg.contains("simulated:"));
@@ -2178,7 +2256,12 @@ fn render_agent_config_persona_with_double_quotes() {
         None,
     );
     agent.persona = Some(r#"You are "the best" agent."#.to_string());
-    let cfg = render_agent_config("http://nsed:8080", &providers, &[agent]);
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &[agent],
+    );
     // Double quotes in persona should be escaped
     assert!(cfg.contains(r#"persona: "You are \"the best\" agent.""#));
 }
@@ -2240,7 +2323,12 @@ fn render_agent_config_multiple_providers_all_types() {
             Some(0.0),
         ),
     ];
-    let cfg = render_agent_config("http://nsed:8080", &providers, &agents);
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &agents,
+    );
 
     // Remote provider: env-var api_key, concurrency, qps
     assert!(cfg.contains("api_key: \"${TOGETHER_AI_API_KEY}\""));
@@ -2260,7 +2348,7 @@ fn render_agent_config_multiple_providers_all_types() {
 #[test]
 fn render_agent_config_empty_agents() {
     let providers = sample_providers();
-    let cfg = render_agent_config("http://nsed:8080", &providers, &[]);
+    let cfg = render_agent_config("http://nsed:8080", "${NSED_BEARER_TOKEN}", &providers, &[]);
     assert!(cfg.contains("orchestrators:"));
     assert!(cfg.contains("providers:"));
     assert!(cfg.contains("agents:"));
@@ -2277,7 +2365,7 @@ fn render_agent_config_empty_providers() {
         None,
         None,
     )];
-    let cfg = render_agent_config("http://nsed:8080", &[], &agents);
+    let cfg = render_agent_config("http://nsed:8080", "${NSED_BEARER_TOKEN}", &[], &agents);
     assert!(cfg.contains("providers:"));
     assert!(cfg.contains("agents:"));
     assert!(cfg.contains("name: \"TEST\""));
@@ -2827,7 +2915,12 @@ fn render_agent_config_all_presets() {
             slot
         })
         .collect();
-    let cfg = render_agent_config("http://nsed:8080", &providers, &agents);
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &agents,
+    );
     // Every preset name should appear in the output
     for preset in AGENT_PRESETS {
         assert!(
@@ -3544,7 +3637,7 @@ fn compose_worker_uses_bearer_token_env_var() {
 
 #[test]
 fn render_agent_config_orchestrator_section_structure() {
-    let cfg = render_agent_config("http://nsed:9090", &[], &[]);
+    let cfg = render_agent_config("http://nsed:9090", "${NSED_BEARER_TOKEN}", &[], &[]);
     assert!(cfg.contains("orchestrators:"));
     assert!(cfg.contains("  - id: \"primary\""));
     assert!(cfg.contains("    url: \"http://nsed:9090\""));
@@ -3582,7 +3675,12 @@ fn render_agent_config_agent_with_all_flags_set() {
     agent.json_mode = Some(true);
     agent.disable_native_tools = Some(false);
     agent.scratchpad_limit = Some(3000);
-    let cfg = render_agent_config("http://nsed:8080", &providers, &[agent]);
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &[agent],
+    );
 
     // Agent uses dotpath model reference
     assert!(cfg.contains("  - name: \"FULL\""));
@@ -3624,7 +3722,12 @@ fn render_agent_config_agent_with_no_flags_all_commented() {
         None,
         None,
     );
-    let cfg = render_agent_config("http://nsed:8080", &providers, &[agent]);
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &[agent],
+    );
 
     // Agent uses dotpath model reference
     assert!(cfg.contains("    model: \"prov.model-x\""));
@@ -3650,7 +3753,7 @@ fn render_agent_config_provider_base_url_not_emitted_when_empty() {
         models: vec![],
         engine: None,
     }];
-    let cfg = render_agent_config("http://nsed:8080", &providers, &[]);
+    let cfg = render_agent_config("http://nsed:8080", "${NSED_BEARER_TOKEN}", &providers, &[]);
     // Simulated provider with empty base_url should NOT have base_url line
     // Find the simulated provider section and verify no base_url
     let sim_idx = cfg.find("simulated:").unwrap();
@@ -3672,7 +3775,7 @@ fn render_agent_config_local_provider_concurrency() {
         models: vec![],
         engine: None,
     }];
-    let cfg = render_agent_config("http://nsed:8080", &providers, &[]);
+    let cfg = render_agent_config("http://nsed:8080", "${NSED_BEARER_TOKEN}", &providers, &[]);
     // Local provider should have higher concurrency and no qps
     assert!(cfg.contains("    concurrency: 1000"));
     // Local provider should NOT have qps
@@ -3695,7 +3798,7 @@ fn render_agent_config_remote_provider_has_qps() {
         models: vec![],
         engine: None,
     }];
-    let cfg = render_agent_config("http://nsed:8080", &providers, &[]);
+    let cfg = render_agent_config("http://nsed:8080", "${NSED_BEARER_TOKEN}", &providers, &[]);
     // Remote provider should have concurrency=500 and qps=50
     assert!(cfg.contains("    concurrency: 500"));
     assert!(cfg.contains("    qps: 50"));
@@ -4021,7 +4124,7 @@ fn render_env_and_agent_config_provider_keys_consistent() {
         engine: None,
     }];
     let env = render_env("owner", 8080, 4222, "s", "w", "sa", &providers, None, None);
-    let cfg = render_agent_config("http://nsed:8080", &providers, &[]);
+    let cfg = render_agent_config("http://nsed:8080", "${NSED_BEARER_TOKEN}", &providers, &[]);
 
     // Both should use MY_PROVIDER as the env key base
     assert!(env.contains("MY_PROVIDER_API_KEY=sk-abc"));
@@ -4033,7 +4136,12 @@ fn render_compose_and_agent_config_same_agent_names() {
     let providers = sample_providers();
     let agents = sample_agents();
     let compose = render_compose_owner(8080, 4222, &providers, &agents);
-    let cfg = render_agent_config("http://nsed:8080", &providers, &agents);
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &agents,
+    );
 
     // Both should reference the same agent names
     for agent in &agents {
@@ -4432,7 +4540,12 @@ fn render_orchestrator_config_all_section_headers_present() {
 
 #[test]
 fn render_agent_config_all_section_headers_present() {
-    let cfg = render_agent_config("http://nsed:8080", &sample_providers(), &sample_agents());
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
+        &sample_providers(),
+        &sample_agents(),
+    );
     assert!(cfg.contains("# Orchestrators"));
     assert!(cfg.contains("# LLM Providers"));
     assert!(cfg.contains("# Agents"));
@@ -4443,7 +4556,7 @@ fn render_agent_config_all_section_headers_present() {
 
 #[test]
 fn render_agent_config_engine_strategy_comments() {
-    let cfg = render_agent_config("http://nsed:8080", &[], &[]);
+    let cfg = render_agent_config("http://nsed:8080", "${NSED_BEARER_TOKEN}", &[], &[]);
     assert!(cfg.contains("\"harmony\""));
     assert!(cfg.contains("\"vllm\""));
     assert!(cfg.contains("\"vllm_responses\""));
@@ -4524,7 +4637,7 @@ fn full_owner_render_workflow() {
         None,
     );
     let orch_url = format!("http://nsed:${{APP_PORT:-{app_port}}}");
-    let agent_cfg = render_agent_config(&orch_url, &providers, &agents);
+    let agent_cfg = render_agent_config(&orch_url, "${NSED_BEARER_TOKEN}", &providers, &agents);
     let orch_cfg = render_orchestrator_config(app_port, nats_port, &providers);
 
     // Verify consistency across all outputs
@@ -4599,7 +4712,7 @@ fn full_worker_render_workflow() {
         Some(orch_url),
         None,
     );
-    let agent_cfg = render_agent_config(orch_url, &providers, &agents);
+    let agent_cfg = render_agent_config(orch_url, "${NSED_BEARER_TOKEN}", &providers, &agents);
 
     // Worker compose should not have NATS or orchestrator services
     assert!(!compose.contains("  nats:"));
@@ -5331,7 +5444,12 @@ fn render_agent_config_full_scenario_all_branches() {
     agent_partial.json_mode = Some(true);
 
     let agents = vec![agent_all, agent_none, agent_preset, agent_partial];
-    let cfg = render_agent_config("http://nsed:7070", &providers, &agents);
+    let cfg = render_agent_config(
+        "http://nsed:7070",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &agents,
+    );
 
     // Orchestrator section
     assert!(cfg.contains("url: \"http://nsed:7070\""));
@@ -5507,7 +5625,12 @@ fn write_files_full_owner_scenario() {
     let env = render_env(
         "owner", 8080, 4222, "admin-s", "worker-s", "SA_SEED", &providers, None, None,
     );
-    let agent_cfg = render_agent_config("http://nsed:8080", &providers, &agents);
+    let agent_cfg = render_agent_config(
+        "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &agents,
+    );
     let orch_cfg = render_orchestrator_config(8080, 4222, &providers);
 
     let configs = ConfigFiles {
@@ -5568,7 +5691,12 @@ fn write_files_full_worker_scenario() {
         Some("http://orch:8080"),
         None,
     );
-    let agent_cfg = render_agent_config("http://orch:8080", &providers, &agents);
+    let agent_cfg = render_agent_config(
+        "http://orch:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &agents,
+    );
 
     let configs = ConfigFiles {
         agent_config: Some(agent_cfg),
@@ -5835,7 +5963,12 @@ fn render_agent_config_exercises_all_preset_personas() {
         })
         .collect();
 
-    let cfg = render_agent_config("http://nsed:8080", &providers, &agents);
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &agents,
+    );
 
     // All preset names should appear
     for pc in PRESET_CONFIGS {
@@ -6262,7 +6395,7 @@ fn render_env_contains_warning_comment() {
 
 #[test]
 fn render_agent_config_header_structure() {
-    let cfg = render_agent_config("http://nsed:8080", &[], &[]);
+    let cfg = render_agent_config("http://nsed:8080", "${NSED_BEARER_TOKEN}", &[], &[]);
     assert!(cfg.contains("NSED Agent Configuration"));
     assert!(cfg.contains("Generated by nsed init"));
     assert!(cfg.contains("Override values by creating config/local.yml"));
@@ -6270,7 +6403,7 @@ fn render_agent_config_header_structure() {
 
 #[test]
 fn render_agent_config_provider_section_comments() {
-    let cfg = render_agent_config("http://nsed:8080", &[], &[]);
+    let cfg = render_agent_config("http://nsed:8080", "${NSED_BEARER_TOKEN}", &[], &[]);
     assert!(cfg.contains("LLM Providers"));
     assert!(cfg.contains("Engine strategies control LLM protocol"));
     assert!(cfg.contains("\"harmony\""));
@@ -7677,6 +7810,7 @@ fn access_agent(read: &[&str], write: &[&str]) -> AgentSlot {
 fn render_agent_access_native_read_emits_builtin_read_file() {
     let cfg = render_agent_config(
         "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
         &provider_of_type("openai"),
         &[access_agent(&["docs/", "src/api.rs"], &[])],
     );
@@ -7689,6 +7823,7 @@ fn render_agent_access_native_read_emits_builtin_read_file() {
 fn render_agent_access_native_write_emits_note_not_tool() {
     let cfg = render_agent_config(
         "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
         &provider_of_type("openai"),
         &[access_agent(&[], &["./out"])],
     );
@@ -7705,6 +7840,7 @@ fn render_agent_access_claude_read_only_emits_context_files_no_writable() {
     // write tools can never reach them; no writable flag.
     let cfg = render_agent_config(
         "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
         &provider_of_type("claude"),
         &[access_agent(&["docs/"], &[])],
     );
@@ -7723,6 +7859,7 @@ fn render_agent_access_claude_write_separates_context_from_add_dirs() {
     // stay separate so the read path is never in the writable scope.
     let cfg = render_agent_config(
         "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
         &provider_of_type("claude"),
         &[access_agent(&["docs/"], &["./src"])],
     );
@@ -7739,6 +7876,7 @@ fn render_agent_access_claude_write_separates_context_from_add_dirs() {
 fn render_agent_access_none_emits_no_access_block() {
     let cfg = render_agent_config(
         "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
         &provider_of_type("openai"),
         &[access_agent(&[], &[])],
     );
@@ -7751,7 +7889,12 @@ fn render_agent_access_none_emits_no_access_block() {
 fn render_agent_access_exec_uses_working_dir_prefers_write() {
     let mut a = access_agent(&["./read"], &["./work"]);
     a.exec_command = Some(vec!["python3".to_string(), "agent.py".to_string()]);
-    let cfg = render_agent_config("http://nsed:8080", &provider_of_type("exec"), &[a]);
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
+        &provider_of_type("exec"),
+        &[a],
+    );
     assert!(cfg.contains("    exec:"));
     assert!(cfg.contains("      working_dir: \"./work\""));
     assert!(!cfg.contains("builtin_tools:"));

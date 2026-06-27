@@ -57,6 +57,18 @@ For chat-only codes only the `.token` is written; you can't run
 agents off a chat-only invite. Ask the admin for a unified code
 (`capabilities: ["chat", "agent"]`).
 
+> **The operator token is what attributes your agents.** On every boot
+> `serve` registers each fleet agent with the orchestrator
+> (`/credentials/register`) using the orchestrator entry's `bearer_token`,
+> and *that* call is what records each `agent_id → operator` link. The
+> bearer must be your **operator token** (`operator.token`, which carries
+> the `manage_agents` role + a display name). `quorum init --invite`
+> scaffolds `bearer_token: "file:~/.nsed/operator.token"` for you. An
+> env-var ref (`bearer_token: "${OPERATOR_TOKEN}"`) works too for
+> CI/devops. A missing/blank bearer → registration 403s → agents
+> heartbeat **unattributed** and the orchestrator **drops** them. `serve`
+> logs a loud `ERROR` when this happens.
+
 ## Step 2 — scaffold `agent.yml`
 
 ```bash
