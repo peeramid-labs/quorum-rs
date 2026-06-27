@@ -487,18 +487,18 @@ async fn main() -> ExitCode {
             // code, then scaffold the config its audience implies. Takes
             // precedence over the wizard / one-shot template selection.
             if let Some(code) = invite {
-                let client_target = cli.config_path();
-                let fleet_target = if cli.config.is_some() {
+                // One unified file. `--config PATH` overrides; otherwise the
+                // single `quorum.yml` every command reads by default.
+                let target = if cli.config.is_some() {
                     cli.config_path()
                 } else {
-                    std::path::PathBuf::from("agent.yml")
+                    std::path::PathBuf::from("quorum.yml")
                 };
                 return commands::init::run_onboard(commands::init::OnboardSpec {
                     code,
                     orchestrator_url,
                     out_dir: out_dir.as_deref(),
-                    client_target: &client_target,
-                    fleet_target: &fleet_target,
+                    target: &target,
                     room,
                     agents,
                     non_interactive,
