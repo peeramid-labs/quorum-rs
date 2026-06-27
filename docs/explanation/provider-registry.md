@@ -22,7 +22,7 @@ Every provider is a [`ProviderFactory`](../reference/README.md). A [`ProviderReg
 
 ```mermaid
 flowchart TD
-    A["agent.yml<br/>provider.type"] --> B["build_worker"]
+    A["quorum.yml<br/>provider.type"] --> B["build_worker"]
     B --> C["ProviderRegistry::build_agent(type, …)"]
     C -->|registered| D["ProviderFactory::build_agent"]
     C -->|unknown| E["Ok(None) — skip agent, warn"]

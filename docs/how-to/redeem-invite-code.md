@@ -169,7 +169,7 @@ flavour above) writes three things under `~/.nsed/`:
 - `agent.creds` + `agent.seed` — only for unified (`agent`-capable) codes.
 
 With the address persisted beside the token, the discovery and submit
-commands need **no `nsed.yaml`**:
+commands need **no `quorum.yml`**:
 
 ```bash
 quorum redeem eyJhbGc...            # writes ~/.nsed/{operator.token,orchestrator}
@@ -180,19 +180,19 @@ quorum status <job-id>
 
 `run`, `status`, `rooms`, and `trace` synthesize a single-orchestrator
 workspace from `~/.nsed/orchestrator` + `~/.nsed/operator.token` when no
-workspace file is found. Policies and rooms are discovered live from the
+config file is found. Policies and rooms are discovered live from the
 orchestrator's grant-filtered `GET /policies` and `GET /rooms`, so a
 joiner picks from `quorum rooms` instead of hand-writing config.
 
 Endpoint precedence: `$QUORUM_ORCHESTRATOR` env wins, then the persisted
 `orchestrator` file. The file is looked up in the current directory
 first (so `quorum redeem --out-dir .` then running from that dir works),
-then `~/.nsed`. A `nsed.yaml` (via `--config`) still overrides everything
+then `~/.nsed`. A `quorum.yml` (via `--config`) still overrides everything
 when you need multi-orchestrator routing.
 
 > Note: in this config-free mode `quorum run` targets the single
 > redeemed orchestrator. Routing a job to a specific room id without a
-> `nsed.yaml` (`--room`) is a follow-up; today pass `--policy <label>`.
+> `quorum.yml` (`--room`) is a follow-up; today pass `--policy <label>`.
 
 ## Embedding instead of shelling out
 

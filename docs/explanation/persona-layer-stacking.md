@@ -1,6 +1,6 @@
 # Why persona layer stacking, and why CWD-relative paths
 
-> Design rationale for the layered-persona feature on `agent.yml`.
+> Design rationale for the layered-persona feature on `quorum.yml`.
 > Covers why the layered shape exists, why files are read at
 > parse time, and why paths resolve against process CWD instead
 > of the yaml file's parent directory.
@@ -57,7 +57,7 @@ The cost is that the deserializer does I/O. That's normally
 considered bad form, but the I/O is bounded (one file read per
 layer, no fan-out), happens once per fleet boot, and fits the
 existing pattern of `quorum validate` / `quorum serve` already
-doing file I/O against `agent.yml` and `~/.nsed/agent.creds`.
+doing file I/O against `quorum.yml` and `~/.nsed/agent.creds`.
 
 ## Why CWD-relative paths
 
@@ -90,7 +90,7 @@ Concretely:
 - Operators running `quorum serve` from a project root (typical)
   use `./prompts/x.md` and the path works.
 - Service units / Docker entrypoints set `WorkingDirectory=` /
-  `WORKDIR` to the directory holding `agent.yml` — paths still
+  `WORKDIR` to the directory holding `quorum.yml` — paths still
   work.
 - CI jobs that invoke `quorum serve` from a parent dir use
   absolute paths or a wrapper shell script that `cd`s first.
@@ -115,7 +115,7 @@ enough.
 - **Roundtrip preservation of the layered shape.** Serialising
   an `AgentConfig` back to yaml writes the resolved string. If
   operators want to dump-and-re-edit a layered persona, they
-  do so against the source `agent.yml`, not against a
+  do so against the source `quorum.yml`, not against a
   serialised snapshot of `AgentConfig`.
 
 ## See also

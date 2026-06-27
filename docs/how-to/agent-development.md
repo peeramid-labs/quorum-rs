@@ -165,7 +165,7 @@ The `AgentContext` argument carries everything the agent needs about the current
 
 ### Running it under `quorum serve`
 
-Hand-wiring a worker in `main()` (above) is one option. The other is to let `quorum serve` boot your agent from a fleet `agent.yml` like any built-in provider — register a [`ProviderFactory`](../explanation/provider-registry.md) for a custom `provider.type` and pass the registry via `ServeOptions.registry`. Then operators add your agent to the fleet with a few lines of YAML, no Rust. See [Register a custom provider](register-a-custom-provider.md).
+Hand-wiring a worker in `main()` (above) is one option. The other is to let `quorum serve` boot your agent from the `providers:` / `agents:` fleet in `quorum.yml` like any built-in provider — register a [`ProviderFactory`](../explanation/provider-registry.md) for a custom `provider.type` and pass the registry via `ServeOptions.registry`. Then operators add your agent to the fleet with a few lines of YAML, no Rust. See [Register a custom provider](register-a-custom-provider.md).
 
 ## Path 3: non-Rust agent
 

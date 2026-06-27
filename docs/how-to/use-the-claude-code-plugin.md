@@ -14,7 +14,7 @@
 | `/quorum:init` | `quorum init` (interactive workspace setup) with pre-flight `.env` scan + provider key detection. |
 | `/quorum:redeem <code>` | `quorum redeem` — JWT invite → `~/.nsed/agent.creds` + `operator.token` at `0600`. |
 | `/quorum:run "<task>"` | `quorum run` — dispatch into the workspace's default room; stream the verdict. |
-| `/quorum:serve` | `quorum serve` — boot the agent fleet from `agent.yml`. |
+| `/quorum:serve` | `quorum serve` — boot the agent fleet from `quorum.yml`. |
 | `/quorum:status` | `quorum status` — orchestrator health + agent listing. |
 | `/quorum:trace <job_id>` | `quorum trace` — per-round deliberation history. |
 | `/quorum:validate` | `quorum validate` — schema-check the workspace yaml. |
@@ -23,7 +23,7 @@
 Plus an auto-loaded skill (`quorum.md`) that carries the mental
 model + common-failure-mode catalog, so every session starts
 from the same architectural baseline instead of asking Claude
-to re-derive it from `nsed.yaml` contents.
+to re-derive it from `quorum.yml` contents.
 
 ## The recipe
 
@@ -66,7 +66,7 @@ What Claude does behind the prompt:
   suggests an embedded orchestrator instead.
 - Drops the operator into `quorum init`'s interactive wizard
   with sensible defaults pre-pinned to the detected env.
-- After the wizard writes `nsed.yaml`, runs `quorum validate`
+- After the wizard writes `quorum.yml`, runs `quorum validate`
   and surfaces the resolved `default_room`, orchestrator count,
   policy count.
 
@@ -105,8 +105,8 @@ Or to bring up an agent fleet:
 - CI / scripted runs — call the binary directly; the plugin's
   prompts are interactive.
 - Audit reviews — the plugin doesn't replace reading the
-  generated yaml. Always inspect `nsed.yaml` + `agent.yml`
-  before committing them.
+  generated yaml. Always inspect `quorum.yml` before committing
+  it.
 - Multi-tenant orchestrator admin work — those flows touch
   endpoints (`/api/operators`, `/admin/api/invites`) the
   plugin doesn't wrap; use the upstream `nsed-orchestrator`

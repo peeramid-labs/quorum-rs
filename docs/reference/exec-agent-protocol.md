@@ -243,7 +243,7 @@ See [`examples/exec_agent.py`](../examples/exec_agent.py) for a complete Python 
 echo '{"phase":"propose","context":{"task_description":"test","round_number":1,"phase":"Propose","candidates":[],"previous_round_matrix":null,"previous_critiques":[],"user_injections":[],"phase_budget_remaining_secs":60.0}}' \
   | python3 examples/exec_agent.py
 
-# 2. Configure in agent.yml
+# 2. Configure in quorum.yml
 # providers:
 #   exec_local:
 #     type: exec

@@ -3,12 +3,12 @@
 > Recipe for fleet operators who want a single persona text built
 > from reusable building blocks: a domain preamble, a
 > review-style block, and the specific agent's quirks. Assumes
-> you already have a working `agent.yml` and one or more
+> you already have a working `quorum.yml` and one or more
 > `prompts/*.md` files to compose.
 
 ## The problem this fixes
 
-A plain-string `persona:` field in `agent.yml` is fine for one or
+A plain-string `persona:` field in `quorum.yml` is fine for one or
 two agents. As fleets grow, operators end up copying the same
 4–30 lines of prose across every agent block (drift), or
 collapsing everything into one mega-string (unreadable diffs, no
@@ -22,11 +22,11 @@ prompt.
 
 ## The recipe
 
-### 1. Lay out shared prompt files next to `agent.yml`
+### 1. Lay out shared prompt files next to `quorum.yml`
 
 ```
 agents/
-  agent.yml
+  quorum.yml
   prompts/
     review-style.md
     output-format.md
@@ -38,7 +38,7 @@ not enforced — the deserializer only reads the bytes). Keep each
 file to one concern so a single composition decision picks one
 or two files, not whole concatenated docs.
 
-### 2. Reference them in `agent.yml`
+### 2. Reference them in `quorum.yml`
 
 ```yaml
 agents:
@@ -67,7 +67,7 @@ Focus on memory-safety issues specifically.
 ### 3. Boot the fleet
 
 ```
-quorum serve --workspace ./nsed.yaml
+quorum serve --config ./quorum.yml
 ```
 
 If a path is wrong, fleet boot fails with a parse error naming
@@ -85,7 +85,7 @@ already advertising a partial persona.
 ## Path resolution gotcha
 
 Paths in `md` layers resolve relative to the **process CWD when
-`quorum serve` was invoked**, NOT relative to the `agent.yml`
+`quorum serve` was invoked**, NOT relative to the `quorum.yml`
 file's parent directory. The deserializer has no yaml-path
 context.
 

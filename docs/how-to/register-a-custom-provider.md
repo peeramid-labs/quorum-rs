@@ -93,7 +93,7 @@ use quorum_rs::serve::{serve_fleet, ServeOptions};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let fleet = load_config(std::path::Path::new("agent.yml"))?;
+    let fleet = load_config(std::path::Path::new("quorum.yml"))?;
 
     let mut registry = ProviderRegistry::with_builtins(); // keep exec/mcp/claude/openai/…
     registry.register(Arc::new(CodexFactory));
@@ -108,9 +108,9 @@ async fn main() -> anyhow::Result<()> {
 
 `ProviderRegistry::with_builtins()` keeps every built-in provider; `register()` adds (or overrides) one type. If you want **only** your providers, start from `ProviderRegistry::empty()`.
 
-## 4. Reference it from the fleet YAML
+## 4. Reference it from `quorum.yml`
 
-Operators add your agent with a `provider_config:` block — the map your factory deserializes in step 1. No Rust on their side:
+Operators add your agent under the `providers:` / `agents:` blocks of `quorum.yml` with a `provider_config:` block — the map your factory deserializes in step 1. No Rust on their side:
 
 ```yaml
 providers:

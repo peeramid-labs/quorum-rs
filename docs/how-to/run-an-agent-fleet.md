@@ -11,13 +11,23 @@ you know the shape and just need to look up the exact commands.
 
 One command, three things:
 
-1. Loads `agent.yml` (your fleet config).
-2. Picks the right agent implementation for each entry —
+1. Loads `quorum.yml` (the unified config — orchestrators,
+   rooms, policies AND the `providers:` / `agents:` fleet, all
+   in one file).
+2. Picks the right agent implementation for each `agents:` entry —
    `ProposerEvaluatorAgent` for LLM providers (OpenAI-compatible,
    Ollama, simulated), `ExecAgent` for stdin/stdout subprocesses,
    `McpAgent` for MCP, `ClaudeAgent` for the Claude CLI.
 3. Wires them all into a single `MultiAgentRunner` and runs
    until SIGTERM/SIGINT.
+
+On boot, `serve` also registers each `agents:` entry with the
+orchestrator using the orchestrator entry's `token` — see
+the operator-token note in Step 1.
+
+> **Legacy split config still loads.** A pre-existing `nsed.yaml`
+> + separate `agent.yml` pair is auto-detected and works
+> unchanged. New setups should use the single `quorum.yml`.
 
 Out of scope (use the proprietary `nsed serve` from the parent
 repo for these):
@@ -59,29 +69,35 @@ agents off a chat-only invite. Ask the admin for a unified code
 
 > **The operator token is what attributes your agents.** On every boot
 > `serve` registers each fleet agent with the orchestrator
-> (`/credentials/register`) using the orchestrator entry's `bearer_token`,
+> (`/credentials/register`) using the orchestrator entry's `token`,
 > and *that* call is what records each `agent_id → operator` link. The
 > bearer must be your **operator token** (`operator.token`, which carries
 > the `manage_agents` role + a display name). `quorum init --invite`
-> scaffolds `bearer_token: "file:~/.nsed/operator.token"` for you. An
-> env-var ref (`bearer_token: "${OPERATOR_TOKEN}"`) works too for
-> CI/devops. A missing/blank bearer → registration 403s → agents
+> scaffolds `token: "file:~/.nsed/operator.token"` on the
+> orchestrator entry for you. An env-var ref (`token:
+> "${OPERATOR_TOKEN}"`) works too for CI/devops. A missing/blank
+> bearer → registration 403s → agents
 > heartbeat **unattributed** and the orchestrator **drops** them. `serve`
 > logs a loud `ERROR` when this happens.
 
-## Step 2 — scaffold `agent.yml`
+## Step 2 — scaffold `quorum.yml`
 
 ```bash
-quorum init --agent-fleet --agents cortex-a
+quorum init --invite eyJhbGc...
 ```
 
-Writes an `agent.yml` next to you with an active OpenAI-compatible
-provider, commented stanzas for Claude CLI / exec / MCP, and one
-agent entry per name passed to `--agents` (default `cortex-a`).
-Pass `--config PATH` to write elsewhere; `--force` overwrites an
-existing file.
+Writes a single `quorum.yml` next to you: the orchestrator
+entry (with `token: "file:~/.nsed/operator.token"`),
+rooms/policies, and the `providers:` / `agents:` fleet — an
+active OpenAI-compatible provider, commented stanzas for Claude
+CLI / exec / MCP, and one agent entry. Pass `--config PATH` to
+write elsewhere; `--force` overwrites an existing file.
 
-The minimal shape it generates:
+> The legacy `quorum init --agent-fleet` (which scaffolded a
+> separate `agent.yml`) still exists for back-compat, but the
+> unified `quorum.yml` is preferred.
+
+The fleet portion it generates:
 
 ```yaml
 providers:
@@ -103,8 +119,8 @@ when you're ready to spend more.
 
 ### Layering customisations on top of the scaffold
 
-Everything below assumes you started from `quorum init
---agent-fleet`. The patterns differ only in which provider block
+Everything below shows just the `providers:` / `agents:` portion
+of `quorum.yml`. The patterns differ only in which provider block
 you uncomment and what `model_name`s you list under `agents:`.
 
 ### Multiple agents on the same LLM
@@ -166,7 +182,7 @@ agents:
 ```
 
 Requires `claude` on `$PATH`. The agent invokes the CLI directly
-— no API key in `agent.yml` because Claude CLI handles its own
+— no API key in `quorum.yml` because Claude CLI handles its own
 auth.
 
 ### Python / TypeScript / any-language agent via the exec protocol
@@ -228,8 +244,8 @@ The TUI opens on a persistent tab bar — **Deliberate · Rooms · Agents ·
 Policies · Settings**. Press the number keys `1`–`5` or `Tab`/`Shift-Tab` to
 switch tabs (Settings holds Orchestrators + Config). The **Rooms**,
 **Policies**, and **Deliberate** screens each split into a **Local
-(nsed.yaml)** section and a **Remote (orchestrator)** section, so rooms /
-policies you defined in the workspace file aren't confused with runtime ones.
+(quorum.yml)** section and a **Remote (orchestrator)** section, so rooms /
+policies you defined in the config file aren't confused with runtime ones.
 The **Rooms** tab lists each room's bound policy, panel fill (`eligible/desired
 ✓`), tags, and the agents that would serve it; the create-room form picks the
 policy from a selector (`Space`/`←→`). A room whose eligible agents fall below its policy's
@@ -237,7 +253,7 @@ target shows a red `✗` on both the Rooms and Deliberate screens — it can't
 start a deliberation until enough matching agents are online.
 
 The `agents` field on `quorum status` should list every agent
-from your `agent.yml`. If an agent is missing, check the `serve`
+from your `quorum.yml`. If an agent is missing, check the `serve`
 logs — `RUST_LOG=info quorum serve …` shows per-agent startup +
 any failures during build.
 
@@ -262,7 +278,7 @@ The self-check runs only when the orchestrator is a reachable remote
 
 | Symptom | Likely cause |
 |---|---|
-| `no agents to run — fleet config has 0 agents` | `agent.yml` parsed but no `agents:` section, or `--agent` filter matched nothing. Check `quorum serve --agent ALL --config agent.yml`. |
+| `no agents to run — fleet config has 0 agents` | `quorum.yml` parsed but no `agents:` section, or `--agent` filter matched nothing. Check `quorum serve --agent ALL --config quorum.yml`. |
 | `no agents successfully started` | Every fleet entry hit a build error. `RUST_LOG=info quorum serve` shows per-agent failures. |
 | `unknown provider_type — skipping` | A `type:` value the dispatcher doesn't know about — likely a typo. Supported types: `openai`, `ollama`, `simulated`, `exec`, `mcp`, `claude`. |
 | `Agent '<name>' failed ... NATS connection error` | NATS creds bad / orchestrator NATS URL wrong. Verify with `nats sub '>' --server <nats-url> --creds ~/.nsed/agent.creds` (needs `nats-cli`). |
@@ -296,7 +312,7 @@ use quorum_rs::serve::{ServeOptions, serve_fleet};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let fleet = load_config(Path::new("agent.yml"))?;
+    let fleet = load_config(Path::new("quorum.yml"))?;
     let cancel = tokio_util::sync::CancellationToken::new();
 
     // Wire your own SIGTERM handler that calls cancel.cancel()

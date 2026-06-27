@@ -3,7 +3,7 @@
 > Recipe for operators who want the unified per-agent control
 > plane (status, chat capture, buffer inspection, live config
 > tuning) reachable from machines other than the host running
-> `quorum serve`. Assumes you already have a working `agent.yml`
+> `quorum serve`. Assumes you already have a working `quorum.yml`
 > and know the host's network configuration.
 
 ## The recipe
@@ -11,7 +11,7 @@
 ### 1. Pick a port
 
 ```yaml
-# agent.yml
+# quorum.yml
 dashboard_port: 8081
 ```
 

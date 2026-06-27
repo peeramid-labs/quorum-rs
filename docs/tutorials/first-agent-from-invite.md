@@ -150,7 +150,7 @@ export NATS_URL=nats://api.peeramid.xyz:4222    # use what was printed above
 
 ✅ **Checkpoint:** `ls -la ~/.nsed/agent.creds` shows the file with mode 0600.
 
-## Step 3 — scaffold your `agent.yml`
+## Step 3 — scaffold your `quorum.yml`
 
 In a fresh directory of your choice:
 
@@ -158,25 +158,29 @@ In a fresh directory of your choice:
 mkdir ~/my-first-agent && cd ~/my-first-agent
 ```
 
-Generate a starter `agent.yml`:
+Generate a starter `quorum.yml`:
 
 ```bash
-quorum init --agent-fleet --agents cortex-a
+quorum init --invite eyJhbGc...    # ← your invite code again
 ```
 
-> **One-command onboarding:** `quorum init --invite <code>` folds Steps
-> 2, 3 and 5 together — it redeems the code (writing creds/token/endpoint
-> like `quorum redeem`) and then scaffolds **both** configs in one shot:
-> the client-side `nsed.yaml` (for `quorum run`) **and** `agent.yml` (for
-> `quorum serve`). No `--agent-fleet` to remember. On a terminal it walks
-> you through the agent providers/personas interactively; pass
-> `--non-interactive` (or pipe from a script) for a static `agent.yml`
-> template. Add `--out-dir ./creds` to redirect the redeemed credentials.
+`quorum init --invite` is the one-command path: it redeems the
+code (writing creds/token/endpoint like `quorum redeem`, so you
+can fold Step 2 into this) and scaffolds a **single** `quorum.yml`
+that carries everything — the orchestrator entry (for `quorum
+run` / `tui` / `status`) AND the `providers:` / `agents:` fleet
+(for `quorum serve`). On a terminal it walks you through the agent
+providers/personas interactively; pass `--non-interactive` (or
+pipe from a script) for a static template. Add `--out-dir ./creds`
+to redirect the redeemed credentials.
 
-The flag is the important bit — without `--agent-fleet`, `quorum
-init` writes the *client-side* `nsed.yaml` instead (Step 5 uses
-that one). With `--agent-fleet` it writes an `agent.yml` with:
+The generated `quorum.yml` carries:
 
+- The **orchestrator** entry with `token:
+  "file:~/.nsed/operator.token"` so `serve` can register your
+  agents under your operator identity.
+- A **room** (`demo`) bound to a default **policy**, plus
+  `default_room: demo`.
 - An active **OpenAI-compatible** provider block (works for
   OpenAI, Groq, DeepSeek, Together, local llama.cpp — just change
   `base_url`).
@@ -185,6 +189,11 @@ that one). With `--agent-fleet` it writes an `agent.yml` with:
 - One agent entry per name passed to `--agents` (default
   `cortex-a` if you omit it). `cortex-a` is the agent's NATS
   identity in the orchestrator's logs.
+
+> **Legacy split config still loads.** The old `nsed.yaml` +
+> separate `agent.yml` pair (scaffolded by `quorum init
+> --agent-fleet`) is auto-detected and works unchanged. New
+> setups should use the single `quorum.yml`.
 
 Open the file, pick your provider, then set the env var the
 template references. For the default OpenAI block:
@@ -199,16 +208,16 @@ If you uncomment a different block (Claude / exec / MCP), Step 6
 has the per-provider notes.
 
 > **Picking a different filename / location?** Pass `--config
-> ./fleet/agent.yml` to `quorum init` to write there instead.
+> ./fleet/quorum.yml` to `quorum init` to write there instead.
 > You'll then need to point `quorum serve --config
-> ./fleet/agent.yml` in Step 4.
+> ./fleet/quorum.yml` in Step 4.
 
 > **Per-agent setup:** the interactive wizard (`quorum init`, or `init
 > --invite` on a TTY) builds agents one at a time — pick a persona
 > template, **name** it, choose a model, set **capability tags** (rooms
 > and policies schedule agents by matching these), then grant file
 > access, then "add another agent?". Access maps to each provider's real
-> mechanism in `agent.yml`:
+> mechanism in the `agents:` block of `quorum.yml`:
 >
 > - **Claude agents** — **context files** become `claude.context_files`
 >   (inlined read-only, per file — never writable); **writable dirs**
@@ -223,7 +232,7 @@ has the per-provider notes.
 >
 > Leave a prompt blank to grant no access.
 
-✅ **Checkpoint:** `cat agent.yml` prints a `providers:` block
+✅ **Checkpoint:** `cat quorum.yml` prints a `providers:` block
 with `openai:` active and the env var you exported is set.
 
 ## Step 4 — start your agent
@@ -234,12 +243,12 @@ From the same directory:
 quorum serve --nats-url $NATS_URL
 ```
 
-`serve` reads `./agent.yml` and `~/.nsed/agent.creds` by default.
+`serve` reads `./quorum.yml` and `~/.nsed/agent.creds` by default.
 To point at different paths:
 
 ```bash
 quorum serve \
-  --config       ./fleet/agent.yml \
+  --config       ./fleet/quorum.yml \
   --nats-url     $NATS_URL \
   --nats-creds   ./creds/nats.creds
 ```
@@ -265,7 +274,7 @@ this terminal open and open a new one for Step 5.
 > NATS connection error`, double-check the URL printed in Step 2
 > matches what you exported. If you see "no agents to run", the
 > YAML isn't in the directory you're running from — `pwd` and
-> verify `agent.yml` is there.
+> verify `quorum.yml` is there.
 
 ## Step 5 — submit a deliberation
 
@@ -279,24 +288,14 @@ it from `$QUORUM_DEMO_TOKEN`:
 export QUORUM_DEMO_TOKEN=$(cat ~/.nsed/operator.token)
 ```
 
-`quorum run` needs a small config (`nsed.yaml`) telling it which
-orchestrator to talk to and which agents make up the room.
-`quorum init` writes that file:
+`quorum run` reads the same `quorum.yml` you scaffolded in Step 3
+— the orchestrator entry and the `demo` room are already in it,
+so there's no second config to write. One file drives both the
+agent process (`quorum serve`) and task submission (`quorum run`
+/ `quorum tui` / `quorum status`). From the same directory:
 
 ```bash
 cd ~/my-first-agent
-quorum init --orchestrator-url https://api.peeramid.xyz \
-            --agents cortex-a \
-            --room demo
-```
-
-This writes `nsed.yaml` next to your `agent.yml`. (Two yamls
-for two distinct concerns: `agent.yml` configures the AGENT
-PROCESS — `quorum serve` reads it — while `nsed.yaml`
-configures task SUBMISSION — `quorum run` / `quorum tui` /
-`quorum status` read it.) Now submit a task:
-
-```bash
 quorum run --room demo "What is the most efficient way to boil water?"
 ```
 
@@ -333,8 +332,8 @@ and the client got a result.
 > ```
 >
 > For your agent to be *picked* for that policy, it must
-> advertise a matching capability tag — add to its `agent.yml`
-> entry:
+> advertise a matching capability tag — add to its `agents:`
+> entry in `quorum.yml`:
 >
 > ```yaml
 > agents:
@@ -354,7 +353,7 @@ and the client got a result.
 
 ## Step 6 — alternative LLMs
 
-You don't have to use OpenAI. Same `agent.yml` with different
+You don't have to use OpenAI. Same `quorum.yml` with different
 provider entries:
 
 ### Claude CLI (no API key needed in the YAML)
@@ -419,8 +418,9 @@ contributed to a deliberation. The pieces:
   long-lived credentials: an HTTP bearer (for the client API)
   and a NATS User JWT (for the agent worker). It generated the
   NKey locally — the seed never crossed the network.
-- `agent.yml` is the only mutable thing the operator owns: it
-  lists agents, which provider runs each, and which model.
+- `quorum.yml` is the single config the operator owns: the
+  orchestrator + rooms + policies, plus the fleet (`providers:` /
+  `agents:`) listing which provider and model run each agent.
 - `quorum serve` reads the YAML, dispatches each entry to the
   right `NsedAgent` implementation (here: `ProposerEvaluatorAgent`
   + `OpenAICompatibleModel`), wires it into a worker, and runs
@@ -437,7 +437,7 @@ runtime, LLM calls, NKey storage — is local.
 ## Where to go next
 
 - **Multiple agents:** add more entries under `agents:` in
-  `agent.yml`. The [run-an-agent-fleet how-to](../how-to/run-an-agent-fleet.md)
+  `quorum.yml`. The [run-an-agent-fleet how-to](../how-to/run-an-agent-fleet.md)
   covers patterns (same provider × many models, multiple
   providers, mixing LLM + exec/MCP agents in one process).
 - **Custom Rust agent:** when `ProposerEvaluatorAgent` doesn't
@@ -447,7 +447,7 @@ runtime, LLM calls, NKey storage — is local.
 - **Non-Rust agent:** drive an agent from Python / TypeScript /
   anything via the [exec protocol](../reference/exec-agent-protocol.md)
   or [MCP protocol](../reference/mcp-agent-protocol.md). Add an
-  entry to `agent.yml` with `type: exec` or `type: mcp`.
+  entry to `quorum.yml` with `type: exec` or `type: mcp`.
 - **Run your own orchestrator:** that's a separate setup using
   the proprietary `nsed-orchestrator` binary, not covered by
   this OSS SDK.

@@ -68,7 +68,7 @@ The structured answer produced by one agent in the propose phase. Contains the a
 The scoring mechanism used to aggregate evaluations. Raw evaluation scores are transformed so that extreme scores require more "votes" to express, reducing the impact of outlier evaluators. See [scoring-variables.md](scoring-variables.md).
 
 **Room**
-A named workspace endpoint combining a policy and an orchestrator. When a client runs `nsed run`, it targets a room. The room determines which policy governs the deliberation and which orchestrator processes it. Configured in `nsed.yaml`.
+A named workspace endpoint combining a policy and an orchestrator. When a client runs `nsed run`, it targets a room. The room determines which policy governs the deliberation and which orchestrator processes it. Configured in `quorum.yml`.
 
 **Round**
 One full iteration of the propose + evaluate cycle. A deliberation runs 1 to N rounds (determined by the policy). If convergence is detected, the round loop terminates early.
@@ -86,4 +86,4 @@ Synonymous with Job in most contexts. The session ID (`room_id`) identifies the 
 The primary halting signal: `w = ns[winner] / Σ|ns_p|` ∈ [-1, +1]. The winning proposal's signed net support divided by the total absolute net support mass across all proposals. +1 = unanimous endorsement, 0 = split verdict, -1 = unanimous rejection of the winner. Each round's contribution to the evidence accumulator is `Δe(r) = max(w, 0) × u'(r)`. See [convergence-protocol.md](convergence-protocol.md).
 
 **Workspace**
-The local directory containing `nsed.yaml`. The CLI uses the workspace config to know which orchestrators, agents, and rooms to work with.
+The local directory containing `quorum.yml`. The CLI uses the unified config — orchestrators, rooms, policies, and the `providers:` / `agents:` fleet — to know which orchestrators, agents, and rooms to work with. (Legacy split `nsed.yaml` + `agent.yml` is still auto-detected.)

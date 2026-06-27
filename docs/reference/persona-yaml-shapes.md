@@ -79,8 +79,8 @@ honoured as given. See
 `AgentConfig` serialises `persona` back as the resolved string
 (shape A). The original layered shape is NOT preserved on the
 serialised form — by the time it leaves the deserializer it's a
-single string. Operators editing `agent.yml` by hand keep the
-layered shape; tooling that emits `agent.yml` from
+single string. Operators editing `quorum.yml` by hand keep the
+layered shape; tooling that emits `quorum.yml` from
 `AgentConfig` instances writes shape A.
 
 ## See also

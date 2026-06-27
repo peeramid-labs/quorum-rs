@@ -8,14 +8,14 @@
 | input | type | source | precedence |
 |---|---|---|---|
 | `--dashboard-port <PORT>` | `u16` | `quorum serve` CLI flag | wins over yaml |
-| `dashboard_port` | `Option<u16>` | top-level field in `agent.yml` | falls back to None |
+| `dashboard_port` | `Option<u16>` | top-level field in `quorum.yml` | falls back to None |
 | `--dashboard-bind <ADDR>` | `IpAddr` string | `quorum serve` CLI flag | wins over env var |
 | `QUORUM_DASHBOARD_BIND` | `IpAddr` string | env var | falls back to `127.0.0.1` |
 
 ## Resolution
 
 ```
-port = --dashboard-port > agent.yml::dashboard_port > None
+port = --dashboard-port > quorum.yml::dashboard_port > None
 bind = --dashboard-bind > $QUORUM_DASHBOARD_BIND > "127.0.0.1"
 ```
 
