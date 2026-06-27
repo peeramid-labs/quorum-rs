@@ -63,12 +63,26 @@ use tracing::{info, warn};
 /// Runtime knobs for [`serve_fleet`] that aren't sourced from the
 /// fleet YAML. Defaults connect to `nats://localhost:4222` with no
 /// auth — fine for a local dev orchestrator, not for production.
+/// Per-agent NATS connection, produced when the CLI registers each agent
+/// under the operator token at boot so every agent gets its own scoped,
+/// attributed credentials (operator≠agent). Overrides the shared
+/// `nats_url`/`nats_auth` for that one worker.
+#[derive(Debug, Clone)]
+pub struct AgentConn {
+    pub nats_url: String,
+    pub nats_auth: Option<NatsAuth>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     /// NATS server URL all agents connect to. Typically the URL
     /// returned by `POST /redeem` (operator code with the `agent`
     /// capability) or `POST /redeem-agent`.
     pub nats_url: String,
+    /// Per-agent connection overrides keyed by agent name. An agent with an
+    /// entry uses its own registered (scoped + attributed) credentials; agents
+    /// without one fall back to `nats_url`/`nats_auth`. Empty = all shared.
+    pub agent_auth: std::collections::HashMap<String, AgentConn>,
     /// NATS authentication — usually `creds_file` pointing at
     /// `~/.nsed/agent.creds` from `quorum redeem`. `None` for
     /// unauthenticated dev orchestrators.
@@ -111,6 +125,7 @@ impl Default for ServeOptions {
     fn default() -> Self {
         Self {
             nats_url: "nats://localhost:4222".to_string(),
+            agent_auth: std::collections::HashMap::new(),
             nats_auth: None,
             agent_filter: None,
             stream_name: "sphera_jobs".to_string(),
@@ -222,6 +237,21 @@ pub(crate) fn instantiate_builtin_tools(
     Ok(tools)
 }
 
+/// Pick the NATS connection for one agent: its own registered (scoped +
+/// attributed) connection from `agent_auth` if present, else the shared
+/// `nats_url`/`nats_auth`. Network-free so it can be unit-tested.
+fn worker_conn<'a>(
+    agent_auth: &'a std::collections::HashMap<String, AgentConn>,
+    name: &str,
+    shared_url: &'a str,
+    shared_auth: Option<&'a NatsAuth>,
+) -> (&'a str, Option<&'a NatsAuth>) {
+    match agent_auth.get(name) {
+        Some(conn) => (conn.nats_url.as_str(), conn.nats_auth.as_ref()),
+        None => (shared_url, shared_auth),
+    }
+}
+
 pub async fn build_worker(
     fleet: &AgentFleetConfig,
     agent_name: &str,
@@ -328,11 +358,20 @@ pub async fn serve_fleet(fleet: &AgentFleetConfig, opts: ServeOptions) -> Result
     }
 
     for name in &names {
-        match build_worker(
-            fleet,
+        // Per-agent registered creds (scoped + attributed) win; otherwise the
+        // shared connection. The CLI populates `agent_auth` by registering each
+        // agent under the operator token at boot.
+        let (worker_nats_url, worker_nats_auth) = worker_conn(
+            &opts.agent_auth,
             name,
             &opts.nats_url,
             opts.nats_auth.as_ref(),
+        );
+        match build_worker(
+            fleet,
+            name,
+            worker_nats_url,
+            worker_nats_auth,
             &opts.stream_name,
             &opts.api_prefix,
             &registry,
@@ -379,6 +418,38 @@ pub fn install_default_tracing() {
 mod tests {
     use super::*;
     use crate::config::ProviderEntry;
+
+    #[test]
+    fn worker_conn_prefers_per_agent_then_falls_back_to_shared() {
+        let mut agent_auth = std::collections::HashMap::new();
+        agent_auth.insert(
+            "justindgx".to_string(),
+            AgentConn {
+                nats_url: "nats://per-agent:4222".to_string(),
+                nats_auth: Some(NatsAuth {
+                    inline_creds: Some("creds".to_string()),
+                    ..Default::default()
+                }),
+            },
+        );
+        // Per-agent entry wins.
+        let (url, auth) = worker_conn(&agent_auth, "justindgx", "nats://shared:4222", None);
+        assert_eq!(url, "nats://per-agent:4222");
+        assert!(auth.is_some());
+        // No entry → shared connection.
+        let shared_auth = NatsAuth {
+            creds_file: Some("/shared.creds".to_string()),
+            ..Default::default()
+        };
+        let (url, auth) = worker_conn(
+            &agent_auth,
+            "other",
+            "nats://shared:4222",
+            Some(&shared_auth),
+        );
+        assert_eq!(url, "nats://shared:4222");
+        assert_eq!(auth.unwrap().creds_file.as_deref(), Some("/shared.creds"));
+    }
 
     /// `AgentFleetConfig` doesn't `derive(Default)`. Building one in
     /// the tests via YAML deserialization keeps the fixture
