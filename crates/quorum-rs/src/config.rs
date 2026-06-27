@@ -621,13 +621,14 @@ pub fn resolve_env_token(field: &str, raw: &str) -> String {
         }
     }
     if let Some(path) = raw.strip_prefix("file:") {
-        return std::fs::read_to_string(path)
+        let resolved = expand_tilde(path);
+        return std::fs::read_to_string(&resolved)
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|e| {
                 tracing::warn!(
                     "Failed to read {} from file {} ({}) (referenced in {})",
                     field,
-                    path,
+                    resolved.display(),
                     e,
                     field,
                 );
@@ -635,6 +636,24 @@ pub fn resolve_env_token(field: &str, raw: &str) -> String {
             });
     }
     raw.to_string()
+}
+
+/// Expand a leading `~/` (or bare `~`) to `$HOME`. Other paths pass through
+/// unchanged. Tilde expansion is a shell feature, not a filesystem one, so a
+/// `file:~/.nsed/operator.token` reference would otherwise read a literal `~`
+/// directory and fail — this makes such references portable across hosts.
+fn expand_tilde(path: &str) -> std::path::PathBuf {
+    let home = || std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    if path == "~" {
+        if let Some(h) = home() {
+            return std::path::PathBuf::from(h);
+        }
+    } else if let Some(rest) = path.strip_prefix("~/")
+        && let Some(h) = home()
+    {
+        return std::path::Path::new(&h).join(rest);
+    }
+    std::path::PathBuf::from(path)
 }
 
 /// Derive a short orchestrator ID from its URL (hostname + optional port).
@@ -1339,6 +1358,46 @@ agents:
             resolve_env_token("token", "file:/no/such/operator.token"),
             ""
         );
+    }
+
+    #[test]
+    fn expand_tilde_joins_home() {
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(
+                expand_tilde("~/.nsed/operator.token"),
+                std::path::Path::new(&home).join(".nsed/operator.token")
+            );
+            assert_eq!(expand_tilde("~"), std::path::PathBuf::from(&home));
+        }
+    }
+
+    #[test]
+    fn expand_tilde_passthrough_for_absolute_and_literal() {
+        assert_eq!(expand_tilde("/etc/x"), std::path::PathBuf::from("/etc/x"));
+        assert_eq!(
+            expand_tilde("relative/x"),
+            std::path::PathBuf::from("relative/x")
+        );
+        // A bare `~user` (not `~/`) is not expanded — only `~` and `~/`.
+        assert_eq!(expand_tilde("~bob/x"), std::path::PathBuf::from("~bob/x"));
+    }
+
+    #[test]
+    fn test_resolve_env_token_file_scheme_expands_tilde() {
+        // Point HOME at a temp dir, write the token under it, reference via `~/`.
+        let dir = tempfile::tempdir().unwrap();
+        let nsed = dir.path().join(".nsed");
+        std::fs::create_dir_all(&nsed).unwrap();
+        std::fs::write(nsed.join("operator.token"), "tok-from-tilde\n").unwrap();
+        // SAFETY: single-threaded test; restores prior HOME after.
+        let prev = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", dir.path()) };
+        let got = resolve_env_token("token", "file:~/.nsed/operator.token");
+        match prev {
+            Some(p) => unsafe { std::env::set_var("HOME", p) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        assert_eq!(got, "tok-from-tilde");
     }
 
     // ─── derive_orch_id ─────────────────────────────────────────────────

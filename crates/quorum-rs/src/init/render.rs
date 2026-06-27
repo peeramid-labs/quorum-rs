@@ -478,6 +478,7 @@ pub(super) fn compose_flag(compose_name: &str) -> String {
 ///   - `agents:` section (one entry per agent with model, temperature, max_tokens, etc.)
 pub(super) fn render_agent_config(
     orchestrator_url: &str,
+    bearer_ref: &str,
     providers: &[Provider],
     agents: &[AgentSlot],
 ) -> String {
@@ -539,7 +540,12 @@ pub(super) fn render_agent_config(
     writeln!(out, "  - id: \"primary\"").unwrap();
     // TODO(slop): `.unwrap()` / `.expect()` outside tests — propagate the error with `?` or handle it
     writeln!(out, "    url: \"{}\"", orchestrator_url).unwrap();
-    writeln!(out, "    bearer_token: \"${{NSED_BEARER_TOKEN}}\"").unwrap();
+    // The bearer must carry `manage_agents` + a display_name: `serve`
+    // registers every fleet agent with it (`/credentials/register`), which is
+    // what records each agent→operator link. Onboarding points this at the
+    // operator token `redeem` wrote (`file:~/.nsed/operator.token`); an
+    // env-var ref (`${NSED_BEARER_TOKEN}`) works too for CI/devops.
+    writeln!(out, "    bearer_token: \"{bearer_ref}\"").unwrap();
     // TODO(slop): `.unwrap()` / `.expect()` outside tests — propagate the error with `?` or handle it
     writeln!(out, "#  - id: \"secondary\"").unwrap();
     // TODO(slop): `.unwrap()` / `.expect()` outside tests — propagate the error with `?` or handle it

@@ -365,7 +365,7 @@ pub async fn run(output_path: &Path) -> ExitCode {
         // Determine orchestrator URL for the agent config file
         let orch_url = resolve_orchestrator_url(&orchestrators);
 
-        match crate::init::run_agent_setup(&orch_url).await {
+        match crate::init::run_agent_setup(&orch_url, "${NSED_BEARER_TOKEN}").await {
             Ok(Some(result)) => {
                 if !result.agents.is_empty() {
                     eprintln!(

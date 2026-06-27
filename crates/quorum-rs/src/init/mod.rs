@@ -90,7 +90,10 @@ fn print_exec_tools_status(exec_tools: &[DetectedTool]) {
 /// → model assignment). Returns `None` if the user cancels.
 ///
 /// Does NOT write files — the caller decides where to save `agent_config_yaml`.
-pub async fn run_agent_setup(orchestrator_url: &str) -> Result<Option<AgentSetupResult>> {
+pub async fn run_agent_setup(
+    orchestrator_url: &str,
+    bearer_ref: &str,
+) -> Result<Option<AgentSetupResult>> {
     brand::section("provider discovery");
     brand::info("Checking for local Ollama instance…");
     let exec_tools = detect_exec_tools();
@@ -115,7 +118,7 @@ pub async fn run_agent_setup(orchestrator_url: &str) -> Result<Option<AgentSetup
         }));
     }
 
-    let agent_config_yaml = render_agent_config(orchestrator_url, &providers, &agents);
+    let agent_config_yaml = render_agent_config(orchestrator_url, bearer_ref, &providers, &agents);
 
     let summaries: Vec<AgentSummary> = agents
         .iter()
@@ -176,7 +179,12 @@ fn generate_output_content(
         );
         let agent_cfg = if !agents.is_empty() {
             let orch_url = format!("http://nsed:${{APP_PORT:-{app_port}}}");
-            Some(render_agent_config(&orch_url, providers, agents))
+            Some(render_agent_config(
+                &orch_url,
+                "${NSED_BEARER_TOKEN}",
+                providers,
+                agents,
+            ))
         } else {
             None
         };
@@ -204,7 +212,12 @@ fn generate_output_content(
             operator_name,
         );
         let agent_cfg = if !agents.is_empty() {
-            Some(render_agent_config(orch_url, providers, agents))
+            Some(render_agent_config(
+                orch_url,
+                "${NSED_BEARER_TOKEN}",
+                providers,
+                agents,
+            ))
         } else {
             None
         };

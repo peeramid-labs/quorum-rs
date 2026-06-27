@@ -362,7 +362,7 @@ async fn scaffold_after_redeem(
         return run_agent_fleet(fleet_target, spec.agents, force);
     }
 
-    match crate::init::run_agent_setup(spec.orchestrator_url).await {
+    match crate::init::run_agent_setup(spec.orchestrator_url, spec.token_ref).await {
         Ok(Some(result)) if !result.agent_config_yaml.is_empty() => {
             write_fleet_body(fleet_target, &result.agent_config_yaml, force)
         }
