@@ -805,13 +805,21 @@ pub async fn run(output_path: &Path) -> ExitCode {
         }
     };
 
-    // One unified `quorum.yml`: workspace half + the fleet half inline.
-    let yaml = merge_unified(&workspace_yaml, agent_config_yaml.as_deref());
+    // One unified `quorum.yml`: workspace half + the fleet half inline, plus the
+    // top-level `dashboard_port` the unified `QuorumConfig` reads (the legacy
+    // `agents.dashboard_port` pointer is gone).
+    let yaml = with_dashboard_port(
+        merge_unified(&workspace_yaml, agent_config_yaml.as_deref()),
+        dashboard_port,
+    );
 
     // ── Summary (tokens redacted for terminal safety) ─────────────────────
 
     let redacted_ws = render_yaml_redacted(&config).unwrap_or_else(|_| workspace_yaml.clone());
-    let preview = merge_unified(&redacted_ws, agent_config_yaml.as_deref());
+    let preview = with_dashboard_port(
+        merge_unified(&redacted_ws, agent_config_yaml.as_deref()),
+        dashboard_port,
+    );
     eprintln!("\n--- Generated {} ---", output_path.display());
     eprintln!("{preview}");
 
@@ -860,6 +868,15 @@ fn merge_unified(workspace_yaml: &str, fleet: Option<&str>) -> String {
             crate::cli::commands::init::fleet_sections_of(f)
         ),
         None => workspace_yaml.to_string(),
+    }
+}
+
+/// Append the top-level `dashboard_port` line the unified `QuorumConfig` reads.
+/// No-op when unset. `quorum serve` starts the agent dashboard from this value.
+fn with_dashboard_port(yaml: String, port: Option<u16>) -> String {
+    match port {
+        Some(p) => format!("{}\ndashboard_port: {p}\n", yaml.trim_end()),
+        None => yaml,
     }
 }
 
