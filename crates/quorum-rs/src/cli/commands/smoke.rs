@@ -291,6 +291,23 @@ pub async fn run(config_path: &Path, agent_id: &str, runs: u32, assume_yes: bool
             }
         };
 
+    // Make it unmistakable this hits the operator's REAL backend.
+    eprintln!(
+        "smoke `{agent_id}` \u{2192} provider `{}`, model `{}`{}{}",
+        provider.provider_type,
+        agent_config.model_name,
+        if provider.base_url.is_empty() {
+            String::new()
+        } else {
+            format!(" @ {}", provider.base_url)
+        },
+        provider
+            .engine
+            .as_ref()
+            .map(|e| format!(", engine `{e}`"))
+            .unwrap_or_default(),
+    );
+
     let mut all_ok = true;
 
     // ── Stages 1-2: direct model calls (built from the agent's provider) ──
