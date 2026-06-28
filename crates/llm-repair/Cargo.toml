@@ -1,6 +1,6 @@
 [package]
 name = "llm-repair"
-version = "0.6.0"
+version = "0.7.0-rc.18"
 description = "JSON-repair, markdown-extraction, and tool-call recovery helpers for malformed LLM output"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
