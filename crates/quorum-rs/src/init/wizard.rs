@@ -3,10 +3,40 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use inquire::{Confirm, Select, Text};
+use inquire::{Confirm, MultiSelect, Select, Text};
 
 use super::ask;
 use super::presets::{AGENT_PRESETS, AgentSlot, is_tested_model};
+
+/// Engine-strategy labels (how the runtime drives the model).
+const ENGINE_STREAMING: &str = "stream responses";
+const ENGINE_MERGE_SYS: &str = "merge system prompt into first user message";
+const ENGINE_DISABLE_NATIVE_TOOLS: &str = "disable native tool definitions";
+
+/// LLM-repair pass labels (the only ones backed by a real strategy flag).
+const REPAIR_ESCAPES: &str = "fix invalid JSON escapes";
+const REPAIR_HALLUCINATED: &str = "parse hallucinated tool-calls";
+const REPAIR_JSON_MODE: &str = "request JSON mode output";
+
+/// Map selected engine labels to flags, in order:
+/// `(use_streaming, merge_system_prompt, disable_native_tools)`.
+fn engine_flags_from_selection(selected: &[&str]) -> (Option<bool>, Option<bool>, Option<bool>) {
+    (
+        Some(selected.contains(&ENGINE_STREAMING)),
+        Some(selected.contains(&ENGINE_MERGE_SYS)),
+        Some(selected.contains(&ENGINE_DISABLE_NATIVE_TOOLS)),
+    )
+}
+
+/// Map selected repair-pass labels to the three strategy flags, in order:
+/// `(repair_invalid_escapes, unwrap_hallucinated_tool_calls, json_mode)`.
+fn repair_flags_from_selection(selected: &[&str]) -> (Option<bool>, Option<bool>, Option<bool>) {
+    (
+        Some(selected.contains(&REPAIR_ESCAPES)),
+        Some(selected.contains(&REPAIR_HALLUCINATED)),
+        Some(selected.contains(&REPAIR_JSON_MODE)),
+    )
+}
 use super::providers::{
     DetectedTool, FetchedModel, ModelInfo, Provider, build_claude_exec_provider,
     build_exec_provider, build_ollama_provider, build_provider_env_key, build_simulated_provider,
@@ -839,6 +869,63 @@ pub(super) fn wizard_agents(
             }
         }
 
+        // ── Engine strategies (multi-select) ──────────────────────────────
+        let engine_choices = vec![
+            ENGINE_STREAMING,
+            ENGINE_MERGE_SYS,
+            ENGINE_DISABLE_NATIVE_TOOLS,
+        ];
+        let Some(engine_sel) = ask(MultiSelect::new(
+            &format!("Engine strategies for {name} (space toggles):"),
+            engine_choices,
+        )
+        .with_default(&[0])
+        .with_help_message(
+            "How the runtime drives the model. Default: streaming on. Enable the others only \
+             for models that need them.",
+        )
+        .with_render_config(rc)
+        .prompt())?
+        else {
+            return Ok(None);
+        };
+        let (stream, merge_sys, disable_native) = engine_flags_from_selection(&engine_sel);
+        slot.use_streaming = stream;
+        slot.merge_system_prompt = merge_sys;
+        slot.disable_native_tools = disable_native;
+
+        // ── LLM-repair passes (multi-select) ──────────────────────────────
+        let repair_choices = vec![REPAIR_ESCAPES, REPAIR_HALLUCINATED, REPAIR_JSON_MODE];
+        let Some(selected) = ask(MultiSelect::new(
+            &format!("LLM-repair passes for {name} (space toggles):"),
+            repair_choices,
+        )
+        .with_default(&[0, 1])
+        .with_help_message(
+            "Repairs malformed output from smaller models. Defaults: escapes + tool-calls.",
+        )
+        .with_render_config(rc)
+        .prompt())?
+        else {
+            return Ok(None);
+        };
+        let (esc, hall, jm) = repair_flags_from_selection(&selected);
+        slot.repair_invalid_escapes = esc;
+        slot.unwrap_hallucinated_tool_calls = hall;
+        slot.json_mode = jm;
+
+        let Some(fd) = ask(Select::new(
+            &format!("Failure dumps for {name} (on parse/API errors):"),
+            vec!["on", "full", "off"],
+        )
+        .with_help_message("`on` = metadata, `full` = raw payloads, `off` = nothing written.")
+        .with_render_config(rc)
+        .prompt())?
+        else {
+            return Ok(None);
+        };
+        slot.failure_dumps = Some(fd.to_string());
+
         used_names.insert(name);
         agents.push(slot);
 
@@ -868,10 +955,43 @@ pub(super) fn wizard_agents(
 #[cfg(test)]
 mod tests {
     use super::{
-        default_memories_dir, memories_starter, sanitize_agent_name, seed_memories_md, split_paths,
-        split_shell_command, suggest_agent_name,
+        ENGINE_DISABLE_NATIVE_TOOLS, ENGINE_MERGE_SYS, ENGINE_STREAMING, REPAIR_ESCAPES,
+        REPAIR_HALLUCINATED, REPAIR_JSON_MODE, default_memories_dir, engine_flags_from_selection,
+        memories_starter, repair_flags_from_selection, sanitize_agent_name, seed_memories_md,
+        split_paths, split_shell_command, suggest_agent_name,
     };
     use std::collections::HashSet;
+
+    #[test]
+    fn engine_flags_map_selection_to_each_flag() {
+        // Only streaming selected → stream on, others off (explicit Some(false)).
+        let (stream, merge, disable) = engine_flags_from_selection(&[ENGINE_STREAMING]);
+        assert_eq!(
+            (stream, merge, disable),
+            (Some(true), Some(false), Some(false))
+        );
+        // All three.
+        let (stream, merge, disable) = engine_flags_from_selection(&[
+            ENGINE_STREAMING,
+            ENGINE_MERGE_SYS,
+            ENGINE_DISABLE_NATIVE_TOOLS,
+        ]);
+        assert_eq!(
+            (stream, merge, disable),
+            (Some(true), Some(true), Some(true))
+        );
+    }
+
+    #[test]
+    fn repair_flags_map_selection_to_each_flag() {
+        let (esc, hall, jm) = repair_flags_from_selection(&[REPAIR_ESCAPES, REPAIR_HALLUCINATED]);
+        assert_eq!((esc, hall, jm), (Some(true), Some(true), Some(false)));
+        let (esc, hall, jm) = repair_flags_from_selection(&[REPAIR_JSON_MODE]);
+        assert_eq!((esc, hall, jm), (Some(false), Some(false), Some(true)));
+        // Nothing selected → all explicitly off.
+        let (esc, hall, jm) = repair_flags_from_selection(&[]);
+        assert_eq!((esc, hall, jm), (Some(false), Some(false), Some(false)));
+    }
 
     #[test]
     fn suggest_agent_name_lowercases_template_and_dedupes() {

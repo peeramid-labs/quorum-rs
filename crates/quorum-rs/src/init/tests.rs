@@ -1374,6 +1374,29 @@ fn render_agent_config_strategy_flags_some_true() {
 }
 
 #[test]
+fn render_agent_config_emits_failure_dumps_when_set() {
+    let providers = sample_providers();
+    let mut agent = AgentSlot::new(
+        "DEFAULT".to_string(),
+        "together_ai".to_string(),
+        "x".to_string(),
+        None,
+        None,
+    );
+    agent.failure_dumps = Some("full".to_string());
+    let cfg = render_agent_config(
+        "http://nsed:8080",
+        "${NSED_BEARER_TOKEN}",
+        &providers,
+        &[agent],
+    );
+    assert!(
+        cfg.contains("failure_dumps: \"full\""),
+        "failure_dumps must render when set, got:\n{cfg}"
+    );
+}
+
+#[test]
 fn render_agent_config_strategy_flags_some_false() {
     let providers = vec![Provider {
         id: "prov".to_string(),

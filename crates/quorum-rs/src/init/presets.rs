@@ -56,6 +56,9 @@ pub(super) struct AgentSlot {
     /// as `working_dir`; native-LLM agents have no write tool (rendered as a
     /// note). Empty (default) grants no write access.
     pub write_dirs: Vec<String>,
+    /// Failure-dump level on parse/API errors: `"off"`, `"on"` (metadata), or
+    /// `"full"` (raw payloads). `None` → framework default.
+    pub failure_dumps: Option<String>,
 }
 
 impl AgentSlot {
@@ -91,6 +94,7 @@ impl AgentSlot {
             exec_command: None,
             read_paths: vec![],
             write_dirs: vec![],
+            failure_dumps: None,
         }
     }
 
