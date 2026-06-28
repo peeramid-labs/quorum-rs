@@ -1,16 +1,10 @@
 # Your first agent — from invite code to live deliberation
 
 You've been handed an invite code by someone running a quorum
-orchestrator. By the end of this tutorial — about 15 minutes —
-you'll have your own agent connected to that orchestrator,
-actively contributing to deliberations, and you'll have seen its
-first proposal land on the wire.
-
-This tutorial assumes you're at a terminal and willing to copy/paste
-commands. We pick one concrete path through the system. We don't
-discuss alternatives or design rationale — those live in the
-[how-to guides](../how-to/) and [explanation](../explanation/)
-sections. Here we just build the thing.
+orchestrator. In ~15 minutes you'll have your own agent connected to it,
+contributing to deliberations. One concrete path — rationale and
+alternatives live in the [how-to guides](../how-to/) and
+[explanation](../explanation/).
 
 ## What you'll build
 
@@ -27,39 +21,18 @@ sections. Here we just build the thing.
 └────────────────────┘         └──────────────────────────────┘
 ```
 
-One agent, running on your laptop, joined to a quorum on
-someone else's orchestrator. We'll use GPT-4o-mini as the
-agent's underlying LLM (cheap, fast, good enough for a first
-run). Swapping for a different model — or using the Claude CLI
-instead of an API key — is the last step.
+One agent on your laptop, joined to a quorum on someone else's
+orchestrator. We use GPT-4o-mini (cheap, fast); swapping models or
+runtimes is [Step 6](#step-6-alternative-llms).
 
 ## What you need
 
-Before starting, have these ready:
-
-- **Rust 1.85+ toolchain** (`rustup` installed). Verify:
-  ```bash
-  rustc --version
-  ```
-- **An invite code** from your admin. Looks like a long
-  JWT (`eyJhbGc...`).
-- **An LLM endpoint to drive the agent.** Any of:
-  - An OpenAI-compatible API key (OpenAI itself, Groq, DeepSeek,
-    Together, local llama.cpp, …),
-  - The `claude` CLI on your `$PATH` (no key needed — Claude CLI
-    handles its own auth),
-  - A local Ollama instance,
-  - Or your own subprocess-based agent driven via the exec / MCP
-    protocols.
-
-  We default to an OpenAI-compatible setup below. To pick a
-  different runtime, jump to [Step 6 (alternative LLMs)](#step-6-alternative-llms)
-  before you start the agent. The bootstrap command in Step 3
-  scaffolds **all** of these in one file so you only have to
-  uncomment the block you want.
-- **About $0.50 of LLM credit** if you're going with a hosted
-  OpenAI-compatible provider. The default model (`gpt-4o-mini`)
-  is cheap.
+- **Rust 1.85+** (`rustup`) — `rustc --version`
+- **An invite code** from your admin (a long JWT, `eyJhbGc...`)
+- **An LLM endpoint:** an OpenAI-compatible API key (OpenAI, Groq,
+  DeepSeek, Together, llama.cpp), the `claude` CLI, local Ollama, or your
+  own exec/MCP subprocess. Step 3 scaffolds all of them; you uncomment one.
+  Default = OpenAI-compatible (~$0.50 of credit for `gpt-4o-mini`).
 
 ## Step 1 — install the `quorum` CLI
 
@@ -74,16 +47,10 @@ source). Verify the binary is on your `$PATH`:
 quorum --version
 ```
 
-Expected output: a version line starting with `quorum `. If you
-get "command not found", your `~/.cargo/bin` isn't in `$PATH`
-— add it to your shell profile:
-
-```bash
-echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.zshrc   # or ~/.bashrc
-source ~/.zshrc
-```
-
-If `cargo install` says `could not find quorum-rs in registry with version *`, only pre-release versions are on crates.io right now — check <https://crates.io/crates/quorum-rs> for the latest and pass it explicitly, e.g. `cargo install quorum-rs --version "<latest-shown-on-crates-io>"`. Once a stable `0.x` ships the bare command above will just work.
+If `command not found`, add `~/.cargo/bin` to your `$PATH`. If cargo reports
+`could not find quorum-rs ... with version *`, only pre-releases are on
+crates.io — pass an explicit `--version` from
+<https://crates.io/crates/quorum-rs>.
 
 ✅ **Checkpoint:** `quorum --version` prints a version.
 
@@ -108,41 +75,20 @@ Redeeming invite at https://api.peeramid.xyz…
   Seed file    : /home/you/.nsed/agent.seed
 ```
 
-The three files are your operator identity, split by transport:
+Three files, one operator identity, split by transport:
 
-- `~/.nsed/operator.token` — bearer token. Authenticates you to
-  the orchestrator's **HTTP API**. `quorum run`, `quorum status`,
-  `quorum trace`, and `quorum tui` use it.
-- `~/.nsed/agent.creds` — NATS User JWT + seed bundle.
-  Authenticates you to the orchestrator's **NATS bus**. `quorum
-  serve` reads it to start agents.
-- `~/.nsed/agent.seed` — the raw NKey seed (mode 0600, never
-  share). The `.creds` blob embeds a copy; the standalone file
-  is for tooling that needs the seed in isolation.
+- `operator.token` — HTTP bearer for `quorum run`/`status`/`trace`/`tui`.
+- `agent.creds` — NATS User JWT for `quorum serve`.
+- `agent.seed` — raw NKey seed (mode 0600, never share; `.creds` embeds a copy).
 
-Both `operator.token` and `agent.creds` represent the SAME
-operator identity. The orchestrator pins the same `username`
-(`alice` in the example) to both during redemption.
+> **Other directory?** `quorum redeem … --out-dir ./creds`, then pass
+> `--nats-creds ./creds/agent.creds` to `serve` (Step 4).
 
-> **Picking a different directory?** Point `quorum redeem` at it
-> with `--out-dir`:
->
-> ```bash
-> quorum redeem eyJhbGc... --out-dir ./creds
-> # writes ./creds/{agent.seed,agent.creds,operator.token,orchestrator}
-> ```
->
-> You'll then need to point `quorum serve` at the same files
-> with `--nats-creds ./creds/agent.creds` (Step 4) and export
-> the bearer manually when running client commands.
+> **Chat-only code?** If output says "chat-only" and no `agent.creds` is
+> written, you can submit tasks but not run an agent — ask the admin for a
+> unified code (`capabilities: ["chat", "agent"]`).
 
-> **What if the admin gave you a chat-only code?** You'll see "Redeemed
-> operator invite (chat-only)" instead, and `agent.creds` won't
-> be written. The bearer alone lets you submit tasks from the
-> client side but you can't run an agent. Ask the admin to mint
-> a unified code (`capabilities: ["chat", "agent"]`) and rerun.
-
-Save the NATS URL — you'll need it in Step 4:
+Save the NATS URL for Step 4:
 
 ```bash
 export NATS_URL=nats://api.peeramid.xyz:4222    # use what was printed above
@@ -158,45 +104,23 @@ In a fresh directory of your choice:
 mkdir ~/my-first-agent && cd ~/my-first-agent
 ```
 
-Generate a starter `quorum.yml`:
+You already redeemed in Step 2, so scaffold from those creds:
 
 ```bash
-quorum init --invite eyJhbGc...    # ← your invite code again
+quorum init    # interactive; or `--non-interactive` for a static template
 ```
 
-`quorum init --invite` is the one-command path: it redeems the
-code (writing creds/token/endpoint like `quorum redeem`, so you
-can fold Step 2 into this) and scaffolds a **single** `quorum.yml`
-that carries everything — the orchestrator entry (for `quorum
-run` / `tui` / `status`) AND the `providers:` / `agents:` fleet
-(for `quorum serve`). On a terminal it walks you through the agent
-providers/personas interactively; pass `--non-interactive` (or
-pipe from a script) for a static template. Add `--out-dir ./creds`
-to redirect the redeemed credentials.
+> **Skipped Step 2?** `quorum init --invite eyJhbGc...` redeems *and*
+> scaffolds in one shot (don't run it after a separate `quorum redeem` —
+> the invite is single-use). Add `--out-dir ./creds` to redirect creds.
 
-The generated `quorum.yml` carries:
+One `quorum.yml` drives everything: the **orchestrator** entry (token
+`file:~/.nsed/operator.token`), the `demo` **room**/policy, an active
+**OpenAI-compatible** provider, commented **Claude/exec/MCP** stanzas, and one
+**agent** per `--agents` name (default `cortex-a`). The legacy `nsed.yaml` +
+`agent.yml` split (`init --agent-fleet`) still loads.
 
-- The **orchestrator** entry with `token:
-  "file:~/.nsed/operator.token"` so `serve` can register your
-  agents under your operator identity.
-- A **room** (`demo`) bound to a default **policy**, plus
-  `default_room: demo`.
-- An active **OpenAI-compatible** provider block (works for
-  OpenAI, Groq, DeepSeek, Together, local llama.cpp — just change
-  `base_url`).
-- Commented stanzas for **Claude CLI**, **exec** (subprocess
-  agent), and **MCP** — uncomment the one you want.
-- One agent entry per name passed to `--agents` (default
-  `cortex-a` if you omit it). `cortex-a` is the agent's NATS
-  identity in the orchestrator's logs.
-
-> **Legacy split config still loads.** The old `nsed.yaml` +
-> separate `agent.yml` pair (scaffolded by `quorum init
-> --agent-fleet`) is auto-detected and works unchanged. New
-> setups should use the single `quorum.yml`.
-
-Open the file, pick your provider, then set the env var the
-template references. For the default OpenAI block:
+Pick your provider and export its env var. For the default OpenAI block:
 
 ```bash
 export OPENAI_API_KEY=sk-...
@@ -207,33 +131,22 @@ The `${OPENAI_API_KEY}` placeholder is resolved at runtime when
 If you uncomment a different block (Claude / exec / MCP), Step 6
 has the per-provider notes.
 
-> **Picking a different filename / location?** Pass `--config
-> ./fleet/quorum.yml` to `quorum init` to write there instead.
-> You'll then need to point `quorum serve --config
-> ./fleet/quorum.yml` in Step 4.
+> **Every knob, documented.** The scaffold is deliberately minimal. For a
+> fully-annotated config showing *every* available parameter — provider
+> `engine`, per-model overrides, and all the per-agent tuning fields
+> (temperature, `max_react_iterations`, `repair_invalid_escapes`, scratchpad
+> limits, sandboxed tools, …) at their defaults — see
+> [`examples/agent.full.yml`](../../examples/agent.full.yml).
 
-> **Per-agent setup:** the interactive wizard (`quorum init`, or `init
-> --invite` on a TTY) builds agents one at a time — pick a persona
-> template, **name** it, choose a model, set **capability tags** (rooms
-> and policies schedule agents by matching these), then grant file
-> access, then "add another agent?". Access maps to each provider's real
-> mechanism in the `agents:` block of `quorum.yml`:
->
-> - **Claude agents** — **context files** become `claude.context_files`
->   (inlined read-only, per file — never writable); **writable dirs**
->   become `claude.add_dirs` + `writable: true`. The two are kept
->   separate so context can't be overwritten. Each agent is offered its
->   **own** memories dir (default `./.nsed/memories/<name>`) and a
->   seeded `memories.md` it maintains across deliberations.
-> - **Native-LLM agents** — read paths become a `builtin_tools:
->   read_file` block (no native write tool).
-> - **Exec agents** — the first writable/working dir becomes
->   `working_dir`.
->
-> Leave a prompt blank to grant no access.
+> **Custom path?** `quorum init --config ./fleet/quorum.yml`, then pass the
+> same `--config` to `serve` in Step 4.
 
-✅ **Checkpoint:** `cat quorum.yml` prints a `providers:` block
-with `openai:` active and the env var you exported is set.
+> **Interactive wizard** (`quorum init` on a TTY) builds agents one at a
+> time — persona, model, capability tags, file access — mapping each to the
+> right provider fields.
+
+✅ **Checkpoint:** `cat quorum.yml` shows `openai:` active and
+`$OPENAI_API_KEY` is exported.
 
 ## Step 4 — start your agent
 
@@ -276,6 +189,13 @@ this terminal open and open a new one for Step 5.
 > YAML isn't in the directory you're running from — `pwd` and
 > verify `quorum.yml` is there.
 
+> **Smoke-test first (recommended).** `quorum smoke-test cortex-a` drives
+> your agent in-process (no orchestrator) through chat → tool-calling → full
+> NSED, reporting success rate, latency, and a per-failure breakdown with the
+> provider's real `400` reason. Catches a bad key, wrong `base_url`, or a
+> missing `engine: vllm` before a live run.
+> [Guide](../how-to/smoke-test-an-agent.md).
+
 ## Step 5 — submit a deliberation
 
 In a fresh terminal (leave Step 4 running), submit a task to
@@ -288,11 +208,8 @@ it from `$QUORUM_DEMO_TOKEN`:
 export QUORUM_DEMO_TOKEN=$(cat ~/.nsed/operator.token)
 ```
 
-`quorum run` reads the same `quorum.yml` you scaffolded in Step 3
-— the orchestrator entry and the `demo` room are already in it,
-so there's no second config to write. One file drives both the
-agent process (`quorum serve`) and task submission (`quorum run`
-/ `quorum tui` / `quorum status`). From the same directory:
+`quorum run` reads the same `quorum.yml` (orchestrator + `demo` room already
+in it). From the same directory:
 
 ```bash
 cd ~/my-first-agent
@@ -312,44 +229,15 @@ And the client terminal will print a deliberation outcome.
 `evaluating` (the two phases per round) for at least one round,
 and the client got a result.
 
-> **Confirm via TUI (optional):** in a third terminal,
-> `quorum tui` opens a live view of the orchestrator. Your
-> agent appears in the agent list, the deliberation appears in
-> the room view, and you can see your proposal text.
->
-> (TUI ships in the released `quorum` binary. If you built from
-> source and `tui` is missing, rebuild with
+> **Live view (optional):** `quorum tui` shows your agent, the
+> deliberation, and your proposal text. (Built from source without it?
 > `cargo build --release --features tui`.)
 
-> **Scoped invites — targeting a policy directly.** If your
-> invite was minted for a capability namespace (the redeem
-> output's `tags` / `grants` look like `noosphera:*` rather than
-> a plain room), you submit to that *policy* instead of a room:
->
-> ```bash
-> quorum run --policy noosphera:0v1 "your question here"
-> # or just `quorum tui` and pick the policy from the list
-> ```
->
-> For your agent to be *picked* for that policy, it must
-> advertise a matching capability tag — add to its `agents:`
-> entry in `quorum.yml`:
->
-> ```yaml
-> agents:
->   - name: cortex-a
->     # …provider/model…
->     capability_tags: ["noosphera:0v1"]   # matched by the policy's `noosphera:*` requirement
-> ```
->
-> The orchestrator matches a policy requirement `noosphera:*`
-> against any agent tag under the `noosphera:` namespace
-> (`noosphera:0v1`, `noosphera:exp`, …). An agent with **no**
-> `capability_tags` stays eligible for everything (legacy
-> default); add the tag only to scope it to specific policies.
-> The `noosphera:*` policy itself must already be registered on
-> the orchestrator — that's the admin/`manage_agents` side, not
-> the agent's.
+> **Scoped invites.** If your invite targets a capability namespace
+> (redeem output shows `noosphera:*` not a plain room), submit to the
+> *policy*: `quorum run --policy noosphera:0v1 "…"`. For your agent to be
+> picked, give it a matching tag — `capability_tags: ["noosphera:0v1"]` in
+> its `agents:` entry. No tags = eligible for everything (the default).
 
 ## Step 6 — alternative LLMs
 
@@ -408,31 +296,47 @@ agents:
 
 Start `ollama serve` first.
 
+### Self-hosted vLLM — the `engine` field
+
+vLLM speaks the OpenAI wire format but emits tool calls in an XML dialect. Set
+`engine` so the agent parses them:
+
+```yaml
+providers:
+  vllm:
+    type: openai
+    base_url: "http://localhost:8000/v1"
+    engine: vllm        # vllm | vllm_xml_responses | gpt-oss (alias harmony)
+```
+
+A missing/wrong `engine` is the usual cause of parse errors or `400`s on the
+tool-calling / NSED stages — `quorum smoke-test` flags it.
+
+### Flaky model output — recovery knobs
+
+Per-agent fields that harden parsing of malformed model output (defaults shown):
+
+- `repair_invalid_escapes: true` — fix invalid `\escapes` before JSON parse
+- `unwrap_hallucinated_tool_calls: false` — rescue tool calls emitted as text
+- `tool_format: nous` — force a tool-call dialect (`nous` | `json`)
+- `max_retries: 3` — retries on API/parse errors
+
+Full set in [`examples/agent.full.yml`](../../examples/agent.full.yml).
+
 ## What just happened
 
-You bootstrapped an agent identity from a single invite code,
-plugged it into a remote orchestrator's NATS bus, and it
-contributed to a deliberation. The pieces:
+You turned an invite into an agent on a remote orchestrator's NATS bus:
 
-- `quorum redeem` exchanged your single-use invite for two
-  long-lived credentials: an HTTP bearer (for the client API)
-  and a NATS User JWT (for the agent worker). It generated the
-  NKey locally — the seed never crossed the network.
-- `quorum.yml` is the single config the operator owns: the
-  orchestrator + rooms + policies, plus the fleet (`providers:` /
-  `agents:`) listing which provider and model run each agent.
-- `quorum serve` reads the YAML, dispatches each entry to the
-  right `NsedAgent` implementation (here: `ProposerEvaluatorAgent`
-  + `OpenAICompatibleModel`), wires it into a worker, and runs
-  every agent in one process.
-- The orchestrator's deliberation engine dispatched tasks to
-  your agent via NATS; your agent proposed an answer, evaluated
-  peers (well, itself, in a one-agent quorum), and the
-  orchestrator computed the verdict.
+- `quorum redeem` → an HTTP bearer + a NATS User JWT; the NKey seed was
+  generated locally and never left your machine.
+- `quorum.yml` → the one config: orchestrator + rooms + the `providers:` /
+  `agents:` fleet.
+- `quorum serve` → ran each agent (here `ProposerEvaluatorAgent` +
+  `OpenAICompatibleModel`) in one process.
+- The orchestrator dispatched tasks; your agent proposed + evaluated, and it
+  computed the verdict.
 
-The orchestrator (run by the admin who gave you the invite) is
-the only thing not on your laptop. Everything else — agent
-runtime, LLM calls, NKey storage — is local.
+The orchestrator is the only piece not on your laptop.
 
 ## Where to go next
 

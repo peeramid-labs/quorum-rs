@@ -1,0 +1,195 @@
+# =============================================================================
+# quorum agent fleet — FULL parameter reference
+# =============================================================================
+#
+# This is the agent.yml consumed by `quorum serve` (NOT the client-side
+# nsed.yaml used by `quorum run`/`status`/`trace`/`tui`).
+#
+# Generated from `quorum init --agent-fleet`, then extended to show EVERY
+# available parameter with its default. Most fields are optional — the file
+# deserializes with just `providers` + `agents`. Everything commented out below
+# shows the default value; uncomment + change only what you need.
+#
+#   quorum serve --config ./agent.full.yml --nats-url <url-from-quorum-redeem>
+#
+# Validate parsing without connecting:  `quorum serve --config <file>` fails
+# fast on a YAML/schema error before it ever touches NATS.
+# =============================================================================
+
+# ── Top-level fleet options ─────────────────────────────────────────────────
+# response_sla_secs: 3600        # global HITL buffer-hold (s); per-agent overrides win
+# dashboard_port: 8088           # per-agent status/chat/buffer HTTP control plane (--dashboard-port wins)
+
+# Operational telemetry (metrics only, never prompt/response content). Enabled
+# by default; declare endpoints to actually emit. See docs/reference/telemetry.md.
+# telemetry:
+#   enabled: true
+#   endpoints:
+#     - name: service                       # unique within endpoints[]
+#       nats_url: nats://orchestrator:4222  # omit → reuse the agent's primary NATS conn
+#       creds: /etc/nsed/telemetry.creds    # omit → reuse primary creds
+#       subject_prefix: telemetry.agent     # omit → "telemetry.agent"
+
+# Process-wide orchestrators (additive with per-agent agents[].orchestrators).
+# Usually `quorum serve --nats-url` is enough and this stays empty.
+# orchestrators:
+#   - id: main                       # omit → derived from url host
+#     url: http://localhost:8080
+#     bearer_token: "${NSED_TOKEN}"  # ${ENV} supported
+#     invite_code: "${NSED_INVITE}"  # if both set, invite_code wins
+
+providers:
+  # ── OpenAI-compatible LLMs ────────────────────────────────────────────────
+  # Works for OpenAI, plus any OpenAI-wire provider (Groq, DeepSeek, Together,
+  # OpenRouter, vLLM, llama.cpp, …) — change base_url.
+  openai:
+    type: openai                       # openai | ollama | simulated | exec | mcp | claude
+    base_url: "https://api.openai.com/v1"
+    api_key: "${OPENAI_API_KEY}"       # ${ENV} or file:/path/to/key
+    # engine: vllm                     # tool-call parsing strategy for self-hosted
+    #                                  # backends: vllm | vllm_xml_responses |
+    #                                  # gpt-oss (alias harmony). Omit → OpenAI style.
+    # latency_ms: 0                    # simulated provider only
+
+    # Named models (referenced by an agent as `model: "openai.<key>"`). Every
+    # field is optional and overrides the agent default when set.
+    models:
+      gpt4o:
+        model_name: gpt-4o-mini        # actual name sent on the wire
+        # temperature: 0.0
+        # max_tokens: 4096
+        # context_window: 128000
+        # frequency_penalty: 0.0
+        # presence_penalty: 1.5
+        # use_streaming: true
+        # reasoning_effort: medium     # low | medium | high (o1-family)
+        # repair_invalid_escapes: true # fix invalid \escapes in model JSON
+        # tool_format: nous            # nous | json
+        # disable_native_tools: false
+        # merge_system_prompt: false
+        # unwrap_hallucinated_tool_calls: false
+        # json_mode: false
+        # chars_per_token: 4.0         # ~1.5 for CJK/code
+        # scratchpad_limit: 2000
+        # max_scratchpad_size: 32768
+        # supports_native_thinking: false
+        # input_price_per_mtok: 0.15   # USD/Mtok, for cost telemetry
+        # output_price_per_mtok: 0.60
+
+  # ── Self-hosted vLLM (OpenAI-compatible) ──────────────────────────────────
+  # vllm:
+  #   type: openai
+  #   base_url: "http://localhost:8000/v1"
+  #   engine: vllm
+
+  # ── Local Ollama (no key) ─────────────────────────────────────────────────
+  # ollama:
+  #   type: ollama
+  #   base_url: "http://localhost:11434/v1"
+
+  # ── Claude CLI / exec / MCP (subprocess runtimes; no api_key) ──────────────
+  # claude_cli: { type: claude }
+  # exec_local: { type: exec }
+  # mcp_local:  { type: mcp }
+
+agents:
+  # ── Minimal agent ─────────────────────────────────────────────────────────
+  - name: cortex-a
+    provider_id: openai          # or use the dotpath form below instead
+    model_name: gpt-4o-mini
+    # model: "openai.gpt4o"      # dotpath into providers.<id>.models.<key>;
+    #                            # resolves provider + ModelDef, overrides the two above.
+
+  # ── Kitchen-sink agent: every AgentConfig field, shown at its default ──────
+  - name: cortex-b
+    provider_id: openai
+    model_name: gpt-4o-mini
+
+    # ---- sampling / limits ----
+    # temperature: 0.0
+    # max_tokens: 0                       # 0 → provider/model default
+    # context_window: 128000
+    # frequency_penalty: 0.0
+    # presence_penalty: 1.5               # >0 encourages diversity across rounds
+    # reasoning_effort: medium            # low | medium | high
+    # chars_per_token: 4.0
+
+    # ---- persona / prompts ----
+    # system_prompt_override: "…"         # replaces the built-in system prompt
+    # persona: "You are a meticulous risk analyst."
+    # persona:                            # …or stack layers (joined with \n\n):
+    #   - { type: text, prompt: "Be terse." }
+    #   - { type: md,   prompt: ./personas/review.md }   # file read at parse time
+    # merge_system_prompt: false          # fold persona into the system prompt
+    # description: "contract-risk specialist"
+    # capability_tags: [legal, audit]     # directory/picker metadata
+
+    # ---- ReAct loop / robustness (the "LLM recover" knobs) ----
+    # max_react_iterations: 20            # tool-call loop ceiling
+    # max_retries: 3                      # retries on API/parse errors
+    # repair_invalid_escapes: true        # repair invalid \escapes before JSON parse
+    # unwrap_hallucinated_tool_calls: false  # rescue tool-call JSON emitted as text
+    # tool_format: nous                   # force a tool-call dialect: nous | json
+    # disable_native_tools: false         # ignore provider-native tool calling
+    # json_mode: false                    # force JSON-mode output
+    # use_streaming: true
+    # supports_native_thinking: false
+    # prompt_exposure_guard: false        # detect prompt-leak on terminal tool calls + retry
+    # textual_feedback: true
+
+    # ---- scratchpad (cross-round memory) ----
+    # scratchpad_limit: 2000              # initial token budget
+    # max_scratchpad_size: 32768          # bytes before compaction
+    # scratchpad_squeeze_fraction: 0.95   # (0,1]; auto-squeeze trigger
+    # compact_history_default_keep: 2     # >=1; calls kept by compact_history()
+
+    # ---- cost / SLA / ops ----
+    # input_price_per_mtok: 0.15
+    # output_price_per_mtok: 0.60
+    # response_sla_secs: 3600             # per-task hard cap; 0 → no SLA reporting
+    # propagate_payment_error: true       # surface 402 immediately (false → silent pause)
+    # failure_dumps: "on"                 # on | full | off  (env NSED_FAILURE_DUMPS overrides)
+    # auto_stop: false                    # buffer entries start stopped (human-operated stubs)
+
+    # ---- sandboxed built-in tools (native-LLM agents only) ----
+    # builtin_tools:
+    #   - { type: read_file, roots: ["./docs"], max_bytes: 1048576 }
+    #   - { type: grep, roots: ["./docs"], max_bytes: 1048576, max_results: 200, timeout_secs: 10 }
+    #   - { type: pdf_query, trees_root: ./trees, script_path: /opt/pdf_query.py, python_bin: python3, max_results: 10, timeout_secs: 60 }
+
+    # ---- per-task precision (thermodynamic scheduler) ----
+    # task_precision:
+    #   default: { pg: 0.6, pv: 0.8 }     # pg=generation, pv=verification
+
+    # ---- OpenRouter request extensions (only for OpenRouter base_url) ----
+    # openrouter:
+    #   provider_sort: throughput         # throughput | latency | price
+    #   zdr: true                         # Zero-Data-Retention endpoints only
+    #   allow_fallbacks: true
+    #   only: ["akashml/fp8"]
+    #   ignore: ["nextbit"]
+    #   exclude_reasoning: false
+
+  # ── Claude CLI agent (provider type: claude) ──────────────────────────────
+  # - name: cortex-claude
+  #   provider_id: claude_cli
+  #   claude:
+  #     model: sonnet                     # sonnet | opus | haiku | full id
+  #     permission_mode: bypassPermissions  # default | acceptEdits | plan
+  #     writable: false                   # grant Write/Edit/NotebookEdit
+  #     add_dirs: ["./workspace"]
+  #     allowed_tools: ["Read", "Grep", "Bash(git:*)"]
+  #     disallowed_tools: ["Write"]
+  #     context_files: ["./CONTEXT.md"]
+  #     max_budget_usd: 1.0
+  #     mcp_config: ["./mcp.json"]
+  #     extra_args: []
+
+  # ── Exec subprocess agent (any language; provider type: exec) ──────────────
+  # - name: cortex-exec
+  #   provider_id: exec_local
+  #   exec:
+  #     command: ["python3", "./examples/exec_agent.py"]
+  #     working_dir: ./
+  #     timeout_secs: 300
+  #     env: { MY_FLAG: "1" }
