@@ -769,6 +769,9 @@ pub(super) fn render_agent_config(
                         // TODO(slop): `.unwrap()` / `.expect()` outside tests — propagate the error with `?` or handle it
                         writeln!(out, "        disable_native_tools: {}", v).unwrap();
                     }
+                    if let Some(ref v) = agent.failure_dumps {
+                        writeln!(out, "        failure_dumps: \"{}\"", v).unwrap();
+                    }
                     // TODO(slop): add test for new `if` branch (no paired test file in this patch)
                     if let Some(v) = agent.scratchpad_limit {
                         // TODO(slop): `.unwrap()` / `.expect()` outside tests — propagate the error with `?` or handle it
