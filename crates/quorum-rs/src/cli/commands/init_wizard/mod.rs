@@ -771,28 +771,9 @@ pub async fn run(output_path: &Path) -> ExitCode {
             .as_ref()
             .is_some_and(|m| *m == OrchestratorMode::Remote)
     });
-    let agent_config_ref = agent_config_yaml
-        .as_ref()
-        .map(|_| "config/agent.yml".to_string())
-        .or_else(|| {
-            // Preserve existing agent config reference on re-init:
-            // read the current nsed.yaml and reuse its agents.config_file path.
-            let dir = output_path.parent().unwrap_or(Path::new("."));
-            if let Ok(contents) = std::fs::read_to_string(output_path)
-                && let Ok(existing) = serde_yaml::from_str::<WorkspaceConfig>(&contents)
-                && let Some(agents) = existing.agents
-            {
-                let resolved = dir.join(&agents.config_file);
-                if resolved.exists() {
-                    return Some(agents.config_file);
-                }
-            }
-            // Fall back: check default path on disk.
-            let default_path = dir.join("config/agent.yml");
-            default_path
-                .exists()
-                .then(|| "config/agent.yml".to_string())
-        });
+    // Unified single file: the fleet lives inline in `quorum.yml`, so the
+    // workspace half never references a separate `config/agent.yml` pointer.
+    let agent_config_ref = None;
     // Preserve existing dashboard_port on re-init only when the user was not
     // prompted (e.g. no agents configured). If they were prompted and said "No",
     // don't silently re-enable from the old config.
@@ -816,7 +797,7 @@ pub async fn run(output_path: &Path) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let yaml = match render_yaml(&config) {
+    let workspace_yaml = match render_yaml(&config) {
         Ok(y) => y,
         Err(e) => {
             eprintln!("error: {e}");
@@ -824,23 +805,17 @@ pub async fn run(output_path: &Path) -> ExitCode {
         }
     };
 
+    // One unified `quorum.yml`: workspace half + the fleet half inline.
+    let yaml = merge_unified(&workspace_yaml, agent_config_yaml.as_deref());
+
     // ── Summary (tokens redacted for terminal safety) ─────────────────────
 
-    let preview = render_yaml_redacted(&config).unwrap_or_else(|_| yaml.clone());
-    eprintln!("\n--- Generated nsed.yaml ---");
+    let redacted_ws = render_yaml_redacted(&config).unwrap_or_else(|_| workspace_yaml.clone());
+    let preview = merge_unified(&redacted_ws, agent_config_yaml.as_deref());
+    eprintln!("\n--- Generated {} ---", output_path.display());
     eprintln!("{preview}");
 
-    let agent_config_path = output_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("config/agent.yml");
-    let mut files_to_write = vec![output_path.display().to_string()];
-    if agent_config_yaml.is_some() {
-        files_to_write.push(agent_config_path.display().to_string());
-    }
-    eprintln!("Files: {}", files_to_write.join(", "));
-
-    match ask(Confirm::new("Write these files?")
+    match ask(Confirm::new(&format!("Write {}?", output_path.display()))
         .with_default(true)
         .prompt())
     {
@@ -855,34 +830,37 @@ pub async fn run(output_path: &Path) -> ExitCode {
         }
     }
 
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("error: failed to create {}: {e}", parent.display());
+        return ExitCode::FAILURE;
+    }
     if let Err(e) = std::fs::write(output_path, &yaml) {
         eprintln!("error: failed to write {}: {e}", output_path.display());
         return ExitCode::FAILURE;
     }
     eprintln!("✓ Wrote {}", output_path.display());
 
-    // Write agent config if generated — path already resolved above
-    if let Some(ref agent_yaml) = agent_config_yaml {
-        if let Some(parent) = agent_config_path.parent()
-            && !parent.exists()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            eprintln!("error: failed to create {}: {e}", parent.display());
-            return ExitCode::FAILURE;
-        }
-        if let Err(e) = std::fs::write(&agent_config_path, agent_yaml) {
-            eprintln!(
-                "error: failed to write {}: {e}",
-                agent_config_path.display()
-            );
-            return ExitCode::FAILURE;
-        }
-        eprintln!("✓ Wrote config/agent.yml");
-    }
-
     eprint!("{}", format_next_steps(has_remote));
 
     ExitCode::SUCCESS
+}
+
+/// Merge the workspace YAML with the fleet half (providers + agents) into one
+/// unified `quorum.yml` body. The fleet's `orchestrators:` list is dropped — the
+/// workspace `orchestrators:` map is authoritative. `None` fleet (no agents
+/// configured) yields a workspace-only file.
+fn merge_unified(workspace_yaml: &str, fleet: Option<&str>) -> String {
+    match fleet {
+        Some(f) => format!(
+            "{workspace_yaml}\n{}",
+            crate::cli::commands::init::fleet_sections_of(f)
+        ),
+        None => workspace_yaml.to_string(),
+    }
 }
 
 // ── Next-steps message ─────────────────────────────────────────────────────
@@ -890,13 +868,10 @@ pub async fn run(output_path: &Path) -> ExitCode {
 /// Formats the post-init "Next steps" message.
 fn format_next_steps(has_remote: bool) -> String {
     let mut msg = String::from("\nNext steps:\n");
-    msg.push_str("  quorum validate                  # parse nsed.yaml; surface schema errors\n");
+    msg.push_str("  quorum validate                  # parse quorum.yml; surface schema errors\n");
     msg.push_str("  quorum run \"your question\"       # submit a one-shot deliberation\n");
     msg.push_str("  quorum tui                       # interactive monitor of in-flight jobs\n");
-    msg.push_str(
-        "  quorum serve --config config/agent.yml \\\n             --nats-url <from `quorum redeem` output>\n",
-    );
-    msg.push_str("                                   # run YOUR agents against the orchestrator\n");
+    msg.push_str("  quorum serve                     # run YOUR agents against the orchestrator\n");
     if has_remote {
         msg.push('\n');
         msg.push_str(

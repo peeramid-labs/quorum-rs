@@ -341,7 +341,7 @@ fn write_fleet_body(target: &Path, body: &str, force: bool) -> ExitCode {
 /// workspace `orchestrators:` map, so keeping the fleet's list too would be a
 /// duplicate top-level YAML key and break parsing. The providers section header
 /// is a stable split point.
-fn fleet_sections_of(agent_yaml: &str) -> &str {
+pub(crate) fn fleet_sections_of(agent_yaml: &str) -> &str {
     match agent_yaml.find("# LLM Providers") {
         Some(idx) => {
             let start = agent_yaml[..idx].rfind("# ====").unwrap_or(idx);
@@ -404,16 +404,17 @@ pub struct OnboardSpec<'a> {
     pub force: bool,
 }
 
-/// `quorum init --invite <code>` — single-command onboarding. Redeems the
-/// invite (writing creds/token/endpoint via the same path as `quorum redeem`),
-/// then scaffolds ONE unified `quorum.yml` (workspace + agent fleet) so the
-/// operator can immediately `quorum run` AND `quorum serve` from the same file
-/// — no "which yml" choice. On a TTY the agent personas are gathered
-/// interactively; with `--non-interactive` (or no TTY) a static fleet template
-/// is used.
+/// `quorum init --invite <code>` — onboarding is simply **redeem then init**:
+/// it redeems the invite (writing creds/token/endpoint via the same path as
+/// `quorum redeem`) and then runs the ordinary init flow, producing ONE unified
+/// `quorum.yml`. On a TTY that's the interactive wizard (the redeemed
+/// `operator.token` shows up as its "Use existing token" option, so no
+/// re-auth); with `--non-interactive` (or no TTY) a static template is written.
+/// There is no separate onboarding scaffolder — `--invite` is the redeem step
+/// chained in front of `init`.
 pub async fn run_onboard(spec: OnboardSpec<'_>) -> ExitCode {
     // Redeem consumes a single-use invite, so confirm we can write the
-    // scaffolded configs BEFORE burning it — otherwise a non-writable cwd
+    // scaffolded config BEFORE burning it — otherwise a non-writable cwd
     // (e.g. running from `/`) spends the invite with nothing to show.
     if let Err(e) = preflight_writable(spec.target) {
         eprintln!(
@@ -439,6 +440,13 @@ pub async fn run_onboard(spec: OnboardSpec<'_>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let interactive = !spec.non_interactive && std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if interactive {
+        // Chain into the ONE init flow. Redeem just wrote operator.token, which
+        // the wizard offers as "Use existing token" — no second scaffolder.
+        return crate::cli::commands::init_wizard::run(spec.target).await;
+    }
+
     println!("\nScaffolding quorum.yml (workspace + agents)…\n");
     // Point the workspace at the bearer redeem just persisted, so `quorum
     // run`/`tui` authenticate with no manual `export`.
@@ -449,8 +457,8 @@ pub async fn run_onboard(spec: OnboardSpec<'_>) -> ExitCode {
         token_ref: &token_ref,
         agents: spec.agents,
     };
-    let interactive = !spec.non_interactive && std::io::IsTerminal::is_terminal(&std::io::stdin());
-    scaffold_after_redeem(spec.target, &workspace, spec.force, interactive).await
+    // Non-interactive only (the interactive path chained into the wizard above).
+    scaffold_after_redeem(spec.target, &workspace, spec.force, false).await
 }
 
 #[cfg(test)]

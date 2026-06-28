@@ -356,12 +356,14 @@ fn resolve_config_path(explicit: Option<&Path>, exists: impl Fn(&Path) -> bool) 
     if let Some(path) = explicit {
         return path.to_path_buf();
     }
-    for candidate in ["nsed.yaml", "nsed.yml"] {
+    // Prefer the unified `quorum.yml`; fall back to legacy `nsed.yaml`. The
+    // default for a fresh workspace is `quorum.yml`.
+    for candidate in ["quorum.yml", "quorum.yaml", "nsed.yaml", "nsed.yml"] {
         if exists(Path::new(candidate)) {
             return PathBuf::from(candidate);
         }
     }
-    PathBuf::from("nsed.yaml")
+    PathBuf::from("quorum.yml")
 }
 
 #[tokio::main]

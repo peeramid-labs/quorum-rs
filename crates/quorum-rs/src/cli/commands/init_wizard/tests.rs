@@ -1379,3 +1379,39 @@ fn warn_if_token_file_world_readable_does_not_block_read() {
     super::warn_if_token_file_world_readable(&path);
     assert!(path.exists());
 }
+
+#[test]
+fn merge_unified_appends_fleet_and_drops_orchestrators_list() {
+    let workspace = "orchestrators:\n  primary:\n    token: \"file:x\"\n";
+    // A rendered agent.yml: orchestrators LIST + providers + agents.
+    let fleet = "\
+orchestrators:
+  - id: \"primary\"
+    bearer_token: \"x\"
+# =============================================================================
+# LLM Providers
+# =============================================================================
+providers:
+  openai:
+    type: openai
+agents:
+  - name: justindgx
+";
+    let merged = super::merge_unified(workspace, Some(fleet));
+    assert!(
+        merged.contains("orchestrators:\n  primary:"),
+        "workspace map kept"
+    );
+    assert!(merged.contains("providers:"), "fleet providers appended");
+    assert!(merged.contains("name: justindgx"), "fleet agents appended");
+    assert!(
+        !merged.contains("- id: \"primary\""),
+        "fleet orchestrators LIST dropped"
+    );
+}
+
+#[test]
+fn merge_unified_none_fleet_is_workspace_only() {
+    let workspace = "orchestrators:\n  primary:\n    token: \"file:x\"\n";
+    assert_eq!(super::merge_unified(workspace, None), workspace);
+}

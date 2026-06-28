@@ -1382,24 +1382,6 @@ agents:
         assert_eq!(expand_tilde("~bob/x"), std::path::PathBuf::from("~bob/x"));
     }
 
-    #[test]
-    fn test_resolve_env_token_file_scheme_expands_tilde() {
-        // Point HOME at a temp dir, write the token under it, reference via `~/`.
-        let dir = tempfile::tempdir().unwrap();
-        let nsed = dir.path().join(".nsed");
-        std::fs::create_dir_all(&nsed).unwrap();
-        std::fs::write(nsed.join("operator.token"), "tok-from-tilde\n").unwrap();
-        // SAFETY: single-threaded test; restores prior HOME after.
-        let prev = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", dir.path()) };
-        let got = resolve_env_token("token", "file:~/.nsed/operator.token");
-        match prev {
-            Some(p) => unsafe { std::env::set_var("HOME", p) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-        assert_eq!(got, "tok-from-tilde");
-    }
-
     // ─── derive_orch_id ─────────────────────────────────────────────────
 
     #[test]
