@@ -371,6 +371,24 @@ async fn main() -> ExitCode {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
 
+    // First message: instant, cache-only "newer version" notice.
+    if let Some(notice) = quorum_rs::version_check::cached_notice() {
+        eprintln!("{notice}");
+    }
+
+    let code = run_cli(cli).await;
+
+    // Last message: refresh from crates.io if the cache is stale, then notify.
+    // Best-effort — never affects the exit code.
+    let now = chrono::Utc::now().timestamp();
+    if let Some(notice) = quorum_rs::version_check::refreshed_notice(now).await {
+        eprintln!("{notice}");
+    }
+
+    code
+}
+
+async fn run_cli(cli: Cli) -> ExitCode {
     match cli.command {
         Commands::Run {
             ref task,

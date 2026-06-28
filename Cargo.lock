@@ -2954,6 +2954,7 @@ dependencies = [
  "reqwest",
  "rmcp",
  "schemars 1.2.1",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",
