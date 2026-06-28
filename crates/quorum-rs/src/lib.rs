@@ -48,6 +48,7 @@ pub mod serve;
 pub mod status;
 pub mod telemetry;
 pub mod tools;
+pub mod version_check;
 pub mod workers;
 
 // Re-export commonly used items at crate root for convenience
