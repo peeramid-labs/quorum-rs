@@ -12,3 +12,21 @@ The release-prepare workflow prepends new sections automatically via
 `git-cliff`. Edit `cliff.toml` to tune the generated content.
 
 <!-- new sections inserted above this line by release-prepare -->
+
+## [quorum-rs-v0.7.0] - 2026-06-28
+
+### 🚀 Features
+
+- *(smoke)* Show the real backend (provider/model/base_url/engine) being tested
+- *(smoke)* NSED stage runs N deliberations × R rounds (propose+evaluate) with full per-round details
+- *(telemetry)* DeliberationContextAssembled event — prior-context + scratchpad signals per propose/evaluate
+- *(smoke)* Surface every failure with full breakdown, 400 reason, and progress bars
+
+### 🐛 Bug Fixes
+
+- *(release)* Bound changelog at latest stable tag, not latest rc
+
+### 📚 Documentation
+
+- *(telemetry)* Document deliberation_context_assembled event
+- *(init)* Document provider engine field (vllm) in the fleet boilerplate
