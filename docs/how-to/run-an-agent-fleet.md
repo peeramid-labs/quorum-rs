@@ -117,6 +117,29 @@ key out of the YAML, set it in the shell that runs `quorum serve`.
 Bump `model_name` to `gpt-4o` (or whatever your provider exposes)
 when you're ready to spend more.
 
+#### Per-agent strategy prompts (interactive `quorum init`)
+
+On a TTY the wizard also asks, per agent, for the runtime knobs that smaller
+models often need — all optional, sensible defaults pre-selected:
+
+- **Engine strategies** (multi-select): `stream responses` (default on),
+  `merge system prompt into first user message`, `disable native tool
+  definitions`.
+- **LLM-repair passes** (multi-select): `fix invalid JSON escapes` and
+  `parse hallucinated tool-calls` (both default on), `request JSON mode output`.
+  These drive the [`llm-repair`](https://docs.rs/llm-repair) passes that salvage
+  malformed output.
+- **Failure dumps** (`on` / `full` / `off`, default `on`): what to record on a
+  parse/API error — `on` = metadata, `full` = raw payloads, `off` = nothing.
+
+Each maps to a field on the agent in `quorum.yml` (`use_streaming`,
+`merge_system_prompt`, `disable_native_tools`, `repair_invalid_escapes`,
+`unwrap_hallucinated_tool_calls`, `json_mode`, `failure_dumps`) — edit them
+there afterward, or leave the wizard's choices.
+
+Read-vs-writable file access is a separate prompt pair: "Read as context, never
+writable" (`read_paths`) and "Writable scope" (`write_dirs`).
+
 ### Layering customisations on top of the scaffold
 
 Everything below shows just the `providers:` / `agents:` portion
