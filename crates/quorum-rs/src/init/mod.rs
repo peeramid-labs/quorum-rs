@@ -24,6 +24,7 @@
 
 mod files;
 mod guidance;
+mod model_recommendations;
 mod presets;
 mod providers;
 mod render;

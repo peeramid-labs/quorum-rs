@@ -6,6 +6,7 @@ use anyhow::Result;
 use inquire::{Confirm, MultiSelect, Select, Text};
 
 use super::ask;
+use super::model_recommendations::{note_line, recommend, repair_default_indices};
 use super::presets::{AGENT_PRESETS, AgentSlot, is_tested_model};
 
 /// Engine-strategy labels (how the runtime drives the model).
@@ -869,6 +870,9 @@ pub(super) fn wizard_agents(
             }
         }
 
+        let recommendation = recommend(&slot.model_name);
+        print!("{}", note_line(&recommendation));
+
         // ── Engine strategies (multi-select) ──────────────────────────────
         let engine_choices = vec![
             ENGINE_STREAMING,
@@ -900,9 +904,9 @@ pub(super) fn wizard_agents(
             &format!("LLM-repair passes for {name} (space toggles):"),
             repair_choices,
         )
-        .with_default(&[0, 1])
+        .with_default(&repair_default_indices(&recommendation))
         .with_help_message(
-            "Repairs malformed output from smaller models. Defaults: escapes + tool-calls.",
+            "Repairs malformed output from smaller models. Defaults track the model's tested config.",
         )
         .with_render_config(rc)
         .prompt())?

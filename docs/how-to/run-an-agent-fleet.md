@@ -145,6 +145,13 @@ there afterward, or leave the wizard's choices.
 Read-vs-writable file access is a separate prompt pair: "Read as context, never
 writable" (`read_paths`) and "Writable scope" (`write_dirs`).
 
+For known model families the wizard skips the guesswork: if your `model_name`
+matches a family we have a tested integration config for — **qwen3**, **gpt-oss**
+(Harmony engine), **tongyi** — it offers the known-good strategy settings and,
+on accept, applies them and skips the manual engine/repair prompts. `gpt-oss`'s
+engine is a provider-level field, so the wizard advises setting
+`engine: "gpt-oss"` on the provider rather than changing it for you.
+
 ### Layering customisations on top of the scaffold
 
 Everything below shows just the `providers:` / `agents:` portion
