@@ -225,10 +225,13 @@ providers:
   # Default option. Works for OpenAI itself, plus any provider that
   # speaks the OpenAI wire format (Groq, DeepSeek, Together,
   # local llama.cpp, etc.) — just change `base_url`.
+  # For self-hosted vLLM, point `base_url` at it and uncomment `engine`.
   openai:
     type: openai
     base_url: "https://api.openai.com/v1"
     api_key: "${{OPENAI_API_KEY}}"   # resolved from your shell env at runtime
+    # engine: vllm   # tool-call parsing strategy. vllm | vllm_xml_responses |
+    #                # gpt-oss (alias harmony). Omit for the default OpenAI style.
 
   # ── Claude CLI ───────────────────────────────────────────────────────
   # Uncomment if you have `claude` on $PATH and want the CLI to be the
@@ -803,6 +806,11 @@ mod tests {
         assert!(
             yaml.contains("# mcp_local:"),
             "mcp provider must ship commented"
+        );
+        // The `engine` field ships commented inline on the active provider.
+        assert!(
+            yaml.contains("# engine: vllm"),
+            "engine field must ship commented on the openai provider"
         );
     }
 
