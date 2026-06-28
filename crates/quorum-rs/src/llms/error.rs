@@ -34,6 +34,14 @@ pub enum LlmError {
     /// the error message.
     #[error("context overflow ({tokens} input tokens exceeded {limit}-token model limit)")]
     ContextOverflow { tokens: u32, limit: u32 },
+    /// HTTP 400 that isn't a recognized context-overflow. The provider's
+    /// response `body` carries the real reason (bad tool schema, token
+    /// math, unsupported param). `Display` stays terse — the body can
+    /// echo a fragment of the prompt — so logs/dumps don't leak it; the
+    /// body is exposed only via [`LlmError::detail`], which operator-local
+    /// surfaces (e.g. `quorum smoke-test`) opt into showing.
+    #[error("bad request (status {status})")]
+    BadRequest { status: u16, body: String },
     #[error("transport")]
     Transport(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("parse")]
@@ -74,9 +82,21 @@ impl LlmError {
         out
     }
 
+    /// Provider-supplied detail that `Display` deliberately withholds.
+    /// Currently the captured HTTP 400 response body. Operator-local
+    /// surfaces show this; logs/dumps keep using `Display`/`display_chain`
+    /// so the body never leaks server-side.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            LlmError::BadRequest { body, .. } => Some(body),
+            _ => None,
+        }
+    }
+
     /// Map a typed error to the telemetry taxonomy.
     pub fn classify(&self) -> (LlmErrorClass, Option<u16>) {
         match self {
+            LlmError::BadRequest { status, .. } => (LlmErrorClass::Other, Some(*status)),
             LlmError::RateLimit {
                 retry_after_ms: _,
                 status,
@@ -147,6 +167,14 @@ mod tests {
                 LlmErrorClass::Other,
                 None,
             ),
+            (
+                LlmError::BadRequest {
+                    status: 400,
+                    body: "{\"error\":\"bad schema\"}".to_string(),
+                },
+                LlmErrorClass::Other,
+                Some(400),
+            ),
         ];
         for (err, want_class, want_status) in cases {
             let (got_class, got_status) = err.classify();
@@ -182,6 +210,28 @@ mod tests {
         } else {
             unreachable!("matched variant must extract fields");
         }
+    }
+
+    /// `BadRequest` keeps the provider body out of `Display`/`display_chain`
+    /// (those reach logs + dumps and the body can echo the prompt) but
+    /// exposes it via `detail()` for operator-local surfaces.
+    #[test]
+    fn bad_request_body_hidden_from_display_exposed_via_detail() {
+        let body =
+            r#"{"error":{"message":"'max_tokens' too large: 16000 > 21000 - 5395","code":400}}"#;
+        let err = LlmError::BadRequest {
+            status: 400,
+            body: body.to_string(),
+        };
+        assert_eq!(err.to_string(), "bad request (status 400)");
+        assert!(
+            !err.display_chain().contains("max_tokens"),
+            "display_chain must not leak the body: {}",
+            err.display_chain()
+        );
+        assert_eq!(err.detail(), Some(body));
+        // Non-BadRequest variants carry no detail.
+        assert_eq!(LlmError::ServerError { status: 500 }.detail(), None);
     }
 
     /// `From<LlmError> for anyhow::Error` is the bridge used by the

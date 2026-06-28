@@ -324,6 +324,11 @@ impl AiModel for OpenAICompatibleModel {
                     && let Some((limit, tokens)) = parse_vllm_context_error(&body)
                 {
                     LlmError::ContextOverflow { tokens, limit }
+                } else if code == 400 {
+                    // Capture the body so operator-local surfaces can show
+                    // the real reason; Display stays terse so it never
+                    // reaches logs/dumps.
+                    LlmError::BadRequest { status: code, body }
                 } else {
                     LlmError::Other(Box::new(std::io::Error::other(format!(
                         "API request failed with status {status}"

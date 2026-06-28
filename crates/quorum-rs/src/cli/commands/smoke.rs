@@ -24,9 +24,12 @@ use async_openai::types::{
     ChatCompletionToolType, CreateChatCompletionResponse, FunctionObject,
 };
 
+use indicatif::{ProgressBar, ProgressStyle};
+
 use crate::agents::config::AgentConfig;
 use crate::agents::{AgentContext, CandidateProposal, DeliberationPhase, NsedAgent, Proposal};
 use crate::config::{ProviderEntry, load_agent_from_config_with_registry};
+use crate::llms::error::LlmError;
 use crate::llms::openai_compatible::OpenAICompatibleModel;
 use crate::llms::simulated::SimulatedModel;
 use crate::llms::{AiModel, RequestConfig};
@@ -37,14 +40,99 @@ const SMOKE_SAMPLES: u32 = 10;
 const SMOKE_TASK: &str =
     "Smoke test: reply briefly with your role and confirm you are operational.";
 
-/// Tally for one stage: how many of `runs` succeeded, their latency, and the
-/// most recent failure reason. Everything runs in this process, so the reason
-/// has to surface here — there is no server log to consult.
+/// One failed sample, with everything the harness knew at failure time so the
+/// operator can triage without a server log. `context` is a stage-specific
+/// breakdown (round/phase + prior-context for NSED, request shape for the direct
+/// stages); `detail` is the provider's HTTP-400 body, which `LlmError::Display`
+/// withholds but a 400 commonly fills with the real reason (token math, bad tool
+/// schema). Smoke is operator-local, so surfacing the body here is safe.
+struct Failure {
+    seq: u32,
+    context: String,
+    latency_ms: u128,
+    error: String,
+    detail: Option<String>,
+}
+
+impl Failure {
+    /// A direct-stage (chat / tool-calling) failure: we know the request shape.
+    fn direct(seq: u32, with_tools: bool, latency_ms: u128, err: &LlmError) -> Self {
+        let context = format!("req 1 msg, {} tool(s)", if with_tools { 1 } else { 0 });
+        Failure {
+            seq,
+            context,
+            latency_ms,
+            error: err.display_chain().replace('\n', "; "),
+            detail: err.detail().map(str::to_string),
+        }
+    }
+
+    /// A direct-stage failure where the call SUCCEEDED but the model returned no
+    /// tool call (tool stage only) — no `LlmError`, just a contract miss.
+    fn direct_no_tool(seq: u32, latency_ms: u128) -> Self {
+        Failure {
+            seq,
+            context: "req 1 msg, 1 tool(s)".to_string(),
+            latency_ms,
+            error: "model returned no tool call".to_string(),
+            detail: None,
+        }
+    }
+
+    /// An NSED-stage failure: `context` from [`nsed_context`] carries round/phase
+    /// + prior context; the anyhow chain is mined for an `LlmError` 400 body.
+    fn nsed(seq: u32, context: String, err: &anyhow::Error) -> Self {
+        let detail = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<LlmError>().and_then(LlmError::detail))
+            .map(str::to_string);
+        Failure {
+            seq,
+            context,
+            latency_ms: 0,
+            error: format!("{err:#}"),
+            detail,
+        }
+    }
+
+    fn nsed_empty(seq: u32, round: u32) -> Self {
+        Failure {
+            seq,
+            context: format!("round {round}/propose"),
+            latency_ms: 0,
+            error: "empty proposal content".to_string(),
+            detail: None,
+        }
+    }
+
+    fn line(&self) -> String {
+        let lat = if self.latency_ms > 0 {
+            format!(" \u{b7} {}ms", self.latency_ms)
+        } else {
+            String::new()
+        };
+        let mut s = format!(
+            "  #{} {}{}\n      {}",
+            self.seq, self.context, lat, self.error
+        );
+        if let Some(d) = &self.detail {
+            let d = d.trim();
+            if !d.is_empty() {
+                s.push_str(&format!("\n      reason: {d}"));
+            }
+        }
+        s
+    }
+}
+
+/// Tally for one stage: how many of `runs` succeeded, their latency, and every
+/// failure with its breakdown. Everything runs in this process, so the reasons
+/// have to surface here — there is no server log to consult.
 struct StageStats {
     ok: u32,
     runs: u32,
     total_latency_ms: u128,
-    last_error: Option<String>,
+    failures: Vec<Failure>,
 }
 
 impl StageStats {
@@ -53,7 +141,7 @@ impl StageStats {
             ok: 0,
             runs,
             total_latency_ms: 0,
-            last_error: None,
+            failures: Vec::new(),
         }
     }
 
@@ -72,33 +160,94 @@ impl StageStats {
     }
 
     fn line(&self, label: &str) -> String {
-        let mut s = format!(
+        format!(
             "{label}: {}/{} ok \u{b7} avg {}ms \u{b7} errors {}%",
             self.ok,
             self.runs,
             self.avg_latency_ms(),
             self.error_rate_pct()
-        );
-        if self.ok < self.runs
-            && let Some(err) = &self.last_error
-        {
-            s.push_str(&format!(" \u{2014} last error: {err}"));
+        )
+    }
+
+    /// Build the per-failure breakdown lines: an aggregate count per distinct
+    /// error headline, then each failure (capped) with its full context + 400
+    /// body, then a "+N more" line when truncated. Returns the lines so the
+    /// formatting is unit-testable; `print_failures` just emits them.
+    fn report_lines(&self) -> Vec<String> {
+        const CAP: usize = 8;
+        let mut out = Vec::new();
+        if self.failures.is_empty() {
+            return out;
         }
-        s
+        out.push("  failures by error:".to_string());
+        for (err, n) in group_errors(&self.failures) {
+            out.push(format!("    {n}\u{d7} {err}"));
+        }
+        for f in self.failures.iter().take(CAP) {
+            out.push(f.line());
+        }
+        if self.failures.len() > CAP {
+            out.push(format!("  \u{2026} and {} more", self.failures.len() - CAP));
+        }
+        out
+    }
+
+    fn print_failures(&self) {
+        for line in self.report_lines() {
+            eprintln!("{line}");
+        }
     }
 }
 
-/// Flatten an error + its `source()` chain into one line. `LlmError`'s terse
-/// variants (`#[error("other")]`, `"transport"`, `"parse"`) hide the real cause
-/// in `#[source]`, so `to_string()` alone shows a useless "other".
-fn error_chain(e: &dyn std::error::Error) -> String {
-    let mut s = e.to_string();
-    let mut src = e.source();
-    while let Some(cause) = src {
-        s.push_str(&format!(": {cause}"));
-        src = cause.source();
+fn nsed_context(
+    round: u32,
+    phase: &str,
+    prior_proposal: bool,
+    prior_critiques: usize,
+    candidates: usize,
+) -> String {
+    format!(
+        "round {round}/{phase} \u{b7} prior {} critiques {} \u{b7} candidates {}",
+        if prior_proposal {
+            "proposal\u{2713}"
+        } else {
+            "none"
+        },
+        prior_critiques,
+        candidates,
+    )
+}
+
+/// Group failures by identical error headline, preserving first-seen order, so
+/// the breakdown shows "3× bad request (status 400)" instead of three lines.
+fn group_errors(failures: &[Failure]) -> Vec<(String, u32)> {
+    let mut counts: Vec<(String, u32)> = Vec::new();
+    for f in failures {
+        match counts.iter_mut().find(|(k, _)| *k == f.error) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((f.error.clone(), 1)),
+        }
     }
-    s
+    counts
+}
+
+/// Progress bar for a stage. Hidden when stderr isn't a TTY (CI/pipes) so logs
+/// stay clean; `ProgressBar::hidden()` is also what tests pass.
+fn stage_bar(label: &str, len: u32) -> ProgressBar {
+    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        return ProgressBar::hidden();
+    }
+    let bar = ProgressBar::new(len as u64);
+    bar.set_style(
+        ProgressStyle::with_template(
+            "  {prefix} [{bar:24}] {pos}/{len} ok:{msg} {elapsed_precise}",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("=> "),
+    );
+    bar.set_prefix(label.to_string());
+    bar.set_message("0");
+    bar
 }
 
 /// Did the model return at least one tool call?
@@ -198,27 +347,34 @@ async fn run_direct_stage(
     agent: &AgentConfig,
     samples: u32,
     with_tools: bool,
+    bar: &ProgressBar,
 ) -> StageStats {
     let mut stats = StageStats::new(samples);
-    for _ in 0..samples {
+    for seq in 1..=samples {
         let req = if with_tools {
             tool_request()
         } else {
             chat_request()
         };
         let started = Instant::now();
+        let latency = || started.elapsed().as_millis();
         match model.chat_completion(agent, req).await {
             Ok(res) => {
                 if !with_tools || has_tool_call(&res.response) {
                     stats.ok += 1;
-                    stats.total_latency_ms += started.elapsed().as_millis();
+                    stats.total_latency_ms += latency();
                 } else {
-                    stats.last_error = Some("model returned no tool call".to_string());
+                    stats.failures.push(Failure::direct_no_tool(seq, latency()));
                 }
             }
-            Err(e) => stats.last_error = Some(error_chain(&e)),
+            Err(e) => stats
+                .failures
+                .push(Failure::direct(seq, with_tools, latency(), &e)),
         }
+        bar.set_message(stats.ok.to_string());
+        bar.inc(1);
     }
+    bar.finish_and_clear();
     stats
 }
 
@@ -274,12 +430,13 @@ async fn run_nsed_stage(
     agent: &dyn NsedAgent,
     deliberations: u32,
     rounds: u32,
+    bar: &ProgressBar,
 ) -> (StageStats, Vec<RoundDetail>) {
     let mut stats = StageStats::new(deliberations);
     let mut first_detail: Vec<RoundDetail> = Vec::new();
-    for _ in 0..deliberations {
+    for seq in 1..=deliberations {
         let started = Instant::now();
-        match run_one_deliberation(agent, rounds).await {
+        match run_one_deliberation(agent, rounds, seq).await {
             Ok(details) => {
                 if first_detail.is_empty() {
                     first_detail = details;
@@ -287,9 +444,15 @@ async fn run_nsed_stage(
                 stats.ok += 1;
                 stats.total_latency_ms += started.elapsed().as_millis();
             }
-            Err(detail) => stats.last_error = Some(detail),
+            Err(mut failure) => {
+                failure.latency_ms = started.elapsed().as_millis();
+                stats.failures.push(failure);
+            }
         }
+        bar.set_message(stats.ok.to_string());
+        bar.inc(1);
     }
+    bar.finish_and_clear();
     (stats, first_detail)
 }
 
@@ -303,12 +466,15 @@ async fn run_nsed_stage(
 async fn run_one_deliberation(
     agent: &dyn NsedAgent,
     rounds: u32,
-) -> Result<Vec<RoundDetail>, String> {
+    seq: u32,
+) -> Result<Vec<RoundDetail>, Failure> {
     let mut details = Vec::new();
     let mut previous: Option<Proposal> = None;
     let mut previous_score: Option<f32> = None;
     let mut previous_critiques: Vec<String> = Vec::new();
     for round in 1..=rounds {
+        let prior_proposal = previous.is_some();
+        let prior_critiques = previous_critiques.len();
         let mut pctx = smoke_context(&agent.name());
         pctx.round_number = round;
         pctx.total_rounds = rounds;
@@ -316,12 +482,15 @@ async fn run_one_deliberation(
         pctx.previous_own_proposal = previous.clone();
         pctx.previous_own_score = previous_score;
         pctx.previous_critiques = previous_critiques.clone();
-        let proposal = agent
-            .propose(&pctx)
-            .await
-            .map_err(|e| format!("round {round} propose: {e:#}"))?;
+        let proposal = agent.propose(&pctx).await.map_err(|e| {
+            Failure::nsed(
+                seq,
+                nsed_context(round, "propose", prior_proposal, prior_critiques, 0),
+                &e,
+            )
+        })?;
         if proposal.content.trim().is_empty() {
-            return Err(format!("round {round} propose: empty content"));
+            return Err(Failure::nsed_empty(seq, round));
         }
 
         let cand_id = format!("smoke-cand-{round}");
@@ -333,10 +502,13 @@ async fn run_one_deliberation(
             id: cand_id.clone(),
             proposal: proposal.clone(),
         }];
-        let evals = agent
-            .evaluate(&ectx)
-            .await
-            .map_err(|e| format!("round {round} evaluate: {e:#}"))?;
+        let evals = agent.evaluate(&ectx).await.map_err(|e| {
+            Failure::nsed(
+                seq,
+                nsed_context(round, "evaluate", prior_proposal, prior_critiques, 1),
+                &e,
+            )
+        })?;
         let eval = evals.iter().find(|(id, _)| *id == cand_id).map(|(_, e)| e);
 
         details.push(RoundDetail {
@@ -453,16 +625,32 @@ pub async fn run(
     // ── Stages 1-2: direct model calls (built from the agent's provider) ──
     match build_model(&agent_config, &provider) {
         Some(model) => {
-            let chat = run_direct_stage(&*model, &agent_config, SMOKE_SAMPLES, false).await;
+            let chat = run_direct_stage(
+                &*model,
+                &agent_config,
+                SMOKE_SAMPLES,
+                false,
+                &stage_bar("chat ", SMOKE_SAMPLES),
+            )
+            .await;
             eprintln!("{}", chat.line("chat"));
+            chat.print_failures();
             if chat.ok == 0 {
                 eprintln!("\u{2717} chat stage failed for every sample — stopping.");
                 return ExitCode::FAILURE;
             }
             all_ok &= chat.ok == chat.runs;
 
-            let tools = run_direct_stage(&*model, &agent_config, SMOKE_SAMPLES, true).await;
+            let tools = run_direct_stage(
+                &*model,
+                &agent_config,
+                SMOKE_SAMPLES,
+                true,
+                &stage_bar("tools", SMOKE_SAMPLES),
+            )
+            .await;
             eprintln!("{}", tools.line("tools"));
+            tools.print_failures();
             if tools.ok == 0 {
                 eprintln!(
                     "\u{2717} tool-calling stage failed for every sample — stopping before NSED."
@@ -492,8 +680,9 @@ pub async fn run(
             return ExitCode::FAILURE;
         }
     };
-    let (nsed, details) = run_nsed_stage(&*agent, runs, rounds).await;
+    let (nsed, details) = run_nsed_stage(&*agent, runs, rounds, &stage_bar("nsed ", runs)).await;
     eprintln!("{}", nsed.line("nsed"));
+    nsed.print_failures();
     if !details.is_empty() {
         eprintln!(
             "  full details (first deliberation, {} rounds):",
@@ -521,31 +710,104 @@ mod tests {
         let mut s = StageStats::new(10);
         s.ok = 9;
         s.total_latency_ms = 9 * 400;
-        s.last_error = Some("401 Unauthorized".to_string());
         assert_eq!(s.avg_latency_ms(), 400);
         assert_eq!(s.error_rate_pct(), 10);
         let line = s.line("chat");
         assert!(line.contains("9/10 ok"));
         assert!(line.contains("avg 400ms"));
         assert!(line.contains("errors 10%"));
-        assert!(line.contains("last error: 401 Unauthorized"));
     }
 
     #[test]
-    fn stage_stats_line_omits_error_when_all_ok() {
-        let mut s = StageStats::new(10);
-        s.ok = 10;
-        s.total_latency_ms = 10 * 100;
-        assert!(!s.line("chat").contains("last error"));
+    fn direct_failure_line_carries_400_body() {
+        let err = LlmError::BadRequest {
+            status: 400,
+            body: "tools[0].function.parameters: invalid schema".to_string(),
+        };
+        let f = Failure::direct(4, true, 530, &err);
+        let line = f.line();
+        assert!(line.contains("#4"));
+        assert!(line.contains("1 tool(s)"));
+        assert!(line.contains("530ms"));
+        assert!(line.contains("bad request (status 400)"));
+        // The 400 body — withheld by Display — is surfaced as `reason:`.
+        assert!(line.contains("reason: tools[0].function.parameters: invalid schema"));
     }
 
     #[test]
-    fn stage_stats_all_failed_surfaces_error() {
+    fn nsed_failure_mines_llm_detail_from_anyhow_chain() {
+        let err: anyhow::Error = LlmError::BadRequest {
+            status: 400,
+            body: "max_tokens 16000 > 21000 - 5395 input".to_string(),
+        }
+        .into();
+        let err = err.context("round 2 evaluate");
+        let f = Failure::nsed(2, nsed_context(2, "evaluate", true, 1, 1), &err);
+        let line = f.line();
+        assert!(line.contains("round 2/evaluate"));
+        assert!(line.contains("proposal\u{2713} critiques 1"));
+        assert!(line.contains("candidates 1"));
+        assert!(line.contains("reason: max_tokens 16000 > 21000 - 5395 input"));
+    }
+
+    #[test]
+    fn nsed_empty_failure_line_has_no_latency_or_reason() {
+        let line = Failure::nsed_empty(3, 2).line();
+        assert!(line.contains("#3"));
+        assert!(line.contains("round 2/propose"));
+        assert!(line.contains("empty proposal content"));
+        assert!(!line.contains("ms"), "no latency segment: {line}");
+        assert!(!line.contains("reason:"), "no reason segment: {line}");
+    }
+
+    #[test]
+    fn group_errors_dedups_and_preserves_order() {
+        let mk = |seq, msg: &str| Failure {
+            seq,
+            context: String::new(),
+            latency_ms: 0,
+            error: msg.to_string(),
+            detail: None,
+        };
+        let fs = vec![
+            mk(1, "bad request (status 400)"),
+            mk(2, "transport"),
+            mk(3, "bad request (status 400)"),
+        ];
+        let grouped = group_errors(&fs);
+        assert_eq!(
+            grouped,
+            vec![
+                ("bad request (status 400)".to_string(), 2),
+                ("transport".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn report_lines_caps_failures_and_reports_remainder() {
         let mut s = StageStats::new(10);
-        s.last_error = Some("Connection refused".to_string());
-        assert_eq!(s.avg_latency_ms(), 0);
-        assert_eq!(s.error_rate_pct(), 100);
-        assert!(s.line("nsed").contains("last error: Connection refused"));
+        for seq in 1..=10 {
+            s.failures.push(Failure {
+                seq,
+                context: format!("c{seq}"),
+                latency_ms: 0,
+                error: "boom".to_string(),
+                detail: None,
+            });
+        }
+        let lines = s.report_lines();
+        assert_eq!(lines[0], "  failures by error:");
+        assert!(lines.iter().any(|l| l.contains("10\u{d7} boom")));
+        assert!(
+            lines.iter().any(|l| l.contains("and 2 more")),
+            "10 failures, cap 8 → 2 more: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn report_lines_empty_when_no_failures() {
+        assert!(StageStats::new(5).report_lines().is_empty());
     }
 
     #[test]
@@ -660,7 +922,7 @@ mod tests {
             vec![],
             vec![],
         );
-        let (stats, details) = run_nsed_stage(&agent, 3, 2).await;
+        let (stats, details) = run_nsed_stage(&agent, 3, 2, &ProgressBar::hidden()).await;
         assert_eq!(stats.ok, 3, "simulated propose should succeed every run");
         assert_eq!(stats.error_rate_pct(), 0);
         assert_eq!(details.len(), 2);
