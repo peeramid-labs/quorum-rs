@@ -1,13 +1,19 @@
 # Smoke-test an agent
 
-`quorum smoke-test <agent_id>` verifies that one of your agents actually
-participates in real deliberations on the remote orchestrator — the full NSED
-protocol end to end (the agent's real LLM provider, chat **or** responses API,
-proposal + evaluation rounds), not a synthetic ping.
+`quorum smoke-test <agent_id>` verifies one of your own agents in three
+escalating stages — cheapest signal first, full protocol last:
 
-> **It makes real LLM calls.** Each run submits a real deliberation that your
-> agent answers — so it costs tokens and takes provider latency. The command
-> warns and asks for confirmation before running (skip with `--yes`).
+1. **chat** — calls the agent's model directly 10× with a trivial prompt.
+2. **tool-calling** — 10× with a tool defined, expecting a tool call back.
+3. **full NSED** — submits real single-agent deliberations through the
+   orchestrator and checks the agent participated.
+
+Each stage gates the next: if a stage fails every sample, the run stops (no
+point testing tools when chat is down, or NSED when tool-calling is down).
+
+> **It makes real LLM calls.** All three stages hit your provider (and, for
+> NSED, the orchestrator) — real tokens + latency. The command warns and asks
+> for confirmation before running (skip with `--yes`).
 
 ## Prerequisites
 
@@ -28,32 +34,29 @@ quorum smoke-test justindgx --runs 5   # more runs
 quorum smoke-test justindgx --yes      # skip the confirmation prompt (CI)
 ```
 
-## What it does
-
-1. Resolves the remote orchestrator from your `quorum.yml` workspace.
-2. Warns it makes real LLM calls; confirms (unless `--yes` or no TTY).
-3. Checks the target is one of your `quorum.yml` agents AND online.
-4. Submits `--runs` deliberations of a small smoke task with **only that agent**,
-   streams each to completion, and inspects the trace
-   (`/deliberation/{id}/details`) to confirm the agent proposed/evaluated.
-5. Prints a per-run line and a participation rate.
-
-It uses an ad-hoc deliberation (the same path as `quorum run`) — nothing is
-created or left on the orchestrator, so it needs only your operator token (no
-admin / `manage_rooms`).
+`--runs` (default 3) controls the NSED stage; the chat and tool-calling stages
+are fixed at 10 samples each. The chat/tool stages call the model directly
+(built from the agent's provider in `quorum.yml`); the NSED stage submits ad-hoc
+single-agent deliberations the same way `quorum run` does — only your operator
+token, no `manage_rooms`. A **subprocess** provider (`exec` / `claude` / `mcp`)
+can't be called directly, so the chat/tool stages are skipped and only NSED runs.
 
 ## Output
 
 ```
-⚠ smoke-test runs REAL deliberations using your agents (LLM cost + latency).
+⚠ smoke-test makes REAL LLM calls (chat + tools direct, then deliberations) …
   Continue? (y/N) › y
-run 1/3 ✓ justindgx participated (score 0.82)
-run 2/3 ✗ justindgx absent from trace
-run 3/3 ✓ justindgx participated (score 0.79)
-smoke justindgx: 2/3 participated (67%)
+chat: 10/10 ok · avg 412ms · errors 0%
+tools: 9/10 ok · avg 530ms · errors 10%
+nsed 1/3 ✓ justindgx participated (score 0.82)
+nsed 2/3 ✓ justindgx participated (score 0.79)
+nsed 3/3 ✓ justindgx participated (score 0.80)
+nsed justindgx: 3/3 participated (100%)
 ```
 
-Exit code is `0` only when **all** runs pass; non-zero otherwise (CI-friendly).
+Each direct stage reports **success / avg latency / error rate**. Exit code is
+`0` only when every stage that ran fully passed (chat all ok, tools all ok, NSED
+all participated); non-zero otherwise (CI-friendly).
 
 ## Troubleshooting
 
