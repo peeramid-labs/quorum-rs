@@ -302,7 +302,19 @@ jobs:
           # disambiguates entries when multiple crates eventually
           # ship the same numeric version. release-publish.yml's
           # release-notes lookup also keys on $TAG, so both sides match.
-          NEW_SECTION=$(git-cliff --tag "$TAG" --unreleased --strip header 2>/dev/null || true)
+          # Bound the changelog at the latest STABLE release tag, skipping
+          # pre-release tags (`-rc`/`-alpha`/`-beta`). `--unreleased` alone
+          # stops at the newest tag — during a long RC cycle that's an RC, so
+          # everything that shipped earlier in the cycle gets dropped and the
+          # final release notes come out nearly empty. A stable `vX.Y.Z`-style
+          # tag is the right lower bound; before the first one exists, fall
+          # back to the full history.
+          LAST_STABLE=$(git tag --list --sort=-version:refname \
+            | grep -E '^([a-z0-9_-]+-)?v?[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+          if [ -n "$LAST_STABLE" ]; then RANGE="${LAST_STABLE}..HEAD"; else RANGE="HEAD"; fi
+          echo "STEP: changelog range=${RANGE} (last stable tag: ${LAST_STABLE:-none})"
+
+          NEW_SECTION=$(git-cliff --tag "$TAG" "$RANGE" --strip header 2>/dev/null || true)
           if [ -n "$NEW_SECTION" ] && [ -f CHANGELOG.md ]; then
             # `|| true` keeps the pipeline from exiting non-zero
             # when CHANGELOG.md has no `## ` sections yet (fresh
@@ -338,7 +350,7 @@ jobs:
           fi
           git push origin "$BRANCH"
 
-          CHANGELOG_BODY=$(git-cliff --tag "$TAG" --unreleased --strip header 2>/dev/null || echo "Release ${TAG}")
+          CHANGELOG_BODY=$(git-cliff --tag "$TAG" "$RANGE" --strip header 2>/dev/null || echo "Release ${TAG}")
           {
             echo "## Release v${VERSION}"
             echo ""

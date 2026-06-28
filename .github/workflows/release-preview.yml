@@ -167,12 +167,19 @@ jobs:
           else
             TAG="${CRATE}-v${VERSION}"
           fi
+          # Bound at the latest STABLE tag, skipping pre-release (`-rc` etc.)
+          # tags so a long RC cycle doesn't truncate the preview. Mirrors
+          # release-prepare.yml. Falls back to full history before the first
+          # stable tag exists.
+          LAST_STABLE=$(git tag --list --sort=-version:refname \
+            | grep -E '^([a-z0-9_-]+-)?v?[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+          if [ -n "$LAST_STABLE" ]; then RANGE="${LAST_STABLE}..HEAD"; else RANGE="HEAD"; fi
           {
             echo ""
-            echo "### Changelog dry-run (${TAG})"
+            echo "### Changelog dry-run (${TAG}, range ${RANGE})"
             echo ""
             echo '```markdown'
-            git-cliff --tag "$TAG" --unreleased --strip header 2>/dev/null \
-              || echo "(git-cliff produced no output — no conventional commits since last tag?)"
+            git-cliff --tag "$TAG" "$RANGE" --strip header 2>/dev/null \
+              || echo "(git-cliff produced no output — no conventional commits in range?)"
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
