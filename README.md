@@ -1,40 +1,52 @@
 # quorum-rs
 
-**Get your distributed AI agent team on the same page.**
+### One LLM guesses. A quorum argues until it's sure.
 
 [![crates.io](https://img.shields.io/crates/v/quorum-rs.svg)](https://crates.io/crates/quorum-rs)
 [![docs.rs](https://img.shields.io/docsrs/quorum-rs)](https://docs.rs/quorum-rs)
 [![license](https://img.shields.io/crates/l/quorum-rs.svg)](#license)
 
-`quorum` is a parallel synchronisation engine for AI agents. Many agents — each
-a potentially different model, prompt, or toolchain — propose answers in
-parallel, evaluate each other, and the protocol drives the team to a
-quorum-backed verdict. Pooling models against a shared goal raises reasoning
-power over any single agent, and early-stop convergence detection ends the round
-the moment agreement is reached instead of burning the full iteration budget.
+Throw many models at one question. They answer in parallel, grade each other's
+work, and the protocol stops the instant they agree — so you get a checked
+answer, not a single model's first guess, without burning a fixed iteration
+budget.
 
-Useful wherever single-model failure modes are expensive — security review,
-technical decisions, content moderation: anywhere a wrong call is costly.
+```mermaid
+flowchart TD
+    Q(["Is this auth middleware safe?"]) -->|fan out| A[gpt-4o]
+    Q --> B[claude]
+    Q --> C[qwen-72b]
+    A -->|propose| X{{grade each other}}
+    B --> X
+    C --> X
+    X -->|converge early once they agree| V(["&#10007; Unsafe — expiry check uses &lt; not &lt;=,<br/>off-by-one lets a just-expired token through.<br/>2 of 3 agents flagged it."])
+```
 
-Deep dive: [arXiv:2601.16863](https://arxiv.org/abs/2601.16863).
+Three mediocre models that *disagree well* beat one big model that's confidently
+wrong. Best where a wrong call is expensive: security review, technical
+decisions, content moderation.
 
-`quorum-rs` is the open-source SDK + reference runtime + `quorum` CLI for
-building agents against this protocol. The orchestrator that drives a round runs
-as a separate service; you get an invite code to join one.
+Paper: [arXiv:2601.16863](https://arxiv.org/abs/2601.16863).
+`quorum-rs` is the open-source SDK + runtime + `quorum` CLI for building agents
+against this protocol. The orchestrator that runs a round is a separate service;
+an invite code joins you to one.
 
-## Quickstart
+## Run it
 
-Take an invite code to a live agent in a few commands:
+Invite code → live agent, five commands:
 
 ```bash
 cargo install quorum-rs
-quorum redeem eyJhbGc...        # your invite → local NATS creds + operator token
+quorum redeem eyJhbGc...        # invite → local NATS creds + operator token
 quorum init                    # scaffold quorum.yml (providers + agents)
-quorum smoke-test cortex-a     # verify the agent: chat → tool-calling → full NSED
-quorum serve                   # run it; it joins the orchestrator and deliberates
+quorum smoke-test cortex-a     # gut-check: chat → tool-calling → full deliberation
+quorum serve                   # live — joins the orchestrator and starts arguing
 ```
 
-Full walkthrough: **[Your first agent — from invite to live deliberation](docs/tutorials/first-agent-from-invite.md)**.
+`smoke-test` is the part you'll love: it drives your real agent end-to-end before
+a single live round and tells you *exactly* why a model choked (bad key, wrong
+`base_url`, missing `engine: vllm`, the raw 400 reason). Full walkthrough:
+**[your first agent, from invite to live deliberation](docs/tutorials/first-agent-from-invite.md)**.
 
 ## Crates
 
@@ -69,10 +81,11 @@ Adds `/quorum:init`, `:redeem`, `:run`, `:serve`, `:status`, `:trace`,
 `:validate`, `:tui` — see
 [use the Claude Code plugin](docs/how-to/use-the-claude-code-plugin.md).
 
-## Configure an agent
+## Wire any model
 
-`quorum.yml` wires providers (LLM endpoints) to agents. Point `base_url` at any
-OpenAI-compatible backend; set `engine` for self-hosted runtimes:
+`quorum.yml` plugs providers into agents. Point `base_url` at anything that
+speaks OpenAI — hosted, vLLM, llama.cpp — and set `engine` for self-hosted
+tool-call dialects:
 
 ```yaml
 providers:
@@ -107,7 +120,7 @@ Built for small + open-weight models, battle-tested in production runs. Full API
 
 ## Documentation
 
-[`docs/`](docs/), organised by [Diátaxis](https://diataxis.fr):
+[`docs/`](docs/):
 
 - **[Tutorials](docs/tutorials/)** — [your first agent from an invite](docs/tutorials/first-agent-from-invite.md)
 - **[How-to](docs/how-to/)** — [smoke-test an agent](docs/how-to/smoke-test-an-agent.md), [run a fleet](docs/how-to/run-an-agent-fleet.md), [agent development](docs/how-to/agent-development.md), [verify telemetry](docs/how-to/verify-telemetry.md)
