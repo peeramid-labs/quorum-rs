@@ -11,12 +11,14 @@ proposal + evaluation rounds), not a synthetic ping.
 
 ## Prerequisites
 
-- The agent must be **serving and online**: run `quorum serve` first. Smoke-test
-  builds a deliberation from the orchestrator's *online* agents; an offline
+- The agent must be one of **your own** agents — declared in `quorum.yml`'s
+  `agents:`. An id that isn't yours is refused (smoke never pulls in other
+  operators' / remote agents).
+- The agent must be **serving and online**: run `quorum serve` first. An offline
   target is rejected.
-- At least **2** of your agents online (a deliberation needs ≥2 participants).
-  Smoke-test fills the deliberation with the target plus your other online
-  agents.
+
+**Only the specified agent** runs the deliberation — no other agents are
+involved.
 
 ## Usage
 
@@ -30,11 +32,10 @@ quorum smoke-test justindgx --yes      # skip the confirmation prompt (CI)
 
 1. Resolves the remote orchestrator from your `quorum.yml` workspace.
 2. Warns it makes real LLM calls; confirms (unless `--yes` or no TTY).
-3. Reads the orchestrator's online agents, checks the target is online, and
-   selects the target + enough other online agents for a deliberation.
-4. Submits `--runs` deliberations of a small smoke task, streams each to
-   completion, and inspects the trace (`/deliberation/{id}/details`) to confirm
-   the **target** agent proposed or evaluated.
+3. Checks the target is one of your `quorum.yml` agents AND online.
+4. Submits `--runs` deliberations of a small smoke task with **only that agent**,
+   streams each to completion, and inspects the trace
+   (`/deliberation/{id}/details`) to confirm the agent proposed/evaluated.
 5. Prints a per-run line and a participation rate.
 
 It uses an ad-hoc deliberation (the same path as `quorum run`) — nothing is
@@ -58,6 +59,6 @@ Exit code is `0` only when **all** runs pass; non-zero otherwise (CI-friendly).
 
 | Symptom | Cause |
 |---|---|
+| `not one of your agents in quorum.yml` | You passed an id that isn't in your `agents:` (e.g. someone else's remote agent). Use one of your own. |
 | `agent not online` | The agent isn't serving — run `quorum serve`. |
-| `needs ≥2 online agents` | Fewer than 2 of your agents are online. Start more. |
-| target keeps showing `absent from trace` | The agent is online but not eligible/selected for the deliberation — check its operator grants vs the room/policy tags (see [run an agent fleet](run-an-agent-fleet.md)). |
+| `absent from trace` | The agent is online but the deliberation didn't record a contribution — check its operator grants/capabilities vs the policy (see [run an agent fleet](run-an-agent-fleet.md)). |
