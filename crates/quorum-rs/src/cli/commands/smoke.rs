@@ -25,6 +25,22 @@ use async_openai::types::{
 use crate::agents::config::AgentConfig;
 use crate::cli::remote::{AgentInfo, JobDetails, JobOutcome, RemoteOrchestrator, TraceRecord};
 use crate::cli::request::DeliberationRequest;
+use crate::cli::workspace::{PolicyConfig, PolicyMode};
+
+/// A throwaway single-agent NSED policy. `passthrough` mode runs one agent (the
+/// deliberation mode would reject <2), so the target can be smoke-tested solo.
+fn smoke_policy(target: &str) -> PolicyConfig {
+    PolicyConfig {
+        agents: Some(vec![target.to_string()]),
+        roles: None,
+        max_rounds: 1,
+        effort: 0.7,
+        sla: None,
+        capabilities: None,
+        tags: None,
+        mode: PolicyMode::Passthrough,
+    }
+}
 use crate::config::{ProviderEntry, load_agent_from_config_with_registry};
 use crate::llms::openai_compatible::OpenAICompatibleModel;
 use crate::llms::simulated::SimulatedModel;
@@ -336,16 +352,28 @@ pub async fn run(config_path: &Path, agent_id: &str, runs: u32, assume_yes: bool
         }
     }
 
-    // ── Stage 3: full NSED deliberation (only the specified agent) ──
-    let chosen = vec![agent_id.to_string()];
+    // ── Stage 3: NSED through the orchestrator, ONLY the specified agent ──
+    // A direct (policy-less) deliberation requires ≥2 agents; a single agent
+    // runs via a passthrough policy. Register a throwaway one and submit to it.
+    let policy = smoke_policy(agent_id);
+    let policy_id = match client
+        .push_policy(&format!("smoke-{}", uuid::Uuid::new_v4().simple()), &policy)
+        .await
+    {
+        Ok(r) => r.policy_id,
+        Err(e) => {
+            eprintln!("nsed \u{2717} could not register smoke policy: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mut passed = 0u32;
     for k in 1..=runs {
         let req = DeliberationRequest {
             room_id: format!("smoke-{}", uuid::Uuid::new_v4().simple()),
             user_query: SMOKE_TASK.to_string(),
             deliberation_rounds: SMOKE_ROUNDS,
-            agent_names: Some(chosen.clone()),
-            policy_id: None,
+            agent_names: Some(vec![agent_id.to_string()]),
+            policy_id: Some(policy_id.clone()),
             effort: None,
             scope: None,
             timeout_seconds: None,
@@ -468,6 +496,17 @@ mod tests {
         assert_eq!(s.avg_latency_ms(), 0);
         assert_eq!(s.error_rate_pct(), 100);
         assert!(s.line("chat").contains("last error: Connection refused"));
+    }
+
+    #[test]
+    fn smoke_policy_is_single_agent_passthrough() {
+        let p = smoke_policy("justindgx");
+        assert_eq!(p.mode, PolicyMode::Passthrough);
+        assert_eq!(
+            p.agents.as_deref(),
+            Some(["justindgx".to_string()].as_slice())
+        );
+        assert!(p.roles.is_none());
     }
 
     #[test]
