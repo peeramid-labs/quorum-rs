@@ -872,6 +872,9 @@ fn format_next_steps(has_remote: bool) -> String {
     msg.push_str("  quorum run \"your question\"       # submit a one-shot deliberation\n");
     msg.push_str("  quorum tui                       # interactive monitor of in-flight jobs\n");
     msg.push_str("  quorum serve                     # run YOUR agents against the orchestrator\n");
+    msg.push_str(
+        "  quorum smoke-test <agent>        # after serve: verify the agent joins real deliberations\n",
+    );
     if has_remote {
         msg.push('\n');
         msg.push_str(

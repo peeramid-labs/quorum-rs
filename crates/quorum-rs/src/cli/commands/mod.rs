@@ -26,6 +26,7 @@ pub mod redeem;
 pub mod rooms;
 pub mod run;
 pub mod serve;
+pub mod smoke;
 pub mod status;
 pub mod trace;
 pub mod validate;

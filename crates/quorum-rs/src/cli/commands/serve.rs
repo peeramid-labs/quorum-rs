@@ -148,7 +148,7 @@ fn try_build_orchestrator_client(
 /// `token` (the operator token from `quorum redeem`/`init --invite`), which
 /// carries `manage_agents` and is what attributes agents to the operator.
 /// `None` for embedded / no-workspace / missing-field runs.
-fn resolve_remote_orchestrator(
+pub(crate) fn resolve_remote_orchestrator(
     workspace_path: &Path,
     room_flag: Option<&str>,
 ) -> Option<(String, String)> {
