@@ -339,6 +339,21 @@ enum Commands {
     /// Reports a one-line summary on success, exits non-zero on parse
     /// failure. Pure CLI helper — no network, no LLM, no mutation.
     Validate,
+
+    /// Run real NSED deliberations on the remote orchestrator filled with your
+    /// own online agents, and report how often `<agent_id>` actually
+    /// participated. Connects to the orchestrator and makes real LLM calls.
+    /// The agent must already be serving (`quorum serve`).
+    SmokeTest {
+        /// Local agent id to verify (must be online).
+        agent_id: String,
+        /// How many deliberations to run.
+        #[arg(long, default_value_t = 3)]
+        runs: u32,
+        /// Skip the "this makes real LLM calls" confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 impl Cli {
@@ -617,6 +632,12 @@ async fn run_cli(cli: Cli) -> ExitCode {
         }
 
         Commands::Validate => commands::validate::run(&cli.config_path()),
+
+        Commands::SmokeTest {
+            ref agent_id,
+            runs,
+            yes,
+        } => commands::smoke::run(&cli.config_path(), agent_id, runs, yes).await,
     }
 }
 
