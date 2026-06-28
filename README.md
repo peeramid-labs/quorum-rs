@@ -50,24 +50,18 @@ a single live round and tells you *exactly* why a model choked (bad key, wrong
 
 ## Crates
 
-| Crate | Version | Description |
-|---|---|---|
-| [`quorum-rs`](crates/quorum-rs) | `0.7` | SDK + reference runtime + `quorum` CLI: agent traits (`NsedAgent`, `Tool`, `AiModel`, `PromptSet`), data types (`AgentContext`, `Proposal`, `Evaluation`), the reference `ProposerEvaluatorAgent` (ReAct loop over any OpenAI-compatible LLM), `Exec`/`Mcp`/`Claude` agent integrations, the NATS worker runtime, telemetry catalog, and the `quorum` binary (`run` / `serve` / `smoke-test` / `status` / `trace` / `tui` / `init`). One crate: `cargo install` gives the binary, `cargo add` gives the SDK. |
-| [`llm-repair`](crates/llm-repair) | `0.7` | JSON-repair, markdown extraction, and tool-call recovery for malformed LLM output. Standalone-useful for any Rust project calling real-world LLMs. |
-| [`quorum-crypto-core`](crates/quorum-crypto-core) | `0.7` | Ed25519 / secp256k1 / SHA3 primitives + audit envelope. Optional dep of `quorum-rs` (`audit` feature). |
+| Crate | Description |
+|---|---|
+| [`quorum-rs`](crates/quorum-rs) | SDK + reference runtime + `quorum` CLI: agent traits (`NsedAgent`, `Tool`, `AiModel`, `PromptSet`), data types (`AgentContext`, `Proposal`, `Evaluation`), the reference `ProposerEvaluatorAgent` (ReAct loop over any OpenAI-compatible LLM), `Exec`/`Mcp`/`Claude` agent integrations, the NATS worker runtime, telemetry catalog, and the `quorum` binary (`run` / `serve` / `smoke-test` / `status` / `trace` / `tui` / `init`). One crate: `cargo install` gives the binary, `cargo add` gives the SDK. |
+| [`llm-repair`](crates/llm-repair) | JSON-repair, markdown extraction, and tool-call recovery for malformed LLM output. Standalone-useful for any Rust project calling real-world LLMs. |
+| [`quorum-crypto-core`](crates/quorum-crypto-core) | Ed25519 / secp256k1 / SHA3 primitives + audit envelope. Optional dep of `quorum-rs` (`audit` feature). |
 
 ## Install
 
-```toml
-# library (the SDK)
-quorum-rs = "0.7"
-# just the JSON-repair helpers
-llm-repair = "0.7"
-```
-
 ```bash
-# CLI binary (same crate, default features)
-cargo install quorum-rs
+cargo add quorum-rs        # the SDK
+cargo add llm-repair       # just the JSON-repair helpers
+cargo install quorum-rs    # the CLI binary (same crate)
 ```
 
 As a Claude Code plugin (slash commands wrapping the CLI):
@@ -133,8 +127,9 @@ Rustdoc: [quorum-rs](https://docs.rs/quorum-rs) · [llm-repair](https://docs.rs/
 
 ## Status
 
-`0.7` is an early public release. Breaking changes are expected while the API is
-polished; semver-stable releases begin at `1.0`.
+Early public release. Breaking changes are expected while the API is polished;
+semver-stable releases begin at `1.0`. Current version:
+[crates.io](https://crates.io/crates/quorum-rs).
 
 ## Contributing
 
