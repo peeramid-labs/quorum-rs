@@ -752,6 +752,31 @@ pub struct AgentResponse {
     pub final_scratchpad: Option<String>,
 }
 
+/// Emit a [`DeliberationContextAssembled`](crate::telemetry::DeliberationContextAssembled)
+/// for a propose/evaluate call. `candidates_count` is the evaluate fan-in (`0`
+/// for propose); `final_scratchpad` is the scratchpad the agent produced, if any.
+fn emit_context_assembled(
+    context: &AgentContext,
+    final_scratchpad: Option<&str>,
+    candidates_count: u32,
+) {
+    let written = final_scratchpad.filter(|s| !s.is_empty());
+    let chars = |s: &str| s.chars().count() as u32;
+    emit_for!(
+        context,
+        DeliberationContextAssembled {
+            scratchpad_loaded_chars: context.scratchpad.as_deref().map(chars).unwrap_or(0),
+            scratchpad_written: written.is_some(),
+            scratchpad_written_chars: written.map(chars).unwrap_or(0),
+            prior_own_proposal_included: context.previous_own_proposal.is_some(),
+            prior_score_included: context.previous_own_score.is_some(),
+            prior_critiques_count: context.previous_critiques.len() as u32,
+            candidates_count,
+            previous_round_matrix_included: context.previous_round_matrix.is_some(),
+        }
+    );
+}
+
 #[derive(Debug, Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct BatchEvaluationItem {
@@ -1154,6 +1179,8 @@ impl NsedAgent for ProposerEvaluatorAgent {
             }
         }
 
+        emit_context_assembled(context, agent_response.final_scratchpad.as_deref(), 0);
+
         Ok(Proposal {
             thought_process: response.thought_process,
             content: response.solution_content,
@@ -1288,6 +1315,12 @@ impl NsedAgent for ProposerEvaluatorAgent {
             input_tokens: agent_response.input_tokens.unwrap_or(0),
             output_tokens: agent_response.output_tokens.unwrap_or(0),
         });
+
+        emit_context_assembled(
+            context,
+            agent_response.final_scratchpad.as_deref(),
+            context.candidates.len() as u32,
+        );
 
         // Build the set of valid candidate IDs so we can filter out
         // hallucinated self-evaluations before normalization.
