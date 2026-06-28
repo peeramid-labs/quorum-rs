@@ -49,34 +49,61 @@ agents implement `propose`).
 
 ## Output
 
+A live progress bar runs per stage (hidden when stderr isn't a TTY, e.g. CI):
+
+```
+  nsed  [==============>         ] 6/10 ok:3 00:00:24
+```
+
+When the stage finishes the bar clears and the summary + breakdown print:
+
 ```
 ⚠ smoke-test makes REAL LLM calls (chat, tool-calling, and NSED propose) …
   Continue? (y/N) › y
 smoke `justindgx` → provider `vllm`, model `qwen2.5-72b` @ http://localhost:8000/v1
 chat: 10/10 ok · avg 412ms · errors 0%
 tools: 9/10 ok · avg 530ms · errors 10%
-nsed: 10/10 ok · avg 4820ms · errors 0%
+  failures by error:
+    1× model returned no tool call
+  #7 req 1 msg, 1 tool(s) · 480ms
+      model returned no tool call
+nsed: 5/10 ok · avg 4820ms · errors 50%
+  failures by error:
+    5× bad request (status 400)
+  #2 round 1/propose · prior none critiques 0 · candidates 0 · 1240ms
+      round 1 propose: bad request (status 400)
+      reason: {"error":{"message":"'max_tokens' too large: 16000 > 21000 - 5395 input","code":400}}
+  …
   full details (first deliberation, 5 rounds):
   round 1: proposal 240c · scratchpad none · prior: none (first round) · evaluated 1 candidate(s) → score 0.50
-  round 2: proposal 310c · scratchpad written 412c · prior: proposal✓ score 0.50 critiques 1 · evaluated 1 candidate(s) → score 0.62
   …
 ```
 
-Each stage reports **success / avg latency / error rate**, with `— last error: …`
-appended on any failure (everything runs in this process, so there is no server
-log to consult). The NSED stage also prints the **full details** of the first
-successful deliberation, round by round: proposal size, whether the agent wrote
-its scratchpad, what prior context (proposal / score / critiques) was fed into
-that round, and the resulting evaluation score — so you can confirm the agent
-actually exercised cross-round state. Exit code is `0` only when every stage that
-ran fully passed; non-zero otherwise (CI-friendly).
+Each stage reports **success / avg latency / error rate**. **Every** failure is
+listed (not just the last) under `failures by error:` — an aggregate count per
+distinct error, then each failure with its full breakdown: which sample, the
+round/phase, the prior context fed in (proposal / critiques / candidates), the
+latency, and the error.
+
+For an HTTP **400**, the provider's response body — normally withheld from logs
+because it can echo your prompt — is surfaced here as `reason:` (smoke is
+operator-local, so showing your own backend's reason in your own terminal is
+safe). That body usually names the actual cause: token math, an unsupported
+param, or a bad tool schema.
+
+The NSED stage also prints the **full details** of the first successful
+deliberation, round by round: proposal size, whether the agent wrote its
+scratchpad, what prior context was fed in, and the evaluation score — so you can
+confirm the agent exercised cross-round state. Exit code is `0` only when every
+stage that ran fully passed; non-zero otherwise (CI-friendly).
 
 ## Troubleshooting
 
 | Symptom | Cause |
 |---|---|
 | `not one of your agents in quorum.yml` | You passed an id that isn't in your `agents:` (e.g. someone else's remote agent). Use one of your own. |
-| `chat: 0/10 … last error: Connection refused` | Provider unreachable / wrong `base_url`. |
-| `chat: 0/10 … last error: 401` | Bad/missing API key for the provider. |
-| `tools: … last error: model returned no tool call` | The model didn't emit a tool call — it may not support tool-calling, or needs the repair/engine flags (see [run an agent fleet](run-an-agent-fleet.md)). |
-| `nsed: 0/N … last error: …` | The agent's `propose()` failed — the error is the agent/LLM error verbatim. |
+| `Connection refused` | Provider unreachable / wrong `base_url`. |
+| `401` / `403` | Bad/missing API key for the provider. |
+| `model returned no tool call` | The model didn't emit a tool call — it may not support tool-calling, or needs the repair/engine flags (see [run an agent fleet](run-an-agent-fleet.md)). |
+| `bad request (status 400)` | Read the `reason:` line — it carries the provider's 400 body (token math, unsupported param, bad tool schema). |
+| NSED `propose`/`evaluate` failures | Each failure shows its round/phase + prior context; the `reason:` line has the underlying LLM error. |
