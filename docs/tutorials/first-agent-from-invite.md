@@ -88,11 +88,8 @@ Three files, one operator identity, split by transport:
 > written, you can submit tasks but not run an agent — ask the admin for a
 > unified code (`capabilities: ["chat", "agent"]`).
 
-Save the NATS URL for Step 4:
-
-```bash
-export NATS_URL=nats://api.peeramid.xyz:4222    # use what was printed above
-```
+(No need to copy the NATS URL — Step 3's `quorum init` writes it into your
+config, so `quorum serve` finds it automatically.)
 
 ✅ **Checkpoint:** `ls -la ~/.nsed/agent.creds` shows the file with mode 0600.
 
@@ -153,17 +150,18 @@ has the per-provider notes.
 From the same directory:
 
 ```bash
-quorum serve --nats-url $NATS_URL
+quorum serve
 ```
 
-`serve` reads `./quorum.yml` and `~/.nsed/agent.creds` by default.
-To point at different paths:
+`serve` reads `./quorum.yml` + `~/.nsed/agent.creds`, and the NATS URL from the
+config (`init` wrote it there). Override only when needed:
 
 ```bash
 quorum serve \
-  --config       ./fleet/quorum.yml \
-  --nats-url     $NATS_URL \
-  --nats-creds   ./creds/nats.creds
+  --config     ./fleet/quorum.yml \
+  --nats-creds ./creds/agent.creds \
+  --nats-url   nats://host:4222     # only if the config has no NATS URL
+                                    # (hand-written / --non-interactive scaffold)
 ```
 
 You'll see startup logs like:
