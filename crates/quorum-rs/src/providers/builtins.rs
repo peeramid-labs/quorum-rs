@@ -19,6 +19,22 @@ use crate::llms::OpenAICompatibleModel;
 use crate::prompts::defaults::DefaultPromptSet;
 use crate::serve::instantiate_builtin_tools;
 
+/// Resolve the base URL for an OpenAI-compatible provider, or `None` when it
+/// can't be safely defaulted. An explicit `base_url` wins; an empty one
+/// defaults to `api.openai.com` ONLY for the `openai` type (or an empty type) —
+/// any other type with no `base_url` returns `None` so a typoed `type:` can't
+/// leak the API key to OpenAI. Shared by the provider factory and `smoke-test`.
+pub(crate) fn resolve_openai_base_url(provider_type: &str, base_url: &str) -> Option<String> {
+    if !base_url.is_empty() {
+        return Some(base_url.to_string());
+    }
+    if provider_type.is_empty() || provider_type == "openai" {
+        Some("https://api.openai.com/v1".to_string())
+    } else {
+        None
+    }
+}
+
 /// `exec` — external subprocess, no LLM.
 pub struct ExecFactory;
 
@@ -151,23 +167,16 @@ impl ProviderFactory for OpenAiCompatibleFactory {
         agent_config: &AgentConfig,
         provider: &ProviderEntry,
     ) -> Result<Option<Arc<dyn NsedAgent>>> {
-        // Base-URL resolution mirrors the old dispatch: only `openai`
-        // gets the api.openai.com default. Any other type with an
-        // empty `base_url` is skipped so a typoed `type:` can't leak
-        // the API key to api.openai.com.
-        let base_url = if provider.base_url.is_empty() {
-            if self.provider_type == "openai" {
-                "https://api.openai.com/v1".to_string()
-            } else {
+        let base_url = match resolve_openai_base_url(self.provider_type(), &provider.base_url) {
+            Some(url) => url,
+            None => {
                 warn!(
                     agent = %agent_config.name,
-                    provider_type = %self.provider_type,
+                    provider_type = %self.provider_type(),
                     "no `base_url` set for non-openai provider type — skipping"
                 );
                 return Ok(None);
             }
-        } else {
-            provider.base_url.clone()
         };
 
         let llm =
@@ -205,6 +214,26 @@ impl ProviderFactory for OpenAiCompatibleFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_openai_base_url_rules() {
+        // Explicit base_url always wins.
+        assert_eq!(
+            resolve_openai_base_url("anything", "https://x/v1").as_deref(),
+            Some("https://x/v1")
+        );
+        // Empty + openai (or empty type) → the OpenAI default.
+        assert_eq!(
+            resolve_openai_base_url("openai", "").as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(
+            resolve_openai_base_url("", "").as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        // Empty + any other type → None (don't leak the key to OpenAI).
+        assert!(resolve_openai_base_url("groq", "").is_none());
+    }
 
     fn resolve(yaml: &str, agent: &str) -> (AgentConfig, ProviderEntry) {
         let fleet: crate::config::AgentFleetConfig =

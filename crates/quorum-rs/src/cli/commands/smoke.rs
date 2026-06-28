@@ -1,17 +1,19 @@
 //! `quorum smoke-test <agent_id>` — staged escalation for ONE of the operator's
-//! own online agents:
+//! own agents, run entirely IN-PROCESS (no orchestrator, no NATS, no peers):
 //!
 //! 1. **chat** — call the agent's model directly N times with a trivial prompt;
-//!    report success/avg-latency/error-rate.
+//!    report success / avg-latency / error-rate.
 //! 2. **tool-calling** — same model, N times, expecting a tool call back.
-//! 3. **full NSED** — submit single-agent deliberations through the orchestrator
-//!    and verify the agent participated.
+//! 3. **NSED** — build the agent and call `propose()` directly with a synthetic
+//!    context. `propose()` is the full NSED wrapper (ReAct loop + tool-calling),
+//!    so this exercises the deliberation path for a single agent — no second
+//!    participant and no orchestrator required.
 //!
 //! Each stage gates the next (a stage that fails every sample stops the run).
-//! Stages 1-2 are direct model calls (built from the agent's provider in
-//! `quorum.yml`); a subprocess provider (`exec`/`claude`/`mcp`) can't be called
-//! directly, so those stages are skipped and only the NSED stage runs. It never
-//! pulls in other operators' / remote agents.
+//! Stages 1-2 are direct model calls; a subprocess provider (`exec`/`claude`/
+//! `mcp`) has no directly-callable model, so those are skipped — but the NSED
+//! stage still runs (those agents implement `propose`). `quorum serve` need not
+//! be running.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -23,8 +25,7 @@ use async_openai::types::{
 };
 
 use crate::agents::config::AgentConfig;
-use crate::cli::remote::{AgentInfo, JobDetails, JobOutcome, RemoteOrchestrator, TraceRecord};
-use crate::cli::request::DeliberationRequest;
+use crate::agents::{AgentContext, DeliberationPhase, NsedAgent};
 use crate::config::{ProviderEntry, load_agent_from_config_with_registry};
 use crate::llms::openai_compatible::OpenAICompatibleModel;
 use crate::llms::simulated::SimulatedModel;
@@ -35,11 +36,10 @@ use crate::providers::ProviderRegistry;
 const SMOKE_SAMPLES: u32 = 10;
 const SMOKE_TASK: &str =
     "Smoke test: reply briefly with your role and confirm you are operational.";
-const SMOKE_ROUNDS: u32 = 1;
 
-/// Tally for one direct stage: how many of `runs` succeeded, their latency, and
-/// the most recent failure reason (these stages call the provider directly — so
-/// `quorum serve` logs nothing; the reason has to surface here).
+/// Tally for one stage: how many of `runs` succeeded, their latency, and the
+/// most recent failure reason. Everything runs in this process, so the reason
+/// has to surface here — there is no server log to consult.
 struct StageStats {
     ok: u32,
     runs: u32,
@@ -48,6 +48,15 @@ struct StageStats {
 }
 
 impl StageStats {
+    fn new(runs: u32) -> Self {
+        StageStats {
+            ok: 0,
+            runs,
+            total_latency_ms: 0,
+            last_error: None,
+        }
+    }
+
     fn avg_latency_ms(&self) -> u64 {
         if self.ok == 0 {
             0
@@ -70,8 +79,6 @@ impl StageStats {
             self.avg_latency_ms(),
             self.error_rate_pct()
         );
-        // Surface why it failed — these direct calls never touch `quorum serve`,
-        // so without this the operator sees a 0% with no clue.
         if self.ok < self.runs
             && let Some(err) = &self.last_error
         {
@@ -143,21 +150,30 @@ fn build_model(agent: &AgentConfig, provider: &ProviderEntry) -> Option<Box<dyn 
         ))),
         "exec" | "claude" | "mcp" => None,
         _ => {
-            let base_url = if provider.base_url.is_empty() {
-                if provider.provider_type.is_empty() || provider.provider_type == "openai" {
-                    "https://api.openai.com/v1".to_string()
-                } else {
-                    return None;
-                }
-            } else {
-                provider.base_url.clone()
-            };
+            let base_url = crate::providers::builtins::resolve_openai_base_url(
+                &provider.provider_type,
+                &provider.base_url,
+            )?;
             Some(Box::new(OpenAICompatibleModel::new(
                 base_url,
                 provider.api_key.clone(),
                 provider.engine.clone(),
             )))
         }
+    }
+}
+
+/// A minimal first-round proposing context for the NSED stage. `session_id` and
+/// `agent_id` are required by the agent's telemetry path even with no endpoints.
+fn smoke_context(agent_id: &str) -> AgentContext {
+    AgentContext {
+        task_description: SMOKE_TASK.to_string(),
+        round_number: 1,
+        total_rounds: 1,
+        phase: DeliberationPhase::Proposing,
+        session_id: Some(format!("smoke-{agent_id}")),
+        agent_id: agent_id.to_string(),
+        ..Default::default()
     }
 }
 
@@ -170,12 +186,7 @@ async fn run_direct_stage(
     samples: u32,
     with_tools: bool,
 ) -> StageStats {
-    let mut stats = StageStats {
-        ok: 0,
-        runs: samples,
-        total_latency_ms: 0,
-        last_error: None,
-    };
+    let mut stats = StageStats::new(samples);
     for _ in 0..samples {
         let req = if with_tools {
             tool_request()
@@ -198,71 +209,64 @@ async fn run_direct_stage(
     stats
 }
 
-/// Did `agent_id` propose or evaluate anywhere in the deliberation trace?
-fn participated(details: &JobDetails, agent_id: &str) -> bool {
-    let touched = |r: &TraceRecord| {
-        r.author_agent_id == agent_id
-            || r.evaluations
-                .iter()
-                .any(|e| e.evaluator_agent_id == agent_id)
-    };
-    details.history.iter().any(touched) || details.final_result.as_ref().is_some_and(touched)
+/// Run the NSED stage in-process: `runs` calls to `agent.propose()` with a
+/// synthetic proposing context. A run is ok when it returns a proposal with
+/// non-empty content. Exercises the full NSED wrapper (ReAct loop + tools).
+async fn run_nsed_stage(agent: &dyn NsedAgent, runs: u32) -> StageStats {
+    let ctx = smoke_context(&agent.name());
+    let mut stats = StageStats::new(runs);
+    for _ in 0..runs {
+        let started = Instant::now();
+        match agent.propose(&ctx).await {
+            Ok(p) if !p.content.trim().is_empty() => {
+                stats.ok += 1;
+                stats.total_latency_ms += started.elapsed().as_millis();
+            }
+            Ok(_) => stats.last_error = Some("proposal had empty content".to_string()),
+            Err(e) => stats.last_error = Some(e.to_string()),
+        }
+    }
+    stats
 }
 
-/// The NSED-stage report line, e.g. `nsed alice: 4/5 participated (80%)`.
-fn report_line(agent_id: &str, passed: u32, runs: u32) -> String {
-    let pct = (passed * 100).checked_div(runs).unwrap_or(0);
-    format!("nsed {agent_id}: {passed}/{runs} participated ({pct}%)")
-}
-
-/// Validate the smoke target: it must be one of the operator's OWN agents
-/// (declared in `quorum.yml`'s `agents:`) AND currently online at the
-/// orchestrator. Returns errors (no panics); never selects any other agent —
-/// the smoke runs exactly the specified agent, not strangers' remote agents.
-fn validate_target(
-    local_agents: &[String],
-    online: &[AgentInfo],
-    target: &str,
-) -> Result<(), String> {
-    if !local_agents.iter().any(|n| n == target) {
-        return Err(format!(
+/// The target must be one of the operator's OWN agents (declared in
+/// `quorum.yml`'s `agents:`). It is built and driven locally, so it need not be
+/// serving. Never accepts a stranger's / remote agent id.
+fn validate_target(local_agents: &[String], target: &str) -> Result<(), String> {
+    if local_agents.iter().any(|n| n == target) {
+        Ok(())
+    } else {
+        Err(format!(
             "`{target}` is not one of your agents in quorum.yml. Your agents: {}",
             if local_agents.is_empty() {
                 "(none)".to_string()
             } else {
                 local_agents.join(", ")
             }
-        ));
+        ))
     }
-    if !online.iter().any(|a| a.agent_id == target && a.is_online) {
-        return Err(format!(
-            "agent `{target}` is not online — run `quorum serve` first"
-        ));
-    }
-    Ok(())
 }
 
 pub async fn run(config_path: &Path, agent_id: &str, runs: u32, assume_yes: bool) -> ExitCode {
-    let Some((address, token)) = super::serve::resolve_remote_orchestrator(config_path, None)
-    else {
-        eprintln!(
-            "error: no remote orchestrator resolvable from the workspace ({}). \
-             smoke-test needs a remote orchestrator entry with an address + token.",
-            config_path.display()
-        );
-        return ExitCode::FAILURE;
-    };
-    let client = match RemoteOrchestrator::new(&address, &token) {
-        Ok(c) => c,
+    let fleet = match super::serve::load_fleet_unified(config_path) {
+        Ok(f) => f,
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!(
+                "error: could not load your fleet from {}: {e}",
+                config_path.display()
+            );
             return ExitCode::FAILURE;
         }
     };
+    let local_agents: Vec<String> = fleet.agents.iter().map(|a| a.name.clone()).collect();
+    if let Err(m) = validate_target(&local_agents, agent_id) {
+        eprintln!("error: {m}");
+        return ExitCode::FAILURE;
+    }
 
     eprintln!(
-        "\u{26a0} smoke-test makes REAL LLM calls (chat + tools direct to your provider, then \
-         deliberations on {address}) — cost + latency."
+        "\u{26a0} smoke-test makes REAL LLM calls (chat, tool-calling, and NSED propose for \
+         `{agent_id}`) — cost + latency."
     );
     if !assume_yes && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         match inquire::Confirm::new("Proceed?")
@@ -277,106 +281,63 @@ pub async fn run(config_path: &Path, agent_id: &str, runs: u32, assume_yes: bool
         }
     }
 
-    let fleet = match super::serve::load_fleet_unified(config_path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!(
-                "error: could not load your fleet from {}: {e}",
-                config_path.display()
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-    let local_agents: Vec<String> = fleet.agents.iter().map(|a| a.name.clone()).collect();
-    let agents = match client.agents().await {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("error: could not list agents (GET /agents): {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    if let Err(m) = validate_target(&local_agents, &agents, agent_id) {
-        eprintln!("error: {m}");
-        return ExitCode::FAILURE;
-    }
+    let registry = ProviderRegistry::with_builtins();
+    let (agent_config, provider) =
+        match load_agent_from_config_with_registry(&fleet, agent_id, &registry) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("error: could not load agent `{agent_id}` from your fleet: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     let mut all_ok = true;
 
     // ── Stages 1-2: direct model calls (built from the agent's provider) ──
-    let registry = ProviderRegistry::with_builtins();
-    match load_agent_from_config_with_registry(&fleet, agent_id, &registry) {
-        Ok((agent_config, provider)) => match build_model(&agent_config, &provider) {
-            Some(model) => {
-                let chat = run_direct_stage(&*model, &agent_config, SMOKE_SAMPLES, false).await;
-                eprintln!("{}", chat.line("chat"));
-                if chat.ok == 0 {
-                    eprintln!("\u{2717} chat stage failed for every sample — stopping.");
-                    return ExitCode::FAILURE;
-                }
-                all_ok &= chat.ok == chat.runs;
-
-                let tools = run_direct_stage(&*model, &agent_config, SMOKE_SAMPLES, true).await;
-                eprintln!("{}", tools.line("tools"));
-                if tools.ok == 0 {
-                    eprintln!(
-                        "\u{2717} tool-calling stage failed for every sample — stopping before NSED."
-                    );
-                    return ExitCode::FAILURE;
-                }
-                all_ok &= tools.ok == tools.runs;
+    match build_model(&agent_config, &provider) {
+        Some(model) => {
+            let chat = run_direct_stage(&*model, &agent_config, SMOKE_SAMPLES, false).await;
+            eprintln!("{}", chat.line("chat"));
+            if chat.ok == 0 {
+                eprintln!("\u{2717} chat stage failed for every sample — stopping.");
+                return ExitCode::FAILURE;
             }
-            None => eprintln!(
-                "\u{2139} chat/tool stages skipped — `{}` is a subprocess agent (no direct model)",
+            all_ok &= chat.ok == chat.runs;
+
+            let tools = run_direct_stage(&*model, &agent_config, SMOKE_SAMPLES, true).await;
+            eprintln!("{}", tools.line("tools"));
+            if tools.ok == 0 {
+                eprintln!(
+                    "\u{2717} tool-calling stage failed for every sample — stopping before NSED."
+                );
+                return ExitCode::FAILURE;
+            }
+            all_ok &= tools.ok == tools.runs;
+        }
+        None => eprintln!(
+            "\u{2139} chat/tool stages skipped — `{}` is a subprocess agent (no direct model)",
+            provider.provider_type
+        ),
+    }
+
+    // ── Stage 3: NSED in-process via the agent's own propose() ──
+    let agent = match registry.build_agent(&provider.provider_type, &agent_config, &provider) {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            eprintln!(
+                "\u{2717} no NSED agent implementation for provider type `{}`",
                 provider.provider_type
-            ),
-        },
-        Err(e) => {
-            eprintln!("error: could not load agent `{agent_id}` from your fleet: {e}");
+            );
             return ExitCode::FAILURE;
         }
-    }
-
-    // ── Stage 3: full NSED deliberation (only the specified agent) ──
-    let chosen = vec![agent_id.to_string()];
-    let mut passed = 0u32;
-    for k in 1..=runs {
-        let req = DeliberationRequest {
-            room_id: format!("smoke-{}", uuid::Uuid::new_v4().simple()),
-            user_query: SMOKE_TASK.to_string(),
-            deliberation_rounds: SMOKE_ROUNDS,
-            agent_names: Some(chosen.clone()),
-            policy_id: None,
-            effort: None,
-            scope: None,
-            timeout_seconds: None,
-        };
-        let job_id = match client.submit(&req).await {
-            Ok(id) => id,
-            Err(e) => {
-                eprintln!("nsed {k}/{runs} \u{2717} submit failed: {e}");
-                continue;
-            }
-        };
-        match client.stream_events(&job_id).await {
-            Ok(JobOutcome::Success(payload)) => match client.details(&job_id).await {
-                Ok(details) if participated(&details, agent_id) => {
-                    passed += 1;
-                    eprintln!(
-                        "nsed {k}/{runs} \u{2713} {agent_id} participated (score {:.2})",
-                        payload.best_proposal_score
-                    );
-                }
-                Ok(_) => eprintln!("nsed {k}/{runs} \u{2717} {agent_id} absent from trace"),
-                Err(e) => eprintln!("nsed {k}/{runs} \u{2717} could not fetch trace: {e}"),
-            },
-            Ok(JobOutcome::Failed(status)) => {
-                eprintln!("nsed {k}/{runs} \u{2717} deliberation failed: {status}")
-            }
-            Err(e) => eprintln!("nsed {k}/{runs} \u{2717} stream failed: {e}"),
+        Err(e) => {
+            eprintln!("error: could not build agent `{agent_id}`: {e}");
+            return ExitCode::FAILURE;
         }
-    }
-    eprintln!("{}", report_line(agent_id, passed, runs));
-    all_ok &= passed == runs;
+    };
+    let nsed = run_nsed_stage(&*agent, runs).await;
+    eprintln!("{}", nsed.line("nsed"));
+    all_ok &= nsed.ok == nsed.runs;
 
     if all_ok {
         ExitCode::SUCCESS
@@ -388,96 +349,42 @@ pub async fn run(config_path: &Path, agent_id: &str, runs: u32, assume_yes: bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::remote::{TraceEvalDetail, TraceEvaluation, TraceProposal};
-
-    fn record(author: &str, evaluators: &[&str]) -> TraceRecord {
-        TraceRecord {
-            round: 1,
-            author_agent_id: author.to_string(),
-            proposal: TraceProposal {
-                content: String::new(),
-                thought_process: String::new(),
-            },
-            evaluations: evaluators
-                .iter()
-                .map(|e| TraceEvaluation {
-                    evaluator_agent_id: e.to_string(),
-                    evaluation: TraceEvalDetail {
-                        score: 0.0,
-                        justification: String::new(),
-                    },
-                })
-                .collect(),
-            aggregated_score: 0.0,
-        }
-    }
-
-    fn details(history: Vec<TraceRecord>) -> JobDetails {
-        JobDetails {
-            job_id: "j".to_string(),
-            history,
-            final_result: None,
-        }
-    }
-
-    fn agent(id: &str, online: bool) -> AgentInfo {
-        AgentInfo {
-            agent_id: id.to_string(),
-            is_online: online,
-            ..Default::default()
-        }
-    }
 
     #[test]
     fn stage_stats_math_and_line() {
-        let s = StageStats {
-            ok: 9,
-            runs: 10,
-            total_latency_ms: 9 * 400,
-            last_error: Some("401 Unauthorized".to_string()),
-        };
+        let mut s = StageStats::new(10);
+        s.ok = 9;
+        s.total_latency_ms = 9 * 400;
+        s.last_error = Some("401 Unauthorized".to_string());
         assert_eq!(s.avg_latency_ms(), 400);
         assert_eq!(s.error_rate_pct(), 10);
         let line = s.line("chat");
         assert!(line.contains("9/10 ok"));
         assert!(line.contains("avg 400ms"));
         assert!(line.contains("errors 10%"));
-        // Failures present → surface the reason.
         assert!(line.contains("last error: 401 Unauthorized"));
     }
 
     #[test]
     fn stage_stats_line_omits_error_when_all_ok() {
-        let s = StageStats {
-            ok: 10,
-            runs: 10,
-            total_latency_ms: 10 * 100,
-            last_error: None,
-        };
+        let mut s = StageStats::new(10);
+        s.ok = 10;
+        s.total_latency_ms = 10 * 100;
         assert!(!s.line("chat").contains("last error"));
     }
 
     #[test]
     fn stage_stats_all_failed_surfaces_error() {
-        let s = StageStats {
-            ok: 0,
-            runs: 10,
-            total_latency_ms: 0,
-            last_error: Some("Connection refused".to_string()),
-        };
+        let mut s = StageStats::new(10);
+        s.last_error = Some("Connection refused".to_string());
         assert_eq!(s.avg_latency_ms(), 0);
         assert_eq!(s.error_rate_pct(), 100);
-        assert!(s.line("chat").contains("last error: Connection refused"));
+        assert!(s.line("nsed").contains("last error: Connection refused"));
     }
 
     #[test]
     fn stage_stats_zero_runs_no_divide_by_zero() {
-        let s = StageStats {
-            ok: 0,
-            runs: 0,
-            total_latency_ms: 0,
-            last_error: None,
-        };
+        let s = StageStats::new(0);
         assert_eq!(s.error_rate_pct(), 0);
         assert_eq!(s.avg_latency_ms(), 0);
     }
@@ -533,66 +440,62 @@ mod tests {
                 "{t} must have no direct model"
             );
         }
-        // openai with no base_url → default openai endpoint, buildable.
         assert!(build_model(&agent, &provider("openai")).is_some());
-        // simulated → buildable.
         assert!(build_model(&agent, &provider("simulated")).is_some());
     }
 
     #[test]
-    fn participated_true_as_proposer_or_evaluator() {
-        assert!(participated(
-            &details(vec![record("alice", &["bob"])]),
-            "alice"
-        ));
-        assert!(participated(
-            &details(vec![record("bob", &["alice"])]),
-            "alice"
-        ));
+    fn build_model_none_for_non_openai_without_base_url() {
+        let agent = AgentConfig {
+            model_name: "m".to_string(),
+            ..Default::default()
+        };
+        // Non-openai type with no base_url → no model (won't leak the key to OpenAI).
+        assert!(build_model(&agent, &provider("groq")).is_none());
     }
 
     #[test]
-    fn participated_false_when_absent() {
-        assert!(!participated(
-            &details(vec![record("bob", &["carol"])]),
-            "alice"
-        ));
-        assert!(!participated(&details(vec![]), "alice"));
-    }
-
-    #[test]
-    fn report_line_percentages() {
-        assert!(report_line("a", 3, 3).contains("3/3 participated (100%)"));
-        assert!(report_line("a", 2, 3).contains("2/3 participated (66%)"));
-        assert!(report_line("a", 0, 3).contains("0/3 participated (0%)"));
-        assert!(report_line("a", 0, 0).contains("0/0 participated (0%)"));
-    }
-
-    #[test]
-    fn validate_ok_when_local_and_online() {
+    fn validate_accepts_local_target() {
         let local = vec!["alice".to_string(), "bob".to_string()];
-        let online = [agent("alice", true), agent("cortex-a", true)];
-        assert!(validate_target(&local, &online, "alice").is_ok());
+        assert!(validate_target(&local, "alice").is_ok());
     }
 
     #[test]
     fn validate_rejects_non_local_target() {
         let local = vec!["alice".to_string()];
-        let online = [agent("cortex-a", true)];
-        assert!(validate_target(&local, &online, "cortex-a").is_err());
-    }
-
-    #[test]
-    fn validate_rejects_offline_local_target() {
-        let local = vec!["alice".to_string()];
-        let online = [agent("alice", false)];
-        assert!(validate_target(&local, &online, "alice").is_err());
+        // A stranger's / remote agent id is refused — smoke only runs YOUR agent.
+        assert!(validate_target(&local, "cortex-a").is_err());
     }
 
     #[test]
     fn validate_rejects_when_no_local_agents() {
-        let online = [agent("alice", true)];
-        let err = validate_target(&[], &online, "alice").unwrap_err();
+        let err = validate_target(&[], "alice").unwrap_err();
         assert!(err.contains("(none)"));
+    }
+
+    /// True local end-to-end of the NSED stage: a real `ProposerEvaluatorAgent`
+    /// backed by the offline `SimulatedModel`, driven through `propose()` with
+    /// no orchestrator or network.
+    #[tokio::test]
+    async fn nsed_stage_runs_against_simulated_agent() {
+        use crate::agents::ProposerEvaluatorAgent;
+        use crate::prompts::defaults::DefaultPromptSet;
+
+        let agent_config = AgentConfig {
+            name: "sim".to_string(),
+            provider_id: "sim".to_string(),
+            model_name: "sim-model".to_string(),
+            ..Default::default()
+        };
+        let agent = ProposerEvaluatorAgent::new(
+            agent_config,
+            Box::new(SimulatedModel::new("sim-model".to_string(), 0)),
+            Box::new(DefaultPromptSet::new()),
+            vec![],
+            vec![],
+        );
+        let stats = run_nsed_stage(&agent, 3).await;
+        assert_eq!(stats.ok, 3, "simulated propose should succeed every run");
+        assert_eq!(stats.error_rate_pct(), 0);
     }
 }
