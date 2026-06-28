@@ -150,6 +150,21 @@ Fired when the agent runs an internal tool.
 
 Not sent: tool arguments, tool output, search queries.
 
+### `deliberation_context_assembled`
+
+Fired once per `propose` / `evaluate` call, recording what prior-round context the agent assembled into its prompt and whether it wrote its scratchpad. Lets a dashboard confirm a serving agent actually inspects its own past proposals/evals across rounds — the same signals `quorum smoke-test` prints in-process.
+
+| Field | Type | Description |
+|---|---|---|
+| `scratchpad_loaded_chars` | int | Scratchpad characters loaded into the prompt from the persistent store |
+| `scratchpad_written` | bool | `true` when the agent wrote its scratchpad during this call |
+| `scratchpad_written_chars` | int | Size of the scratchpad the agent produced |
+| `prior_own_proposal_included` | bool | `true` when the prior round's own proposal was fed back into the prompt |
+| `prior_score_included` | bool | `true` when the prior round's own score was fed back in |
+| `prior_critiques_count` | int | Number of prior-round evaluator critiques fed into the prompt |
+| `candidates_count` | int | Candidates fed to the evaluate phase (`0` in propose) |
+| `previous_round_matrix_included` | bool | `true` when the cross-agent previous-round matrix was included |
+
 ### `retry_loop_attempt`
 
 Fired each time the structured-output retry loop iterates.
