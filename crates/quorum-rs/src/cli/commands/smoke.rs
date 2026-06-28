@@ -1,20 +1,186 @@
-//! `quorum smoke-test <agent_id>` — run real NSED deliberations with ONLY the
-//! one specified agent (which must be the operator's own, from `quorum.yml`),
-//! then report how often it actually participated. The full protocol runs
-//! server-side (so it exercises whichever API the agent uses — chat-completions
-//! or responses). Submits ad-hoc deliberations the same way `quorum run` does
-//! (an ad-hoc `room_id` + `agent_names`), so it needs only the operator token —
-//! no `manage_rooms`. It never pulls in other operators' / remote agents.
+//! `quorum smoke-test <agent_id>` — staged escalation for ONE of the operator's
+//! own online agents:
+//!
+//! 1. **chat** — call the agent's model directly N times with a trivial prompt;
+//!    report success/avg-latency/error-rate.
+//! 2. **tool-calling** — same model, N times, expecting a tool call back.
+//! 3. **full NSED** — submit single-agent deliberations through the orchestrator
+//!    and verify the agent participated.
+//!
+//! Each stage gates the next (a stage that fails every sample stops the run).
+//! Stages 1-2 are direct model calls (built from the agent's provider in
+//! `quorum.yml`); a subprocess provider (`exec`/`claude`/`mcp`) can't be called
+//! directly, so those stages are skipped and only the NSED stage runs. It never
+//! pulls in other operators' / remote agents.
 
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Instant;
 
+use async_openai::types::{
+    ChatCompletionRequestUserMessage, ChatCompletionTool, ChatCompletionToolChoiceOption,
+    ChatCompletionToolType, CreateChatCompletionResponse, FunctionObject,
+};
+
+use crate::agents::config::AgentConfig;
 use crate::cli::remote::{AgentInfo, JobDetails, JobOutcome, RemoteOrchestrator, TraceRecord};
 use crate::cli::request::DeliberationRequest;
+use crate::config::{ProviderEntry, load_agent_from_config_with_registry};
+use crate::llms::openai_compatible::OpenAICompatibleModel;
+use crate::llms::simulated::SimulatedModel;
+use crate::llms::{AiModel, RequestConfig};
+use crate::providers::ProviderRegistry;
 
+/// Samples per direct stage (chat, tool-calling).
+const SMOKE_SAMPLES: u32 = 10;
 const SMOKE_TASK: &str =
     "Smoke test: reply briefly with your role and confirm you are operational.";
 const SMOKE_ROUNDS: u32 = 1;
+
+/// Tally for one direct stage: how many of `runs` succeeded and their latency.
+struct StageStats {
+    ok: u32,
+    runs: u32,
+    total_latency_ms: u128,
+}
+
+impl StageStats {
+    fn avg_latency_ms(&self) -> u64 {
+        if self.ok == 0 {
+            0
+        } else {
+            (self.total_latency_ms / self.ok as u128) as u64
+        }
+    }
+
+    fn error_rate_pct(&self) -> u32 {
+        ((self.runs - self.ok) * 100)
+            .checked_div(self.runs)
+            .unwrap_or(0)
+    }
+
+    fn line(&self, label: &str) -> String {
+        format!(
+            "{label}: {}/{} ok \u{b7} avg {}ms \u{b7} errors {}%",
+            self.ok,
+            self.runs,
+            self.avg_latency_ms(),
+            self.error_rate_pct()
+        )
+    }
+}
+
+/// Did the model return at least one tool call?
+fn has_tool_call(resp: &CreateChatCompletionResponse) -> bool {
+    resp.choices
+        .first()
+        .and_then(|c| c.message.tool_calls.as_ref())
+        .is_some_and(|calls| !calls.is_empty())
+}
+
+fn chat_request() -> RequestConfig {
+    RequestConfig {
+        messages: vec![
+            ChatCompletionRequestUserMessage {
+                content: "Reply briefly: OK".into(),
+                ..Default::default()
+            }
+            .into(),
+        ],
+        tools: None,
+        tool_choice: None,
+        presence_penalty: None,
+    }
+}
+
+fn tool_request() -> RequestConfig {
+    let echo = ChatCompletionTool {
+        r#type: ChatCompletionToolType::Function,
+        function: FunctionObject {
+            name: "echo".to_string(),
+            description: Some("Echo the given text back to the caller.".to_string()),
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "text": { "type": "string" } },
+                "required": ["text"]
+            })),
+            strict: None,
+        },
+    };
+    RequestConfig {
+        messages: vec![
+            ChatCompletionRequestUserMessage {
+                content: "Use the echo tool to echo the text \"ok\".".into(),
+                ..Default::default()
+            }
+            .into(),
+        ],
+        tools: Some(vec![echo]),
+        tool_choice: Some(ChatCompletionToolChoiceOption::Auto),
+        presence_penalty: None,
+    }
+}
+
+/// Build a directly-callable model for the agent's provider, or `None` for
+/// subprocess providers (`exec`/`claude`/`mcp`) and misconfigured openai-types
+/// with no base_url. Mirrors `providers::builtins` base-url resolution.
+fn build_model(agent: &AgentConfig, provider: &ProviderEntry) -> Option<Box<dyn AiModel>> {
+    match provider.provider_type.as_str() {
+        "simulated" => Some(Box::new(SimulatedModel::new(
+            agent.model_name.clone(),
+            provider.latency_ms,
+        ))),
+        "exec" | "claude" | "mcp" => None,
+        _ => {
+            let base_url = if provider.base_url.is_empty() {
+                if provider.provider_type.is_empty() || provider.provider_type == "openai" {
+                    "https://api.openai.com/v1".to_string()
+                } else {
+                    return None;
+                }
+            } else {
+                provider.base_url.clone()
+            };
+            Some(Box::new(OpenAICompatibleModel::new(
+                base_url,
+                provider.api_key.clone(),
+                provider.engine.clone(),
+            )))
+        }
+    }
+}
+
+/// Run one direct stage: `samples` model calls; a sample is "ok" when the call
+/// succeeds (and, for the tool stage, returns a tool call). Latency is summed
+/// over ok samples only.
+async fn run_direct_stage(
+    model: &dyn AiModel,
+    agent: &AgentConfig,
+    samples: u32,
+    with_tools: bool,
+) -> StageStats {
+    let mut stats = StageStats {
+        ok: 0,
+        runs: samples,
+        total_latency_ms: 0,
+    };
+    for _ in 0..samples {
+        let req = if with_tools {
+            tool_request()
+        } else {
+            chat_request()
+        };
+        let started = Instant::now();
+        if let Ok(res) = model.chat_completion(agent, req).await {
+            let good = !with_tools || has_tool_call(&res.response);
+            if good {
+                stats.ok += 1;
+                stats.total_latency_ms += started.elapsed().as_millis();
+            }
+        }
+    }
+    stats
+}
 
 /// Did `agent_id` propose or evaluate anywhere in the deliberation trace?
 fn participated(details: &JobDetails, agent_id: &str) -> bool {
@@ -27,10 +193,10 @@ fn participated(details: &JobDetails, agent_id: &str) -> bool {
     details.history.iter().any(touched) || details.final_result.as_ref().is_some_and(touched)
 }
 
-/// The final report line, e.g. `smoke alice: 4/5 participated (80%)`.
+/// The NSED-stage report line, e.g. `nsed alice: 4/5 participated (80%)`.
 fn report_line(agent_id: &str, passed: u32, runs: u32) -> String {
     let pct = (passed * 100).checked_div(runs).unwrap_or(0);
-    format!("smoke {agent_id}: {passed}/{runs} participated ({pct}%)")
+    format!("nsed {agent_id}: {passed}/{runs} participated ({pct}%)")
 }
 
 /// Validate the smoke target: it must be one of the operator's OWN agents
@@ -79,8 +245,8 @@ pub async fn run(config_path: &Path, agent_id: &str, runs: u32, assume_yes: bool
     };
 
     eprintln!(
-        "\u{26a0} smoke-test runs REAL deliberations on {address} using your agents — \
-         real LLM calls (cost + latency)."
+        "\u{26a0} smoke-test makes REAL LLM calls (chat + tools direct to your provider, then \
+         deliberations on {address}) — cost + latency."
     );
     if !assume_yes && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         match inquire::Confirm::new("Proceed?")
@@ -95,11 +261,8 @@ pub async fn run(config_path: &Path, agent_id: &str, runs: u32, assume_yes: bool
         }
     }
 
-    // The target must be the operator's OWN agent (from quorum.yml), not just
-    // any agent visible at the orchestrator — otherwise the smoke would run
-    // against strangers' remote agents.
-    let local_agents: Vec<String> = match super::serve::load_fleet_unified(config_path) {
-        Ok(fleet) => fleet.agents.into_iter().map(|a| a.name).collect(),
+    let fleet = match super::serve::load_fleet_unified(config_path) {
+        Ok(f) => f,
         Err(e) => {
             eprintln!(
                 "error: could not load your fleet from {}: {e}",
@@ -108,6 +271,7 @@ pub async fn run(config_path: &Path, agent_id: &str, runs: u32, assume_yes: bool
             return ExitCode::FAILURE;
         }
     };
+    let local_agents: Vec<String> = fleet.agents.iter().map(|a| a.name.clone()).collect();
     let agents = match client.agents().await {
         Ok(a) => a,
         Err(e) => {
@@ -119,10 +283,45 @@ pub async fn run(config_path: &Path, agent_id: &str, runs: u32, assume_yes: bool
         eprintln!("error: {m}");
         return ExitCode::FAILURE;
     }
-    // ONLY the specified agent participates.
-    let chosen = vec![agent_id.to_string()];
-    eprintln!("smoke: 1 agent → {agent_id}");
 
+    let mut all_ok = true;
+
+    // ── Stages 1-2: direct model calls (built from the agent's provider) ──
+    let registry = ProviderRegistry::with_builtins();
+    match load_agent_from_config_with_registry(&fleet, agent_id, &registry) {
+        Ok((agent_config, provider)) => match build_model(&agent_config, &provider) {
+            Some(model) => {
+                let chat = run_direct_stage(&*model, &agent_config, SMOKE_SAMPLES, false).await;
+                eprintln!("{}", chat.line("chat"));
+                if chat.ok == 0 {
+                    eprintln!("\u{2717} chat stage failed for every sample — stopping.");
+                    return ExitCode::FAILURE;
+                }
+                all_ok &= chat.ok == chat.runs;
+
+                let tools = run_direct_stage(&*model, &agent_config, SMOKE_SAMPLES, true).await;
+                eprintln!("{}", tools.line("tools"));
+                if tools.ok == 0 {
+                    eprintln!(
+                        "\u{2717} tool-calling stage failed for every sample — stopping before NSED."
+                    );
+                    return ExitCode::FAILURE;
+                }
+                all_ok &= tools.ok == tools.runs;
+            }
+            None => eprintln!(
+                "\u{2139} chat/tool stages skipped — `{}` is a subprocess agent (no direct model)",
+                provider.provider_type
+            ),
+        },
+        Err(e) => {
+            eprintln!("error: could not load agent `{agent_id}` from your fleet: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // ── Stage 3: full NSED deliberation (only the specified agent) ──
+    let chosen = vec![agent_id.to_string()];
     let mut passed = 0u32;
     for k in 1..=runs {
         let req = DeliberationRequest {
@@ -138,7 +337,7 @@ pub async fn run(config_path: &Path, agent_id: &str, runs: u32, assume_yes: bool
         let job_id = match client.submit(&req).await {
             Ok(id) => id,
             Err(e) => {
-                eprintln!("run {k}/{runs} \u{2717} submit failed: {e}");
+                eprintln!("nsed {k}/{runs} \u{2717} submit failed: {e}");
                 continue;
             }
         };
@@ -147,22 +346,23 @@ pub async fn run(config_path: &Path, agent_id: &str, runs: u32, assume_yes: bool
                 Ok(details) if participated(&details, agent_id) => {
                     passed += 1;
                     eprintln!(
-                        "run {k}/{runs} \u{2713} {agent_id} participated (score {:.2})",
+                        "nsed {k}/{runs} \u{2713} {agent_id} participated (score {:.2})",
                         payload.best_proposal_score
                     );
                 }
-                Ok(_) => eprintln!("run {k}/{runs} \u{2717} {agent_id} absent from trace"),
-                Err(e) => eprintln!("run {k}/{runs} \u{2717} could not fetch trace: {e}"),
+                Ok(_) => eprintln!("nsed {k}/{runs} \u{2717} {agent_id} absent from trace"),
+                Err(e) => eprintln!("nsed {k}/{runs} \u{2717} could not fetch trace: {e}"),
             },
             Ok(JobOutcome::Failed(status)) => {
-                eprintln!("run {k}/{runs} \u{2717} deliberation failed: {status}")
+                eprintln!("nsed {k}/{runs} \u{2717} deliberation failed: {status}")
             }
-            Err(e) => eprintln!("run {k}/{runs} \u{2717} stream failed: {e}"),
+            Err(e) => eprintln!("nsed {k}/{runs} \u{2717} stream failed: {e}"),
         }
     }
-
     eprintln!("{}", report_line(agent_id, passed, runs));
-    if passed == runs {
+    all_ok &= passed == runs;
+
+    if all_ok {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -213,6 +413,100 @@ mod tests {
     }
 
     #[test]
+    fn stage_stats_math_and_line() {
+        let s = StageStats {
+            ok: 9,
+            runs: 10,
+            total_latency_ms: 9 * 400,
+        };
+        assert_eq!(s.avg_latency_ms(), 400);
+        assert_eq!(s.error_rate_pct(), 10);
+        let line = s.line("chat");
+        assert!(line.contains("9/10 ok"));
+        assert!(line.contains("avg 400ms"));
+        assert!(line.contains("errors 10%"));
+    }
+
+    #[test]
+    fn stage_stats_all_failed_is_safe() {
+        let s = StageStats {
+            ok: 0,
+            runs: 10,
+            total_latency_ms: 0,
+        };
+        assert_eq!(s.avg_latency_ms(), 0);
+        assert_eq!(s.error_rate_pct(), 100);
+    }
+
+    #[test]
+    fn stage_stats_zero_runs_no_divide_by_zero() {
+        let s = StageStats {
+            ok: 0,
+            runs: 0,
+            total_latency_ms: 0,
+        };
+        assert_eq!(s.error_rate_pct(), 0);
+        assert_eq!(s.avg_latency_ms(), 0);
+    }
+
+    #[test]
+    fn has_tool_call_detects_presence_and_absence() {
+        let with = serde_json::json!({
+            "id": "x", "created": 0, "model": "m", "object": "chat.completion",
+            "choices": [{
+                "index": 0, "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant", "content": null,
+                    "tool_calls": [{
+                        "id": "c1", "type": "function",
+                        "function": { "name": "echo", "arguments": "{}" }
+                    }]
+                }
+            }]
+        });
+        let without = serde_json::json!({
+            "id": "x", "created": 0, "model": "m", "object": "chat.completion",
+            "choices": [{
+                "index": 0, "finish_reason": "stop",
+                "message": { "role": "assistant", "content": "hello" }
+            }]
+        });
+        let with: CreateChatCompletionResponse = serde_json::from_value(with).unwrap();
+        let without: CreateChatCompletionResponse = serde_json::from_value(without).unwrap();
+        assert!(has_tool_call(&with));
+        assert!(!has_tool_call(&without));
+    }
+
+    fn provider(provider_type: &str) -> ProviderEntry {
+        ProviderEntry {
+            provider_type: provider_type.to_string(),
+            base_url: String::new(),
+            api_key: String::new(),
+            engine: None,
+            latency_ms: 0,
+            models: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn build_model_skips_subprocess_providers() {
+        let agent = AgentConfig {
+            model_name: "m".to_string(),
+            ..Default::default()
+        };
+        for t in ["exec", "claude", "mcp"] {
+            assert!(
+                build_model(&agent, &provider(t)).is_none(),
+                "{t} must have no direct model"
+            );
+        }
+        // openai with no base_url → default openai endpoint, buildable.
+        assert!(build_model(&agent, &provider("openai")).is_some());
+        // simulated → buildable.
+        assert!(build_model(&agent, &provider("simulated")).is_some());
+    }
+
+    #[test]
     fn participated_true_as_proposer_or_evaluator() {
         assert!(participated(
             &details(vec![record("alice", &["bob"])]),
@@ -250,8 +544,6 @@ mod tests {
 
     #[test]
     fn validate_rejects_non_local_target() {
-        // cortex-a is online at the orchestrator but NOT one of the operator's
-        // own agents → must be rejected (never smoke strangers' remote agents).
         let local = vec!["alice".to_string()];
         let online = [agent("cortex-a", true)];
         assert!(validate_target(&local, &online, "cortex-a").is_err());
@@ -266,7 +558,6 @@ mod tests {
 
     #[test]
     fn validate_rejects_when_no_local_agents() {
-        // Empty fleet → the "(none)" message branch; always an error.
         let online = [agent("alice", true)];
         let err = validate_target(&[], &online, "alice").unwrap_err();
         assert!(err.contains("(none)"));
