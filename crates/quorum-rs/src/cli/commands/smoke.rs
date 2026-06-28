@@ -37,11 +37,14 @@ const SMOKE_TASK: &str =
     "Smoke test: reply briefly with your role and confirm you are operational.";
 const SMOKE_ROUNDS: u32 = 1;
 
-/// Tally for one direct stage: how many of `runs` succeeded and their latency.
+/// Tally for one direct stage: how many of `runs` succeeded, their latency, and
+/// the most recent failure reason (these stages call the provider directly — so
+/// `quorum serve` logs nothing; the reason has to surface here).
 struct StageStats {
     ok: u32,
     runs: u32,
     total_latency_ms: u128,
+    last_error: Option<String>,
 }
 
 impl StageStats {
@@ -60,13 +63,21 @@ impl StageStats {
     }
 
     fn line(&self, label: &str) -> String {
-        format!(
+        let mut s = format!(
             "{label}: {}/{} ok \u{b7} avg {}ms \u{b7} errors {}%",
             self.ok,
             self.runs,
             self.avg_latency_ms(),
             self.error_rate_pct()
-        )
+        );
+        // Surface why it failed — these direct calls never touch `quorum serve`,
+        // so without this the operator sees a 0% with no clue.
+        if self.ok < self.runs
+            && let Some(err) = &self.last_error
+        {
+            s.push_str(&format!(" \u{2014} last error: {err}"));
+        }
+        s
     }
 }
 
@@ -163,6 +174,7 @@ async fn run_direct_stage(
         ok: 0,
         runs: samples,
         total_latency_ms: 0,
+        last_error: None,
     };
     for _ in 0..samples {
         let req = if with_tools {
@@ -171,12 +183,16 @@ async fn run_direct_stage(
             chat_request()
         };
         let started = Instant::now();
-        if let Ok(res) = model.chat_completion(agent, req).await {
-            let good = !with_tools || has_tool_call(&res.response);
-            if good {
-                stats.ok += 1;
-                stats.total_latency_ms += started.elapsed().as_millis();
+        match model.chat_completion(agent, req).await {
+            Ok(res) => {
+                if !with_tools || has_tool_call(&res.response) {
+                    stats.ok += 1;
+                    stats.total_latency_ms += started.elapsed().as_millis();
+                } else {
+                    stats.last_error = Some("model returned no tool call".to_string());
+                }
             }
+            Err(e) => stats.last_error = Some(e.to_string()),
         }
     }
     stats
@@ -418,6 +434,7 @@ mod tests {
             ok: 9,
             runs: 10,
             total_latency_ms: 9 * 400,
+            last_error: Some("401 Unauthorized".to_string()),
         };
         assert_eq!(s.avg_latency_ms(), 400);
         assert_eq!(s.error_rate_pct(), 10);
@@ -425,17 +442,32 @@ mod tests {
         assert!(line.contains("9/10 ok"));
         assert!(line.contains("avg 400ms"));
         assert!(line.contains("errors 10%"));
+        // Failures present → surface the reason.
+        assert!(line.contains("last error: 401 Unauthorized"));
     }
 
     #[test]
-    fn stage_stats_all_failed_is_safe() {
+    fn stage_stats_line_omits_error_when_all_ok() {
+        let s = StageStats {
+            ok: 10,
+            runs: 10,
+            total_latency_ms: 10 * 100,
+            last_error: None,
+        };
+        assert!(!s.line("chat").contains("last error"));
+    }
+
+    #[test]
+    fn stage_stats_all_failed_surfaces_error() {
         let s = StageStats {
             ok: 0,
             runs: 10,
             total_latency_ms: 0,
+            last_error: Some("Connection refused".to_string()),
         };
         assert_eq!(s.avg_latency_ms(), 0);
         assert_eq!(s.error_rate_pct(), 100);
+        assert!(s.line("chat").contains("last error: Connection refused"));
     }
 
     #[test]
@@ -444,6 +476,7 @@ mod tests {
             ok: 0,
             runs: 0,
             total_latency_ms: 0,
+            last_error: None,
         };
         assert_eq!(s.error_rate_pct(), 0);
         assert_eq!(s.avg_latency_ms(), 0);
