@@ -1,9 +1,10 @@
-//! `quorum smoke-test <agent_id>` — run real NSED deliberations filled with the
-//! operator's own online agents, then report how often the target agent actually
-//! participated. The full protocol runs server-side (so it exercises whichever
-//! API each agent uses — chat-completions or responses). Submits ad-hoc
-//! deliberations the same way `quorum run` does (an ad-hoc `room_id` +
-//! `agent_names`), so it needs only the operator token — no `manage_rooms`.
+//! `quorum smoke-test <agent_id>` — run real NSED deliberations with ONLY the
+//! one specified agent (which must be the operator's own, from `quorum.yml`),
+//! then report how often it actually participated. The full protocol runs
+//! server-side (so it exercises whichever API the agent uses — chat-completions
+//! or responses). Submits ad-hoc deliberations the same way `quorum run` does
+//! (an ad-hoc `room_id` + `agent_names`), so it needs only the operator token —
+//! no `manage_rooms`. It never pulls in other operators' / remote agents.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -13,7 +14,7 @@ use crate::cli::request::DeliberationRequest;
 
 const SMOKE_TASK: &str =
     "Smoke test: reply briefly with your role and confirm you are operational.";
-const SMOKE_ROUNDS: u32 = 2;
+const SMOKE_ROUNDS: u32 = 1;
 
 /// Did `agent_id` propose or evaluate anywhere in the deliberation trace?
 fn participated(details: &JobDetails, agent_id: &str) -> bool {
@@ -32,29 +33,31 @@ fn report_line(agent_id: &str, passed: u32, runs: u32) -> String {
     format!("smoke {agent_id}: {passed}/{runs} participated ({pct}%)")
 }
 
-/// Pick agents for the smoke deliberation: the target must be present AND online;
-/// fill with the other online agents the caller can see to reach the 2-agent
-/// deliberation minimum. Errors (no panics) when the target is offline or there
-/// aren't enough online agents.
-fn choose_smoke_agents(all: &[AgentInfo], target: &str) -> Result<Vec<String>, String> {
-    if !all.iter().any(|a| a.agent_id == target && a.is_online) {
+/// Validate the smoke target: it must be one of the operator's OWN agents
+/// (declared in `quorum.yml`'s `agents:`) AND currently online at the
+/// orchestrator. Returns errors (no panics); never selects any other agent —
+/// the smoke runs exactly the specified agent, not strangers' remote agents.
+fn validate_target(
+    local_agents: &[String],
+    online: &[AgentInfo],
+    target: &str,
+) -> Result<(), String> {
+    if !local_agents.iter().any(|n| n == target) {
+        return Err(format!(
+            "`{target}` is not one of your agents in quorum.yml. Your agents: {}",
+            if local_agents.is_empty() {
+                "(none)".to_string()
+            } else {
+                local_agents.join(", ")
+            }
+        ));
+    }
+    if !online.iter().any(|a| a.agent_id == target && a.is_online) {
         return Err(format!(
             "agent `{target}` is not online — run `quorum serve` first"
         ));
     }
-    let mut chosen = vec![target.to_string()];
-    for a in all {
-        if a.is_online && a.agent_id != target {
-            chosen.push(a.agent_id.clone());
-        }
-    }
-    if chosen.len() < 2 {
-        return Err(format!(
-            "smoke needs at least 2 online agents; only {} available",
-            chosen.len()
-        ));
-    }
-    Ok(chosen)
+    Ok(())
 }
 
 pub async fn run(config_path: &Path, agent_id: &str, runs: u32, assume_yes: bool) -> ExitCode {
@@ -92,6 +95,19 @@ pub async fn run(config_path: &Path, agent_id: &str, runs: u32, assume_yes: bool
         }
     }
 
+    // The target must be the operator's OWN agent (from quorum.yml), not just
+    // any agent visible at the orchestrator — otherwise the smoke would run
+    // against strangers' remote agents.
+    let local_agents: Vec<String> = match super::serve::load_fleet_unified(config_path) {
+        Ok(fleet) => fleet.agents.into_iter().map(|a| a.name).collect(),
+        Err(e) => {
+            eprintln!(
+                "error: could not load your fleet from {}: {e}",
+                config_path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
     let agents = match client.agents().await {
         Ok(a) => a,
         Err(e) => {
@@ -99,14 +115,13 @@ pub async fn run(config_path: &Path, agent_id: &str, runs: u32, assume_yes: bool
             return ExitCode::FAILURE;
         }
     };
-    let chosen = match choose_smoke_agents(&agents, agent_id) {
-        Ok(c) => c,
-        Err(m) => {
-            eprintln!("error: {m}");
-            return ExitCode::FAILURE;
-        }
-    };
-    eprintln!("smoke: {} agent(s) → {}", chosen.len(), chosen.join(", "));
+    if let Err(m) = validate_target(&local_agents, &agents, agent_id) {
+        eprintln!("error: {m}");
+        return ExitCode::FAILURE;
+    }
+    // ONLY the specified agent participates.
+    let chosen = vec![agent_id.to_string()];
+    eprintln!("smoke: 1 agent → {agent_id}");
 
     let mut passed = 0u32;
     for k in 1..=runs {
@@ -227,34 +242,33 @@ mod tests {
     }
 
     #[test]
-    fn choose_requires_target_online() {
-        let all = [
-            agent("alice", false),
-            agent("bob", true),
-            agent("carol", true),
-        ];
-        assert!(choose_smoke_agents(&all, "alice").is_err());
+    fn validate_ok_when_local_and_online() {
+        let local = vec!["alice".to_string(), "bob".to_string()];
+        let online = [agent("alice", true), agent("cortex-a", true)];
+        assert!(validate_target(&local, &online, "alice").is_ok());
     }
 
     #[test]
-    fn choose_includes_target_and_others() {
-        let all = [
-            agent("alice", true),
-            agent("bob", true),
-            agent("carol", false),
-        ];
-        let chosen = choose_smoke_agents(&all, "alice").unwrap();
-        assert_eq!(chosen[0], "alice", "target first");
-        assert!(chosen.contains(&"bob".to_string()), "online other included");
-        assert!(
-            !chosen.contains(&"carol".to_string()),
-            "offline other excluded"
-        );
+    fn validate_rejects_non_local_target() {
+        // cortex-a is online at the orchestrator but NOT one of the operator's
+        // own agents → must be rejected (never smoke strangers' remote agents).
+        let local = vec!["alice".to_string()];
+        let online = [agent("cortex-a", true)];
+        assert!(validate_target(&local, &online, "cortex-a").is_err());
     }
 
     #[test]
-    fn choose_errors_when_too_few_online() {
-        let all = [agent("alice", true), agent("bob", false)];
-        assert!(choose_smoke_agents(&all, "alice").is_err());
+    fn validate_rejects_offline_local_target() {
+        let local = vec!["alice".to_string()];
+        let online = [agent("alice", false)];
+        assert!(validate_target(&local, &online, "alice").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_when_no_local_agents() {
+        // Empty fleet → the "(none)" message branch; always an error.
+        let online = [agent("alice", true)];
+        let err = validate_target(&[], &online, "alice").unwrap_err();
+        assert!(err.contains("(none)"));
     }
 }

@@ -241,7 +241,7 @@ const DEFAULT_FLEET_PATHS: &[&str] = &[
 /// (workspace + fleet in one file) or a legacy `agent.yml`. The unified parse
 /// is tried first; a legacy `agent.yml` (whose `orchestrators:` is a list, not
 /// a map) fails it and falls through to [`crate::config::load_config`].
-fn load_fleet_unified(path: &Path) -> Result<crate::config::AgentFleetConfig> {
+pub(crate) fn load_fleet_unified(path: &Path) -> Result<crate::config::AgentFleetConfig> {
     match QuorumConfig::load(path) {
         Ok(q) => Ok(q.to_fleet()),
         Err(_) => crate::config::load_config(path),
