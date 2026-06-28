@@ -19,7 +19,7 @@ flowchart TD
     A -->|propose| X{{grade each other}}
     B --> X
     C --> X
-    X -->|converge early once they agree| V(["&#10007; Unsafe — expiry check uses &lt; not &lt;=,<br/>off-by-one lets a just-expired token through.<br/>2 of 3 agents flagged it."])
+    X -->|agree, stop early| V(["Verdict: unsafe &#10007;<br/>2 of 3 caught the bug"])
 ```
 
 Three mediocre models that *disagree well* beat one big model that's confidently
