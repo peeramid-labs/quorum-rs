@@ -1415,3 +1415,23 @@ fn merge_unified_none_fleet_is_workspace_only() {
     let workspace = "orchestrators:\n  primary:\n    token: \"file:x\"\n";
     assert_eq!(super::merge_unified(workspace, None), workspace);
 }
+
+#[test]
+fn with_dashboard_port_appends_top_level_and_flows_to_fleet() {
+    let ws = "orchestrators:\n  primary:\n    token: \"file:x\"\npolicies:\n  default:\n    agents: [a, b]\nrooms:\n  m:\n    policy: default\n    orchestrator: primary\ndefault_room: m\n";
+    let yaml = super::with_dashboard_port(ws.to_string(), Some(8081));
+    assert!(yaml.contains("dashboard_port: 8081"));
+    let cfg: crate::cli::workspace::QuorumConfig =
+        serde_yaml::from_str(&yaml).expect("parses as QuorumConfig");
+    assert_eq!(cfg.dashboard_port, Some(8081));
+    // The value `quorum serve` reads to start the dashboard.
+    assert_eq!(cfg.to_fleet().dashboard_port, Some(8081));
+}
+
+#[test]
+fn with_dashboard_port_none_is_noop() {
+    assert_eq!(
+        super::with_dashboard_port("x: 1\n".to_string(), None),
+        "x: 1\n"
+    );
+}
