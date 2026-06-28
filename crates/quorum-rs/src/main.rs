@@ -626,14 +626,21 @@ mod config_path_tests {
     }
 
     #[test]
-    fn yaml_wins_when_both_present() {
+    fn quorum_yml_wins_when_all_present() {
+        // Unified quorum.yml is preferred over legacy nsed.yaml when both exist.
         let got = resolve_config_path(None, |_| true);
-        assert_eq!(got, PathBuf::from("nsed.yaml"));
+        assert_eq!(got, PathBuf::from("quorum.yml"));
     }
 
     #[test]
-    fn defaults_to_yaml_when_neither_present() {
+    fn defaults_to_quorum_yml_when_neither_present() {
         let got = resolve_config_path(None, |_| false);
+        assert_eq!(got, PathBuf::from("quorum.yml"));
+    }
+
+    #[test]
+    fn falls_back_to_legacy_nsed_when_only_nsed_present() {
+        let got = resolve_config_path(None, |p| p == Path::new("nsed.yaml"));
         assert_eq!(got, PathBuf::from("nsed.yaml"));
     }
 }
