@@ -2,124 +2,134 @@
 
 **Get your distributed AI agent team on the same page.**
 
-`quorum` is a parallel synchronisation engine for AI agents. Multiple agents
-contribute their own perspectives in parallel, then the protocol drives the
-team toward consensus on a single task. Pooling many models against a shared
-goal substantially raises reasoning power over any single agent — and
-token-efficient early-stop convergence detection ends the round the moment
-agreement is reached, instead of burning the full iteration budget.
+[![crates.io](https://img.shields.io/crates/v/quorum-rs.svg)](https://crates.io/crates/quorum-rs)
+[![docs.rs](https://img.shields.io/docsrs/quorum-rs)](https://docs.rs/quorum-rs)
+[![license](https://img.shields.io/crates/l/quorum-rs.svg)](#license)
 
-Deep tech dive: [arXiv:2601.16863](https://arxiv.org/abs/2601.16863).
+`quorum` is a parallel synchronisation engine for AI agents. Many agents — each
+a potentially different model, prompt, or toolchain — propose answers in
+parallel, evaluate each other, and the protocol drives the team to a
+quorum-backed verdict. Pooling models against a shared goal raises reasoning
+power over any single agent, and early-stop convergence detection ends the round
+the moment agreement is reached instead of burning the full iteration budget.
+
+Useful wherever single-model failure modes are expensive — security review,
+technical decisions, content moderation: anywhere a wrong call is costly.
+
+Deep dive: [arXiv:2601.16863](https://arxiv.org/abs/2601.16863).
+
+`quorum-rs` is the open-source SDK + reference runtime + `quorum` CLI for
+building agents against this protocol. The orchestrator that drives a round runs
+as a separate service; you get an invite code to join one.
+
+## Quickstart
+
+Take an invite code to a live agent in a few commands:
+
+```bash
+cargo install quorum-rs
+quorum redeem eyJhbGc...        # your invite → local NATS creds + operator token
+quorum init                    # scaffold quorum.yml (providers + agents)
+quorum smoke-test cortex-a     # verify the agent: chat → tool-calling → full NSED
+quorum serve                   # run it; it joins the orchestrator and deliberates
+```
+
+Full walkthrough: **[Your first agent — from invite to live deliberation](docs/tutorials/first-agent-from-invite.md)**.
 
 ## Crates
 
 | Crate | Version | Description |
 |---|---|---|
-| [`quorum-rs`](crates/quorum-rs) | `0.6.0` | The SDK + reference runtime + `quorum` CLI: agent traits (`NsedAgent`, `Tool`, `AiModel`, `PromptSet`), data types (`AgentContext`, `Proposal`, `Evaluation`), the reference `ProposerEvaluatorAgent` (ReAct loop over any OpenAI-compatible LLM), additional `ExecAgent` / `McpAgent` / `ClaudeAgent` integrations, NATS-based worker runtime, telemetry catalog, middleware framework, and the user-facing `quorum` binary (`run` / `status` / `trace` / `tui` / `init`). Library and CLI ship as one crate so `cargo install quorum-rs` gives you the binary and `cargo add quorum-rs` gives you the SDK. |
-| [`llm-repair`](crates/llm-repair) | `0.6.0` | JSON-repair, markdown-extraction, and tool-call recovery for malformed LLM output. Useful for any Rust project that calls real-world LLMs and has to handle whatever they actually return. |
-| [`quorum-crypto-core`](crates/quorum-crypto-core) | `0.6.0` | Ed25519 / secp256k1 / SHA3 cryptographic primitives + audit envelope. Optional dep of `quorum-rs` (gated behind the `audit` feature). |
+| [`quorum-rs`](crates/quorum-rs) | `0.7` | SDK + reference runtime + `quorum` CLI: agent traits (`NsedAgent`, `Tool`, `AiModel`, `PromptSet`), data types (`AgentContext`, `Proposal`, `Evaluation`), the reference `ProposerEvaluatorAgent` (ReAct loop over any OpenAI-compatible LLM), `Exec`/`Mcp`/`Claude` agent integrations, the NATS worker runtime, telemetry catalog, and the `quorum` binary (`run` / `serve` / `smoke-test` / `status` / `trace` / `tui` / `init`). One crate: `cargo install` gives the binary, `cargo add` gives the SDK. |
+| [`llm-repair`](crates/llm-repair) | `0.7` | JSON-repair, markdown extraction, and tool-call recovery for malformed LLM output. Standalone-useful for any Rust project calling real-world LLMs. |
+| [`quorum-crypto-core`](crates/quorum-crypto-core) | `0.7` | Ed25519 / secp256k1 / SHA3 primitives + audit envelope. Optional dep of `quorum-rs` (`audit` feature). |
 
 ## Install
 
-As a library:
-
 ```toml
-[dependencies]
-quorum-rs = "0.6"
+# library (the SDK)
+quorum-rs = "0.7"
+# just the JSON-repair helpers
+llm-repair = "0.7"
 ```
-
-For the JSON-repair helpers in isolation:
-
-```toml
-[dependencies]
-llm-repair = "0.6"
-```
-
-As a CLI binary (same crate, default features build the `quorum` binary):
 
 ```bash
+# CLI binary (same crate, default features)
 cargo install quorum-rs
 ```
 
-As a Claude Code plugin (slash commands + auto-loaded context wrapping the CLI):
+As a Claude Code plugin (slash commands wrapping the CLI):
 
 ```
 /plugin marketplace add peeramid-labs/plugin-marketplace
 /plugin install quorum
 ```
 
-The plugin layers `/quorum:init`, `/quorum:redeem`, `/quorum:run`, `/quorum:serve`, `/quorum:status`, `/quorum:trace`, `/quorum:validate`, `/quorum:tui` onto the binary. See [docs/how-to/use-the-claude-code-plugin.md](docs/how-to/use-the-claude-code-plugin.md).
+Adds `/quorum:init`, `:redeem`, `:run`, `:serve`, `:status`, `:trace`,
+`:validate`, `:tui` — see
+[use the Claude Code plugin](docs/how-to/use-the-claude-code-plugin.md).
 
-## How it works
+## Configure an agent
 
-Each round, every agent — potentially a different model, prompt, or
-toolchain — independently proposes an answer, then evaluates the peer
-proposals, and the protocol selects a quorum-backed outcome. Convergence
-detection short-circuits the round as soon as agreement is high enough to
-make further iteration unprofitable. The result: stronger answers than any
-single agent, without paying for tokens you don't need.
+`quorum.yml` wires providers (LLM endpoints) to agents. Point `base_url` at any
+OpenAI-compatible backend; set `engine` for self-hosted runtimes:
 
-Useful wherever single-model failure modes are expensive — security
-review, technical decisions, content moderation, anywhere a wrong call is
-costly.
+```yaml
+providers:
+  vllm:
+    type: openai
+    base_url: "http://localhost:8000/v1"
+    engine: vllm        # vllm | vllm_xml_responses | gpt-oss (alias harmony)
+agents:
+  - name: cortex-a
+    provider_id: vllm
+    model_name: qwen2.5-72b
+    capability_tags: ["mid:0v1"]
+```
 
-`quorum-rs` is the open-source SDK + reference runtime for building agents
-against this protocol. The orchestrator that drives a deliberation round
-runs as a separate service.
+Every parameter, annotated: [`examples/agent.full.yml`](examples/agent.full.yml).
 
-## Quick example: `llm-repair`
+## Standalone: `llm-repair`
+
+Recover whatever an LLM actually returns — truncation, invalid LaTeX escapes,
+markdown wrappers, Python-syntax tool calls:
 
 ```rust
 use llm_repair::{extract_python_tool_calls, repair_truncated_json, clean_json_string};
 
-// LLM returned a malformed JSON tool-call payload? Recover it.
-let raw = r#"{"name":"search","arguments":{"q":"hello"#;  // truncated
-let repaired = repair_truncated_json(raw);
-
-// Model emitted a Python-style tool call instead of JSON? Extract it.
-let py = r#"search(q="hello", limit=10)"#;
-let calls = extract_python_tool_calls(py, &["search"]);
-
-// Got JSON wrapped in markdown / backticks / commentary? Clean it.
-let dirty = "```json\n{\"answer\": 42}\n```";
-let clean = clean_json_string(dirty, false, None);
+let repaired = repair_truncated_json(r#"{"name":"search","arguments":{"q":"hello"#);
+let calls = extract_python_tool_calls(r#"search(q="hello", limit=10)"#, &["search"]);
+let clean = clean_json_string("```json\n{\"answer\": 42}\n```", false, None);
 ```
 
-Built for the failure modes of small + open-weight models: truncation, invalid escapes (LaTeX), conversational wrappers, Python-syntax tool calls, markdown wrapping. Battle-tested in production deliberation runs.
-
-See [`crates/llm-repair/README.md`](crates/llm-repair/README.md) for the full API.
+Built for small + open-weight models, battle-tested in production runs. Full API:
+[`crates/llm-repair/README.md`](crates/llm-repair/README.md).
 
 ## Documentation
 
-See [`docs/`](docs/) — organized by the [Diátaxis](https://diataxis.fr) framework:
+[`docs/`](docs/), organised by [Diátaxis](https://diataxis.fr):
 
-- [Tutorials](docs/tutorials/) — learning-by-doing lessons _(coming as the SDK content stabilises)_
-- [How-to guides](docs/how-to/) — task-oriented recipes (agent development, telemetry inspection, opt-out)
-- [Reference](docs/reference/) — API surface, types, schemas, wire protocols
-- [Explanation](docs/explanation/) — design rationale, tradeoffs
+- **[Tutorials](docs/tutorials/)** — [your first agent from an invite](docs/tutorials/first-agent-from-invite.md)
+- **[How-to](docs/how-to/)** — [smoke-test an agent](docs/how-to/smoke-test-an-agent.md), [run a fleet](docs/how-to/run-an-agent-fleet.md), [agent development](docs/how-to/agent-development.md), [verify telemetry](docs/how-to/verify-telemetry.md)
+- **[Reference](docs/reference/)** — API, types, schemas, wire protocols, [telemetry catalog](docs/reference/telemetry.md)
+- **[Explanation](docs/explanation/)** — design rationale, tradeoffs
 
-Runnable examples in [`examples/`](examples/) (Python exec + MCP agents) and
-[`crates/quorum-rs/examples/`](crates/quorum-rs/examples/) (`cargo run --example` programs).
-
-Per-crate rustdoc: <https://docs.rs/quorum-rs>, <https://docs.rs/llm-repair>, <https://docs.rs/quorum-crypto-core>.
+Runnable examples: [`examples/`](examples/) (Python exec + MCP agents) and
+[`crates/quorum-rs/examples/`](crates/quorum-rs/examples/) (`cargo run --example`).
+Rustdoc: [quorum-rs](https://docs.rs/quorum-rs) · [llm-repair](https://docs.rs/llm-repair) · [quorum-crypto-core](https://docs.rs/quorum-crypto-core).
 
 ## Status
 
-The published `0.6` series is the initial public release. Breaking changes are expected as the public API surface is polished — semver-respecting versions begin at `1.0` once the API stabilises.
+`0.7` is an early public release. Breaking changes are expected while the API is
+polished; semver-stable releases begin at `1.0`.
 
 ## Contributing
 
-Contributions welcome — issues, bug reports, and PRs are all good. PR titles follow [conventional commits](https://www.conventionalcommits.org/) (enforced by CI).
+Issues, bug reports, and PRs welcome. PR titles follow
+[conventional commits](https://www.conventionalcommits.org/) (CI-enforced).
 
 ## License
 
-Dual-licensed under either:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
-
-at your option.
-
-### Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+Dual-licensed under either [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at
+your option. Unless you state otherwise, any contribution you submit is dual
+licensed as above, without additional terms.
