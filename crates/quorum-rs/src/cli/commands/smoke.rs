@@ -150,15 +150,10 @@ fn build_model(agent: &AgentConfig, provider: &ProviderEntry) -> Option<Box<dyn 
         ))),
         "exec" | "claude" | "mcp" => None,
         _ => {
-            let base_url = if provider.base_url.is_empty() {
-                if provider.provider_type.is_empty() || provider.provider_type == "openai" {
-                    "https://api.openai.com/v1".to_string()
-                } else {
-                    return None;
-                }
-            } else {
-                provider.base_url.clone()
-            };
+            let base_url = crate::providers::builtins::resolve_openai_base_url(
+                &provider.provider_type,
+                &provider.base_url,
+            )?;
             Some(Box::new(OpenAICompatibleModel::new(
                 base_url,
                 provider.api_key.clone(),
@@ -447,6 +442,16 @@ mod tests {
         }
         assert!(build_model(&agent, &provider("openai")).is_some());
         assert!(build_model(&agent, &provider("simulated")).is_some());
+    }
+
+    #[test]
+    fn build_model_none_for_non_openai_without_base_url() {
+        let agent = AgentConfig {
+            model_name: "m".to_string(),
+            ..Default::default()
+        };
+        // Non-openai type with no base_url → no model (won't leak the key to OpenAI).
+        assert!(build_model(&agent, &provider("groq")).is_none());
     }
 
     #[test]
