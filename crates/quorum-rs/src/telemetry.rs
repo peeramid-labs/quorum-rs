@@ -608,6 +608,37 @@ pub struct ToolCallExecuted {
     pub paginated: bool,
 }
 
+/// Emitted once per `propose`/`evaluate` call, recording what prior-round
+/// context the agent assembled into its prompt and whether it wrote its
+/// scratchpad. Lets dashboards confirm a *serving* agent actually inspects its
+/// own past proposals/evals + scratchpad during normal operation — the same
+/// signals `quorum smoke-test` prints in-process.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeliberationContextAssembled {
+    #[serde(flatten)]
+    pub common: AgentEventCommon,
+    /// Scratchpad characters loaded into the prompt from the persistent store.
+    #[serde(default)]
+    pub scratchpad_loaded_chars: u32,
+    /// `true` when the agent wrote its scratchpad during this call.
+    #[serde(default)]
+    pub scratchpad_written: bool,
+    #[serde(default)]
+    pub scratchpad_written_chars: u32,
+    /// `true` when the prior round's own proposal was fed back into the prompt.
+    #[serde(default)]
+    pub prior_own_proposal_included: bool,
+    #[serde(default)]
+    pub prior_score_included: bool,
+    #[serde(default)]
+    pub prior_critiques_count: u32,
+    /// Candidates fed to the evaluate phase (`0` in propose).
+    #[serde(default)]
+    pub candidates_count: u32,
+    #[serde(default)]
+    pub previous_round_matrix_included: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RetryLoopAttempt {
     #[serde(flatten)]
@@ -935,6 +966,7 @@ pub enum TelemetryEvent {
     LlmRequestFailed(LlmRequestFailed),
     LlmRequestStalled(LlmRequestStalled),
     ToolCallExecuted(ToolCallExecuted),
+    DeliberationContextAssembled(DeliberationContextAssembled),
     RetryLoopAttempt(RetryLoopAttempt),
     TaskAccepted(TaskAccepted),
     TaskCompleted(TaskCompleted),
@@ -960,6 +992,7 @@ impl TelemetryEvent {
             TelemetryEvent::LlmRequestFailed(_) => "llm_request_failed",
             TelemetryEvent::LlmRequestStalled(_) => "llm_request_stalled",
             TelemetryEvent::ToolCallExecuted(_) => "tool_call_executed",
+            TelemetryEvent::DeliberationContextAssembled(_) => "deliberation_context_assembled",
             TelemetryEvent::RetryLoopAttempt(_) => "retry_loop_attempt",
             TelemetryEvent::TaskAccepted(_) => "task_accepted",
             TelemetryEvent::TaskCompleted(_) => "task_completed",
@@ -982,6 +1015,7 @@ impl TelemetryEvent {
             TelemetryEvent::LlmRequestFailed(e) => &e.common.agent_id,
             TelemetryEvent::LlmRequestStalled(e) => &e.common.agent_id,
             TelemetryEvent::ToolCallExecuted(e) => &e.common.agent_id,
+            TelemetryEvent::DeliberationContextAssembled(e) => &e.common.agent_id,
             TelemetryEvent::RetryLoopAttempt(e) => &e.common.agent_id,
             TelemetryEvent::TaskAccepted(e) => &e.common.agent_id,
             TelemetryEvent::TaskCompleted(e) => &e.common.agent_id,
@@ -1882,6 +1916,32 @@ mod tests {
         assert!(json.contains("\"type\":\"prompt_exposure_detected\""));
     }
 
+    #[test]
+    fn roundtrip_deliberation_context_assembled() {
+        let evt = TelemetryEvent::DeliberationContextAssembled(DeliberationContextAssembled {
+            common: sample_agent_common(),
+            scratchpad_loaded_chars: 1024,
+            scratchpad_written: true,
+            scratchpad_written_chars: 412,
+            prior_own_proposal_included: true,
+            prior_score_included: true,
+            prior_critiques_count: 2,
+            candidates_count: 3,
+            previous_round_matrix_included: true,
+        });
+        let json = serde_json::to_string(&evt).unwrap();
+        let back: TelemetryEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(evt, back);
+        assert_eq!(evt.kind(), "deliberation_context_assembled");
+        // Scalar fields land at top level (flattened common + own fields) so
+        // Loki's `| json` filter can promote them without nesting.
+        let v: serde_json::Value = serde_json::to_value(&evt).unwrap();
+        assert_eq!(v["type"], "deliberation_context_assembled");
+        assert_eq!(v["scratchpad_written"], true);
+        assert_eq!(v["candidates_count"], 3);
+        assert_eq!(v["agent_id"], "CortexB");
+    }
+
     /// The variant must be reachable from `TelemetryEvent::kind()` with the
     /// stable `prompt_exposure_detected` tag. The existing
     /// `event_kind_covers_every_variant` test enforces the exhaustive
@@ -2085,6 +2145,17 @@ mod tests {
                 output_tokens_estimated: None,
                 truncated: false,
                 paginated: false,
+            }),
+            TelemetryEvent::DeliberationContextAssembled(DeliberationContextAssembled {
+                common: sample_agent_common(),
+                scratchpad_loaded_chars: 0,
+                scratchpad_written: false,
+                scratchpad_written_chars: 0,
+                prior_own_proposal_included: false,
+                prior_score_included: false,
+                prior_critiques_count: 0,
+                candidates_count: 0,
+                previous_round_matrix_included: false,
             }),
             TelemetryEvent::RetryLoopAttempt(RetryLoopAttempt {
                 common: sample_agent_common(),
