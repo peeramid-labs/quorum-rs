@@ -25,7 +25,7 @@ use async_openai::types::{
 };
 
 use crate::agents::config::AgentConfig;
-use crate::agents::{AgentContext, DeliberationPhase, NsedAgent};
+use crate::agents::{AgentContext, CandidateProposal, DeliberationPhase, NsedAgent, Proposal};
 use crate::config::{ProviderEntry, load_agent_from_config_with_registry};
 use crate::llms::openai_compatible::OpenAICompatibleModel;
 use crate::llms::simulated::SimulatedModel;
@@ -86,6 +86,19 @@ impl StageStats {
         }
         s
     }
+}
+
+/// Flatten an error + its `source()` chain into one line. `LlmError`'s terse
+/// variants (`#[error("other")]`, `"transport"`, `"parse"`) hide the real cause
+/// in `#[source]`, so `to_string()` alone shows a useless "other".
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut src = e.source();
+    while let Some(cause) = src {
+        s.push_str(&format!(": {cause}"));
+        src = cause.source();
+    }
+    s
 }
 
 /// Did the model return at least one tool call?
@@ -203,30 +216,151 @@ async fn run_direct_stage(
                     stats.last_error = Some("model returned no tool call".to_string());
                 }
             }
-            Err(e) => stats.last_error = Some(e.to_string()),
+            Err(e) => stats.last_error = Some(error_chain(&e)),
         }
     }
     stats
 }
 
-/// Run the NSED stage in-process: `runs` calls to `agent.propose()` with a
-/// synthetic proposing context. A run is ok when it returns a proposal with
-/// non-empty content. Exercises the full NSED wrapper (ReAct loop + tools).
-async fn run_nsed_stage(agent: &dyn NsedAgent, runs: u32) -> StageStats {
-    let ctx = smoke_context(&agent.name());
-    let mut stats = StageStats::new(runs);
-    for _ in 0..runs {
+/// Per-round observability for one deliberation: what prior context was fed back
+/// into `propose()` (so we can show the agent had past proposals/evals/critiques
+/// to inspect) and whether the agent wrote its scratchpad. Printed as "full
+/// details" so the operator sees the NSED loop actually exercised cross-round
+/// state, not just isolated one-shot calls.
+struct RoundDetail {
+    round: u32,
+    proposal_chars: usize,
+    scratchpad_chars: usize,
+    prior_proposal_fed: bool,
+    prior_score: Option<f32>,
+    prior_critiques: usize,
+    candidates_evaluated: usize,
+    eval_score: Option<f32>,
+}
+
+impl RoundDetail {
+    fn line(&self) -> String {
+        let scratchpad = if self.scratchpad_chars > 0 {
+            format!("written {}c", self.scratchpad_chars)
+        } else {
+            "none".to_string()
+        };
+        let prior = if self.prior_proposal_fed {
+            format!(
+                "proposal\u{2713} score {} critiques {}",
+                self.prior_score
+                    .map(|s| format!("{s:.2}"))
+                    .unwrap_or_else(|| "n/a".to_string()),
+                self.prior_critiques,
+            )
+        } else {
+            "none (first round)".to_string()
+        };
+        let eval = self
+            .eval_score
+            .map(|s| format!("\u{2192} score {s:.2}"))
+            .unwrap_or_else(|| "\u{2192} no score".to_string());
+        format!(
+            "  round {}: proposal {}c \u{b7} scratchpad {} \u{b7} prior: {} \u{b7} evaluated {} candidate(s) {}",
+            self.round, self.proposal_chars, scratchpad, prior, self.candidates_evaluated, eval,
+        )
+    }
+}
+
+/// Run the NSED stage in-process: `deliberations` full deliberations, each of
+/// `rounds` rounds running BOTH NSED phases. Returns the tally plus the per-round
+/// detail of the first successful deliberation (for the "full details" report).
+async fn run_nsed_stage(
+    agent: &dyn NsedAgent,
+    deliberations: u32,
+    rounds: u32,
+) -> (StageStats, Vec<RoundDetail>) {
+    let mut stats = StageStats::new(deliberations);
+    let mut first_detail: Vec<RoundDetail> = Vec::new();
+    for _ in 0..deliberations {
         let started = Instant::now();
-        match agent.propose(&ctx).await {
-            Ok(p) if !p.content.trim().is_empty() => {
+        match run_one_deliberation(agent, rounds).await {
+            Ok(details) => {
+                if first_detail.is_empty() {
+                    first_detail = details;
+                }
                 stats.ok += 1;
                 stats.total_latency_ms += started.elapsed().as_millis();
             }
-            Ok(_) => stats.last_error = Some("proposal had empty content".to_string()),
-            Err(e) => stats.last_error = Some(e.to_string()),
+            Err(detail) => stats.last_error = Some(detail),
         }
     }
-    stats
+    (stats, first_detail)
+}
+
+/// One full deliberation: `rounds` rounds, each running BOTH NSED phases — the
+/// agent proposes, then evaluates its own proposal (the candidate). The
+/// evaluation's score + justification are threaded back into the next round's
+/// proposing context (`previous_own_score`, `previous_critiques`), so the agent
+/// inspects its own past proposals and evals exactly as in real deliberation.
+/// Exercises the real ReAct loop + tool-calling in propose AND evaluate. Returns
+/// a detailed `round N <phase>: <error chain>` string on the first failure.
+async fn run_one_deliberation(
+    agent: &dyn NsedAgent,
+    rounds: u32,
+) -> Result<Vec<RoundDetail>, String> {
+    let mut details = Vec::new();
+    let mut previous: Option<Proposal> = None;
+    let mut previous_score: Option<f32> = None;
+    let mut previous_critiques: Vec<String> = Vec::new();
+    for round in 1..=rounds {
+        let mut pctx = smoke_context(&agent.name());
+        pctx.round_number = round;
+        pctx.total_rounds = rounds;
+        pctx.phase = DeliberationPhase::Proposing;
+        pctx.previous_own_proposal = previous.clone();
+        pctx.previous_own_score = previous_score;
+        pctx.previous_critiques = previous_critiques.clone();
+        let proposal = agent
+            .propose(&pctx)
+            .await
+            .map_err(|e| format!("round {round} propose: {e:#}"))?;
+        if proposal.content.trim().is_empty() {
+            return Err(format!("round {round} propose: empty content"));
+        }
+
+        let cand_id = format!("smoke-cand-{round}");
+        let mut ectx = smoke_context(&agent.name());
+        ectx.round_number = round;
+        ectx.total_rounds = rounds;
+        ectx.phase = DeliberationPhase::Evaluating;
+        ectx.candidates = vec![CandidateProposal {
+            id: cand_id.clone(),
+            proposal: proposal.clone(),
+        }];
+        let evals = agent
+            .evaluate(&ectx)
+            .await
+            .map_err(|e| format!("round {round} evaluate: {e:#}"))?;
+        let eval = evals.iter().find(|(id, _)| *id == cand_id).map(|(_, e)| e);
+
+        details.push(RoundDetail {
+            round,
+            proposal_chars: proposal.content.chars().count(),
+            scratchpad_chars: proposal
+                .final_scratchpad
+                .as_deref()
+                .map(|s| s.chars().count())
+                .unwrap_or(0),
+            prior_proposal_fed: previous.is_some(),
+            prior_score: previous_score,
+            prior_critiques: previous_critiques.len(),
+            candidates_evaluated: ectx.candidates.len(),
+            eval_score: eval.map(|e| e.score),
+        });
+
+        previous_score = eval.map(|e| e.score);
+        previous_critiques = eval
+            .map(|e| vec![e.justification.clone()])
+            .unwrap_or_default();
+        previous = Some(proposal);
+    }
+    Ok(details)
 }
 
 /// The target must be one of the operator's OWN agents (declared in
@@ -247,7 +381,13 @@ fn validate_target(local_agents: &[String], target: &str) -> Result<(), String> 
     }
 }
 
-pub async fn run(config_path: &Path, agent_id: &str, runs: u32, assume_yes: bool) -> ExitCode {
+pub async fn run(
+    config_path: &Path,
+    agent_id: &str,
+    runs: u32,
+    rounds: u32,
+    assume_yes: bool,
+) -> ExitCode {
     let fleet = match super::serve::load_fleet_unified(config_path) {
         Ok(f) => f,
         Err(e) => {
@@ -352,8 +492,17 @@ pub async fn run(config_path: &Path, agent_id: &str, runs: u32, assume_yes: bool
             return ExitCode::FAILURE;
         }
     };
-    let nsed = run_nsed_stage(&*agent, runs).await;
+    let (nsed, details) = run_nsed_stage(&*agent, runs, rounds).await;
     eprintln!("{}", nsed.line("nsed"));
+    if !details.is_empty() {
+        eprintln!(
+            "  full details (first deliberation, {} rounds):",
+            details.len()
+        );
+        for d in &details {
+            eprintln!("{}", d.line());
+        }
+    }
     all_ok &= nsed.ok == nsed.runs;
 
     if all_ok {
@@ -511,8 +660,45 @@ mod tests {
             vec![],
             vec![],
         );
-        let stats = run_nsed_stage(&agent, 3).await;
+        let (stats, details) = run_nsed_stage(&agent, 3, 2).await;
         assert_eq!(stats.ok, 3, "simulated propose should succeed every run");
         assert_eq!(stats.error_rate_pct(), 0);
+        assert_eq!(details.len(), 2);
+        assert!(!details[0].prior_proposal_fed);
+        assert!(details[1].prior_proposal_fed);
+        assert_eq!(details[0].candidates_evaluated, 1);
+    }
+
+    #[test]
+    fn round_detail_line_shows_prior_context_and_scratchpad() {
+        let first = RoundDetail {
+            round: 1,
+            proposal_chars: 240,
+            scratchpad_chars: 0,
+            prior_proposal_fed: false,
+            prior_score: None,
+            prior_critiques: 0,
+            candidates_evaluated: 1,
+            eval_score: Some(0.5),
+        }
+        .line();
+        assert!(first.contains("round 1"));
+        assert!(first.contains("scratchpad none"));
+        assert!(first.contains("none (first round)"));
+        assert!(first.contains("score 0.50"));
+
+        let second = RoundDetail {
+            round: 2,
+            proposal_chars: 310,
+            scratchpad_chars: 412,
+            prior_proposal_fed: true,
+            prior_score: Some(0.5),
+            prior_critiques: 1,
+            candidates_evaluated: 1,
+            eval_score: Some(0.62),
+        }
+        .line();
+        assert!(second.contains("scratchpad written 412c"));
+        assert!(second.contains("proposal\u{2713} score 0.50 critiques 1"));
     }
 }

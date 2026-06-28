@@ -345,11 +345,14 @@ enum Commands {
     /// participated. Connects to the orchestrator and makes real LLM calls.
     /// The agent must already be serving (`quorum serve`).
     SmokeTest {
-        /// Local agent id to verify (must be online).
+        /// Local agent id to verify (one of your `quorum.yml` agents).
         agent_id: String,
-        /// How many deliberations to run.
-        #[arg(long, default_value_t = 3)]
+        /// How many NSED deliberations to run.
+        #[arg(long, default_value_t = 10)]
         runs: u32,
+        /// Rounds per deliberation (each round runs propose + evaluate).
+        #[arg(long, default_value_t = 5)]
+        rounds: u32,
         /// Skip the "this makes real LLM calls" confirmation.
         #[arg(long)]
         yes: bool,
@@ -636,8 +639,9 @@ async fn run_cli(cli: Cli) -> ExitCode {
         Commands::SmokeTest {
             ref agent_id,
             runs,
+            rounds,
             yes,
-        } => commands::smoke::run(&cli.config_path(), agent_id, runs, yes).await,
+        } => commands::smoke::run(&cli.config_path(), agent_id, runs, rounds, yes).await,
     }
 }
 
