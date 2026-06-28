@@ -45,6 +45,11 @@ repo for these):
   errors with `could not find quorum-rs ... with version *`;
   pass `--version "<latest>"` referring to the version on
   <https://crates.io/crates/quorum-rs>.
+  - `quorum` checks crates.io for a newer release and prints a one-line
+    upgrade notice at the start and end of a run (cached 24h, 3s timeout,
+    silent when offline — never blocks). It's channel-aware: a stable build
+    is told only about newer **stable** releases; an rc build about any newer
+    version (a newer rc, or the stable that supersedes it).
 - An invite code from your admin AND NATS credentials for the
   orchestrator. `quorum redeem <code>` writes both to `~/.nsed/`
   by default; pass `--out-dir DIR` to put them elsewhere.
