@@ -79,7 +79,32 @@ impl QuorumConfig {
         let contents = std::fs::read_to_string(path)?;
         let config: Self = serde_yaml::from_str(&contents)?;
         config.to_workspace().validate()?;
+        config.validate_fleet()?;
         Ok(config)
+    }
+
+    /// Validate the inline fleet: agent names must be present and unique, and
+    /// any `provider_id` reference must resolve to a defined provider. Kept
+    /// light — per-agent LLM tuning is the agent runner's concern.
+    fn validate_fleet(&self) -> Result<(), ConfigError> {
+        let mut seen = HashSet::new();
+        for (index, agent) in self.agents.iter().enumerate() {
+            if agent.name.trim().is_empty() {
+                return Err(ConfigError::FleetEmptyAgentName { index });
+            }
+            if !seen.insert(agent.name.as_str()) {
+                return Err(ConfigError::FleetDuplicateAgent {
+                    name: agent.name.clone(),
+                });
+            }
+            if !agent.provider_id.is_empty() && !self.providers.contains_key(&agent.provider_id) {
+                return Err(ConfigError::FleetUnknownProvider {
+                    agent: agent.name.clone(),
+                    provider: agent.provider_id.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Load `path` and return the workspace view. Accepts EITHER a unified
@@ -442,6 +467,15 @@ pub enum ConfigError {
          so a role can be designated moderator: true"
     )]
     ModeratorRequiresRoles { policy: String },
+
+    #[error("fleet: agent at index {index} has an empty name")]
+    FleetEmptyAgentName { index: usize },
+
+    #[error("fleet: duplicate agent name '{name}'")]
+    FleetDuplicateAgent { name: String },
+
+    #[error("fleet: agent '{agent}' references unknown provider '{provider}'")]
+    FleetUnknownProvider { agent: String, provider: String },
 
     #[error("{0}")]
     ConfigFree(String),
