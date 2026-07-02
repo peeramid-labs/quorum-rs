@@ -65,6 +65,61 @@ agents: []
             "too-few-agents must fail load"
         );
     }
+
+    fn load_from(yaml: &str) -> Result<QuorumConfig, ConfigError> {
+        let tmpdir = tempfile::TempDir::new()?;
+        let p = tmpdir.path().join("quorum.yml");
+        std::fs::write(&p, yaml)?;
+        QuorumConfig::load(&p)
+    }
+
+    #[test]
+    fn unified_load_validates_fleet_ok() {
+        assert!(load_from(unified_yaml()).is_ok(), "valid fleet must load");
+    }
+
+    #[test]
+    fn fleet_duplicate_agent_rejected() {
+        let yaml = r#"
+providers:
+  openai: { type: openai }
+agents:
+  - name: dup
+    provider_id: openai
+  - name: dup
+    provider_id: openai
+"#;
+        assert!(matches!(
+            load_from(yaml),
+            Err(ConfigError::FleetDuplicateAgent { name }) if name == "dup"
+        ));
+    }
+
+    #[test]
+    fn fleet_unknown_provider_rejected() {
+        let yaml = r#"
+agents:
+  - name: a
+    provider_id: ghost
+"#;
+        assert!(matches!(
+            load_from(yaml),
+            Err(ConfigError::FleetUnknownProvider { agent, provider })
+                if agent == "a" && provider == "ghost"
+        ));
+    }
+
+    #[test]
+    fn fleet_empty_agent_name_rejected() {
+        let yaml = r#"
+agents:
+  - name: "  "
+"#;
+        assert!(matches!(
+            load_from(yaml),
+            Err(ConfigError::FleetEmptyAgentName { index: 0 })
+        ));
+    }
 }
 
 #[cfg(test)]

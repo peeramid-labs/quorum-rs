@@ -1,5 +1,10 @@
-//! `quorum validate` — check that a workspace yaml deserialises cleanly
-//! against the [`WorkspaceConfig`] schema and report a one-line summary.
+//! `quorum validate` — check that a config yaml deserialises cleanly and
+//! report a one-line summary.
+//!
+//! Accepts both layouts: a unified `quorum.yml` (workspace + inline fleet)
+//! and a legacy `nsed.yaml` (workspace only, fleet in a separate file). The
+//! unified parse is tried first via [`QuorumConfig::load_workspace`], which
+//! falls back to the legacy [`WorkspaceConfig`] schema.
 //!
 //! Pure CLI helper — no network calls, no LLM calls, no filesystem
 //! mutation. Exits non-zero on parse failure so it can be wired into
@@ -8,20 +13,19 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::cli::workspace::WorkspaceConfig;
+use crate::cli::workspace::QuorumConfig;
 
 /// Streams + exit-code contract for the module-level command.
 ///
 /// - Success: writes the one-line summary to **stdout** (counts +
-///   resolved `default_room`, `"(none)"` when absent) and returns
+///   resolved `default_room`, `"(none)"` when absent, plus the inline
+///   fleet agent count for a unified `quorum.yml`) and returns
 ///   [`ExitCode::SUCCESS`].
 /// - Failure (path missing, file unreadable, yaml syntax error,
 ///   schema validation error): writes the error message to
-///   **stderr** and returns [`ExitCode::FAILURE`]. No further
-///   diagnostics are emitted — the error string from the
-///   [`WorkspaceConfig::load`] chain is the whole report.
+///   **stderr** and returns [`ExitCode::FAILURE`].
 pub fn run(path: &Path) -> ExitCode {
-    let config = match WorkspaceConfig::load(path) {
+    let config = match QuorumConfig::load_workspace(path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}");
@@ -31,12 +35,20 @@ pub fn run(path: &Path) -> ExitCode {
 
     let default_room = config.default_room.as_deref().unwrap_or("(none)");
 
+    // Report the inline fleet count when the file is a unified `quorum.yml`.
+    // A legacy `nsed.yaml` fails the unified parse and yields no fleet line.
+    let fleet_summary = match QuorumConfig::load(path) {
+        Ok(q) if !q.agents.is_empty() => format!(", inline fleet: {} agents", q.agents.len()),
+        _ => String::new(),
+    };
+
     println!(
-        "valid — {} policies, {} orchestrators, {} rooms, default_room: {}",
+        "valid — {} policies, {} orchestrators, {} rooms, default_room: {}{}",
         config.policies.len(),
         config.orchestrators.len(),
         config.rooms.len(),
         default_room,
+        fleet_summary,
     );
 
     ExitCode::SUCCESS
@@ -77,6 +89,56 @@ default_room: demo
 "#,
         );
         assert_eq!(run(&path), ExitCode::SUCCESS);
+    }
+
+    /// A unified `quorum.yml` (workspace + inline fleet, `agents:` as a list)
+    /// must validate — the regression this command previously failed on, since
+    /// the legacy `WorkspaceConfig` schema rejects a list-valued `agents:`.
+    #[test]
+    fn run_succeeds_on_unified_quorum_yml() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("quorum.yml");
+        std::fs::write(
+            &path,
+            r#"orchestrators:
+  primary:
+    mode: remote
+    address: "https://example.test"
+    token: "${TOK}"
+policies:
+  default:
+    agents: ["A", "B"]
+rooms:
+  demo:
+    policy: default
+    orchestrator: primary
+default_room: demo
+providers:
+  openai:
+    type: openai
+agents:
+  - name: A
+    provider_id: openai
+  - name: B
+    provider_id: openai
+"#,
+        )
+        .unwrap();
+        assert_eq!(run(&path), ExitCode::SUCCESS);
+    }
+
+    /// A unified config whose inline fleet is invalid (duplicate agent name)
+    /// must fail validation.
+    #[test]
+    fn run_fails_on_unified_with_invalid_fleet() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("quorum.yml");
+        std::fs::write(
+            &path,
+            "providers:\n  openai: { type: openai }\nagents:\n  - name: dup\n    provider_id: openai\n  - name: dup\n    provider_id: openai\n",
+        )
+        .unwrap();
+        assert_eq!(run(&path), ExitCode::FAILURE);
     }
 
     #[test]
