@@ -316,6 +316,15 @@ pub struct AgentConfig {
     #[serde(default)]
     pub prompt_exposure_guard: bool,
 
+    /// Agent middleware pipelines (`before_prompt` / `on_provider_response` /
+    /// `on_completion` / `before_release`). Inert unless configured — the worker
+    /// only runs a pipeline when it's non-empty, so existing agents are
+    /// unaffected. Deserialize-only (the config carries a non-serializable
+    /// runtime `moderation_model`).
+    #[serde(default, skip_serializing)]
+    #[schema(ignore)]
+    pub middleware: crate::middleware::MiddlewareConfig,
+
     /// Per-agent filesystem roots for the sandboxed `read_file` tool.
     /// Each entry grants the agent permission to read any file under
     /// the canonical path of that root. Symlink targets that resolve
@@ -978,6 +987,7 @@ impl Default for AgentConfig {
             builtin_tools: Vec::new(),
             prompt_exposure_guard: false,
             read_file_roots: Vec::new(),
+            middleware: Default::default(),
         }
     }
 }
@@ -994,6 +1004,29 @@ pub fn is_openai_family_provider(config: &AgentConfig) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn agent_middleware_block_deserializes() {
+        // An agent's `middleware:` block now parses into AgentConfig; empty by
+        // default so existing agents are unaffected.
+        let yaml = r#"
+name: PropductBot
+provider_id: claude
+middleware:
+  before_prompt:
+    - dylib: ./libpatch_deliberation.dylib
+      config:
+        patch_deliberation: { upstream: epic }
+  on_completion:
+    - dylib: ./libpatch_deliberation.dylib
+"#;
+        let cfg: AgentConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.middleware.before_prompt.len(), 1);
+        assert_eq!(cfg.middleware.on_completion.len(), 1);
+        assert!(cfg.middleware.on_provider_response.is_empty());
+        // default agent → empty middleware (no behavior change)
+        assert!(AgentConfig::default().middleware.is_empty());
+    }
 
     #[test]
     fn provider_config_deserializes_into_typed_struct() {
