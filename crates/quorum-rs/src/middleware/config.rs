@@ -80,6 +80,12 @@ pub enum MiddlewareEntry {
         /// Which stages this middleware runs at (default: all for the hook point).
         #[serde(default)]
         stages: Option<Vec<MiddlewareStage>>,
+        /// Opaque config passed to the dylib. Merged into `MiddlewareContext.metadata`
+        /// before each FFI call, so a dylib self-configures from the yml without env
+        /// vars (feature-parity with builtin `config`). The dylib defines its own
+        /// schema under whatever key it reads.
+        #[serde(default)]
+        config: serde_json::Value,
     },
     /// External binary middleware (stdin/stdout JSON protocol).
     Binary {
@@ -198,7 +204,11 @@ impl MiddlewareConfig {
                     }
                 }
             }
-            MiddlewareEntry::Dylib { dylib, stages } => {
+            MiddlewareEntry::Dylib {
+                dylib,
+                stages,
+                config,
+            } => {
                 let active_stages = stages
                     .as_ref()
                     .cloned()
@@ -206,7 +216,8 @@ impl MiddlewareConfig {
 
                 // Safety: we trust the operator's config to point at a valid dylib.
                 // The FFI contract is documented in dylib.rs.
-                match unsafe { super::DylibMiddleware::load(dylib, active_stages) } {
+                match unsafe { super::DylibMiddleware::load(dylib, active_stages, config.clone()) }
+                {
                     Ok(mw) => {
                         tracing::info!(
                             dylib = ?dylib,
@@ -385,5 +396,32 @@ before_release:
         let pipeline = config.build_before_release_pipeline();
         // rule_based is implemented — should create 1 middleware
         assert_eq!(pipeline.len(), 1);
+    }
+
+    #[test]
+    fn dylib_entry_parses_config() {
+        let yaml = r#"
+before_prompt:
+  - dylib: /nonexistent.dylib
+    config:
+      patch_deliberation:
+        upstream: epic
+        downstream_root: ./downstreams
+"#;
+        let config: MiddlewareConfig = serde_yaml::from_str(yaml).unwrap();
+        match &config.before_prompt[0] {
+            MiddlewareEntry::Dylib { dylib, config, .. } => {
+                assert_eq!(dylib.to_str(), Some("/nonexistent.dylib"));
+                assert_eq!(
+                    config["patch_deliberation"]["upstream"],
+                    serde_json::json!("epic")
+                );
+                assert_eq!(
+                    config["patch_deliberation"]["downstream_root"],
+                    serde_json::json!("./downstreams")
+                );
+            }
+            other => panic!("expected Dylib entry, got {other:?}"),
+        }
     }
 }

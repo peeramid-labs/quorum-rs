@@ -62,6 +62,9 @@ pub struct DylibMiddleware {
     lib: libloading::Library, // must stay alive to keep symbols valid
     execute_fn: MiddlewareExecuteFn,
     active_stages: Vec<MiddlewareStage>,
+    /// Operator config from the yml entry, merged into each context's `metadata`
+    /// before the FFI call so the dylib self-configures without env vars.
+    config: serde_json::Value,
 }
 
 // Safety: the Library + function pointer are created together and the Library
@@ -86,7 +89,11 @@ impl DylibMiddleware {
     /// - Export `nsed_middleware_execute` with the correct C ABI signature
     /// - Be thread-safe (the function may be called from multiple threads)
     /// - Not cause undefined behavior when called with valid inputs
-    pub unsafe fn load(path: &PathBuf, stages: Vec<MiddlewareStage>) -> Result<Self, String> {
+    pub unsafe fn load(
+        path: &PathBuf,
+        stages: Vec<MiddlewareStage>,
+        config: serde_json::Value,
+    ) -> Result<Self, String> {
         let lib = unsafe {
             libloading::Library::new(path)
                 .map_err(|e| format!("Failed to load dylib {}: {e}", path.display()))?
@@ -115,14 +122,40 @@ impl DylibMiddleware {
             lib,
             execute_fn,
             active_stages: stages,
+            config,
         })
     }
+
+    /// Merge the operator `config` into a clone of the context's `metadata`
+    /// before the FFI call, so the dylib self-configures from the yml.
+    fn with_config(&self, ctx: &MiddlewareContext) -> MiddlewareContext {
+        merge_config(&self.config, ctx)
+    }
+}
+
+/// Overlay `config` onto a clone of `ctx.metadata` (config keys win). No-op when
+/// config is null; adopts config wholesale when metadata isn't an object.
+fn merge_config(config: &serde_json::Value, ctx: &MiddlewareContext) -> MiddlewareContext {
+    if config.is_null() {
+        return ctx.clone();
+    }
+    let mut ctx = ctx.clone();
+    match (&mut ctx.metadata, config) {
+        (serde_json::Value::Object(meta), serde_json::Value::Object(cfg)) => {
+            for (k, v) in cfg {
+                meta.insert(k.clone(), v.clone());
+            }
+        }
+        _ => ctx.metadata = config.clone(),
+    }
+    ctx
 }
 
 #[async_trait]
 impl AgentMiddleware for DylibMiddleware {
     async fn execute(&self, ctx: &MiddlewareContext) -> MiddlewareVerdict {
-        let input = match serde_json::to_vec(ctx) {
+        let ctx = self.with_config(ctx);
+        let input = match serde_json::to_vec(&ctx) {
             Ok(v) => v,
             Err(e) => {
                 return MiddlewareVerdict::block(
@@ -215,7 +248,13 @@ mod tests {
 
     #[test]
     fn dylib_load_nonexistent_fails() {
-        let result = unsafe { DylibMiddleware::load(&PathBuf::from("/nonexistent.so"), vec![]) };
+        let result = unsafe {
+            DylibMiddleware::load(
+                &PathBuf::from("/nonexistent.so"),
+                vec![],
+                serde_json::Value::Null,
+            )
+        };
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Failed to load"));
     }
@@ -230,7 +269,7 @@ mod tests {
         #[cfg(target_os = "windows")]
         let path = PathBuf::from("kernel32.dll");
 
-        let result = unsafe { DylibMiddleware::load(&path, vec![]) };
+        let result = unsafe { DylibMiddleware::load(&path, vec![], serde_json::Value::Null) };
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("nsed_middleware_execute"));
     }
@@ -238,6 +277,31 @@ mod tests {
     // Integration test with a real dylib would go here, but requires
     // building a test cdylib first. Covered by the binary middleware
     // tests which validate the same pipeline + verdict flow.
+
+    #[test]
+    fn merge_config_overlays_metadata_and_noops_on_null() {
+        let ctx: MiddlewareContext = serde_json::from_value(serde_json::json!({
+            "content": "x", "action": "propose", "agent_id": "A", "job_id": "J",
+            "round": 0, "stage": "beforeprompt", "metadata": {"keep": 1}, "hook_state": {}
+        }))
+        .unwrap();
+
+        let cfg = serde_json::json!({ "patch_deliberation": { "upstream": "epic" } });
+        let merged = merge_config(&cfg, &ctx);
+        assert_eq!(
+            merged.metadata["keep"],
+            serde_json::json!(1),
+            "existing metadata preserved"
+        );
+        assert_eq!(
+            merged.metadata["patch_deliberation"]["upstream"],
+            serde_json::json!("epic")
+        );
+
+        // null config → context unchanged
+        let same = merge_config(&serde_json::Value::Null, &ctx);
+        assert_eq!(same.metadata, ctx.metadata);
+    }
 
     #[test]
     fn verdict_from_status_codes() {
