@@ -13,6 +13,20 @@ The release-prepare workflow prepends new sections automatically via
 
 <!-- new sections inserted above this line by release-prepare -->
 
+
+## [0.7.1] - 2026-07-03
+
+### 🐛 Bug Fixes
+
+- *(validate)* Accept unified quorum.yml in `quorum validate`
+
+### 📚 Documentation
+
+- *(readme)* Revamp — quickstart, badges, 0.7 versions, current doc links
+- *(readme)* Punch up tone — hook line, mermaid deliberation diagram, drop diataxis
+- *(readme)* Simplify the verdict node in the deliberation diagram
+- *(readme)* Drop hard-coded crate versions (table column + install pins + status)
+
 ## [quorum-rs-v0.7.0] - 2026-06-28
 
 ### 🚀 Features
