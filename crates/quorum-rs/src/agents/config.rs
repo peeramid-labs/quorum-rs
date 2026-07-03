@@ -1019,10 +1019,13 @@ middleware:
         patch_deliberation: { upstream: epic }
   on_completion:
     - dylib: ./libpatch_deliberation.dylib
+  on_job_complete:
+    - dylib: ./libpatch_deliberation.dylib
 "#;
         let cfg: AgentConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.middleware.before_prompt.len(), 1);
         assert_eq!(cfg.middleware.on_completion.len(), 1);
+        assert_eq!(cfg.middleware.on_job_complete.len(), 1);
         assert!(cfg.middleware.on_provider_response.is_empty());
         // default agent → empty middleware (no behavior change)
         assert!(AgentConfig::default().middleware.is_empty());

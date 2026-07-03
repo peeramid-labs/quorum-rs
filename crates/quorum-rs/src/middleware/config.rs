@@ -40,9 +40,12 @@ pub struct MiddlewareConfig {
     /// Middleware that runs before constructing the LLM prompt.
     #[serde(default)]
     pub before_prompt: Vec<MiddlewareEntry>,
-    /// Middleware that runs after deliberation completes.
+    /// Middleware that runs after deliberation completes (per round).
     #[serde(default)]
     pub on_completion: Vec<MiddlewareEntry>,
+    /// Middleware that runs once at job-final (terminal winner known).
+    #[serde(default)]
+    pub on_job_complete: Vec<MiddlewareEntry>,
     /// Optional AiModel instance for LLM moderation middleware.
     /// Set at runtime (not from YAML) — call [`Self::with_moderation_model()`].
     #[serde(skip)]
@@ -139,12 +142,18 @@ impl MiddlewareConfig {
         self.build_pipeline(&self.on_completion, &[MiddlewareStage::Completion])
     }
 
+    /// Build a pipeline for the `on_job_complete` hook point.
+    pub fn build_job_complete_pipeline(&self) -> MiddlewarePipeline {
+        self.build_pipeline(&self.on_job_complete, &[MiddlewareStage::JobComplete])
+    }
+
     /// Returns true if no middleware is configured at any hook point.
     pub fn is_empty(&self) -> bool {
         self.before_release.is_empty()
             && self.on_provider_response.is_empty()
             && self.before_prompt.is_empty()
             && self.on_completion.is_empty()
+            && self.on_job_complete.is_empty()
     }
 
     fn build_pipeline(

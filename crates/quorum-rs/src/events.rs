@@ -5,6 +5,39 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+/// SSE event: emitted once when a deliberation halts (terminal). The orchestrator
+/// publishes this under `...result.event.job_complete`; the SDK mirrors the wire
+/// shape so agent workers can deserialize it and fire the `on_job_complete` hook
+/// with the final winner (`best_proposal_author`). Unknown/extra fields on the
+/// wire (e.g. `chain_head`) are ignored.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct JobCompleteEvent {
+    /// Status string (e.g. "Success").
+    #[serde(default)]
+    pub status: String,
+    /// The job / session id.
+    #[serde(default)]
+    pub job_id: String,
+    /// Total rounds actually completed.
+    #[serde(default)]
+    pub rounds_completed: u32,
+    /// Rounds planned (0 = unknown on older payloads).
+    #[serde(default)]
+    pub total_rounds: u32,
+    /// Content of the winning proposal.
+    #[serde(default)]
+    pub best_proposal_content: String,
+    /// Score of the winning proposal.
+    #[serde(default)]
+    pub best_proposal_score: f32,
+    /// Winning proposal's author — the final winner.
+    #[serde(default)]
+    pub best_proposal_author: String,
+    /// Set when a user force-finalized a specific agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalized_by_user: Option<String>,
+}
+
 /// SSE event: emitted after evaluation scoring completes each round.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct RoundSummaryEvent {
@@ -134,6 +167,27 @@ pub struct CategoryScoreBreakdown {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_complete_event_deserializes_orchestrator_wire() {
+        // Exact shape the orchestrator publishes, including `chain_head` which the
+        // SDK struct omits — must be ignored, not rejected.
+        let wire = serde_json::json!({
+            "status": "Success",
+            "job_id": "sess1",
+            "rounds_completed": 3,
+            "total_rounds": 5,
+            "best_proposal_content": "final answer",
+            "best_proposal_score": 7.2,
+            "best_proposal_author": "AgentA",
+            "chain_head": "deadbeef"
+        });
+        let e: JobCompleteEvent = serde_json::from_value(wire).unwrap();
+        assert_eq!(e.best_proposal_author, "AgentA");
+        assert_eq!(e.rounds_completed, 3);
+        assert_eq!(e.best_proposal_score, 7.2);
+        assert_eq!(e.finalized_by_user, None);
+    }
 
     #[test]
     fn test_round_summary_serde_roundtrip() {
