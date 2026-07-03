@@ -11,3 +11,4 @@
 review*.txt
 qwen_review*
 .slop/
+.git-worktrees/
