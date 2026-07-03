@@ -21,9 +21,15 @@ One command, three things:
 3. Wires them all into a single `MultiAgentRunner` and runs
    until SIGTERM/SIGINT.
 
-On boot, `serve` also registers each `agents:` entry with the
-orchestrator using the orchestrator entry's `token` — see
-the operator-token note in Step 1.
+On boot, `serve` also:
+
+- registers each `agents:` entry with the orchestrator using the
+  orchestrator entry's `token` — see the operator-token note in Step 1;
+- pushes every **role-based** policy from the config to the orchestrator
+  (idempotent, keyed by content hash), so OpenAI-compat model names
+  (`nsed:<tag>`) and `--policy` runs resolve without a separate
+  `quorum run`. Static agent-list policies dispatch by name and aren't
+  pushed. A failed push is logged, never fatal.
 
 > **Legacy split config still loads.** A pre-existing `nsed.yaml`
 > + separate `agent.yml` pair is auto-detected and works
