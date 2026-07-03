@@ -1620,6 +1620,11 @@ impl NatsNsedWorker {
             {
                 if let Some(td) = new.get("task_description").and_then(|v| v.as_str()) {
                     context.task_description = td.to_string();
+                } else {
+                    tracing::debug!(
+                        agent_id = %self.agent_id,
+                        "before_prompt middleware returned no string `task_description` — transform dropped"
+                    );
                 }
             }
         }
@@ -1641,6 +1646,9 @@ impl NatsNsedWorker {
                             let mut proposal = self.agent.propose(&context).await?;
                             // on_provider_response hook — transform the proposal
                             // content before it is serialized / buffered / published.
+                            // NOTE: this runs inside the transient-error retry loop,
+                            // so it re-executes once per LLM attempt — middleware here
+                            // must be idempotent / side-effect-safe across retries.
                             if self.provider_response_mw.is_some() {
                                 if let Some(new) = self
                                     .run_stage_mw(
