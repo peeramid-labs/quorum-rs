@@ -424,6 +424,8 @@ pub struct NatsNsedWorker {
     before_prompt_mw: Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
     provider_response_mw: Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
     completion_mw: Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
+    /// Job-final hook — fires once on the orchestrator's `job_complete` event.
+    job_complete_mw: Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
 }
 
 impl NatsNsedWorker {
@@ -512,6 +514,7 @@ impl NatsNsedWorker {
         let provider_response_mw =
             opt_pipeline(agent_config.middleware.build_provider_response_pipeline());
         let completion_mw = opt_pipeline(agent_config.middleware.build_completion_pipeline());
+        let job_complete_mw = opt_pipeline(agent_config.middleware.build_job_complete_pipeline());
 
         Ok(Self {
             agent,
@@ -534,6 +537,7 @@ impl NatsNsedWorker {
             before_prompt_mw,
             provider_response_mw,
             completion_mw,
+            job_complete_mw,
         })
     }
 
@@ -770,6 +774,28 @@ impl NatsNsedWorker {
             None
         };
 
+        // Job-complete subscription — the orchestrator's terminal event. Only
+        // subscribe when an `on_job_complete` hook is configured (zero overhead
+        // otherwise). Core NATS, same per-session publish pattern as scores.
+        let job_complete_subject =
+            format!("{}.*.result.event.job_complete", self.config.subject_prefix);
+        let job_complete_subscription: Option<async_nats::Subscriber> =
+            if self.job_complete_mw.is_some() {
+                match self.nats.subscribe(job_complete_subject.clone()).await {
+                    Ok(sub) => Some(sub),
+                    Err(e) => {
+                        warn!(
+                            "Failed to subscribe to job_complete on {}: {}. \
+                             on_job_complete hook disabled.",
+                            job_complete_subject, e
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
         // Passthrough subscription — Core NATS request-reply for PolicyMode::Passthrough.
         // When the orchestrator routes a request directly to this agent (no deliberation
         // cycle), it publishes to this subject and waits for a synchronous reply.
@@ -805,6 +831,7 @@ impl NatsNsedWorker {
         let mut task_messages = task_consumer.messages().await?;
         let mut manifest_messages = manifest_consumer.messages().await?;
         let mut score_messages = score_subscription;
+        let mut job_complete_messages = job_complete_subscription;
         let mut passthrough_messages = passthrough_subscription;
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(10));
         let mut drain_interval = tokio::time::interval(std::time::Duration::from_millis(500));
@@ -860,6 +887,19 @@ impl NatsNsedWorker {
                     tokio::spawn(async move {
                         if let Err(e) = worker.handle_round_summary(msg).await {
                             warn!("Failed to process round summary: {:?}", e);
+                        }
+                    });
+                }
+                Some(msg) = async {
+                    match &mut job_complete_messages {
+                        Some(sub) => sub.next().await,
+                        None => std::future::pending::<Option<async_nats::Message>>().await,
+                    }
+                } => {
+                    let worker = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = worker.handle_job_complete(msg).await {
+                            warn!("Failed to process job_complete: {:?}", e);
                         }
                     });
                 }
@@ -1088,6 +1128,57 @@ impl NatsNsedWorker {
             }
         }
 
+        Ok(())
+    }
+
+    /// Handle the orchestrator's terminal `job_complete` event — fire the
+    /// `on_job_complete` hook **once** with the final winner. Distinct from the
+    /// per-round `on_completion` (which stays for per-round agent reactions).
+    async fn handle_job_complete(&self, msg: async_nats::Message) -> Result<()> {
+        let event: crate::events::JobCompleteEvent =
+            serde_json::from_slice(&msg.payload).map_err(|e| {
+                warn!("Failed to parse job_complete event: {}", e);
+                e
+            })?;
+
+        let prefix_count = if self.config.subject_prefix.is_empty() {
+            0
+        } else {
+            self.config.subject_prefix.split('.').count()
+        };
+        let session_id = msg
+            .subject
+            .as_str()
+            .split('.')
+            .nth(prefix_count)
+            .unwrap_or("?")
+            .to_string();
+
+        let winner = event.best_proposal_author.clone();
+        let content = serde_json::json!({
+            "winner": winner.clone(),
+            "score": event.best_proposal_score,
+            "content": event.best_proposal_content,
+            "rounds_completed": event.rounds_completed,
+        });
+        let meta = serde_json::json!({
+            "winner": winner,
+            "finalized_by_user": event.finalized_by_user,
+        });
+        if let Err(e) = self
+            .run_stage_mw(
+                &self.job_complete_mw,
+                "job_complete",
+                &session_id,
+                event.rounds_completed,
+                crate::middleware::MiddlewareStage::JobComplete,
+                content,
+                meta,
+            )
+            .await
+        {
+            warn!(agent_id = %self.agent_id, error = %e, "on_job_complete middleware error");
+        }
         Ok(())
     }
 
@@ -2330,6 +2421,7 @@ impl Clone for NatsNsedWorker {
             before_prompt_mw: self.before_prompt_mw.clone(),
             provider_response_mw: self.provider_response_mw.clone(),
             completion_mw: self.completion_mw.clone(),
+            job_complete_mw: self.job_complete_mw.clone(),
         }
     }
 }
