@@ -418,6 +418,12 @@ pub struct NatsNsedWorker {
     paused: Arc<AtomicBool>,
     /// Optional telemetry emitter for recording LLM call metrics.
     telemetry: Option<TelemetryEmitterMux>,
+    /// Agent middleware pipelines, built from `agent_config.middleware`.
+    /// `None` when the hook point is unconfigured → zero overhead + no behavior
+    /// change for existing agents.
+    before_prompt_mw: Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
+    provider_response_mw: Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
+    completion_mw: Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
 }
 
 impl NatsNsedWorker {
@@ -493,6 +499,20 @@ impl NatsNsedWorker {
             processed_bucket_name, scratchpad_bucket_name
         );
 
+        // Build the middleware pipelines once. `None` when a hook point has no
+        // entries, so the hot path stays untouched for agents without middleware.
+        let opt_pipeline = |p: crate::middleware::pipeline::MiddlewarePipeline| {
+            if p.is_empty() {
+                None
+            } else {
+                Some(Arc::new(p))
+            }
+        };
+        let before_prompt_mw = opt_pipeline(agent_config.middleware.build_before_prompt_pipeline());
+        let provider_response_mw =
+            opt_pipeline(agent_config.middleware.build_provider_response_pipeline());
+        let completion_mw = opt_pipeline(agent_config.middleware.build_completion_pipeline());
+
         Ok(Self {
             agent,
             agent_config,
@@ -511,6 +531,9 @@ impl NatsNsedWorker {
             response_buffer: None,
             paused: Arc::new(AtomicBool::new(false)),
             telemetry,
+            before_prompt_mw,
+            provider_response_mw,
+            completion_mw,
         })
     }
 
@@ -1038,6 +1061,33 @@ impl NatsNsedWorker {
             }
         }
 
+        // on_completion hook — fires per round-summary with the round's winner
+        // (top aggregated_score) in `metadata.winner`. NOTE: this is per-round,
+        // not a single job-final signal (the orchestrator owns halting), so a
+        // completion middleware with once-only side effects must guard itself.
+        if self.completion_mw.is_some() {
+            let winner = pick_winner(&summary.proposal_scores);
+            let content = serde_json::json!({
+                "round": summary.round,
+                "proposal_scores": summary.proposal_scores,
+            });
+            let meta = serde_json::json!({ "winner": winner });
+            if let Err(e) = self
+                .run_stage_mw(
+                    &self.completion_mw,
+                    "complete",
+                    &session_id,
+                    summary.round,
+                    crate::middleware::MiddlewareStage::Completion,
+                    content,
+                    meta,
+                )
+                .await
+            {
+                warn!(agent_id = %self.agent_id, error = %e, "on_completion middleware error");
+            }
+        }
+
         Ok(())
     }
 
@@ -1223,6 +1273,40 @@ impl NatsNsedWorker {
             }
         };
         let _ = self.nats.publish(reply_subject, payload.into()).await;
+    }
+
+    /// Run one middleware pipeline for a hook point. Returns the (possibly
+    /// transformed) `content` on pass, `None` when the pipeline is unconfigured,
+    /// or an `Err` when a middleware blocks (fails the task).
+    async fn run_stage_mw(
+        &self,
+        pipeline: &Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
+        action: &str,
+        session_id: &str,
+        round: u32,
+        stage: crate::middleware::MiddlewareStage,
+        content: serde_json::Value,
+        metadata: serde_json::Value,
+    ) -> Result<Option<serde_json::Value>> {
+        let Some(p) = pipeline else {
+            return Ok(None);
+        };
+        let mut ctx = crate::middleware::MiddlewareContext {
+            content,
+            action: action.to_string(),
+            agent_id: self.agent_id.clone(),
+            job_id: session_id.to_string(),
+            round,
+            stage,
+            metadata,
+            hook_state: std::collections::HashMap::new(),
+        };
+        match p.run(&mut ctx).await {
+            crate::middleware::pipeline::PipelineResult::Blocked {
+                category, reason, ..
+            } => Err(anyhow::anyhow!("middleware blocked ({category}): {reason}")),
+            _ => Ok(Some(ctx.content)),
+        }
     }
 
     async fn handle_message(&self, msg: async_nats::jetstream::Message) -> Result<()> {
@@ -1423,6 +1507,32 @@ impl NatsNsedWorker {
             }
         });
 
+        // before_prompt hook — transform the task before the agent builds its
+        // prompt. Mutates `task_description` (which feeds the PromptSet). No-op
+        // when unconfigured; a block fails the task.
+        if self.before_prompt_mw.is_some() {
+            let content = serde_json::json!({
+                "task_description": context.task_description,
+                "user_injections": context.user_injections,
+            });
+            if let Some(new) = self
+                .run_stage_mw(
+                    &self.before_prompt_mw,
+                    action,
+                    &session_id,
+                    context.round_number,
+                    crate::middleware::MiddlewareStage::BeforePrompt,
+                    content,
+                    serde_json::json!({}),
+                )
+                .await?
+            {
+                if let Some(td) = new.get("task_description").and_then(|v| v.as_str()) {
+                    context.task_description = td.to_string();
+                }
+            }
+        }
+
         let task_start = Instant::now();
         // Retry loop for transient transport errors (broken pipe, connection reset, etc.).
         // Wraps the full propose/evaluate call because the SDK cannot pinpoint where inside
@@ -1438,6 +1548,26 @@ impl NatsNsedWorker {
                     match action {
                         "propose" => {
                             let mut proposal = self.agent.propose(&context).await?;
+                            // on_provider_response hook — transform the proposal
+                            // content before it is serialized / buffered / published.
+                            if self.provider_response_mw.is_some() {
+                                if let Some(new) = self
+                                    .run_stage_mw(
+                                        &self.provider_response_mw,
+                                        "propose",
+                                        &session_id,
+                                        context.round_number,
+                                        crate::middleware::MiddlewareStage::ProviderResponse,
+                                        serde_json::json!(proposal.content),
+                                        serde_json::json!({}),
+                                    )
+                                    .await?
+                                {
+                                    if let Some(c) = new.as_str() {
+                                        proposal.content = c.to_string();
+                                    }
+                                }
+                            }
                             proposal.published_at_ms = chrono::Utc::now().timestamp_millis();
                             serde_json::to_vec(&proposal).map_err(|e| anyhow::anyhow!(e))
                         }
@@ -2197,8 +2327,24 @@ impl Clone for NatsNsedWorker {
             response_buffer: self.response_buffer.clone(),
             paused: self.paused.clone(),
             telemetry: self.telemetry.clone(),
+            before_prompt_mw: self.before_prompt_mw.clone(),
+            provider_response_mw: self.provider_response_mw.clone(),
+            completion_mw: self.completion_mw.clone(),
         }
     }
+}
+
+/// The winning agent of a round summary = the highest aggregated score.
+/// `None` for an empty score list. Ties resolve to the first max encountered.
+fn pick_winner(scores: &[crate::events::ProposalScoreEntry]) -> Option<String> {
+    scores
+        .iter()
+        .max_by(|a, b| {
+            a.aggregated_score
+                .partial_cmp(&b.aggregated_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|e| e.agent_id.clone())
 }
 
 /// Extract a human-readable content preview from a serialized response payload.
@@ -2432,6 +2578,30 @@ fn should_publish_failure_marker(action: &str, is_payment_error: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_winner_selects_highest_score() {
+        use crate::events::ProposalScoreEntry;
+        let scores = vec![
+            ProposalScoreEntry {
+                agent_id: "alpha".into(),
+                aggregated_score: 3.2,
+                ..Default::default()
+            },
+            ProposalScoreEntry {
+                agent_id: "beta".into(),
+                aggregated_score: 6.5,
+                ..Default::default()
+            },
+            ProposalScoreEntry {
+                agent_id: "gamma".into(),
+                aggregated_score: 1.0,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(pick_winner(&scores).as_deref(), Some("beta"));
+        assert_eq!(pick_winner(&[]), None);
+    }
 
     #[test]
     fn test_worker_config_new_defaults() {
