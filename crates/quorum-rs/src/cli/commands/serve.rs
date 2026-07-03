@@ -30,7 +30,7 @@
 //! config without guessing.
 
 use crate::cli::remote::{AgentInfo, RemoteError, RemoteOrchestrator};
-use crate::cli::workspace::{OrchestratorMode, QuorumConfig};
+use crate::cli::workspace::{OrchestratorMode, PolicyConfig, QuorumConfig, WorkspaceConfig};
 use crate::nats_utils::NatsAuth;
 use crate::serve::{ServeOptions, serve_fleet};
 use anyhow::{Context, Result};
@@ -163,6 +163,44 @@ pub(crate) fn resolve_remote_orchestrator(
             Some((address, token))
         }
         Some(OrchestratorMode::Embedded) => None,
+    }
+}
+
+/// Role-based policies from the workspace — the set `serve` registers at
+/// boot. Static agent-list policies dispatch by name and need no content-hash
+/// push (matching `quorum run`, which only pushes role-based policies).
+fn policies_to_register(workspace: &WorkspaceConfig) -> Vec<(&String, &PolicyConfig)> {
+    workspace
+        .policies
+        .iter()
+        .filter(|(_, p)| p.roles.is_some())
+        .collect()
+}
+
+/// Push every role-based workspace policy to the orchestrator so its content
+/// hash is known before any request (including OpenAI-compat `nsed:<tag>`
+/// model names) references it — otherwise the orchestrator 404s until someone
+/// runs `quorum run` for that policy. Idempotent (push is keyed by hash) and
+/// best-effort: a failed push is logged, never fatal to serving.
+async fn register_workspace_policies(orch: &RemoteOrchestrator, workspace_path: &Path) {
+    let workspace = match QuorumConfig::load_workspace(workspace_path) {
+        Ok(w) => w,
+        Err(_) => return,
+    };
+    for (name, policy) in policies_to_register(&workspace) {
+        match orch.push_policy(name, policy).await {
+            Ok(r) => tracing::info!(
+                policy = %name,
+                policy_id = %r.policy_id,
+                created = r.created,
+                "registered workspace policy"
+            ),
+            Err(e) => tracing::warn!(
+                policy = %name,
+                error = %e,
+                "failed to register workspace policy (will 404 until pushed)"
+            ),
+        }
     }
 }
 
@@ -448,6 +486,13 @@ pub async fn run(
         }
         None => std::collections::HashMap::new(),
     };
+
+    // Register the workspace's role-based policies at boot so OpenAI-compat
+    // model names (`nsed:<tag>`) and `--policy` runs resolve without a separate
+    // `quorum run`. Best-effort against a reachable remote orchestrator.
+    if let Some(orch) = try_build_orchestrator_client(effective_workspace, room) {
+        register_workspace_policies(&orch, effective_workspace).await;
+    }
 
     let cancel = tokio_util::sync::CancellationToken::new();
 
@@ -847,5 +892,33 @@ orchestrators:
             evaluate_registration("a", &agents),
             RegVerdict::NoOperatorTags
         );
+    }
+
+    /// `serve` registers only role-based policies at boot — static agent-list
+    /// policies dispatch by name and need no content-hash push (matches `run`).
+    #[test]
+    fn policies_to_register_selects_role_based_only() {
+        let workspace_dir = TempDir::new().unwrap();
+        let ws = workspace_dir.path().join("quorum.yml");
+        std::fs::write(
+            &ws,
+            r#"
+policies:
+  role_based:
+    roles:
+      - role: r
+        count: 2
+        capabilities: ["x"]
+  static_list:
+    agents: ["a", "b"]
+"#,
+        )
+        .unwrap();
+        let workspace = QuorumConfig::load_workspace(&ws).unwrap();
+        let selected: Vec<&str> = policies_to_register(&workspace)
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(selected, vec!["role_based"]);
     }
 }
