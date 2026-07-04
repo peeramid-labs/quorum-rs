@@ -10,6 +10,7 @@ NSED agents support a pluggable middleware system for validation, transformation
 | `on_provider_response` | After LLM returns, before buffer entry creation | Response transformation, format repair, raw logging |
 | `before_prompt` | Before constructing the LLM prompt | PII redaction, context injection |
 | `on_completion` | After deliberation result is finalized | Export, notification, result transformation |
+| `on_job_complete` | Once at job-final (orchestrator `job_complete` event) | Winner-merge side effects, per-agent finalization |
 
 The `before_release` point has two stages:
 - **Edit stage**: runs on buffer edits (lightweight, early feedback)
@@ -139,6 +140,45 @@ pub extern "C" fn nsed_middleware_execute(
 ```
 
 FFI middleware runs on a blocking thread (`spawn_blocking`) to avoid blocking the tokio runtime.
+
+## Structured-output enforcement (middleware-declared schema)
+
+A `before_prompt` middleware can constrain the agent's **proposal submission** to a
+JSON schema, forcing the model to return a schema-shaped structured object instead
+of free prose (e.g. patch-deliberation's `{rationale, ops}` envelope). This removes
+the reliance on the agent *voluntarily* emitting valid JSON.
+
+**Declaring the schema.** The `before_prompt` verdict returns a `proposal_schema`
+field (a JSON Schema object) alongside the transformed `task_description`:
+
+```json
+{ "task_description": "…injected prompt…",
+  "proposal_schema": {
+    "type": "object",
+    "properties": { "rationale": {"type": "string"}, "ops": {"type": "array"} },
+    "required": ["rationale", "ops"] } }
+```
+
+The worker threads it to `AgentContext.forced_proposal_schema`. Enforcement then
+depends on the provider path:
+
+| provider path | mechanism |
+|---|---|
+| OpenAI / native | the schema becomes the `submit_proposal` tool's `parameters` **and** the request sets `tool_choice: required` — the model must return a schema-valid tool call |
+| Claude / MCP (subprocess) | `NsedMcpServer::list_tools` nests the schema into the advertised `nsed_propose` `input_schema`; a forceful `MissingTerminalCall` retry drives the submission |
+
+The tool-call arguments become `Proposal.content` verbatim, so an
+`on_provider_response` middleware receives the guaranteed-shaped object.
+
+**Scope + caveats:**
+- Generic — any middleware may declare any schema; not patch-deliberation-specific.
+- The SDK treats the payload as **opaque** (it never parses the envelope) — parsing
+  is the declaring middleware's job. So a forced proposal's `thought_process` is
+  empty; the substance lives in `content`.
+- OpenAI is a **hard** guarantee (`tool_choice: required`); Claude/MCP is
+  schema-guided + retry-forced (the `claude` CLI exposes no tool-choice flag).
+- **No enforcement** when the agent runs with `disable_native_tools` (XML/Nous
+  models) — the request can't carry `tool_choice`.
 
 ## Builtin Middleware
 
