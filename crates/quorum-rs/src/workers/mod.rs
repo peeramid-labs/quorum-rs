@@ -1059,18 +1059,7 @@ impl NatsNsedWorker {
             })?;
 
         // Extract session_id from subject: {prefix}.{session_id}.result.event.round_summary
-        let prefix_count = if self.config.subject_prefix.is_empty() {
-            0
-        } else {
-            self.config.subject_prefix.split('.').count()
-        };
-        let session_id = msg
-            .subject
-            .as_str()
-            .split('.')
-            .nth(prefix_count)
-            .unwrap_or("?")
-            .to_string();
+        let session_id = session_id_from_subject(msg.subject.as_str(), &self.config.subject_prefix);
 
         // Do not gate on active_jobs — that set tracks task-in-flight and is
         // cleared after each task completion, but round_summary events arrive
@@ -1141,30 +1130,8 @@ impl NatsNsedWorker {
                 e
             })?;
 
-        let prefix_count = if self.config.subject_prefix.is_empty() {
-            0
-        } else {
-            self.config.subject_prefix.split('.').count()
-        };
-        let session_id = msg
-            .subject
-            .as_str()
-            .split('.')
-            .nth(prefix_count)
-            .unwrap_or("?")
-            .to_string();
-
-        let winner = event.best_proposal_author.clone();
-        let content = serde_json::json!({
-            "winner": winner.clone(),
-            "score": event.best_proposal_score,
-            "content": event.best_proposal_content,
-            "rounds_completed": event.rounds_completed,
-        });
-        let meta = serde_json::json!({
-            "winner": winner,
-            "finalized_by_user": event.finalized_by_user,
-        });
+        let session_id = session_id_from_subject(msg.subject.as_str(), &self.config.subject_prefix);
+        let (content, meta) = job_complete_payload(&event);
         if let Err(e) = self
             .run_stage_mw(
                 &self.job_complete_mw,
@@ -1369,6 +1336,7 @@ impl NatsNsedWorker {
     /// Run one middleware pipeline for a hook point. Returns the (possibly
     /// transformed) `content` on pass, `None` when the pipeline is unconfigured,
     /// or an `Err` when a middleware blocks (fails the task).
+    #[allow(clippy::too_many_arguments)] // cohesive hook-invocation signature
     async fn run_stage_mw(
         &self,
         pipeline: &Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
@@ -1379,24 +1347,20 @@ impl NatsNsedWorker {
         content: serde_json::Value,
         metadata: serde_json::Value,
     ) -> Result<Option<serde_json::Value>> {
-        let Some(p) = pipeline else {
-            return Ok(None);
-        };
-        let mut ctx = crate::middleware::MiddlewareContext {
-            content,
-            action: action.to_string(),
-            agent_id: self.agent_id.clone(),
-            job_id: session_id.to_string(),
-            round,
-            stage,
-            metadata,
-            hook_state: std::collections::HashMap::new(),
-        };
-        match p.run(&mut ctx).await {
-            crate::middleware::pipeline::PipelineResult::Blocked {
-                category, reason, ..
-            } => Err(anyhow::anyhow!("middleware blocked ({category}): {reason}")),
-            _ => Ok(Some(ctx.content)),
+        match pipeline {
+            Some(p) => run_stage_pipeline(
+                p,
+                &self.agent_id,
+                action,
+                session_id,
+                round,
+                stage,
+                content,
+                metadata,
+            )
+            .await
+            .map(Some),
+            None => Ok(None),
         }
     }
 
@@ -2434,6 +2398,73 @@ impl Clone for NatsNsedWorker {
     }
 }
 
+/// Run a middleware pipeline for a hook point and return the (possibly
+/// transformed) `content`, or an `Err` when a middleware blocks. Free fn so it's
+/// unit-testable with a mock pipeline — no worker / NATS needed.
+#[allow(clippy::too_many_arguments)] // cohesive hook-invocation signature
+async fn run_stage_pipeline(
+    pipeline: &crate::middleware::pipeline::MiddlewarePipeline,
+    agent_id: &str,
+    action: &str,
+    session_id: &str,
+    round: u32,
+    stage: crate::middleware::MiddlewareStage,
+    content: serde_json::Value,
+    metadata: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let mut ctx = crate::middleware::MiddlewareContext {
+        content,
+        action: action.to_string(),
+        agent_id: agent_id.to_string(),
+        job_id: session_id.to_string(),
+        round,
+        stage,
+        metadata,
+        hook_state: std::collections::HashMap::new(),
+    };
+    match pipeline.run(&mut ctx).await {
+        crate::middleware::pipeline::PipelineResult::Blocked {
+            category, reason, ..
+        } => Err(anyhow::anyhow!("middleware blocked ({category}): {reason}")),
+        _ => Ok(ctx.content),
+    }
+}
+
+/// Extract the session id from a result-event subject shaped like
+/// `{prefix}.{session_id}.result.event.{kind}`. `prefix` may be empty.
+fn session_id_from_subject(subject: &str, prefix: &str) -> String {
+    let prefix_count = if prefix.is_empty() {
+        0
+    } else {
+        prefix.split('.').count()
+    };
+    subject
+        .split('.')
+        .nth(prefix_count)
+        .unwrap_or("?")
+        .to_string()
+}
+
+/// The (content, metadata) a `job_complete` event contributes to the
+/// `on_job_complete` hook context. `metadata.winner` = the final winner.
+fn job_complete_payload(
+    event: &crate::events::JobCompleteEvent,
+) -> (serde_json::Value, serde_json::Value) {
+    let winner = event.best_proposal_author.clone();
+    (
+        serde_json::json!({
+            "winner": winner,
+            "score": event.best_proposal_score,
+            "content": event.best_proposal_content,
+            "rounds_completed": event.rounds_completed,
+        }),
+        serde_json::json!({
+            "winner": winner,
+            "finalized_by_user": event.finalized_by_user,
+        }),
+    )
+}
+
 /// The winning agent of a round summary = the highest aggregated score.
 /// `None` for an empty score list. Ties resolve to the first max encountered.
 fn pick_winner(scores: &[crate::events::ProposalScoreEntry]) -> Option<String> {
@@ -2678,6 +2709,182 @@ fn should_publish_failure_marker(action: &str, is_payment_error: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::middleware::pipeline::MiddlewarePipeline;
+    use crate::middleware::{
+        AgentMiddleware, MiddlewareContext, MiddlewareStage, MiddlewareVerdict,
+    };
+
+    // --- mock middleware for hook-invocation tests (no NATS needed) ---
+
+    // The default `stages()` excludes BeforePrompt/Completion/JobComplete; these
+    // mocks are built directly (not via the per-entry build path that overrides
+    // stages), so opt into every stage.
+    fn all_stages() -> Vec<MiddlewareStage> {
+        use MiddlewareStage::*;
+        vec![
+            Edit,
+            Release,
+            ProviderResponse,
+            BeforePrompt,
+            Completion,
+            JobComplete,
+        ]
+    }
+
+    #[derive(Debug)]
+    struct ContentReplaceMock(serde_json::Value);
+    #[async_trait::async_trait]
+    impl AgentMiddleware for ContentReplaceMock {
+        // TODO(slop): placeholder identifier — pick a name that says what this is
+        async fn execute(&self, _ctx: &MiddlewareContext) -> MiddlewareVerdict {
+            MiddlewareVerdict::pass_with_content(self.0.clone())
+        }
+        fn name(&self) -> &str {
+            "content-replace-mock"
+        }
+        fn stages(&self) -> Vec<MiddlewareStage> {
+            all_stages()
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingMock;
+    #[async_trait::async_trait]
+    impl AgentMiddleware for BlockingMock {
+        // TODO(slop): placeholder identifier — pick a name that says what this is
+        async fn execute(&self, _ctx: &MiddlewareContext) -> MiddlewareVerdict {
+            MiddlewareVerdict::block("mock_block", "rejected by mock middleware")
+        }
+        fn name(&self) -> &str {
+            "blocking-mock"
+        }
+        fn stages(&self) -> Vec<MiddlewareStage> {
+            all_stages()
+        }
+    }
+
+    /// Echoes the context it received (so a test can assert how the worker built it).
+    #[derive(Debug)]
+    struct ContextEchoMock;
+    #[async_trait::async_trait]
+    impl AgentMiddleware for ContextEchoMock {
+        // TODO(slop): placeholder identifier — pick a name that says what this is
+        async fn execute(&self, ctx: &MiddlewareContext) -> MiddlewareVerdict {
+            MiddlewareVerdict::pass_with_content(serde_json::json!({
+                "stage": format!("{:?}", ctx.stage),
+                "agent": ctx.agent_id,
+                "job": ctx.job_id,
+                "round": ctx.round,
+                "action": ctx.action,
+                "meta": ctx.metadata,
+            }))
+        }
+        fn name(&self) -> &str {
+            "context-echo-mock"
+        }
+        fn stages(&self) -> Vec<MiddlewareStage> {
+            all_stages()
+        }
+    }
+
+    #[tokio::test]
+    async fn run_stage_pipeline_returns_transformed_content() {
+        let p = MiddlewarePipeline::new(vec![Box::new(ContentReplaceMock(serde_json::json!(
+            "changed"
+        )))]);
+        let out = run_stage_pipeline(
+            &p,
+            "AgentA",
+            "propose",
+            "job1",
+            2,
+            MiddlewareStage::ProviderResponse,
+            serde_json::json!("orig"),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, serde_json::json!("changed"));
+    }
+
+    #[tokio::test]
+    async fn run_stage_pipeline_block_is_err() {
+        let p = MiddlewarePipeline::new(vec![Box::new(BlockingMock)]);
+        let r = run_stage_pipeline(
+            &p,
+            "A",
+            "propose",
+            "j",
+            0,
+            MiddlewareStage::BeforePrompt,
+            serde_json::json!("x"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(r.is_err(), "a blocking middleware must fail the hook");
+    }
+
+    #[tokio::test]
+    async fn run_stage_pipeline_builds_context_correctly() {
+        let p = MiddlewarePipeline::new(vec![Box::new(ContextEchoMock)]);
+        let out = run_stage_pipeline(
+            &p,
+            "AgentA",
+            "job_complete",
+            "sess9",
+            3,
+            MiddlewareStage::JobComplete,
+            serde_json::json!("x"),
+            serde_json::json!({"winner": "AgentA"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["agent"], "AgentA");
+        assert_eq!(out["job"], "sess9");
+        assert_eq!(out["round"], 3);
+        assert_eq!(out["action"], "job_complete");
+        assert_eq!(out["stage"], "JobComplete");
+        assert_eq!(out["meta"]["winner"], "AgentA");
+    }
+
+    #[test]
+    fn session_id_from_subject_cases() {
+        assert_eq!(
+            session_id_from_subject("nsed.sess1.result.event.job_complete", "nsed"),
+            "sess1"
+        );
+        assert_eq!(
+            session_id_from_subject("sess2.result.event.round_summary", ""),
+            "sess2"
+        );
+        assert_eq!(
+            session_id_from_subject("org.nsed.s42.result.event.x", "org.nsed"),
+            "s42"
+        );
+        assert_eq!(
+            session_id_from_subject("", "nsed"),
+            "?",
+            "malformed → sentinel, no panic"
+        );
+    }
+
+    #[test]
+    fn job_complete_payload_maps_winner() {
+        let ev = crate::events::JobCompleteEvent {
+            best_proposal_author: "AgentB".into(),
+            best_proposal_score: 7.5,
+            best_proposal_content: "final".into(),
+            rounds_completed: 4,
+            finalized_by_user: Some("op".into()),
+            ..Default::default()
+        };
+        let (content, meta) = job_complete_payload(&ev);
+        assert_eq!(content["winner"], "AgentB");
+        assert_eq!(content["score"], 7.5);
+        assert_eq!(content["rounds_completed"], 4);
+        assert_eq!(meta["winner"], "AgentB");
+        assert_eq!(meta["finalized_by_user"], "op");
+    }
 
     #[test]
     fn pick_winner_selects_highest_score() {
