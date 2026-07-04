@@ -1452,6 +1452,8 @@ fn force_tool_choice(
     if schema_declared && has_tools && !disable_native_tools {
         Some(async_openai::types::ChatCompletionToolChoiceOption::Required)
     } else {
+        // TODO: disable_native_tools (XML/Nous-format models) → no schema
+        // enforcement at all. Add a non-native forcing path or document the gap.
         None
     }
 }
