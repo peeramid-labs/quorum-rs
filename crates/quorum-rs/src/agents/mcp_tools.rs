@@ -8,12 +8,21 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
 /// Input for `nsed_propose` — submit a proposal (terminal tool).
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+///
+/// Flexible so a middleware-declared schema (see `NsedMcpServer::list_tools`) can
+/// override the advertised shape: the default `{thought_process, content}`, or an
+/// envelope like `{rationale, ops}` (captured via `extra` and forwarded verbatim).
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct ProposeInput {
     /// The agent's reasoning and analysis process.
+    #[serde(default)]
     pub thought_process: String,
-    /// The actual proposal content.
-    pub content: String,
+    /// The actual proposal content (a string body, or a structured object).
+    #[serde(default)]
+    pub content: serde_json::Value,
+    /// Any other top-level fields (e.g. a `{rationale, ops}` envelope).
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Input for `nsed_evaluate` — submit evaluations (terminal tool).

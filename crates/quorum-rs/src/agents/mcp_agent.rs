@@ -28,7 +28,7 @@ use rmcp::transport::async_rw::AsyncRwTransport;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
-use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{ServerHandler, tool, tool_router};
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -228,9 +228,13 @@ impl NsedMcpServer {
     }
 
     /// Submit a proposal (terminal tool — ends the propose phase).
+    ///
+    /// Accepts raw args so the advertised schema can be overridden per-instance
+    /// (see `list_tools`): a middleware-declared envelope like `{rationale, ops}`,
+    /// or the default `{thought_process, content}`.
     #[tool(
         description = "Submit your final proposal. This ends the current phase. \
-        Fields: thought_process (your reasoning) and content (your proposal)."
+        Provide the fields required by this tool's input schema."
     )]
     async fn nsed_propose(
         &self,
@@ -241,9 +245,20 @@ impl NsedMcpServer {
                 "nsed_propose can only be called during the propose phase",
             )]));
         }
+        // Content resolution across the possible shapes:
+        //   {content:"body"}          → the string body (legacy/default)
+        //   {content:{...}}           → the object serialized (envelope in content)
+        //   {rationale,ops}           → the flattened `extra` serialized (forced schema)
+        let content = match input.content {
+            serde_json::Value::String(s) => s,
+            serde_json::Value::Null if !input.extra.is_empty() => {
+                serde_json::to_string(&serde_json::Value::Object(input.extra)).unwrap_or_default()
+            }
+            other => serde_json::to_string(&other).unwrap_or_default(),
+        };
         let result = McpResult::Proposal {
             thought_process: input.thought_process,
-            content: input.content,
+            content,
         };
         let mut tx_guard = self.result_tx.lock().await;
         if let Some(tx) = tx_guard.take() {
@@ -462,7 +477,6 @@ impl NsedMcpServer {
     }
 }
 
-#[tool_handler]
 impl ServerHandler for NsedMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
@@ -471,6 +485,44 @@ impl ServerHandler for NsedMcpServer {
                  (nsed_read_proposal, nsed_search, nsed_read_critiques, nsed_update_scratchpad) \
                  as needed, then call nsed_propose or nsed_evaluate to submit your result.",
         )
+    }
+
+    /// Hand-rolled (not `#[tool_handler]`) so a middleware-declared proposal schema
+    /// can be nested into `nsed_propose`'s advertised `input_schema` per-instance —
+    /// the Claude/MCP analog of the OpenAI forced-tool-schema path.
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let mut tools = self.tool_router.list_all();
+        if self.phase == ActivePhase::Proposing {
+            if let Some(schema) = self
+                .context
+                .forced_proposal_schema
+                .as_ref()
+                .and_then(|s| s.as_object())
+            {
+                for t in tools.iter_mut() {
+                    if t.name == "nsed_propose" {
+                        t.input_schema = std::sync::Arc::new(schema.clone());
+                    }
+                }
+            }
+        }
+        Ok(rmcp::model::ListToolsResult {
+            tools,
+            ..Default::default()
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
     }
 }
 
@@ -2084,7 +2136,14 @@ fn extract_propose_args(
     use super::claude_recovery::RecoveryOutcome;
     use super::mcp_tools::McpResult;
 
-    let content = str_field(&raw, "content");
+    let mut content = str_field(&raw, "content");
+    if content.trim().is_empty() {
+        // A middleware-declared envelope ({rationale, ops}) carries no `content`
+        // field — forward the whole args so the dylib parses the envelope.
+        if raw.get("ops").is_some() || raw.get("rationale").is_some() {
+            content = serde_json::to_string(&raw).unwrap_or_default();
+        }
+    }
     if content.trim().is_empty() {
         // tool_use was emitted but its `content` field is
         // missing/blank — surface as Malformed so the retry
@@ -3554,6 +3613,27 @@ mod tests {
             extract_propose_args(blank),
             RecoveryOutcome::Malformed(_)
         ));
+    }
+
+    #[test]
+    fn extract_propose_args_recovers_envelope_without_content_field() {
+        use super::super::claude_recovery::RecoveryOutcome;
+        use super::super::mcp_tools::McpResult;
+        // A middleware envelope has no `content` field — recover the whole args.
+        let raw = serde_json::json!({"rationale": "r", "ops": [{"op": "write", "path": "a.md", "content": "x"}]});
+        match extract_propose_args(raw) {
+            RecoveryOutcome::Recovered(McpResult::Proposal { content, .. }) => {
+                assert!(
+                    content.contains("rationale"),
+                    "envelope forwarded: {content}"
+                );
+                assert!(
+                    content.contains("\"op\":\"write\""),
+                    "ops forwarded: {content}"
+                );
+            }
+            other => panic!("expected Recovered envelope, got {other:?}"),
+        }
     }
 
     #[test]
