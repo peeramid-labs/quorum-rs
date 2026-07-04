@@ -418,6 +418,14 @@ pub struct NatsNsedWorker {
     paused: Arc<AtomicBool>,
     /// Optional telemetry emitter for recording LLM call metrics.
     telemetry: Option<TelemetryEmitterMux>,
+    /// Agent middleware pipelines, built from `agent_config.middleware`.
+    /// `None` when the hook point is unconfigured → zero overhead + no behavior
+    /// change for existing agents.
+    before_prompt_mw: Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
+    provider_response_mw: Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
+    completion_mw: Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
+    /// Job-final hook — fires once on the orchestrator's `job_complete` event.
+    job_complete_mw: Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
 }
 
 impl NatsNsedWorker {
@@ -493,6 +501,21 @@ impl NatsNsedWorker {
             processed_bucket_name, scratchpad_bucket_name
         );
 
+        // Build the middleware pipelines once. `None` when a hook point has no
+        // entries, so the hot path stays untouched for agents without middleware.
+        let opt_pipeline = |p: crate::middleware::pipeline::MiddlewarePipeline| {
+            if p.is_empty() {
+                None
+            } else {
+                Some(Arc::new(p))
+            }
+        };
+        let before_prompt_mw = opt_pipeline(agent_config.middleware.build_before_prompt_pipeline());
+        let provider_response_mw =
+            opt_pipeline(agent_config.middleware.build_provider_response_pipeline());
+        let completion_mw = opt_pipeline(agent_config.middleware.build_completion_pipeline());
+        let job_complete_mw = opt_pipeline(agent_config.middleware.build_job_complete_pipeline());
+
         Ok(Self {
             agent,
             agent_config,
@@ -511,6 +534,10 @@ impl NatsNsedWorker {
             response_buffer: None,
             paused: Arc::new(AtomicBool::new(false)),
             telemetry,
+            before_prompt_mw,
+            provider_response_mw,
+            completion_mw,
+            job_complete_mw,
         })
     }
 
@@ -747,6 +774,28 @@ impl NatsNsedWorker {
             None
         };
 
+        // Job-complete subscription — the orchestrator's terminal event. Only
+        // subscribe when an `on_job_complete` hook is configured (zero overhead
+        // otherwise). Core NATS, same per-session publish pattern as scores.
+        let job_complete_subject =
+            format!("{}.*.result.event.job_complete", self.config.subject_prefix);
+        let job_complete_subscription: Option<async_nats::Subscriber> =
+            if self.job_complete_mw.is_some() {
+                match self.nats.subscribe(job_complete_subject.clone()).await {
+                    Ok(sub) => Some(sub),
+                    Err(e) => {
+                        warn!(
+                            "Failed to subscribe to job_complete on {}: {}. \
+                             on_job_complete hook disabled.",
+                            job_complete_subject, e
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
         // Passthrough subscription — Core NATS request-reply for PolicyMode::Passthrough.
         // When the orchestrator routes a request directly to this agent (no deliberation
         // cycle), it publishes to this subject and waits for a synchronous reply.
@@ -782,6 +831,7 @@ impl NatsNsedWorker {
         let mut task_messages = task_consumer.messages().await?;
         let mut manifest_messages = manifest_consumer.messages().await?;
         let mut score_messages = score_subscription;
+        let mut job_complete_messages = job_complete_subscription;
         let mut passthrough_messages = passthrough_subscription;
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(10));
         let mut drain_interval = tokio::time::interval(std::time::Duration::from_millis(500));
@@ -837,6 +887,19 @@ impl NatsNsedWorker {
                     tokio::spawn(async move {
                         if let Err(e) = worker.handle_round_summary(msg).await {
                             warn!("Failed to process round summary: {:?}", e);
+                        }
+                    });
+                }
+                Some(msg) = async {
+                    match &mut job_complete_messages {
+                        Some(sub) => sub.next().await,
+                        None => std::future::pending::<Option<async_nats::Message>>().await,
+                    }
+                } => {
+                    let worker = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = worker.handle_job_complete(msg).await {
+                            warn!("Failed to process job_complete: {:?}", e);
                         }
                     });
                 }
@@ -996,18 +1059,7 @@ impl NatsNsedWorker {
             })?;
 
         // Extract session_id from subject: {prefix}.{session_id}.result.event.round_summary
-        let prefix_count = if self.config.subject_prefix.is_empty() {
-            0
-        } else {
-            self.config.subject_prefix.split('.').count()
-        };
-        let session_id = msg
-            .subject
-            .as_str()
-            .split('.')
-            .nth(prefix_count)
-            .unwrap_or("?")
-            .to_string();
+        let session_id = session_id_from_subject(msg.subject.as_str(), &self.config.subject_prefix);
 
         // Do not gate on active_jobs — that set tracks task-in-flight and is
         // cleared after each task completion, but round_summary events arrive
@@ -1038,6 +1090,62 @@ impl NatsNsedWorker {
             }
         }
 
+        // on_completion hook — fires per round-summary with the round's winner
+        // (top aggregated_score) in `metadata.winner`. NOTE: this is per-round,
+        // not a single job-final signal (the orchestrator owns halting), so a
+        // completion middleware with once-only side effects must guard itself.
+        if self.completion_mw.is_some() {
+            let winner = pick_winner(&summary.proposal_scores);
+            let content = serde_json::json!({
+                "round": summary.round,
+                "proposal_scores": summary.proposal_scores,
+            });
+            let meta = serde_json::json!({ "winner": winner });
+            if let Err(e) = self
+                .run_stage_mw(
+                    &self.completion_mw,
+                    "complete",
+                    &session_id,
+                    summary.round,
+                    crate::middleware::MiddlewareStage::Completion,
+                    content,
+                    meta,
+                )
+                .await
+            {
+                warn!(agent_id = %self.agent_id, error = %e, "on_completion middleware error");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle the orchestrator's terminal `job_complete` event — fire the
+    /// `on_job_complete` hook **once** with the final winner. Distinct from the
+    /// per-round `on_completion` (which stays for per-round agent reactions).
+    async fn handle_job_complete(&self, msg: async_nats::Message) -> Result<()> {
+        let event: crate::events::JobCompleteEvent =
+            serde_json::from_slice(&msg.payload).map_err(|e| {
+                warn!("Failed to parse job_complete event: {}", e);
+                e
+            })?;
+
+        let session_id = session_id_from_subject(msg.subject.as_str(), &self.config.subject_prefix);
+        let (content, meta) = job_complete_payload(&event);
+        if let Err(e) = self
+            .run_stage_mw(
+                &self.job_complete_mw,
+                "job_complete",
+                &session_id,
+                event.rounds_completed,
+                crate::middleware::MiddlewareStage::JobComplete,
+                content,
+                meta,
+            )
+            .await
+        {
+            warn!(agent_id = %self.agent_id, error = %e, "on_job_complete middleware error");
+        }
         Ok(())
     }
 
@@ -1223,6 +1331,37 @@ impl NatsNsedWorker {
             }
         };
         let _ = self.nats.publish(reply_subject, payload.into()).await;
+    }
+
+    /// Run one middleware pipeline for a hook point. Returns the (possibly
+    /// transformed) `content` on pass, `None` when the pipeline is unconfigured,
+    /// or an `Err` when a middleware blocks (fails the task).
+    #[allow(clippy::too_many_arguments)] // cohesive hook-invocation signature
+    async fn run_stage_mw(
+        &self,
+        pipeline: &Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
+        action: &str,
+        session_id: &str,
+        round: u32,
+        stage: crate::middleware::MiddlewareStage,
+        content: serde_json::Value,
+        metadata: serde_json::Value,
+    ) -> Result<Option<serde_json::Value>> {
+        match pipeline {
+            Some(p) => run_stage_pipeline(
+                p,
+                &self.agent_id,
+                action,
+                session_id,
+                round,
+                stage,
+                content,
+                metadata,
+            )
+            .await
+            .map(Some),
+            None => Ok(None),
+        }
     }
 
     async fn handle_message(&self, msg: async_nats::jetstream::Message) -> Result<()> {
@@ -1423,6 +1562,37 @@ impl NatsNsedWorker {
             }
         });
 
+        // before_prompt hook — transform the task before the agent builds its
+        // prompt. Mutates `task_description` (which feeds the PromptSet). No-op
+        // when unconfigured; a block fails the task.
+        if self.before_prompt_mw.is_some() {
+            let content = serde_json::json!({
+                "task_description": context.task_description,
+                "user_injections": context.user_injections,
+            });
+            if let Some(new) = self
+                .run_stage_mw(
+                    &self.before_prompt_mw,
+                    action,
+                    &session_id,
+                    context.round_number,
+                    crate::middleware::MiddlewareStage::BeforePrompt,
+                    content,
+                    serde_json::json!({}),
+                )
+                .await?
+            {
+                if let Some(td) = new.get("task_description").and_then(|v| v.as_str()) {
+                    context.task_description = td.to_string();
+                } else {
+                    tracing::debug!(
+                        agent_id = %self.agent_id,
+                        "before_prompt middleware returned no string `task_description` — transform dropped"
+                    );
+                }
+            }
+        }
+
         let task_start = Instant::now();
         // Retry loop for transient transport errors (broken pipe, connection reset, etc.).
         // Wraps the full propose/evaluate call because the SDK cannot pinpoint where inside
@@ -1438,6 +1608,29 @@ impl NatsNsedWorker {
                     match action {
                         "propose" => {
                             let mut proposal = self.agent.propose(&context).await?;
+                            // on_provider_response hook — transform the proposal
+                            // content before it is serialized / buffered / published.
+                            // NOTE: this runs inside the transient-error retry loop,
+                            // so it re-executes once per LLM attempt — middleware here
+                            // must be idempotent / side-effect-safe across retries.
+                            if self.provider_response_mw.is_some() {
+                                if let Some(new) = self
+                                    .run_stage_mw(
+                                        &self.provider_response_mw,
+                                        "propose",
+                                        &session_id,
+                                        context.round_number,
+                                        crate::middleware::MiddlewareStage::ProviderResponse,
+                                        serde_json::json!(proposal.content),
+                                        serde_json::json!({}),
+                                    )
+                                    .await?
+                                {
+                                    if let Some(c) = new.as_str() {
+                                        proposal.content = c.to_string();
+                                    }
+                                }
+                            }
                             proposal.published_at_ms = chrono::Utc::now().timestamp_millis();
                             serde_json::to_vec(&proposal).map_err(|e| anyhow::anyhow!(e))
                         }
@@ -2197,8 +2390,92 @@ impl Clone for NatsNsedWorker {
             response_buffer: self.response_buffer.clone(),
             paused: self.paused.clone(),
             telemetry: self.telemetry.clone(),
+            before_prompt_mw: self.before_prompt_mw.clone(),
+            provider_response_mw: self.provider_response_mw.clone(),
+            completion_mw: self.completion_mw.clone(),
+            job_complete_mw: self.job_complete_mw.clone(),
         }
     }
+}
+
+/// Run a middleware pipeline for a hook point and return the (possibly
+/// transformed) `content`, or an `Err` when a middleware blocks. Free fn so it's
+/// unit-testable with a mock pipeline — no worker / NATS needed.
+#[allow(clippy::too_many_arguments)] // cohesive hook-invocation signature
+async fn run_stage_pipeline(
+    pipeline: &crate::middleware::pipeline::MiddlewarePipeline,
+    agent_id: &str,
+    action: &str,
+    session_id: &str,
+    round: u32,
+    stage: crate::middleware::MiddlewareStage,
+    content: serde_json::Value,
+    metadata: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let mut ctx = crate::middleware::MiddlewareContext {
+        content,
+        action: action.to_string(),
+        agent_id: agent_id.to_string(),
+        job_id: session_id.to_string(),
+        round,
+        stage,
+        metadata,
+        hook_state: std::collections::HashMap::new(),
+    };
+    match pipeline.run(&mut ctx).await {
+        crate::middleware::pipeline::PipelineResult::Blocked {
+            category, reason, ..
+        } => Err(anyhow::anyhow!("middleware blocked ({category}): {reason}")),
+        _ => Ok(ctx.content),
+    }
+}
+
+/// Extract the session id from a result-event subject shaped like
+/// `{prefix}.{session_id}.result.event.{kind}`. `prefix` may be empty.
+fn session_id_from_subject(subject: &str, prefix: &str) -> String {
+    let prefix_count = if prefix.is_empty() {
+        0
+    } else {
+        prefix.split('.').count()
+    };
+    subject
+        .split('.')
+        .nth(prefix_count)
+        .unwrap_or("?")
+        .to_string()
+}
+
+/// The (content, metadata) a `job_complete` event contributes to the
+/// `on_job_complete` hook context. `metadata.winner` = the final winner.
+fn job_complete_payload(
+    event: &crate::events::JobCompleteEvent,
+) -> (serde_json::Value, serde_json::Value) {
+    let winner = event.best_proposal_author.clone();
+    (
+        serde_json::json!({
+            "winner": winner,
+            "score": event.best_proposal_score,
+            "content": event.best_proposal_content,
+            "rounds_completed": event.rounds_completed,
+        }),
+        serde_json::json!({
+            "winner": winner,
+            "finalized_by_user": event.finalized_by_user,
+        }),
+    )
+}
+
+/// The winning agent of a round summary = the highest aggregated score.
+/// `None` for an empty score list. Ties resolve to the first max encountered.
+fn pick_winner(scores: &[crate::events::ProposalScoreEntry]) -> Option<String> {
+    scores
+        .iter()
+        .max_by(|a, b| {
+            a.aggregated_score
+                .partial_cmp(&b.aggregated_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|e| e.agent_id.clone())
 }
 
 /// Extract a human-readable content preview from a serialized response payload.
@@ -2432,6 +2709,206 @@ fn should_publish_failure_marker(action: &str, is_payment_error: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::middleware::pipeline::MiddlewarePipeline;
+    use crate::middleware::{
+        AgentMiddleware, MiddlewareContext, MiddlewareStage, MiddlewareVerdict,
+    };
+
+    // --- mock middleware for hook-invocation tests (no NATS needed) ---
+
+    // The default `stages()` excludes BeforePrompt/Completion/JobComplete; these
+    // mocks are built directly (not via the per-entry build path that overrides
+    // stages), so opt into every stage.
+    fn all_stages() -> Vec<MiddlewareStage> {
+        use MiddlewareStage::*;
+        vec![
+            Edit,
+            Release,
+            ProviderResponse,
+            BeforePrompt,
+            Completion,
+            JobComplete,
+        ]
+    }
+
+    #[derive(Debug)]
+    struct ContentReplaceMock(serde_json::Value);
+    #[async_trait::async_trait]
+    impl AgentMiddleware for ContentReplaceMock {
+        // TODO(slop): placeholder identifier — pick a name that says what this is
+        async fn execute(&self, _ctx: &MiddlewareContext) -> MiddlewareVerdict {
+            MiddlewareVerdict::pass_with_content(self.0.clone())
+        }
+        fn name(&self) -> &str {
+            "content-replace-mock"
+        }
+        fn stages(&self) -> Vec<MiddlewareStage> {
+            all_stages()
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingMock;
+    #[async_trait::async_trait]
+    impl AgentMiddleware for BlockingMock {
+        // TODO(slop): placeholder identifier — pick a name that says what this is
+        async fn execute(&self, _ctx: &MiddlewareContext) -> MiddlewareVerdict {
+            MiddlewareVerdict::block("mock_block", "rejected by mock middleware")
+        }
+        fn name(&self) -> &str {
+            "blocking-mock"
+        }
+        fn stages(&self) -> Vec<MiddlewareStage> {
+            all_stages()
+        }
+    }
+
+    /// Echoes the context it received (so a test can assert how the worker built it).
+    #[derive(Debug)]
+    struct ContextEchoMock;
+    #[async_trait::async_trait]
+    impl AgentMiddleware for ContextEchoMock {
+        // TODO(slop): placeholder identifier — pick a name that says what this is
+        async fn execute(&self, ctx: &MiddlewareContext) -> MiddlewareVerdict {
+            MiddlewareVerdict::pass_with_content(serde_json::json!({
+                "stage": format!("{:?}", ctx.stage),
+                "agent": ctx.agent_id,
+                "job": ctx.job_id,
+                "round": ctx.round,
+                "action": ctx.action,
+                "meta": ctx.metadata,
+            }))
+        }
+        fn name(&self) -> &str {
+            "context-echo-mock"
+        }
+        fn stages(&self) -> Vec<MiddlewareStage> {
+            all_stages()
+        }
+    }
+
+    #[tokio::test]
+    async fn run_stage_pipeline_returns_transformed_content() {
+        let p = MiddlewarePipeline::new(vec![Box::new(ContentReplaceMock(serde_json::json!(
+            "changed"
+        )))]);
+        let out = run_stage_pipeline(
+            &p,
+            "AgentA",
+            "propose",
+            "job1",
+            2,
+            MiddlewareStage::ProviderResponse,
+            serde_json::json!("orig"),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, serde_json::json!("changed"));
+    }
+
+    #[tokio::test]
+    async fn run_stage_pipeline_block_is_err() {
+        let p = MiddlewarePipeline::new(vec![Box::new(BlockingMock)]);
+        let r = run_stage_pipeline(
+            &p,
+            "A",
+            "propose",
+            "j",
+            0,
+            MiddlewareStage::BeforePrompt,
+            serde_json::json!("x"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(r.is_err(), "a blocking middleware must fail the hook");
+    }
+
+    #[tokio::test]
+    async fn run_stage_pipeline_builds_context_correctly() {
+        let p = MiddlewarePipeline::new(vec![Box::new(ContextEchoMock)]);
+        let out = run_stage_pipeline(
+            &p,
+            "AgentA",
+            "job_complete",
+            "sess9",
+            3,
+            MiddlewareStage::JobComplete,
+            serde_json::json!("x"),
+            serde_json::json!({"winner": "AgentA"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["agent"], "AgentA");
+        assert_eq!(out["job"], "sess9");
+        assert_eq!(out["round"], 3);
+        assert_eq!(out["action"], "job_complete");
+        assert_eq!(out["stage"], "JobComplete");
+        assert_eq!(out["meta"]["winner"], "AgentA");
+    }
+
+    #[test]
+    fn session_id_from_subject_cases() {
+        assert_eq!(
+            session_id_from_subject("nsed.sess1.result.event.job_complete", "nsed"),
+            "sess1"
+        );
+        assert_eq!(
+            session_id_from_subject("sess2.result.event.round_summary", ""),
+            "sess2"
+        );
+        assert_eq!(
+            session_id_from_subject("org.nsed.s42.result.event.x", "org.nsed"),
+            "s42"
+        );
+        assert_eq!(
+            session_id_from_subject("", "nsed"),
+            "?",
+            "malformed → sentinel, no panic"
+        );
+    }
+
+    #[test]
+    fn job_complete_payload_maps_winner() {
+        let ev = crate::events::JobCompleteEvent {
+            best_proposal_author: "AgentB".into(),
+            best_proposal_score: 7.5,
+            best_proposal_content: "final".into(),
+            rounds_completed: 4,
+            finalized_by_user: Some("op".into()),
+            ..Default::default()
+        };
+        let (content, meta) = job_complete_payload(&ev);
+        assert_eq!(content["winner"], "AgentB");
+        assert_eq!(content["score"], 7.5);
+        assert_eq!(content["rounds_completed"], 4);
+        assert_eq!(meta["winner"], "AgentB");
+        assert_eq!(meta["finalized_by_user"], "op");
+    }
+
+    #[test]
+    fn pick_winner_selects_highest_score() {
+        use crate::events::ProposalScoreEntry;
+        let scores = vec![
+            ProposalScoreEntry {
+                agent_id: "alpha".into(),
+                aggregated_score: 3.2,
+                ..Default::default()
+            },
+            ProposalScoreEntry {
+                agent_id: "beta".into(),
+                aggregated_score: 6.5,
+                ..Default::default()
+            },
+            ProposalScoreEntry {
+                agent_id: "gamma".into(),
+                aggregated_score: 1.0,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(pick_winner(&scores).as_deref(), Some("beta"));
+        assert_eq!(pick_winner(&[]), None);
+    }
 
     #[test]
     fn test_worker_config_new_defaults() {

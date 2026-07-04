@@ -68,7 +68,8 @@ pub use control_plane::{AgentControlPlane, ConfigPatch};
 #[cfg(feature = "audit")]
 pub use crypto::{AgentKeyPair, SigningHook};
 pub use events::{
-    CategoryScoreBreakdown, ProposalControversyEntry, ProposalScoreEntry, RoundSummaryEvent,
+    CategoryScoreBreakdown, JobCompleteEvent, ProposalControversyEntry, ProposalScoreEntry,
+    RoundSummaryEvent,
 };
 pub use llms::{
     AiModel, ChatCompletionResult, LlmRequestSpan, RequestConfig, SimpleOpenAIModel, TimingMetadata,

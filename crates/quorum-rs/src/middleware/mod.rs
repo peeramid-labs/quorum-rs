@@ -134,6 +134,10 @@ pub enum MiddlewareStage {
     BeforePrompt,
     /// After deliberation result is finalized.
     Completion,
+    /// Once at job-final — the whole deliberation has halted and the terminal
+    /// winner is known (from the orchestrator's `job_complete` event). Distinct
+    /// from `Completion`, which fires per round.
+    JobComplete,
 }
 
 // ---------------------------------------------------------------------------
