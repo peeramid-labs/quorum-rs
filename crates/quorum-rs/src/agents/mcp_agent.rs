@@ -519,6 +519,10 @@ impl ServerHandler for NsedMcpServer {
                 for t in tools.iter_mut() {
                     if t.name == "nsed_propose" {
                         t.input_schema = std::sync::Arc::new(schema.clone());
+                        tracing::info!(
+                            schema_keys = ?schema.keys().collect::<Vec<_>>(),
+                            "nsed_propose input_schema overridden with middleware-declared schema"
+                        );
                     }
                 }
             }
