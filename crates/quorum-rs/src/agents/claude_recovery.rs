@@ -428,10 +428,11 @@ pub fn retry_feedback_block(failure: &LastFailureKind, terminal_tool: &str) -> S
     let footer = "</previous_attempt_failed>";
     let body = match failure {
         LastFailureKind::MissingTerminalCall => format!(
-            "Your previous attempt finished without calling the `{terminal_tool}` tool. \
-             That tool is the ONLY way to submit your result for this phase. \
-             Re-run your reasoning if you need to, then call `{terminal_tool}` with \
-             valid JSON arguments to terminate this turn."
+            "STOP — your previous attempt ended WITHOUT calling `{terminal_tool}`, so \
+             NOTHING was submitted and the turn failed. Calling `{terminal_tool}` is \
+             mandatory and is the ONLY way to submit. Your very next action MUST be the \
+             `{terminal_tool}` tool call with valid JSON arguments. Do NOT write any \
+             prose, analysis, or explanation outside the tool call — call the tool now."
         ),
         LastFailureKind::MalformedArgs { reason } => format!(
             "Your previous `{terminal_tool}` call failed to deserialize: {reason}. \
@@ -620,7 +621,8 @@ mod tests {
             &LastFailureKind::MissingTerminalCall,
             "mcp__nsed__nsed_propose",
         );
-        assert!(missing.contains("without calling"));
+        assert!(missing.to_lowercase().contains("without calling"));
+        assert!(missing.contains("mandatory"));
         assert!(missing.contains("mcp__nsed__nsed_propose"));
 
         let malformed = retry_feedback_block(
