@@ -59,6 +59,14 @@ pub struct AgentContext {
     /// Structured feedback from previous round's evaluations (Phase 2 context pipeline).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_feedback: Option<StructuredFeedback>,
+    /// A JSON schema a `before_prompt` middleware declared for the proposal
+    /// submission. When set, the propose tool's `parameters` are constrained to
+    /// it and the terminal tool call is forced (`tool_choice: required`) — the
+    /// model must return a schema-valid structured proposal. Runtime-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(ignore)]
+    #[schemars(skip)]
+    pub forced_proposal_schema: Option<serde_json::Value>,
     /// Runtime-only: handler for user tool calls (injected by agent worker, not serialized).
     /// The concrete type is supplied via [`UserToolHandlerFactory`](crate::workers::UserToolHandlerFactory);
     /// this field holds an opaque Arc wrapper.
@@ -1994,6 +2002,7 @@ mod tests {
                 evaluator_count: 2,
                 category_breakdown: None,
             }),
+            forced_proposal_schema: None,
             user_tool_handler: None, // serde(skip)
             role: Some("security".to_string()),
             role_context: Some("Per-role context content".to_string()),

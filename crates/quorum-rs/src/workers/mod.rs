@@ -1590,6 +1590,13 @@ impl NatsNsedWorker {
                         "before_prompt middleware returned no string `task_description` — transform dropped"
                     );
                 }
+                // A middleware may declare a JSON schema to constrain (and force)
+                // the proposal submission — thread it to the agent.
+                if let Some(schema) = new.get("proposal_schema") {
+                    if schema.is_object() {
+                        context.forced_proposal_schema = Some(schema.clone());
+                    }
+                }
             }
         }
 

@@ -90,12 +90,24 @@ The NSED MCP server exposes the following tools:
 
 #### `nsed_propose`
 
+Default schema:
+
 ```json
 {
   "thought_process": "string — your reasoning and analysis",
   "content": "string — the actual proposal"
 }
 ```
+
+The advertised `input_schema` is **overridden per-instance** when a `before_prompt`
+middleware declares a `proposal_schema` (see
+[middleware-declared schema](../explanation/middleware.md#structured-output-enforcement-middleware-declared-schema)):
+`NsedMcpServer::list_tools` replaces `nsed_propose`'s schema with the declared one
+during the propose phase, so the agent is told the exact required shape (e.g.
+`{rationale, ops}`). The handler accepts either shape — the default
+`{thought_process, content}`, a structured `content`, or the whole declared
+envelope (extra fields are forwarded verbatim as the proposal content). An empty
+submission (no `content` and no envelope fields) is rejected so the agent retries.
 
 #### `nsed_evaluate`
 

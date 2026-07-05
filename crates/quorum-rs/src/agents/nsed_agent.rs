@@ -807,9 +807,11 @@ struct StructuredBatchEvaluationResponse {
 
 #[derive(Debug, Deserialize, serde::Serialize)]
 struct StructuredProposalResponse {
-    #[serde(deserialize_with = "deserialize_string_or_array_or_object")]
+    // `default` so a middleware-declared envelope schema (which has neither field)
+    // deserializes cleanly — the raw args become `Proposal.content` in that case.
+    #[serde(default, deserialize_with = "deserialize_string_or_array_or_object")]
     thought_process: String,
-    #[serde(deserialize_with = "deserialize_string_or_array_or_object")]
+    #[serde(default, deserialize_with = "deserialize_string_or_array_or_object")]
     solution_content: String,
 }
 
@@ -1107,21 +1109,29 @@ impl NsedAgent for ProposerEvaluatorAgent {
             context.structured_feedback.as_ref(),
         );
 
+        // A `before_prompt` middleware may constrain the submission to its own
+        // JSON schema (structured output); otherwise the default thought/solution.
+        let forced_schema = context.forced_proposal_schema.clone();
         let submit_tool_schema = ChatCompletionTool {
             r#type: ChatCompletionToolType::Function,
             function: FunctionObject {
                 name: "submit_proposal".to_string(),
                 description: Some("Submit the final proposal.".to_string()),
-                parameters: Some(json!({
-                    "type": "object",
-                    "properties": {
-                        "thought_process": { "type": "string" },
-                        "solution_content": { "type": "string" }
-                    },
-                    "required": ["thought_process", "solution_content"],
-                    "additionalProperties": false
+                parameters: Some(forced_schema.clone().unwrap_or_else(|| {
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "thought_process": { "type": "string" },
+                            "solution_content": { "type": "string" }
+                        },
+                        "required": ["thought_process", "solution_content"],
+                        "additionalProperties": false
+                    })
                 })),
-                strict: Some(true),
+                // Strict only for the built-in simple schema; a middleware-declared
+                // schema may use unions/optionals that OpenAI strict mode rejects —
+                // the forced tool call + lenient parse carry it instead.
+                strict: Some(forced_schema.is_none()),
             },
         };
 
@@ -1183,7 +1193,14 @@ impl NsedAgent for ProposerEvaluatorAgent {
 
         Ok(Proposal {
             thought_process: response.thought_process,
-            content: response.solution_content,
+            // With a middleware-declared schema, the whole tool-call args ARE the
+            // proposal (e.g. the patch-deliberation `{rationale, ops}` envelope) —
+            // deliver them verbatim so `on_provider_response` gets the full object.
+            content: if forced_schema.is_some() {
+                agent_response.content.clone()
+            } else {
+                response.solution_content
+            },
             final_scratchpad: agent_response.final_scratchpad.clone(), // Capture the scratchpad
             token_usage_stats: Some(TokenUsage {
                 input_tokens: agent_response.input_tokens.unwrap_or(0),
@@ -1423,6 +1440,22 @@ impl ChatCapable for ProposerEvaluatorAgent {
 }
 
 // ... helpers (react_loop, generate_structured_output) ...
+
+/// `tool_choice` for a request: force a tool call (`required`) only when a
+/// middleware declared a proposal schema AND native tools are actually available.
+fn force_tool_choice(
+    schema_declared: bool,
+    has_tools: bool,
+    disable_native_tools: bool,
+) -> Option<async_openai::types::ChatCompletionToolChoiceOption> {
+    if schema_declared && has_tools && !disable_native_tools {
+        Some(async_openai::types::ChatCompletionToolChoiceOption::Required)
+    } else {
+        // TODO: disable_native_tools (XML/Nous-format models) → no schema
+        // enforcement at all. Add a non-native forcing path or document the gap.
+        None
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn generate_structured_output<T>(
@@ -2767,7 +2800,15 @@ async fn react_loop(
             } else {
                 Some(active_tool_schemas.clone())
             },
-            tool_choice: None,
+            // When a middleware declared a proposal schema, force a tool call each
+            // turn (`required`) so the model can't end with prose instead of the
+            // structured submission. The terminal tool's schema enforces the
+            // shape; `required` guarantees the call happens.
+            tool_choice: force_tool_choice(
+                context.forced_proposal_schema.is_some(),
+                !active_tool_schemas.is_empty(),
+                agent_config.disable_native_tools,
+            ),
             presence_penalty: if context.phase == DeliberationPhase::Evaluating {
                 agent_config.presence_penalty.map(|p| p / 2.0)
             } else {
@@ -3502,6 +3543,28 @@ fn resolve_finalize_window(raw: Option<&str>) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn force_tool_choice_only_when_schema_and_tools() {
+        use super::force_tool_choice;
+        use async_openai::types::ChatCompletionToolChoiceOption;
+        assert!(matches!(
+            force_tool_choice(true, true, false),
+            Some(ChatCompletionToolChoiceOption::Required)
+        ));
+        assert!(
+            force_tool_choice(false, true, false).is_none(),
+            "no schema → no force"
+        );
+        assert!(
+            force_tool_choice(true, false, false).is_none(),
+            "no tools → no force"
+        );
+        assert!(
+            force_tool_choice(true, true, true).is_none(),
+            "native tools disabled → no force"
+        );
+    }
+
     use super::{
         DEFAULT_FINALIZE_WINDOW, FailureDumpParams, StructuredBatchEvaluationResponse,
         StructuredProposalResponse, apply_tool_output_cap, empty_terminal_tool_content,
