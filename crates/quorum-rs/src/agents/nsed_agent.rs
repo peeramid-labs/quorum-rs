@@ -1441,7 +1441,6 @@ impl ChatCapable for ProposerEvaluatorAgent {
 
 // ... helpers (react_loop, generate_structured_output) ...
 
-#[allow(clippy::too_many_arguments)]
 /// `tool_choice` for a request: force a tool call (`required`) only when a
 /// middleware declared a proposal schema AND native tools are actually available.
 fn force_tool_choice(
@@ -1458,6 +1457,7 @@ fn force_tool_choice(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn generate_structured_output<T>(
     llm_client: &dyn AiModel,
     agent_config: &AgentConfig,
