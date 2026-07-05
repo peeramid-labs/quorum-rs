@@ -58,6 +58,27 @@ fn read_nonempty(path: &Path) -> Option<String> {
     }
 }
 
+/// Orchestrator HTTP endpoint for fallback resolution: `$QUORUM_ORCHESTRATOR`
+/// wins, else the address `quorum redeem` persisted at `~/.nsed/orchestrator`.
+/// `None` when neither is set. Lets a config-file orchestrator entry omit
+/// `address` and inherit the redeemed endpoint.
+pub fn nsed_endpoint() -> Option<String> {
+    if let Ok(v) = std::env::var(ENDPOINT_ENV) {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    read_nonempty(&nsed_dir()?.join(ENDPOINT_FILE))
+}
+
+/// Operator bearer `quorum redeem` persisted at `~/.nsed/operator.token`.
+/// `None` when the file is absent or empty. Lets a config-file orchestrator
+/// entry omit `token` and inherit the redeemed operator bearer.
+pub fn nsed_operator_token() -> Option<String> {
+    read_nonempty(&nsed_dir()?.join(TOKEN_FILE))
+}
+
 /// Build a synthetic single-orchestrator workspace from the redeemed
 /// endpoint + token, for the config-free client.
 ///
@@ -322,6 +343,47 @@ mod tests {
         assert_eq!(ws.orchestrators.len(), 1);
         assert!(ws.orchestrators.contains_key("default"));
         assert!(ws.policies.is_empty() && ws.rooms.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn nsed_endpoint_env_wins_over_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_nsed(tmp.path(), "http://home-orch", "tok");
+        let got = with_home(tmp.path(), Some("http://env-orch"), nsed_endpoint);
+        assert_eq!(got.as_deref(), Some("http://env-orch"));
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn nsed_endpoint_reads_persisted_file_when_env_unset() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_nsed(tmp.path(), "http://home-orch", "tok");
+        let got = with_home(tmp.path(), None, nsed_endpoint);
+        assert_eq!(got.as_deref(), Some("http://home-orch"));
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn nsed_endpoint_none_when_nothing_redeemed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(with_home(tmp.path(), None, nsed_endpoint).is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn nsed_operator_token_reads_persisted_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_nsed(tmp.path(), "http://home-orch", "home-bearer");
+        let got = with_home(tmp.path(), None, nsed_operator_token);
+        assert_eq!(got.as_deref(), Some("home-bearer"));
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn nsed_operator_token_none_when_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(with_home(tmp.path(), None, nsed_operator_token).is_none());
     }
 
     #[test]
