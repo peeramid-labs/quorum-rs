@@ -284,8 +284,33 @@ things rooms do not do:
    milestone that turns the `op:` tag convention into NATS *account* isolation
    (#234) is what makes the room a broker-enforced boundary. Until then, treat
    room visibility as *access control for the API*, and defence-in-depth rather
-   than the sole wall. See [tenancy](tenancy.md#relationship-to-234--nats-account-multi-tenancy)
-   for how the two layers compose.
+   than the sole wall. (The orchestrator's own tenancy docs cover how the
+   app-layer and broker-layer fences compose.)
+
+---
+
+## Where this is heading
+
+Two evolutions are worth flagging so today's model isn't mistaken for the end
+state:
+
+- **Client side: the room disappears behind a *session*.** The interactive
+  client (TUI) is moving to a Claude-Code-style chat: a stable session id you
+  store and resume, with the **policy chosen as if it were a model** and
+  swappable mid-conversation. In that framing *policy is the model* and *session
+  is the thread*; the room becomes an auto-minted, hidden implementation detail
+  rather than something a user picks first. The client owns the transcript
+  (standard Chat Completions semantics), so restore does not depend on the
+  server's history retention. See [Policy-as-model and the chat
+  session](policy-as-model-and-sessions.md).
+- **Server side: the room grows toward a *channel*.** Public rooms already let
+  others watch a deliberation; the direction is reply-style follow-ups and
+  agent tools that can *query or reference a channel's prior deliberations*.
+  That is a larger, separate design effort — noted here only so the "channel"
+  intuition has a home.
+
+Neither changes what a room *is* today (a job-scope + access boundary); they
+change how much of it a user has to see.
 
 ---
 
