@@ -120,27 +120,17 @@ async fn run_registration_selfcheck(orch: &RemoteOrchestrator, agent_ids: &[Stri
 }
 
 /// Best-effort build of an HTTP orchestrator client from the workspace +
-/// room, for the post-boot self-check. Returns `None` (logging at debug)
-/// whenever the orchestrator isn't a reachable remote — embedded mode, a
-/// `--nats-url` run with no workspace, or any missing field. The
-/// self-check is a diagnostic, never a hard dependency.
+/// room, for the post-boot self-check. Shares [`resolve_remote_orchestrator`],
+/// so it inherits the same `~/.nsed` address/token fallback. Returns `None`
+/// when the orchestrator isn't a reachable remote — embedded mode, a
+/// `--nats-url` run with no workspace, or no address/token resolvable from
+/// config or `~/.nsed`. The self-check is a diagnostic, never a hard dependency.
 fn try_build_orchestrator_client(
     workspace_path: &Path,
     room_flag: Option<&str>,
 ) -> Option<RemoteOrchestrator> {
-    let workspace = QuorumConfig::load_workspace(workspace_path).ok()?;
-    let (_room_name, room) = workspace.resolve_room(room_flag).ok()?;
-    let orch_name = room.orchestrator.as_deref()?;
-    let orch = workspace.orchestrators.get(orch_name)?;
-    match orch.mode.as_ref() {
-        Some(OrchestratorMode::Remote) | None => {
-            let address = orch.address.as_deref()?;
-            let token_raw = orch.token.as_deref()?;
-            let token = crate::config::resolve_env_token("token", token_raw);
-            RemoteOrchestrator::new(address, &token).ok()
-        }
-        Some(OrchestratorMode::Embedded) => None,
-    }
+    let (address, token) = resolve_remote_orchestrator(workspace_path, room_flag)?;
+    RemoteOrchestrator::new(&address, &token).ok()
 }
 
 /// Resolve `(orchestrator HTTP url, operator bearer token)` from the workspace
@@ -158,11 +148,29 @@ pub(crate) fn resolve_remote_orchestrator(
     let orch = workspace.orchestrators.get(orch_name)?;
     match orch.mode.as_ref() {
         Some(OrchestratorMode::Remote) | None => {
-            let address = orch.address.as_deref()?.to_string();
-            let token = crate::config::resolve_env_token("token", orch.token.as_deref()?);
+            let address =
+                nonblank(orch.address.as_deref()).or_else(crate::cli::endpoint::nsed_endpoint)?;
+            let token = orch
+                .token
+                .as_deref()
+                .map(|raw| crate::config::resolve_env_token("token", raw))
+                .and_then(|resolved| nonblank(Some(&resolved)))
+                .or_else(crate::cli::endpoint::nsed_operator_token)?;
             Some((address, token))
         }
         Some(OrchestratorMode::Embedded) => None,
+    }
+}
+
+/// Trim `s`, returning an owned copy only when non-empty. Blank/missing config
+/// fields (`address: ""`, absent `token:`) collapse to `None` so remote
+/// resolution can fall back to the redeemed `~/.nsed` endpoint/token.
+fn nonblank(s: Option<&str>) -> Option<String> {
+    let trimmed = s?.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -616,7 +624,7 @@ mod tests {
     /// returns None — runner connects unauthenticated, which is
     /// fine for a local dev NATS without an account JWT.
     #[test]
-    #[serial_test::serial(home)]
+    #[serial_test::serial(home_env)]
     fn resolve_nats_auth_returns_none_when_no_creds_anywhere() {
         let tmp = TempDir::new().unwrap();
         let prev_home = std::env::var_os("HOME");
@@ -786,6 +794,114 @@ default_room: main
         .unwrap();
         // Loads cleanly; None specifically because the orchestrator is embedded.
         assert!(resolve_remote_orchestrator(&ws_path, None).is_none());
+    }
+
+    /// Blank `address` + absent `token` → both inherited from the redeemed
+    /// `~/.nsed/{orchestrator,operator.token}`, so a config file need only
+    /// name the orchestrator to reach it.
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn resolve_remote_orchestrator_blank_fields_fall_back_to_nsed() {
+        let home = TempDir::new().unwrap();
+        let nsed = home.path().join(".nsed");
+        std::fs::create_dir_all(&nsed).unwrap();
+        std::fs::write(nsed.join("orchestrator"), "https://home-orch\n").unwrap();
+        std::fs::write(nsed.join("operator.token"), "home-bearer\n").unwrap();
+
+        let ws = TempDir::new().unwrap();
+        let ws_path = ws.path().join("nsed.yaml");
+        std::fs::write(
+            &ws_path,
+            r#"
+orchestrators:
+  prod:
+    mode: remote
+    address: ""
+policies:
+  default:
+    agents: [a, b]
+rooms:
+  main:
+    policy: default
+    orchestrator: prod
+default_room: main
+"#,
+        )
+        .unwrap();
+
+        let prev_home = std::env::var_os("HOME");
+        let prev_env = std::env::var_os("QUORUM_ORCHESTRATOR");
+        // SAFETY: serialised via `#[serial(home)]`.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::remove_var("QUORUM_ORCHESTRATOR");
+        }
+        let resolved = resolve_remote_orchestrator(&ws_path, None);
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_env {
+                Some(v) => std::env::set_var("QUORUM_ORCHESTRATOR", v),
+                None => std::env::remove_var("QUORUM_ORCHESTRATOR"),
+            }
+        }
+        assert_eq!(
+            resolved,
+            Some(("https://home-orch".into(), "home-bearer".into()))
+        );
+    }
+
+    /// An `${UNSET}` token reference resolving to empty also falls back to the
+    /// redeemed operator token, while a literal `address` still wins.
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn resolve_remote_orchestrator_unset_env_token_falls_back_to_nsed() {
+        let home = TempDir::new().unwrap();
+        let nsed = home.path().join(".nsed");
+        std::fs::create_dir_all(&nsed).unwrap();
+        std::fs::write(nsed.join("operator.token"), "home-bearer\n").unwrap();
+
+        let ws = TempDir::new().unwrap();
+        let ws_path = ws.path().join("nsed.yaml");
+        std::fs::write(
+            &ws_path,
+            r#"
+orchestrators:
+  prod:
+    mode: remote
+    address: "https://cfg-orch"
+    token: "${QUORUM_TEST_TOKEN_UNSET_XYZ}"
+policies:
+  default:
+    agents: [a, b]
+rooms:
+  main:
+    policy: default
+    orchestrator: prod
+default_room: main
+"#,
+        )
+        .unwrap();
+
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: serialised via `#[serial(home)]`.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::remove_var("QUORUM_TEST_TOKEN_UNSET_XYZ");
+        }
+        let resolved = resolve_remote_orchestrator(&ws_path, None);
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert_eq!(
+            resolved,
+            Some(("https://cfg-orch".into(), "home-bearer".into()))
+        );
     }
 
     #[test]

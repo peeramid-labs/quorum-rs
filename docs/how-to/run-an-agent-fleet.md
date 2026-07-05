@@ -86,10 +86,25 @@ agents off a chat-only invite. Ask the admin for a unified code
 > the `manage_agents` role + a display name). `quorum init --invite`
 > scaffolds `token: "file:~/.nsed/operator.token"` on the
 > orchestrator entry for you. An env-var ref (`token:
-> "${OPERATOR_TOKEN}"`) works too for CI/devops. A missing/blank
-> bearer → registration 403s → agents
-> heartbeat **unattributed** and the orchestrator **drops** them. `serve`
-> logs a loud `ERROR` when this happens.
+> "${OPERATOR_TOKEN}"`) works too for CI/devops.
+>
+> **You can also omit `address` and `token` entirely** (or set them
+> blank). A remote orchestrator entry with either field missing/blank
+> inherits it from the redeemed `~/.nsed/` files — `address` from
+> `$QUORUM_ORCHESTRATOR` then `~/.nsed/orchestrator`, `token` from
+> `~/.nsed/operator.token` — so after `quorum redeem` a config need only
+> name the orchestrator:
+>
+> ```yaml
+> orchestrators:
+>   remote:
+>     mode: remote   # address + token inherited from ~/.nsed
+> ```
+>
+> If nothing resolves (no config value, nothing redeemed), the bearer is
+> blank → registration 403s → agents heartbeat **unattributed** and the
+> orchestrator **drops** them. `serve` logs a loud `ERROR` when this
+> happens (see the self-check table below).
 
 ## Step 2 — scaffold `quorum.yml`
 
