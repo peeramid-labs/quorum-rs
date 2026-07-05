@@ -6,6 +6,7 @@ Read these away from the keyboard when you want to understand a design decision 
 
 | Article | Topic |
 |---|---|
+| [Understanding rooms and policies](rooms-and-policies.md) | Why a room (where a job lives + who can watch) and a policy (who deliberates + how) are separate, and the public/private visibility rules that bite. |
 | [Agent internals](agent-internals.md) | Library API surface + ReAct loop architecture inside `quorum-rs`. |
 | [About the provider registry](provider-registry.md) | Why `provider.type` dispatch is a registry of factories, and how a third-party crate adds a provider without forking the SDK. |
 | [Agent ranking](agent-ranking.md) | Capability declaration + how agents earn rank through deliberation outcomes. |
