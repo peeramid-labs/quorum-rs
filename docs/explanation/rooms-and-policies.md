@@ -111,7 +111,7 @@ What a room does **not** do is thread successive submissions into one
 does not automatically feed the previous answer back in as context. If you want
 the second question to build on the first, that continuity is the client's job —
 pass the prior context into the next query. A room shares a recipe and a
-visibility boundary across the jobs that pass through it; it is not a chat thread
+visibility boundary across the jobs that pass through it; it is not a conversation thread
 that auto-remembers across turns.
 
 ### 2. The tenancy room (orchestrator side, `RoomConfig`)
@@ -271,7 +271,7 @@ Public widens the audience, not the authority.
 Two failure modes worth calling out, because they send people to rooms for
 things rooms do not do:
 
-1. **Conversation memory.** A room is not a chat thread. Each deliberation's
+1. **Conversation memory.** A room is not a conversation thread. Each deliberation's
    transcript *is* stored (in NATS, visibility-gated — see above), but the room
    does not thread successive `nsed run` invocations into one conversation: the
    next job does not automatically get the previous answer as context. If you
@@ -294,15 +294,16 @@ things rooms do not do:
 Two evolutions are worth flagging so today's model isn't mistaken for the end
 state:
 
-- **Client side: the room disappears behind a *session*.** The interactive
-  client (TUI) is moving to a Claude-Code-style chat: a stable session id you
+- **Client side: the room disappears behind a *thread*.** The interactive
+  client (TUI) is moving to a Claude-Code-style thread: a stable thread id you
   store and resume, with the **policy chosen as if it were a model** and
-  swappable mid-conversation. In that framing *policy is the model* and *session
-  is the thread*; the room becomes an auto-minted, hidden implementation detail
-  rather than something a user picks first. The client owns the transcript
-  (standard Chat Completions semantics), so restore does not depend on the
-  server's history retention. See [Policy-as-model and the chat
-  session](policy-as-model-and-sessions.md).
+  swappable mid-thread. In that framing *policy is the model* and *a thread is
+  the conversation*; the room becomes an auto-minted, hidden implementation
+  detail rather than something a user picks first. The client owns the
+  transcript (standard Chat Completions semantics), so restore does not depend
+  on the server's history retention. The product is positioned as AI email, not
+  chat — so the user-facing name is always *thread*, never "chat". See
+  [Policy-as-model and the thread](policy-as-model-and-threads.md).
 - **Server side: the room grows toward a *channel*.** Public rooms already let
   others watch a deliberation; the direction is reply-style follow-ups and
   agent tools that can *query or reference a channel's prior deliberations*.
@@ -333,7 +334,7 @@ table's visibility deliberately, and when unsure, keep the door private.
 ## See also
 
 - [Glossary](../reference/glossary.md) — one-line definitions of room, policy,
-  job, session, effort, and the surrounding vocabulary.
+  job, thread, effort, and the surrounding vocabulary.
 - [Run an agent fleet](../how-to/run-an-agent-fleet.md) — the `orchestrators` /
   `rooms` / `policies` blocks in `quorum.yml`, in practice.
 - [NATS topology](nats-topology.md) — the subjects and JetStream KV buckets
