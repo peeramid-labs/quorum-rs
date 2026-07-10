@@ -990,11 +990,14 @@ rooms:
         );
     }
 
+    /// Remote orchestrators may omit `address` — `quorum serve` inherits it
+    /// from `$QUORUM_ORCHESTRATOR` / `~/.nsed/orchestrator` at resolution time,
+    /// so validation must not reject the config.
     #[test]
-    fn remote_orchestrator_missing_address() {
+    fn remote_orchestrator_missing_address_is_valid() {
         let mut config = valid_static_config();
         config.orchestrators.insert(
-            "bad_remote".to_string(),
+            "redeem_remote".to_string(),
             OrchestratorConfig {
                 mode: Some(OrchestratorMode::Remote),
                 address: None,
@@ -1003,18 +1006,15 @@ rooms:
                 config_file: None,
             },
         );
-        let err = config.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("address"),
-            "error should mention missing address: {err}"
-        );
+        assert!(config.validate().is_ok());
     }
 
+    /// Likewise `token` — inherited from `~/.nsed/operator.token`.
     #[test]
-    fn remote_orchestrator_missing_token() {
+    fn remote_orchestrator_missing_token_is_valid() {
         let mut config = valid_static_config();
         config.orchestrators.insert(
-            "bad_remote".to_string(),
+            "redeem_remote".to_string(),
             OrchestratorConfig {
                 mode: Some(OrchestratorMode::Remote),
                 address: Some("https://example.com".to_string()),
@@ -1023,11 +1023,7 @@ rooms:
                 config_file: None,
             },
         );
-        let err = config.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("token"),
-            "error should mention missing token: {err}"
-        );
+        assert!(config.validate().is_ok());
     }
 
     #[test]

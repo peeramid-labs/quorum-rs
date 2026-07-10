@@ -345,12 +345,6 @@ pub enum ConfigError {
     #[error("no rooms defined")]
     NoRooms,
 
-    #[error("orchestrator '{name}': remote mode requires an address")]
-    RemoteMissingAddress { name: String },
-
-    #[error("orchestrator '{name}': remote mode requires a token")]
-    RemoteMissingToken { name: String },
-
     #[error("policy '{policy}': agents and roles are mutually exclusive")]
     AgentsAndRolesExclusive { policy: String },
 
@@ -666,17 +660,11 @@ impl WorkspaceConfig {
             }
         }
 
-        // Validate orchestrators
-        for (name, orch) in &self.orchestrators {
-            if orch.mode == Some(OrchestratorMode::Remote) {
-                if orch.address.is_none() {
-                    return Err(ConfigError::RemoteMissingAddress { name: name.clone() });
-                }
-                if orch.token.is_none() {
-                    return Err(ConfigError::RemoteMissingToken { name: name.clone() });
-                }
-            }
-        }
+        // Remote orchestrators may omit `address`/`token`: `quorum serve`
+        // falls back to the redeemed `~/.nsed/{orchestrator,operator.token}`
+        // (and `$QUORUM_ORCHESTRATOR`) at resolution time, and the post-boot
+        // registration self-check loudly flags any agent left unattributed.
+        // So a config file need only name the orchestrator to reach it.
 
         // Validate policies
         for (policy_name, policy) in &self.policies {
