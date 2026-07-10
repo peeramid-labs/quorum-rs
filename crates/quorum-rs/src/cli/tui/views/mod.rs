@@ -7,6 +7,8 @@ pub mod policies;
 pub mod rooms;
 pub mod settings;
 pub mod settings_menu;
+pub mod thread;
+pub mod thread_list;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -39,6 +41,18 @@ pub enum ViewAction {
         /// Set from the main-menu launcher when the operator types a
         /// custom threshold before submitting.
         effort_override: Option<f32>,
+        /// Id of the thread this launch belongs to, when submitted from a
+        /// thread view. The loop records the deliberation's reply back into
+        /// this thread on completion. `None` for one-shot launches.
+        thread_id: Option<String>,
+        /// Per-branch session key (the replied-to branch's `branch_id`). Keys
+        /// the claude session so a linear branch resumes and a fork gets a fresh
+        /// session. `None` falls back to the room id (one-shot / non-thread).
+        conversation_id: Option<String>,
+        /// The new turn only (this send's message). Sent so a resumed session's
+        /// delta prompt carries just this, not the whole flattened `task`. `None`
+        /// for the first turn (fresh — needs the full task).
+        new_turn: Option<String>,
     },
     /// Apply a config mutation to nsed.yaml.
     WriteConfig(ConfigMutation),
@@ -50,6 +64,13 @@ pub enum ViewAction {
     },
     /// Show a transient status message.
     SetStatus(String, StatusLevel),
+    /// Open the deliberation detail for a thread's in-flight job (user-driven,
+    /// via `Ctrl-D` in the thread view). The loop resolves the thread's active
+    /// `job_id` and pushes the detail view, or reports none is running.
+    OpenThreadJob {
+        thread_id: String,
+        orchestrator: String,
+    },
 }
 
 /// Async data fetch requests dispatched to the `TuiClient`.
@@ -84,6 +105,36 @@ pub enum FetchRequest {
     StartSseStream {
         orchestrator: String,
         job_id: String,
+    },
+    /// Reconcile a reopened thread's pending job — fetch its result and append
+    /// the reply if the deliberation has finished (recovers replies that landed
+    /// while the TUI was closed).
+    ReconcileThread {
+        orchestrator: String,
+        job_id: String,
+        thread_id: String,
+    },
+    /// Cancel (kill) a thread's running deliberation (Ctrl-C). Aborts it with no
+    /// result and clears the thread's pending marker so a follow-up can continue.
+    CancelJob {
+        orchestrator: String,
+        job_id: String,
+        thread_id: String,
+    },
+    /// Answer an agent's pending `ask_user` question — POST the result so the
+    /// blocked agent resumes.
+    RespondToolCall {
+        orchestrator: String,
+        job_id: String,
+        call_id: String,
+        result: String,
+    },
+    /// Fetch a job's pending `ask_user` questions (GET). Recovers a question that
+    /// fired while the thread view wasn't focused — surfaced on reopen.
+    PendingToolCalls {
+        orchestrator: String,
+        job_id: String,
+        thread_id: String,
     },
 }
 
@@ -133,5 +184,17 @@ pub trait View {
     /// top-level tab switching. Defaults to `false`.
     fn captures_input(&self) -> bool {
         false
+    }
+
+    /// The model (policy) this view is currently acting under, shown in the
+    /// footer. `None` lets the footer fall back to the app-wide default.
+    fn active_model(&self) -> Option<&str> {
+        None
+    }
+
+    /// The effort (convergence threshold) this view is acting under, shown in
+    /// the footer. `None` lets the footer fall back to the app-wide default.
+    fn active_effort(&self) -> Option<f32> {
+        None
     }
 }

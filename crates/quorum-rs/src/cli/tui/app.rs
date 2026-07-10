@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::cli::workspace::WorkspaceConfig;
@@ -14,6 +15,13 @@ pub enum ViewId {
     Rooms,
     Orchestrators,
     Settings,
+    /// List of stored threads (the "Threads" tab landing view).
+    Threads,
+    /// One email-style thread. `id` selects a stored thread; `None` opens a
+    /// fresh one.
+    Thread {
+        id: Option<String>,
+    },
     JobDetail {
         job_id: String,
         orchestrator: String,
@@ -28,6 +36,21 @@ pub struct App {
     pub should_quit: bool,
     pub status_message: Option<(String, super::views::StatusLevel)>,
     pub active_tab: usize,
+    /// Thread id of a launch awaiting its `JobSubmitted` (which carries the
+    /// job id). Promoted into [`Self::job_thread`] once the job id is known.
+    /// A launch failure (no `JobSubmitted`) clears it.
+    pub pending_thread_launch: Option<String>,
+    /// Maps an in-flight deliberation's `job_id` → the thread that launched it,
+    /// so a completion is attributed to the *correct* thread (never to whichever
+    /// job merely finishes first). Entry removed when the job reaches a terminal
+    /// state.
+    pub job_thread: HashMap<String, String>,
+    /// The policy currently acting as the "model" for new threads — shown in
+    /// the footer and applied when composing. Defaults from the workspace.
+    pub active_model: Option<String>,
+    /// Effort (convergence threshold) override shown in the footer. `None` uses
+    /// the policy's own default.
+    pub active_effort: Option<f32>,
 }
 
 impl App {
@@ -36,10 +59,15 @@ impl App {
         Self {
             config,
             config_path,
-            view_stack: vec![ViewId::MainMenu],
+            // Land in the inbox (threads), the email-client front door.
+            view_stack: vec![ViewId::Threads],
             should_quit: false,
             status_message: None,
             active_tab: 0,
+            pending_thread_launch: None,
+            job_thread: HashMap::new(),
+            active_model: None,
+            active_effort: None,
         }
     }
 
@@ -91,9 +119,9 @@ mod tests {
     }
 
     #[test]
-    fn new_starts_at_main_menu() {
+    fn new_starts_at_inbox() {
         let app = App::new(minimal_config(), PathBuf::from("nsed.yaml"));
-        assert_eq!(app.current_view(), Some(&ViewId::MainMenu));
+        assert_eq!(app.current_view(), Some(&ViewId::Threads));
         assert!(!app.should_quit);
         assert!(app.status_message.is_none());
     }
@@ -110,8 +138,8 @@ mod tests {
         assert!(app.pop_view()); // Agents → Policies
         assert_eq!(app.current_view(), Some(&ViewId::Policies));
 
-        assert!(app.pop_view()); // Policies → MainMenu
-        assert_eq!(app.current_view(), Some(&ViewId::MainMenu));
+        assert!(app.pop_view()); // Policies → Threads (root)
+        assert_eq!(app.current_view(), Some(&ViewId::Threads));
     }
 
     #[test]
@@ -119,7 +147,7 @@ mod tests {
         let mut app = App::new(minimal_config(), PathBuf::from("nsed.yaml"));
         assert!(!app.pop_view());
         // Stack unchanged
-        assert_eq!(app.current_view(), Some(&ViewId::MainMenu));
+        assert_eq!(app.current_view(), Some(&ViewId::Threads));
     }
 
     #[test]

@@ -514,6 +514,9 @@ impl MainMenuView {
                         room: Some(room.id.clone()),
                         policy: Some(policy),
                         effort_override,
+                        thread_id: None,
+                        conversation_id: None,
+                        new_turn: None,
                     })
                 }
                 // Local room: submit via the orchestrator pinned in nsed.yaml.
@@ -534,6 +537,9 @@ impl MainMenuView {
                         room: Some(room_name.clone()),
                         policy: None,
                         effort_override,
+                        thread_id: None,
+                        conversation_id: None,
+                        new_turn: None,
                     })
                 }
                 None => Some(ViewAction::SetStatus(
@@ -797,6 +803,9 @@ mod tests {
                 room: Some("local".into()),
                 policy: None,
                 effort_override: Some(0.7),
+                thread_id: None,
+                conversation_id: None,
+                new_turn: None,
             })
         );
         assert!(!view.task_input_active);
@@ -1043,6 +1052,9 @@ mod tests {
                 room: Some("alpha".into()),
                 policy: Some("review".into()),
                 effort_override: Some(0.7),
+                thread_id: None,
+                conversation_id: None,
+                new_turn: None,
             })
         );
     }
