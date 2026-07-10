@@ -855,7 +855,7 @@ impl ClaudeAgent {
         // drift (CR PR #349 nitpick).
         {
             let claude_session =
-                Self::claude_session_uuid_for(&self.name, ctx.session_id.as_deref());
+                Self::claude_session_uuid_for(&self.name, ctx.claude_session_key());
 
             // Note: persistence of the (session_id, agent, uuid) mapping is
             // done by the caller (`run_phase`) to keep `build_command` pure
@@ -1441,14 +1441,10 @@ impl ClaudeAgent {
     }
 
     /// Returns `true` when claude-cli refused to start because the
-    /// `session-env/<uuid>/` lock dir already exists. The pre-spawn
-    /// sweep in `run_phase` clears orphans, but a race with a still-
-    /// dying sibling claude-cli can re-create the dir between sweep
-    /// and spawn. Detection here is exposed for the on-error retry
-    /// path planned in the broader durability work (issue T-claude-
-    /// session-recovery); the test below pins the matching rule so
-    /// the wire-in patch can land without regressing detection.
-    #[allow(dead_code)]
+    /// `session-env/<uuid>/` lock dir already exists. This happens when a
+    /// prior attempt's claude-cli child (this process's own child, killed
+    /// mid-call by a quota/rate limit) left a non-empty lock dir that the
+    /// empty-only pre-spawn sweep can't reap. The retry path force-clears it.
     fn is_session_already_in_use(stderr: &str) -> bool {
         let lower = stderr.to_lowercase();
         lower.contains("session id") && lower.contains("already in use")
@@ -1946,7 +1942,7 @@ impl ClaudeAgent {
         // the on-disk transcript for legacy jobs without `session_id`
         // (CR finding on PR #349).
         let claude_session_uuid: String =
-            Self::claude_session_uuid_for(&self.name, ctx.session_id.as_deref());
+            Self::claude_session_uuid_for(&self.name, ctx.claude_session_key());
 
         // Pre-spawn sweep: clear orphaned `session-env/<uuid>/` lock
         // dirs left behind by a SIGKILL'd claude-cli (parent agent
@@ -2013,6 +2009,7 @@ impl ClaudeAgent {
             }
             Err((err, stderr, exit_code, kind_override)) => {
                 let is_session_not_found = Self::is_session_not_found(&stderr, exit_code);
+                let is_already_in_use = Self::is_session_already_in_use(&stderr);
                 let retry_kind = Self::classify_failure_for_retry(
                     &err,
                     &stderr,
@@ -2020,32 +2017,34 @@ impl ClaudeAgent {
                     kind_override.as_ref(),
                 );
 
-                // Retry on either a session-not-found (clean restart
-                // — claude couldn't find the resumed session at all)
-                // OR any classified retry-eligible failure (currently
-                // MissingTerminalCall / Timeout — issue #347 Option 2
-                // feedback-block guides the next attempt). Other
-                // failure modes (non-zero exit with stderr) bubble up.
-                if !is_session_not_found && retry_kind.is_none() {
+                // Retry on a session-not-found (clean restart — claude
+                // couldn't find the resumed session at all), an
+                // already-in-use collision (our own prior child, killed
+                // mid-call by a quota/rate limit, left a non-empty lock
+                // the empty-only pre-spawn sweep couldn't reap), OR any
+                // classified retry-eligible failure (MissingTerminalCall
+                // / Timeout — issue #347 Option 2). Other failure modes
+                // (non-zero exit with stderr) bubble up.
+                if !is_session_not_found && !is_already_in_use && retry_kind.is_none() {
                     server_ct.cancel();
                     return Err(err);
                 }
 
-                if is_session_not_found {
+                // A fresh-session retry needs a clean lock dir. Our own
+                // attempt-1 child has already exited (we hold its exit
+                // code), so its `session-env/<uuid>/` is orphaned by a
+                // dead process — force-clear it even if non-empty. This
+                // is the fix for the quota-kills-resume → non-empty
+                // orphan → fresh spawn "already in use" hard-fail cascade.
+                let restart_fresh = is_session_not_found || is_already_in_use;
+                if restart_fresh {
                     tracing::info!(
                         agent = %self.name,
                         phase = %phase,
-                        "Session not found, creating fresh persistent session"
+                        already_in_use = is_already_in_use,
+                        "Restarting claude with a fresh persistent session"
                     );
-                    // Sweep before the fresh-session retry. claude-cli
-                    // sometimes creates `session-env/<uuid>/` during a
-                    // failed `--resume` attempt and exits without
-                    // cleanup; the next `--session-id <uuid>` spawn
-                    // would then collide with "Session ID is already
-                    // in use" (incident 2026-05-09 R1 propose: 4 opus
-                    // agents collided here). Empty-dir-only — live
-                    // dirs untouched. See issue #402.
-                    super::claude_recovery::sweep_orphan_session_env_lock(&claude_session_uuid);
+                    super::claude_recovery::force_clear_session_env_lock(&claude_session_uuid);
                 } else {
                     tracing::warn!(
                         agent = %self.name,
@@ -2083,12 +2082,13 @@ impl ClaudeAgent {
                     }
                 };
 
-                // For session-not-found we want a fresh-session
+                // For a fresh restart (session-not-found or an
+                // already-in-use collision) we want a fresh-session
                 // command (build_command_inner with `resumed=false`).
                 // For retry-eligible failures we want to RESUME the
                 // same session (so context isn't lost) but with the
                 // feedback block appended to the system prompt.
-                let (next_command, _next_sandbox) = if is_session_not_found {
+                let (next_command, _next_sandbox) = if restart_fresh {
                     self.build_command_inner(ctx, mcp_config_file2.path(), false)
                 } else {
                     self.build_command(ctx, mcp_config_file2.path())
@@ -2107,11 +2107,7 @@ impl ClaudeAgent {
                 // Pick the prompt that matches the command shape:
                 // resumed sessions take the delta prompt, fresh
                 // sessions take the full one (mirrors attempt 1).
-                let next_prompt = if is_session_not_found {
-                    full_prompt
-                } else {
-                    prompt
-                };
+                let next_prompt = if restart_fresh { full_prompt } else { prompt };
 
                 let attempt_result = self
                     .execute_phase_attempt(
@@ -2344,9 +2340,13 @@ fn extract_evaluate_args(
 #[async_trait]
 impl NsedAgent for ClaudeAgent {
     async fn propose(&self, context: &AgentContext) -> Result<Proposal> {
-        // Delta prompt for resumed sessions (omits task + general instructions)
+        // Delta prompt for resumed sessions (omits task + general instructions).
+        // On a resumed thread turn the prior turns already live in the session, so
+        // the round-1 fallback carries only `new_turn` — not the whole flattened
+        // history. Fresh sessions use the full prompt below.
+        let delta_task = context.delta_task();
         let prompt = self.prompt_set.get_proposer_delta_prompt(
-            &context.task_description,
+            delta_task,
             context.previous_round_matrix.clone(),
             context.previous_own_proposal.as_ref(),
             context.previous_own_score,
@@ -2386,9 +2386,11 @@ impl NsedAgent for ClaudeAgent {
     }
 
     async fn evaluate(&self, context: &AgentContext) -> Result<Vec<(String, Evaluation)>> {
-        // Delta prompt for resumed sessions
+        // Delta prompt for resumed sessions — carries only `new_turn` on the
+        // round-1 fallback (the flattened history is already in the session).
+        let delta_task = context.delta_task();
         let prompt = self.prompt_set.get_evaluator_delta_prompt(
-            &context.task_description,
+            delta_task,
             &context.candidates,
             context.previous_own_proposal.as_ref(),
             context.round_number as usize,

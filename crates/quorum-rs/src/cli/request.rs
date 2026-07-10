@@ -14,6 +14,11 @@ fn rand_u64() -> u64 {
 #[derive(Debug, Serialize)]
 pub struct DeliberationRequest {
     pub room_id: String,
+    /// Stable conversation key (the thread id) shared across a thread's turns —
+    /// the `room_id` above carries a per-run nonce, so this is what lets the
+    /// agents resume the same claude session turn to turn. `None` for ad-hoc runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
     pub user_query: String,
     pub deliberation_rounds: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -26,6 +31,49 @@ pub struct DeliberationRequest {
     pub scope: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
+    /// Human-in-the-loop tools offered to the agents. The TUI ships `ask_user`
+    /// so an agent can ask the operator a clarifying question mid-deliberation
+    /// (and the TUI surfaces it + posts the answer back).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_tools: Option<Vec<crate::agents::UserToolDefinition>>,
+    /// The new turn only (this send's message). Sent so a resumed thread session's
+    /// delta prompt carries just this instead of the whole flattened `user_query`
+    /// (which the session already holds). `None` for the first turn / non-thread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_turn: Option<String>,
+}
+
+/// The `ask_user` HITL tool: an agent asks the operator a clarifying question,
+/// optionally offering a short list of `options` for a quick choice (they may
+/// also answer freely). Request-response — the agent blocks on the answer (up to
+/// its finalization reserve).
+pub fn ask_user_tool() -> crate::agents::UserToolDefinition {
+    crate::agents::UserToolDefinition {
+        name: "ask_user".to_string(),
+        description: "Ask the human operator a clarifying question when you \
+             genuinely need their input to proceed — ambiguous requirements, a \
+             decision only they can make, or missing context. Optionally include \
+             a short `options` list for a quick choice; they may also answer \
+             freely. Use sparingly: only when their answer materially changes the \
+             result."
+            .to_string(),
+        parameters: Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "The question to ask the operator."
+                },
+                "options": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional short list of choices to offer."
+                }
+            },
+            "required": ["question"]
+        })),
+        strict: Some(false),
+    }
 }
 
 /// Build a `DeliberationRequest` from a raw policy_id hash (ad-hoc run).
@@ -39,6 +87,7 @@ pub fn build_request_raw_policy_id(policy_id: &str, task: &str) -> DeliberationR
 
     DeliberationRequest {
         room_id,
+        conversation_id: None,
         user_query: task.to_string(),
         deliberation_rounds: 3,
         agent_names: None,
@@ -46,6 +95,8 @@ pub fn build_request_raw_policy_id(policy_id: &str, task: &str) -> DeliberationR
         effort: None,
         scope: None,
         timeout_seconds: None,
+        user_tools: Some(vec![ask_user_tool()]),
+        new_turn: None,
     }
 }
 
@@ -91,6 +142,9 @@ pub fn build_request(
 
     Ok(DeliberationRequest {
         room_id,
+        // The pre-nonce room name is the stable thread key — carry it so every
+        // turn of the thread resumes the same claude session.
+        conversation_id: Some(room_name.to_string()),
         user_query: task.to_string(),
         deliberation_rounds: policy.max_rounds,
         agent_names,
@@ -98,6 +152,8 @@ pub fn build_request(
         effort: Some(policy.effort),
         scope: None,
         timeout_seconds,
+        user_tools: Some(vec![ask_user_tool()]),
+        new_turn: None,
     })
 }
 
@@ -138,6 +194,24 @@ mod tests {
             tags: None,
             mode: Default::default(),
         }
+    }
+
+    #[test]
+    fn requests_offer_the_ask_user_tool() {
+        let req = build_request("r", &static_policy(), "q").unwrap();
+        let tools = req.user_tools.expect("ships ask_user");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "ask_user");
+        // question required, options optional — expressed in the JSON schema.
+        let params = tools[0].parameters.as_ref().unwrap();
+        assert_eq!(params["required"][0], "question");
+        assert!(params["properties"]["options"].is_object());
+        // Ad-hoc requests carry it too.
+        assert!(
+            build_request_raw_policy_id("p", "q")
+                .user_tools
+                .is_some_and(|t| t[0].name == "ask_user")
+        );
     }
 
     #[test]

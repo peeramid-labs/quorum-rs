@@ -3,6 +3,7 @@ use std::process::ExitCode;
 
 use crate::cli::remote::{DiscoveredPolicy, JobOutcome, RemoteOrchestrator};
 use crate::cli::request::{DeliberationRequest, build_request, build_request_raw_policy_id};
+use crate::cli::thread::{Message, Thread, ThreadStore};
 use crate::cli::workspace::{OrchestratorConfig, OrchestratorMode, PolicyConfig, WorkspaceConfig};
 use crate::config::resolve_env_token;
 
@@ -18,6 +19,25 @@ struct ResolvedRun<'a> {
     role_policy: Option<(String, &'a PolicyConfig)>,
 }
 
+/// How `run` ties this invocation to a stored thread.
+pub enum ResumeMode {
+    /// Resume a specific thread by id; error if it does not exist.
+    ById(String),
+    /// Resume the most recent thread, or start a fresh one if none exist.
+    Latest,
+}
+
+/// A short thread subject from the first line of the task, truncated.
+fn thread_subject(task: &str) -> String {
+    let first = task.lines().next().unwrap_or("").trim();
+    let title: String = first.chars().take(50).collect();
+    if title.is_empty() {
+        "thread".to_string()
+    } else {
+        title
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     config_path: &Path,
@@ -28,6 +48,7 @@ pub async fn run(
     output_dir: Option<&Path>,
     output_file: Option<&Path>,
     force_output: bool,
+    resume: Option<ResumeMode>,
 ) -> ExitCode {
     if !files.is_empty() {
         eprintln!(
@@ -51,14 +72,41 @@ pub async fn run(
         }
     };
 
+    // Thread continuation: when resuming, load the thread, assemble the
+    // full conversation into the submitted query, and inherit the thread's
+    // policy when none was passed explicitly. `task` stays the raw user message
+    // (recorded as the user turn); `submit_task` is what the deliberation sees.
+    let store = ThreadStore::new();
+    let mut thread: Option<Thread> = match &resume {
+        Some(ResumeMode::ById(id)) => match store.load(id) {
+            Some(s) => Some(s),
+            None => {
+                eprintln!("error: no thread '{id}'");
+                return ExitCode::FAILURE;
+            }
+        },
+        Some(ResumeMode::Latest) => Some(
+            store
+                .latest()
+                .unwrap_or_else(|| Thread::new(thread_subject(task))),
+        ),
+        None => None,
+    };
+    let assembled = thread.as_ref().map(|s| s.to_deliberation_query(task));
+    let submit_task = assembled.as_deref().unwrap_or(task);
+    // Owned so it doesn't borrow `thread`, which is mutated after the result.
+    let effective_policy: Option<String> = policy_flag
+        .map(String::from)
+        .or_else(|| thread.as_ref().and_then(|s| s.active_policy.clone()));
+
     // Resolve policy + orchestrator depending on flags
-    let resolved = if let Some(policy_ref) = policy_flag {
-        match resolve_adhoc_run(&config, policy_ref, task, room_flag) {
+    let resolved = if let Some(policy_ref) = effective_policy.as_deref() {
+        match resolve_adhoc_run(&config, policy_ref, submit_task, room_flag) {
             Ok(result) => result,
             // Not a local policy name or hex id — try resolving it as a
             // remote policy label via the orchestrator's /policies catalog.
             Err(local_err) => {
-                match resolve_remote_policy(&config, policy_ref, task, room_flag).await {
+                match resolve_remote_policy(&config, policy_ref, submit_task, room_flag).await {
                     Ok(Some(result)) => {
                         eprintln!("Resolved remote policy '{policy_ref}'");
                         result
@@ -75,7 +123,7 @@ pub async fn run(
             }
         }
     } else {
-        match resolve_room_run(&config, room_flag, task) {
+        match resolve_room_run(&config, room_flag, submit_task) {
             Ok(result) => result,
             Err(msg) => {
                 eprintln!("error: {msg}");
@@ -158,7 +206,7 @@ pub async fn run(
                     "best_proposal_score": payload.best_proposal_score,
                 });
                 if let Err(e) =
-                    write_run_artifacts(dir, task, &payload.best_proposal_content, &dispatch)
+                    write_run_artifacts(dir, submit_task, &payload.best_proposal_content, &dispatch)
                 {
                     eprintln!("error: {e}");
                     return ExitCode::FAILURE;
@@ -177,6 +225,26 @@ pub async fn run(
             }
             if output_dir.is_none() && output_file.is_none() {
                 println!("{}", payload.best_proposal_content);
+            }
+            // Record this exchange into the thread and persist it, so the
+            // conversation can be resumed. `task` is the raw user message; the
+            // assistant turn carries the answer + which policy produced it.
+            if let Some(sess) = thread.as_mut() {
+                if effective_policy.is_some() {
+                    sess.active_policy = effective_policy.clone();
+                }
+                sess.push_message(Message::now("user", task));
+                let mut answer = Message::now("assistant", &payload.best_proposal_content);
+                answer.policy_id = effective_policy.clone();
+                answer.job_id = Some(job_id.clone());
+                sess.push_message(answer);
+                match store.save(sess) {
+                    Ok(()) => eprintln!(
+                        "Session saved: {} (resume with --resume {})",
+                        sess.id, sess.id
+                    ),
+                    Err(e) => eprintln!("warning: failed to save thread: {e}"),
+                }
             }
             ExitCode::SUCCESS
         }
@@ -490,6 +558,16 @@ mod tests {
     use crate::cli::workspace::{
         OrchestratorConfig, OrchestratorMode, PolicyConfig, RoleConfig, RoomConfig, WorkspaceConfig,
     };
+
+    #[test]
+    fn thread_subject_takes_first_line_truncated() {
+        assert_eq!(thread_subject("hello world"), "hello world");
+        assert_eq!(thread_subject("  spaced  \nsecond"), "spaced");
+        assert_eq!(thread_subject(""), "thread");
+        assert_eq!(thread_subject("\n\n"), "thread");
+        let long = "x".repeat(80);
+        assert_eq!(thread_subject(&long).chars().count(), 50);
+    }
 
     fn discovered(policy_id: &str, name: &str) -> DiscoveredPolicy {
         DiscoveredPolicy {

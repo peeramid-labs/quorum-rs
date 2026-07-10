@@ -270,6 +270,8 @@ impl JobDetailView {
                     self.status = JobStatus::Failed;
                 }
             }
+            // ask_user HITL is surfaced in the thread reader, not here.
+            SseEvent::ToolCallPending { .. } | SseEvent::ToolCallResolved { .. } => {}
             SseEvent::Unknown { .. } => {}
         }
     }
@@ -595,7 +597,7 @@ impl View for JobDetailView {
             }
             h.push(("PgUp/PgDn", "Round"));
             if self.status == JobStatus::Running {
-                h.push(("/", "Chat"));
+                h.push(("/", "Steer"));
             }
             h.push(("Esc", "Back"));
             h
@@ -654,13 +656,13 @@ impl JobDetailView {
         let (text, title, style) = if self.inject_input_active {
             (
                 self.inject_text.clone(),
-                " 💬 chatting (Enter=send · Esc=cancel) ",
+                " ✉ steering (Enter=send · Esc=cancel) ",
                 Style::default().fg(Color::Yellow),
             )
         } else {
             (
-                String::from("press / to chat with the team…"),
-                " 💬 ",
+                String::from("press / to steer the deliberation…"),
+                " ✉ ",
                 Style::default().fg(Color::DarkGray),
             )
         };

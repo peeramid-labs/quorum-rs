@@ -54,6 +54,18 @@ pub enum DataEvent {
         sequence: usize,
         round: u32,
     },
+    /// A reopened thread's pending job was reconciled against the server — its
+    /// reply (if the job had finished) was appended to the store; the view
+    /// reloads to show it.
+    ThreadReconciled {
+        thread_id: String,
+    },
+    /// A reopened thread's pending `ask_user` questions, fetched to recover one
+    /// that fired while the view wasn't focused. The view shows the first.
+    ToolCallsLoaded {
+        thread_id: String,
+        calls: Vec<crate::agents::PendingToolCall>,
+    },
     FetchError {
         context: String,
         error: String,
@@ -108,6 +120,20 @@ pub enum SseEvent {
         best_proposal_author: String,
     },
     Timeout(String),
+    /// An agent is asking the operator a question and is blocked on the answer
+    /// (`ask_user`). `arguments` is the raw tool payload — for `ask_user`,
+    /// `{ question, options? }`.
+    ToolCallPending {
+        job_id: String,
+        call_id: String,
+        agent_id: String,
+        arguments: serde_json::Value,
+        round: u32,
+    },
+    /// A pending tool call was answered or expired — clear its question UI.
+    ToolCallResolved {
+        call_id: String,
+    },
     Unknown {
         event_type: String,
     },

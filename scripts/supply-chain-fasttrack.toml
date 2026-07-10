@@ -42,3 +42,9 @@
 #
 # The active list is intentionally empty in day-to-day operation —
 # every new fast-track should land as a separate, auditable commit.
+
+[[fasttrack]]
+name    = "crossbeam-epoch"
+version = "0.9.20"
+reason  = "RUSTSEC-2026-0204 — invalid pointer deref in crossbeam-epoch fmt::Pointer for Atomic/Shared. 0.9.20 is the only patched release and cargo-deny rejects the vulnerable 0.9.18. Transitive via openai-harmony 0.0.8 → image → rayon (image is a hard, non-optional dep — not droppable). Cooldown would keep cargo-deny red on a known advisory."
+expires = 2026-07-16

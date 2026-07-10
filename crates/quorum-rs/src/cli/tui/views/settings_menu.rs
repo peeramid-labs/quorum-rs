@@ -10,6 +10,13 @@ use crate::cli::tui::app::ViewId;
 use crate::cli::tui::event::{self, AppEvent};
 
 const MENU_ITEMS: &[(&str, &str, ViewId)] = &[
+    ("Agents", "Registered agents + live status", ViewId::Agents),
+    (
+        "Policies",
+        "Deliberation policies (the models)",
+        ViewId::Policies,
+    ),
+    ("Rooms", "Rooms you can submit to", ViewId::Rooms),
     (
         "Orchestrators",
         "Check orchestrator health and config",
@@ -140,7 +147,7 @@ mod tests {
     fn enter_pushes_first_item() {
         let mut view = SettingsMenuView::new();
         let action = view.update(&make_key_event(KeyCode::Enter));
-        assert_eq!(action, Some(ViewAction::Push(ViewId::Orchestrators)));
+        assert_eq!(action, Some(ViewAction::Push(ViewId::Agents)));
     }
 
     #[test]

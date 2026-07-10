@@ -35,15 +35,15 @@ use views::orchestrators::OrchestratorsView;
 use views::policies::PoliciesView;
 use views::settings::SettingsView;
 use views::settings_menu::SettingsMenuView;
+use views::thread::ThreadView;
+use views::thread_list::ThreadListView;
 use views::{FetchRequest, StatusLevel, View, ViewAction};
 
 /// Top-level tabs shown in the persistent shell tab bar. The active tab's
 /// view is the navigation-stack root; sub-views (e.g. JobDetail) push on top
 /// and hide the bar until popped.
-const TOP_TABS: [(&str, ViewId); 4] = [
-    ("Room", ViewId::MainMenu),
-    ("Agents", ViewId::Agents),
-    ("Policies", ViewId::Policies),
+const TOP_TABS: [(&str, ViewId); 2] = [
+    ("Threads", ViewId::Threads),
     ("Settings", ViewId::SettingsMenu),
 ];
 
@@ -59,7 +59,7 @@ fn tab_switch_target(ev: &crossterm::event::Event, current: usize) -> Option<usi
     }
     let n = TOP_TABS.len();
     match key.code {
-        KeyCode::Char(c) if ('1'..='5').contains(&c) => {
+        KeyCode::Char(c) if ('1'..='9').contains(&c) => {
             let idx = c as usize - '1' as usize;
             (idx < n).then_some(idx)
         }
@@ -88,6 +88,38 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, active: usize) {
     frame.render_widget(tabs, area);
 }
 
+/// The persistent footer text: the current model (policy) + effort, then the
+/// transient status message, or key hints when idle. Pure, for testing.
+fn footer_text(model: Option<&str>, effort: Option<f32>, status: Option<&str>) -> String {
+    let model = model.unwrap_or("(no model)");
+    let effort = effort
+        .map(|e| format!("{e:.2}"))
+        .unwrap_or_else(|| "default".into());
+    let tail = status.unwrap_or("[n]ew  [enter]open  [tab]switch  [q]uit");
+    format!(" model: {model} · effort: {effort} · {tail}")
+}
+
+fn render_footer(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    model: Option<&str>,
+    effort: Option<f32>,
+) {
+    let color = match app.status_message.as_ref().map(|(_, l)| l) {
+        Some(StatusLevel::Error) => Color::Red,
+        Some(StatusLevel::Success) => Color::Green,
+        Some(StatusLevel::Info) => Color::Yellow,
+        None => Color::DarkGray,
+    };
+    let status = app.status_message.as_ref().map(|(m, _)| m.as_str());
+    let text = footer_text(model, effort, status);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color)))),
+        area,
+    );
+}
+
 /// Run the full interactive TUI starting at the main menu.
 pub async fn run_tui(config_path: &Path) -> ExitCode {
     let config = match WorkspaceConfig::load_or_remote_default_for_view(config_path) {
@@ -98,7 +130,7 @@ pub async fn run_tui(config_path: &Path) -> ExitCode {
         }
     };
 
-    run_tui_loop(config, config_path, ViewId::MainMenu).await
+    run_tui_loop(config, config_path, ViewId::Threads).await
 }
 
 /// Run the TUI with a pre-filled task (from `nsed run --tui`).
@@ -120,7 +152,7 @@ pub async fn run_tui_with_task(
     };
 
     // TODO: pre-fill task in MainMenu and auto-navigate
-    run_tui_loop(config, config_path, ViewId::MainMenu).await
+    run_tui_loop(config, config_path, ViewId::Threads).await
 }
 
 /// Run the TUI jumping directly to a job detail view.
@@ -172,7 +204,14 @@ async fn setup_and_run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Bracketed paste: a paste arrives as one `Event::Paste(text)` instead of
+    // char-by-char + Enter, so pasting multi-line content (e.g. from a PDF) no
+    // longer submits on the first embedded newline.
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        crossterm::event::EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -185,7 +224,9 @@ async fn setup_and_run(
 
     // Create app state
     let mut app = App::new(config, config_path.to_path_buf());
-    if initial_view != ViewId::MainMenu {
+    // Seed the "model" shown in the footer + used for new threads.
+    app.active_model = resolve_thread_policy(&app.config, None);
+    if initial_view != ViewId::Threads {
         app.push_view(initial_view);
     }
 
@@ -207,16 +248,10 @@ async fn setup_and_run(
     loop {
         terminal.draw(|frame| {
             let area = frame.area();
-            // Reserve a 1-line status bar at the bottom whenever there's a
-            // message. Status (errors, "Submitting…", "Job submitted", config
-            // errors) was set on `app.status_message` but never drawn — views
-            // have no access to it — so the TUI failed silently. Render it here.
-            let (body, status_area) = if app.status_message.is_some() {
-                let c = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
-                (c[0], Some(c[1]))
-            } else {
-                (area, None)
-            };
+            // Always reserve a 1-line footer at the bottom: the current model
+            // (policy) + effort, and any transient status — Claude-style.
+            let split = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+            let (body, footer_area) = (split[0], split[1]);
             // Tab bar only at a tab root; a pushed sub-view gets the full area.
             if app.view_stack.len() == 1 {
                 let chunks =
@@ -226,20 +261,9 @@ async fn setup_and_run(
             } else {
                 current_view.draw(frame, body);
             }
-            if let (Some(rect), Some((msg, level))) = (status_area, app.status_message.as_ref()) {
-                let color = match level {
-                    StatusLevel::Error => Color::Red,
-                    StatusLevel::Success => Color::Green,
-                    StatusLevel::Info => Color::Yellow,
-                };
-                frame.render_widget(
-                    Paragraph::new(Line::from(Span::styled(
-                        format!(" {msg}"),
-                        Style::default().fg(color),
-                    ))),
-                    rect,
-                );
-            }
+            // The active view's model (a thread's) wins over the app default.
+            let model = current_view.active_model().or(app.active_model.as_deref());
+            render_footer(frame, footer_area, &app, model, app.active_effort);
         })?;
 
         // Wait for event
@@ -256,6 +280,32 @@ async fn setup_and_run(
             ref orchestrator,
         }) = app_event
         {
+            // A thread launch's job id is now known — bind it so the reply is
+            // attributed to that thread (and not to whichever job finishes first).
+            if let Some(thread_id) = app.pending_thread_launch.take() {
+                app.job_thread.insert(job_id.clone(), thread_id.clone());
+                // Persist the launched job id on the thread so a completion that
+                // lands while the TUI is closed is recoverable on reopen.
+                crate::cli::thread::ThreadStore::new().set_pending_job(&thread_id, job_id);
+                // Stay in the thread — the reply lands inline. Don't hijack the
+                // screen with the deliberation detail (open it with Ctrl-D). But
+                // still open the SSE stream so completion events flow and the
+                // reply is recorded + reloaded (JobDetail's on_enter used to do
+                // this; without it no JobComplete would ever arrive).
+                app.status_message = Some(("Deliberating…".into(), StatusLevel::Info));
+                handle_action(
+                    &mut app,
+                    &mut tui_client,
+                    &data_tx,
+                    &ViewAction::Fetch(FetchRequest::StartSseStream {
+                        orchestrator: orchestrator.clone(),
+                        job_id: job_id.clone(),
+                    }),
+                    config_path,
+                );
+                continue;
+            }
+            // Room / ad-hoc launch: jump to the live deliberation detail.
             app.status_message = Some((
                 format!("Job {} submitted", &job_id[..job_id.len().min(12)]),
                 StatusLevel::Success,
@@ -289,6 +339,21 @@ async fn setup_and_run(
             ));
             // Fall through so the view can also process this event
         }
+        // A submit failed — the pending thread launch produced no job, so drop
+        // it before some later `JobSubmitted` could adopt the stale thread id.
+        if let AppEvent::Data(DataEvent::FetchError { context, .. }) = &app_event
+            && context == "submit"
+        {
+            app.pending_thread_launch = None;
+        }
+        // A thread's deliberation completed — record the reply, attributed by
+        // job id. Falls through so JobDetail still renders completion.
+        {
+            let store = crate::cli::thread::ThreadStore::new();
+            if record_thread_terminal(&store, &mut app.job_thread, &app_event) == Some(true) {
+                app.status_message = Some(("Reply saved to thread".into(), StatusLevel::Success));
+            }
+        }
 
         // Top-level tab switch — digits 1-5 / Tab / BackTab. Only at a tab
         // root (depth 1) and only when the active view isn't capturing text,
@@ -300,6 +365,7 @@ async fn setup_and_run(
         {
             if target != app.active_tab {
                 app.active_tab = target;
+                app.status_message = None; // clear any stale fetch/status
                 app.view_stack = vec![TOP_TABS[target].1.clone()];
                 current_view = create_view(app.current_view().unwrap(), &app);
                 let actions = current_view.on_enter();
@@ -318,6 +384,7 @@ async fn setup_and_run(
                     if !app.pop_view() {
                         break; // At root, quit
                     }
+                    app.status_message = None; // don't carry a stale status across views
                     current_view = create_view(app.current_view().unwrap(), &app);
                     let actions = current_view.on_enter();
                     for a in actions {
@@ -330,6 +397,36 @@ async fn setup_and_run(
                     let actions = current_view.on_enter();
                     for a in actions {
                         handle_action(&mut app, &mut tui_client, &data_tx, &a, config_path);
+                    }
+                }
+                ViewAction::OpenThreadJob {
+                    ref thread_id,
+                    ref orchestrator,
+                } => {
+                    // Resolve the thread's in-flight job and open its detail.
+                    let job = app
+                        .job_thread
+                        .iter()
+                        .find(|(_, tid)| *tid == thread_id)
+                        .map(|(jid, _)| jid.clone());
+                    match job {
+                        Some(job_id) => {
+                            app.push_view(ViewId::JobDetail {
+                                job_id,
+                                orchestrator: orchestrator.clone(),
+                            });
+                            current_view = create_view(app.current_view().unwrap(), &app);
+                            let actions = current_view.on_enter();
+                            for a in actions {
+                                handle_action(&mut app, &mut tui_client, &data_tx, &a, config_path);
+                            }
+                        }
+                        None => {
+                            app.status_message = Some((
+                                "No deliberation running for this thread".into(),
+                                StatusLevel::Info,
+                            ))
+                        }
                     }
                 }
                 ref other => {
@@ -388,6 +485,28 @@ fn create_view(view_id: &ViewId, app: &App) -> Box<dyn View> {
             job_id,
             orchestrator,
         } => Box::new(JobDetailView::new(job_id.clone(), orchestrator.clone())),
+        ViewId::Threads => Box::new(ThreadListView::new(crate::cli::thread::ThreadStore::new())),
+        ViewId::Thread { id } => {
+            let store = crate::cli::thread::ThreadStore::new();
+            let thread = match id.as_deref().and_then(|tid| store.load(tid)) {
+                Some(existing) => existing,
+                None => {
+                    // Fresh thread: empty subject (prompts for one) + inherits
+                    // the footer's active model.
+                    let mut t = crate::cli::thread::Thread::new("");
+                    t.active_policy = app.active_model.clone();
+                    t
+                }
+            };
+            let mut models: Vec<String> = app.config.policies.keys().cloned().collect();
+            models.sort();
+            Box::new(ThreadView::with_thread(
+                thread,
+                store,
+                remote_orch.unwrap_or_else(|| "(no remote orchestrator)".into()),
+                models,
+            ))
+        }
     }
 }
 
@@ -399,6 +518,134 @@ fn build_remote(app: &App, name: &str) -> Result<RemoteOrchestrator, String> {
         .get(name)
         .ok_or_else(|| format!("unknown orchestrator '{name}'"))?;
     RemoteOrchestrator::from_config(name, orch)
+}
+
+/// On a deliberation's completion, record its answer back into the thread that
+/// launched it — attributed by the completing **`job_id`**, so a different job
+/// finishing while this thread waits can never steal the slot. The reply is
+/// saved only for a successful, non-empty result; the `job_thread` entry is
+/// removed either way. Returns `None` when the event isn't a completion of a
+/// tracked thread job, `Some(true)` when a reply was saved, `Some(false)` when
+/// the job was this thread's but failed / was empty.
+fn record_thread_terminal(
+    store: &crate::cli::thread::ThreadStore,
+    job_thread: &mut std::collections::HashMap<String, String>,
+    event: &AppEvent,
+) -> Option<bool> {
+    let AppEvent::Data(DataEvent::SseEvent(event::SseEvent::JobComplete {
+        job_id,
+        status,
+        best_proposal_content,
+        ..
+    })) = event
+    else {
+        return None;
+    };
+    let thread_id = job_thread.remove(job_id)?;
+    if !status.eq_ignore_ascii_case("success") || best_proposal_content.trim().is_empty() {
+        return Some(false);
+    }
+    Some(store.append_reply(&thread_id, best_proposal_content, job_id, None))
+}
+
+/// Resolve the policy label for a roomless (thread) launch: the explicit policy
+/// if given, else the default room's policy, else any configured room's policy.
+/// `None` when nothing is configured to fall back to.
+fn resolve_thread_policy(config: &WorkspaceConfig, explicit: Option<&str>) -> Option<String> {
+    if let Some(p) = explicit {
+        return Some(p.to_string());
+    }
+    config
+        .default_room
+        .as_ref()
+        .and_then(|dr| config.rooms.get(dr))
+        .map(|r| r.policy.clone())
+        .or_else(|| config.rooms.values().next().map(|r| r.policy.clone()))
+}
+
+/// Dispatch a roomless thread launch: resolve the policy, key the deliberation
+/// by the thread id (so the 409-reclaim gives the thread one live job at a
+/// time), record the launching thread for reply attribution, and submit — via the
+/// local-policy path when the label is a config `PolicyConfig`, otherwise via
+/// the orchestrator-side policy dispatch.
+#[allow(clippy::too_many_arguments)]
+fn launch_thread_job(
+    app: &mut App,
+    tui_client: &mut TuiClient,
+    orchestrator: &str,
+    task: &str,
+    policy: Option<&str>,
+    effort_override: Option<f32>,
+    thread_id: Option<&str>,
+    conversation_id: Option<&str>,
+    new_turn: Option<&str>,
+) {
+    let Some(label) = resolve_thread_policy(&app.config, policy) else {
+        app.status_message = Some((
+            "No policy for this thread — pick one or configure a room".into(),
+            StatusLevel::Error,
+        ));
+        return;
+    };
+    let room_id = thread_id.unwrap_or("adhoc").to_string();
+    let remote = match build_remote(app, orchestrator) {
+        Ok(r) => r,
+        Err(e) => {
+            app.status_message = Some((e, StatusLevel::Error));
+            return;
+        }
+    };
+    // Remember the launching thread until its JobSubmitted arrives with the
+    // job id; the loop promotes it into `job_thread` there.
+    app.pending_thread_launch = thread_id.map(str::to_string);
+    app.status_message = Some((format!("Submitting to {orchestrator}…"), StatusLevel::Info));
+
+    let local = app.config.policies.get(&label).cloned();
+    match local {
+        Some(mut pc) => {
+            if let Some(custom) = effort_override {
+                pc.effort = custom.clamp(0.0, 1.0);
+            }
+            match build_request(&room_id, &pc, task) {
+                Ok(mut req) => {
+                    // The room id is per-thread, but the session key is the
+                    // per-branch conversation_id so forks don't share a session.
+                    if let Some(cid) = conversation_id {
+                        req.conversation_id = Some(cid.to_string());
+                    }
+                    if let Some(nt) = new_turn {
+                        req.new_turn = Some(nt.to_string());
+                    }
+                    if pc.roles.is_some() {
+                        tui_client.push_policy_and_submit(
+                            remote,
+                            label,
+                            pc,
+                            req,
+                            orchestrator.to_string(),
+                        );
+                    } else {
+                        tui_client.submit_job(remote, req, orchestrator.to_string());
+                    }
+                }
+                Err(e) => {
+                    // No job was submitted — don't strand the pending launch.
+                    app.pending_thread_launch = None;
+                    app.status_message =
+                        Some((format!("Failed to build request: {e}"), StatusLevel::Error))
+                }
+            }
+        }
+        None => tui_client.submit_with_remote_policy(
+            remote,
+            orchestrator.to_string(),
+            room_id,
+            label,
+            task.to_string(),
+            effort_override,
+            conversation_id.map(str::to_string),
+        ),
+    }
 }
 
 /// Handle a `ViewAction` from a view.
@@ -475,6 +722,56 @@ fn handle_action(
                     });
                     (name, result)
                 }
+                FetchRequest::ReconcileThread {
+                    orchestrator,
+                    job_id,
+                    thread_id,
+                } => {
+                    let name = orchestrator.clone();
+                    let (job_id, thread_id) = (job_id.clone(), thread_id.clone());
+                    let result = build_remote(app, &name).map(|remote| {
+                        tui_client.reconcile_thread(remote, job_id, thread_id);
+                    });
+                    (name, result)
+                }
+                FetchRequest::CancelJob {
+                    orchestrator,
+                    job_id,
+                    thread_id,
+                } => {
+                    let name = orchestrator.clone();
+                    let (job_id, thread_id) = (job_id.clone(), thread_id.clone());
+                    let result = build_remote(app, &name).map(|remote| {
+                        tui_client.cancel_job(remote, job_id, thread_id);
+                    });
+                    (name, result)
+                }
+                FetchRequest::RespondToolCall {
+                    orchestrator,
+                    job_id,
+                    call_id,
+                    result: answer,
+                } => {
+                    let name = orchestrator.clone();
+                    let (job_id, call_id, answer) =
+                        (job_id.clone(), call_id.clone(), answer.clone());
+                    let result = build_remote(app, &name).map(|remote| {
+                        tui_client.respond_tool_call(remote, job_id, call_id, answer);
+                    });
+                    (name, result)
+                }
+                FetchRequest::PendingToolCalls {
+                    orchestrator,
+                    job_id,
+                    thread_id,
+                } => {
+                    let name = orchestrator.clone();
+                    let (job_id, thread_id) = (job_id.clone(), thread_id.clone());
+                    let result = build_remote(app, &name).map(|remote| {
+                        tui_client.fetch_pending_tool_calls(remote, job_id, thread_id);
+                    });
+                    (name, result)
+                }
             };
             match dispatch_result {
                 Ok(()) => {
@@ -492,6 +789,10 @@ fn handle_action(
                         | FetchRequest::CreateRoom { .. }
                         | FetchRequest::DeleteRoom { .. } => "rooms",
                         FetchRequest::StartSseStream { .. } => "sse_stream",
+                        FetchRequest::ReconcileThread { .. } => "reconcile",
+                        FetchRequest::CancelJob { .. } => "cancel",
+                        FetchRequest::RespondToolCall { .. } => "answer",
+                        FetchRequest::PendingToolCalls { .. } => "tool_calls",
                     };
                     let _ = data_tx.send(DataEvent::FetchError {
                         context: context.into(),
@@ -517,12 +818,27 @@ fn handle_action(
             room,
             policy,
             effort_override,
+            thread_id,
+            conversation_id,
+            new_turn,
         } => {
             // Resolve room → policy from config
             let room_name = match room {
                 Some(r) => r.clone(),
                 None => {
-                    app.status_message = Some(("No room specified".into(), StatusLevel::Error));
+                    // Roomless (thread) launch: dispatch the thread's policy
+                    // directly, keyed by the thread id.
+                    launch_thread_job(
+                        app,
+                        tui_client,
+                        orchestrator,
+                        task,
+                        policy.as_deref(),
+                        *effort_override,
+                        thread_id.as_deref(),
+                        conversation_id.as_deref(),
+                        new_turn.as_deref(),
+                    );
                     return;
                 }
             };
@@ -555,6 +871,7 @@ fn handle_action(
                             label,
                             task.clone(),
                             *effort_override,
+                            conversation_id.clone(),
                         );
                     }
                     Err(e) => app.status_message = Some((e, StatusLevel::Error)),
@@ -647,7 +964,10 @@ fn handle_action(
         ViewAction::SetStatus(msg, level) => {
             app.status_message = Some((msg.clone(), *level));
         }
-        ViewAction::Push(_) | ViewAction::Pop | ViewAction::Quit => {
+        ViewAction::Push(_)
+        | ViewAction::Pop
+        | ViewAction::Quit
+        | ViewAction::OpenThreadJob { .. } => {
             // Handled in the main loop
         }
     }
@@ -655,7 +975,12 @@ fn handle_action(
 
 fn restore_terminal() -> Result<(), Box<dyn std::error::Error>> {
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        io::stdout(),
+        crossterm::event::DisableBracketedPaste,
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     Ok(())
 }
 
@@ -854,7 +1179,41 @@ mod tests {
     }
 
     #[test]
-    fn launch_job_no_room_sets_error() {
+    fn launch_thread_without_resolvable_policy_errors() {
+        // Roomless (thread) launch with no policy and no rooms to fall back to.
+        let (data_tx, _) = mpsc::unbounded_channel();
+        let (client_tx, _) = mpsc::unbounded_channel();
+        let mut client = TuiClient::new(client_tx);
+        let mut app = test_app(HashMap::new());
+
+        handle_action(
+            &mut app,
+            &mut client,
+            &data_tx,
+            &ViewAction::LaunchJob {
+                orchestrator: "prod".into(),
+                task: "do something".into(),
+                room: None,
+                policy: None,
+                effort_override: None,
+                thread_id: Some("thread-x".into()),
+                conversation_id: None,
+                new_turn: None,
+            },
+            Path::new("/tmp/test.yaml"),
+        );
+
+        let (msg, level) = app.status_message.unwrap();
+        assert_eq!(level, StatusLevel::Error);
+        assert!(msg.contains("No policy"), "{msg}");
+        assert_eq!(app.pending_thread_launch, None);
+    }
+
+    #[tokio::test]
+    async fn launch_thread_falls_back_to_default_room_policy_and_records_thread() {
+        // Roomless launch: policy resolves from the default room, the thread is
+        // recorded as active so the loop can persist the reply on completion.
+        // Async because a successful resolve reaches the (fire-and-forget) submit.
         let (data_tx, _) = mpsc::unbounded_channel();
         let (client_tx, _) = mpsc::unbounded_channel();
         let mut client = TuiClient::new(client_tx);
@@ -870,13 +1229,168 @@ mod tests {
                 room: None,
                 policy: None,
                 effort_override: None,
+                thread_id: Some("thread-42".into()),
+                conversation_id: None,
+                new_turn: None,
             },
             Path::new("/tmp/test.yaml"),
         );
 
+        assert_eq!(app.pending_thread_launch.as_deref(), Some("thread-42"));
         let (msg, level) = app.status_message.unwrap();
-        assert_eq!(level, StatusLevel::Error);
-        assert!(msg.contains("No room"), "{msg}");
+        assert_eq!(level, StatusLevel::Info);
+        assert!(msg.contains("Submitting"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_thread_policy_prefers_explicit() {
+        let app = test_app_with_room();
+        assert_eq!(
+            resolve_thread_policy(&app.config, Some("custom")).as_deref(),
+            Some("custom")
+        );
+    }
+
+    #[test]
+    fn resolve_thread_policy_falls_back_to_default_room() {
+        let app = test_app_with_room();
+        assert_eq!(
+            resolve_thread_policy(&app.config, None).as_deref(),
+            Some("review")
+        );
+    }
+
+    #[test]
+    fn resolve_thread_policy_none_when_nothing_configured() {
+        let app = test_app(HashMap::new());
+        assert_eq!(resolve_thread_policy(&app.config, None), None);
+    }
+
+    #[test]
+    fn footer_shows_model_effort_and_status() {
+        assert_eq!(
+            footer_text(Some("nsed:review"), Some(0.7), Some("Submitting…")),
+            " model: nsed:review · effort: 0.70 · Submitting…"
+        );
+    }
+
+    #[test]
+    fn footer_defaults_when_unset() {
+        let f = footer_text(None, None, None);
+        assert!(f.contains("model: (no model)"));
+        assert!(f.contains("effort: default"));
+        assert!(f.contains("[n]ew"), "idle footer shows hints");
+    }
+
+    fn job_complete_event(job_id: &str, status: &str, content: &str) -> AppEvent {
+        AppEvent::Data(DataEvent::SseEvent(event::SseEvent::JobComplete {
+            status: status.into(),
+            job_id: job_id.into(),
+            rounds_completed: 2,
+            best_proposal_content: content.into(),
+            best_proposal_score: 0.9,
+            best_proposal_author: "agent-a".into(),
+        }))
+    }
+
+    /// A store + a thread seeded with one user message, and a `job_thread` map
+    /// binding `job_id` → that thread.
+    fn seeded(
+        dir: &std::path::Path,
+        job_id: &str,
+    ) -> (
+        crate::cli::thread::ThreadStore,
+        String,
+        HashMap<String, String>,
+    ) {
+        let store = crate::cli::thread::ThreadStore::with_dir(dir.to_path_buf());
+        let mut t = crate::cli::thread::Thread::new("t");
+        t.push_message(crate::cli::thread::Message::now("user", "q"));
+        store.save(&t).unwrap();
+        let map = HashMap::from([(job_id.to_string(), t.id.clone())]);
+        (store, t.id, map)
+    }
+
+    #[test]
+    fn terminal_completion_appends_reply_and_removes_mapping() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, tid, mut map) = seeded(tmp.path(), "job-1");
+        let saved = record_thread_terminal(
+            &store,
+            &mut map,
+            &job_complete_event("job-1", "success", "ans"),
+        );
+        assert_eq!(saved, Some(true));
+        assert!(map.is_empty(), "mapping consumed");
+        let reloaded = store.load(&tid).unwrap();
+        assert_eq!(reloaded.messages.len(), 2);
+        assert_eq!(reloaded.messages[1].content, "ans");
+    }
+
+    #[test]
+    fn terminal_completion_of_unrelated_job_is_not_appended() {
+        // Bug 1 guard: a different job finishing must NOT steal this thread's slot.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, tid, mut map) = seeded(tmp.path(), "job-thread");
+        let out = record_thread_terminal(
+            &store,
+            &mut map,
+            &job_complete_event("job-OTHER", "success", "not yours"),
+        );
+        assert_eq!(out, None, "unrelated job id → no attribution");
+        assert!(map.contains_key("job-thread"), "our mapping is untouched");
+        assert_eq!(
+            store.load(&tid).unwrap().messages.len(),
+            1,
+            "no reply appended"
+        );
+    }
+
+    #[test]
+    fn terminal_completion_failed_status_removes_mapping_without_appending() {
+        // Bug 3 guard: a failed deliberation's leftover content is not the answer.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, tid, mut map) = seeded(tmp.path(), "job-1");
+        let out = record_thread_terminal(
+            &store,
+            &mut map,
+            &job_complete_event("job-1", "failed", "stale proposal"),
+        );
+        assert_eq!(out, Some(false));
+        assert!(map.is_empty());
+        assert_eq!(
+            store.load(&tid).unwrap().messages.len(),
+            1,
+            "no reply appended"
+        );
+    }
+
+    #[test]
+    fn terminal_completion_empty_content_no_append() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, tid, mut map) = seeded(tmp.path(), "job-1");
+        let out = record_thread_terminal(
+            &store,
+            &mut map,
+            &job_complete_event("job-1", "success", "   "),
+        );
+        assert_eq!(out, Some(false));
+        assert_eq!(store.load(&tid).unwrap().messages.len(), 1);
+    }
+
+    #[test]
+    fn terminal_ignores_non_completion_events() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = crate::cli::thread::ThreadStore::with_dir(tmp.path().to_path_buf());
+        let mut map = HashMap::from([("job-1".to_string(), "thread-x".to_string())]);
+        assert_eq!(
+            record_thread_terminal(&store, &mut map, &AppEvent::Tick),
+            None
+        );
+        assert!(
+            map.contains_key("job-1"),
+            "non-terminal must not touch the map"
+        );
     }
 
     #[test]
@@ -896,6 +1410,9 @@ mod tests {
                 room: Some("nonexistent".into()),
                 policy: None,
                 effort_override: None,
+                thread_id: None,
+                conversation_id: None,
+                new_turn: None,
             },
             Path::new("/tmp/test.yaml"),
         );
@@ -933,6 +1450,9 @@ mod tests {
                 room: Some("remote-policy-room".into()),
                 policy: None,
                 effort_override: None,
+                thread_id: None,
+                conversation_id: None,
+                new_turn: None,
             },
             Path::new("/tmp/test.yaml"),
         );
@@ -962,6 +1482,9 @@ mod tests {
                 room: Some("test-room".into()),
                 policy: None,
                 effort_override: None,
+                thread_id: None,
+                conversation_id: None,
+                new_turn: None,
             },
             Path::new("/tmp/test.yaml"),
         );
@@ -1050,18 +1573,19 @@ mod tests {
     #[test]
     fn tab_switch_digits_jump_to_index() {
         use crossterm::event::KeyCode;
-        assert_eq!(tab_switch_target(&key(KeyCode::Char('1')), 3), Some(0));
-        assert_eq!(tab_switch_target(&key(KeyCode::Char('4')), 0), Some(3));
-        // Out-of-range digit (only 4 tabs now) is not a tab.
-        assert_eq!(tab_switch_target(&key(KeyCode::Char('5')), 0), None);
+        assert_eq!(tab_switch_target(&key(KeyCode::Char('1')), 1), Some(0));
+        assert_eq!(tab_switch_target(&key(KeyCode::Char('2')), 0), Some(1));
+        // Out-of-range digit (2 tabs) is not a tab.
+        assert_eq!(tab_switch_target(&key(KeyCode::Char('3')), 0), None);
     }
 
     #[test]
     fn tab_switch_tab_and_backtab_cycle() {
         use crossterm::event::KeyCode;
-        assert_eq!(tab_switch_target(&key(KeyCode::Tab), 3), Some(0));
+        // 2 tabs now → cycle modulo 2.
+        assert_eq!(tab_switch_target(&key(KeyCode::Tab), 1), Some(0));
         assert_eq!(tab_switch_target(&key(KeyCode::Tab), 0), Some(1));
-        assert_eq!(tab_switch_target(&key(KeyCode::BackTab), 0), Some(3));
+        assert_eq!(tab_switch_target(&key(KeyCode::BackTab), 0), Some(1));
     }
 
     #[test]
@@ -1072,11 +1596,14 @@ mod tests {
     }
 
     #[test]
-    fn top_tabs_first_is_room_root() {
-        assert_eq!(TOP_TABS[0].1, ViewId::MainMenu);
-        assert_eq!(TOP_TABS[0].0, "Room");
-        assert_eq!(TOP_TABS.len(), 4);
-        // The old standalone Rooms tab is folded into the Room tab.
-        assert!(!TOP_TABS.iter().any(|(_, v)| *v == ViewId::Rooms));
+    fn top_tabs_are_inbox_and_settings() {
+        assert_eq!(TOP_TABS[0].1, ViewId::Threads);
+        assert_eq!(TOP_TABS[0].0, "Threads");
+        assert_eq!(TOP_TABS[1].0, "Settings");
+        assert_eq!(TOP_TABS.len(), 2);
+        // Room / Policies / Agents are no longer top tabs — they live under
+        // Settings so the inbox is the front door.
+        assert!(!TOP_TABS.iter().any(|(_, v)| *v == ViewId::MainMenu));
+        assert!(!TOP_TABS.iter().any(|(_, v)| *v == ViewId::Policies));
     }
 }
