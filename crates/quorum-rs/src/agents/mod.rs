@@ -56,6 +56,21 @@ pub struct AgentContext {
     /// The session/job ID for NATS subject construction within the agent worker.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Stable conversation key for the claude-CLI session, when a job belongs to
+    /// a longer-lived thread whose `session_id`/`room_id` is minted fresh per turn
+    /// (the OpenAI-compat path). The deterministic claude session UUID is keyed on
+    /// this so successive turns of one thread `--resume` the same transcript.
+    /// `None` falls back to `session_id` (the thread-TUI path, where the room *is*
+    /// the stable thread id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    /// The new turn only (this job's incremental user message), when the thread's
+    /// prior turns already live in the resumed claude session. Used as the delta
+    /// prompt's task on a resumed session so we don't re-send the whole flattened
+    /// `task_description` (which the session already holds). `None` → the delta
+    /// falls back to `task_description` (fresh session / non-thread paths).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_turn: Option<String>,
     /// Structured feedback from previous round's evaluations (Phase 2 context pipeline).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_feedback: Option<StructuredFeedback>,
@@ -113,6 +128,24 @@ pub struct AgentContext {
 }
 
 impl AgentContext {
+    /// The key the deterministic claude-CLI session UUID is derived from:
+    /// `conversation_id` (a thread stable across turns) when set, else
+    /// `session_id` (the per-job/room id). This is what makes successive turns
+    /// of one thread resume the same transcript.
+    pub fn claude_session_key(&self) -> Option<&str> {
+        self.conversation_id
+            .as_deref()
+            .or(self.session_id.as_deref())
+    }
+
+    /// The task text a *resumed* session's delta prompt should carry: the new
+    /// turn only when set (the prior turns already live in the session), else the
+    /// full `task_description` (fresh session / non-thread paths). This is what
+    /// stops a resumed thread from re-sending its whole flattened history.
+    pub fn delta_task(&self) -> &str {
+        self.new_turn.as_deref().unwrap_or(&self.task_description)
+    }
+
     /// Build a [`TelemetryContext`](crate::telemetry::TelemetryContext)
     /// for telemetry events emitted while processing this task.
     ///
@@ -1995,6 +2028,8 @@ mod tests {
             }],
             phase_budget_remaining_secs: 42.5,
             session_id: Some("sess-123".to_string()),
+            conversation_id: None,
+            new_turn: None,
             structured_feedback: Some(StructuredFeedback {
                 contested_claims: vec![],
                 verified_claims: vec!["claim A".to_string()],
@@ -3029,6 +3064,44 @@ mod tests {
             phase: DeliberationPhase::Evaluating,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn delta_task_uses_new_turn_on_resume_and_is_bounded_vs_thread_length() {
+        // A resumed thread turn: the flattened history is huge and grows every
+        // turn; `new_turn` is just the incremental message.
+        let huge_history = "[user] t1\n[assistant] ...\n".repeat(2000); // ~grows with thread
+        let mut ctx = ctx_with_session(Some("thread-x"));
+        ctx.task_description = huge_history.clone();
+        ctx.new_turn = Some("[user] latest turn".into());
+        // Resume → delta carries only the new turn, NOT the flattened history.
+        assert_eq!(ctx.delta_task(), "[user] latest turn");
+        assert!(
+            !ctx.delta_task().contains("t1"),
+            "prior turns must not re-send"
+        );
+        // Bounded: independent of how long the thread got.
+        assert!(
+            ctx.delta_task().len() < 40,
+            "delta stays small as the thread grows"
+        );
+        // Fresh (no new_turn) → full history (a fresh session needs the context).
+        ctx.new_turn = None;
+        assert_eq!(ctx.delta_task(), huge_history);
+    }
+
+    #[test]
+    fn claude_session_key_prefers_conversation_over_session() {
+        // No conversation_id → falls back to session_id (thread-TUI / native path).
+        let mut ctx = ctx_with_session(Some("room-turn-1"));
+        assert_eq!(ctx.claude_session_key(), Some("room-turn-1"));
+        // A thread key overrides the per-turn room so successive turns resume.
+        ctx.conversation_id = Some("thread-abc".into());
+        assert_eq!(ctx.claude_session_key(), Some("thread-abc"));
+        // Two turns of one thread (different rooms, same conversation) → same key.
+        let mut turn2 = ctx_with_session(Some("room-turn-2"));
+        turn2.conversation_id = Some("thread-abc".into());
+        assert_eq!(ctx.claude_session_key(), turn2.claude_session_key());
     }
 
     /// Happy path: session_id present → context derives a

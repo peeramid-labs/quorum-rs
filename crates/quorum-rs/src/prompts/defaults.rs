@@ -1912,7 +1912,7 @@ mod tests {
 
         assert!(prompt.contains("<own_current_proposal>"));
         // Should be truncated: first 500 chars of "CCC...C" + "..."
-        let expected_preview = format!("{}...", &"C".repeat(500));
+        let expected_preview = format!("{}...", "C".repeat(500));
         assert!(
             prompt.contains(&expected_preview),
             "Long own proposal thought should be truncated to 500 chars + '...'"

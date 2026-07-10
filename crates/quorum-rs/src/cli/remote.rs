@@ -628,6 +628,94 @@ impl RemoteOrchestrator {
             .map_err(|e| RemoteError::ParseError(format!("inject: {e}")))
     }
 
+    /// Cancel (kill) a running deliberation — `POST /deliberation/{job_id}/cancel`.
+    /// Aborts with no result (terminal failed); the TUI's Ctrl-C stop.
+    pub async fn cancel(&self, job_id: &str) -> Result<(), RemoteError> {
+        let url = format!("{}/deliberation/{}/cancel", self.base_url, job_id);
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RemoteError::ApiError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(())
+    }
+
+    /// Pending human-in-the-loop tool calls for a job — an agent's `ask_user`
+    /// questions awaiting an answer. `GET /deliberation/{id}/tool-calls?status=pending`.
+    pub async fn pending_tool_calls(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<crate::agents::PendingToolCall>, RemoteError> {
+        let url = format!(
+            "{}/deliberation/{}/tool-calls?status=pending",
+            self.base_url, job_id
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RemoteError::ApiError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        #[derive(serde::Deserialize)]
+        struct ToolCallsResponse {
+            tool_calls: Vec<crate::agents::PendingToolCall>,
+        }
+        resp.json::<ToolCallsResponse>()
+            .await
+            .map(|r| r.tool_calls)
+            .map_err(|e| RemoteError::ParseError(format!("tool-calls: {e}")))
+    }
+
+    /// Answer an agent's pending tool call — `POST /deliberation/{id}/tool-calls/{call_id}`
+    /// with `{ "result": <answer> }`. The agent's blocked task resumes with it.
+    pub async fn respond_to_tool_call(
+        &self,
+        job_id: &str,
+        call_id: &str,
+        result: &str,
+    ) -> Result<(), RemoteError> {
+        let url = format!(
+            "{}/deliberation/{}/tool-calls/{}",
+            self.base_url, job_id, call_id
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "result": result }))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RemoteError::ApiError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(())
+    }
+
     /// Get the base URL of this orchestrator.
     pub fn address(&self) -> &str {
         &self.base_url
@@ -809,6 +897,7 @@ impl RemoteOrchestrator {
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut stream = resp.bytes_stream();
+        let job_id = job_id.to_string(); // own it for the spawned parse task
 
         tokio::spawn(async move {
             let mut buffer = Vec::<u8>::new();
@@ -947,6 +1036,26 @@ impl RemoteOrchestrator {
                             }
                         }
                         "timeout" => SseEvent::Timeout(data),
+                        "tool_call_pending" => {
+                            let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
+                                continue;
+                            };
+                            SseEvent::ToolCallPending {
+                                job_id: job_id.clone(),
+                                call_id: v["call_id"].as_str().unwrap_or_default().to_string(),
+                                agent_id: v["agent_id"].as_str().unwrap_or_default().to_string(),
+                                arguments: v.get("arguments").cloned().unwrap_or_default(),
+                                round: v["round"].as_u64().unwrap_or(0) as u32,
+                            }
+                        }
+                        "tool_call_responded" | "tool_call_expired" => {
+                            let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
+                                continue;
+                            };
+                            SseEvent::ToolCallResolved {
+                                call_id: v["call_id"].as_str().unwrap_or_default().to_string(),
+                            }
+                        }
                         "keepalive" => continue, // server heartbeat — skip
                         other => SseEvent::Unknown {
                             event_type: other.to_string(),
@@ -1308,6 +1417,9 @@ mod tests {
         let client = RemoteOrchestrator::new(&server.uri(), "test-token").unwrap();
         let req = DeliberationRequest {
             room_id: "room".into(),
+            conversation_id: None,
+            user_tools: None,
+            new_turn: None,
             user_query: "test".into(),
             deliberation_rounds: 3,
             agent_names: Some(vec!["a".into(), "b".into()]),
@@ -1333,6 +1445,9 @@ mod tests {
         let client = RemoteOrchestrator::new(&server.uri(), "bad-token").unwrap();
         let req = DeliberationRequest {
             room_id: "room".into(),
+            conversation_id: None,
+            user_tools: None,
+            new_turn: None,
             user_query: "test".into(),
             deliberation_rounds: 3,
             agent_names: Some(vec!["a".into(), "b".into()]),
@@ -1363,6 +1478,9 @@ mod tests {
         let client = RemoteOrchestrator::new(&server.uri(), "token").unwrap();
         let req = DeliberationRequest {
             room_id: "room".into(),
+            conversation_id: None,
+            user_tools: None,
+            new_turn: None,
             user_query: "test".into(),
             deliberation_rounds: 1,
             agent_names: Some(vec!["a".into(), "b".into()]),
@@ -1393,6 +1511,9 @@ mod tests {
         let client = RemoteOrchestrator::new(&server.uri(), "token").unwrap();
         let req = DeliberationRequest {
             room_id: "room".into(),
+            conversation_id: None,
+            user_tools: None,
+            new_turn: None,
             user_query: "test".into(),
             deliberation_rounds: 1,
             agent_names: Some(vec!["a".into(), "b".into()]),
@@ -1721,6 +1842,48 @@ mod tests {
         let client = RemoteOrchestrator::new(&server.uri(), "tok").unwrap();
         let agents = client.agents().await.unwrap();
         assert!(agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_tool_calls_parses_the_list() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/deliberation/job-1/tool-calls"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tool_calls": [{
+                    "call_id": "c1", "job_id": "job-1", "agent_id": "a1",
+                    "tool_name": "user_ask_user",
+                    "arguments": { "question": "which env?", "options": ["dev", "prod"] },
+                    "round": 1, "phase": "Proposing", "status": "Pending", "created_at": 0
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let client = RemoteOrchestrator::new(&server.uri(), "tok").unwrap();
+        let calls = client.pending_tool_calls("job-1").await.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].call_id, "c1");
+        assert_eq!(calls[0].arguments["question"], "which env?");
+        assert_eq!(calls[0].arguments["options"][1], "prod");
+    }
+
+    #[tokio::test]
+    async fn respond_to_tool_call_posts_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/deliberation/job-1/tool-calls/c1"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "call_id": "c1", "status": "responded" })),
+            )
+            .mount(&server)
+            .await;
+        let client = RemoteOrchestrator::new(&server.uri(), "tok").unwrap();
+        client
+            .respond_to_tool_call("job-1", "c1", "prod")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

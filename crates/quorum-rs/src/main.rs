@@ -82,6 +82,15 @@ enum Commands {
         #[arg(long)]
         force_output: bool,
 
+        /// Resume a stored thread by id — the prior turns are sent as
+        /// context and this turn is appended to the thread.
+        #[arg(long, value_name = "ID", conflicts_with = "continue_thread")]
+        resume: Option<String>,
+
+        /// Continue the most recent thread (fresh one if none exists).
+        #[arg(long = "continue")]
+        continue_thread: bool,
+
         /// Launch an interactive TUI for live deliberation view.
         #[cfg(feature = "tui")]
         #[arg(long, conflicts_with = "files")]
@@ -417,6 +426,8 @@ async fn run_cli(cli: Cli) -> ExitCode {
             ref output_dir,
             ref output_file,
             force_output,
+            ref resume,
+            continue_thread,
             #[cfg(feature = "tui")]
             tui,
         } => {
@@ -443,6 +454,13 @@ async fn run_cli(cli: Cli) -> ExitCode {
                 )
                 .await;
             }
+            let resume_mode = if let Some(id) = resume.clone() {
+                Some(commands::run::ResumeMode::ById(id))
+            } else if continue_thread {
+                Some(commands::run::ResumeMode::Latest)
+            } else {
+                None
+            };
             commands::run::run(
                 &config_path,
                 &resolved_task,
@@ -452,6 +470,7 @@ async fn run_cli(cli: Cli) -> ExitCode {
                 output_dir.as_deref(),
                 output_file.as_deref(),
                 force_output,
+                resume_mode,
             )
             .await
         }

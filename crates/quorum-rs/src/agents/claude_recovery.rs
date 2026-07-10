@@ -200,6 +200,42 @@ pub fn sweep_orphan_session_env_lock(claude_session_uuid: &str) -> bool {
     }
 }
 
+/// Force-remove the `session-env/<uuid>/` lock dir even when it is
+/// NON-empty. Unlike [`sweep_orphan_session_env_lock`] (empty-only,
+/// safe to call speculatively), this is for the post-failure retry
+/// path where the caller has already reaped its own claude-cli child
+/// for this exact uuid — so the dir is definitively orphaned by a
+/// dead process, and leaving it would block the fresh `--session-id`
+/// retry with `Error: Session ID ... is already in use`. The
+/// `<uuid>.jsonl` transcript lives elsewhere and is preserved.
+///
+/// Returns `true` when a dir was removed.
+pub fn force_clear_session_env_lock(claude_session_uuid: &str) -> bool {
+    let Some(dir) = session_env_lock_path(claude_session_uuid) else {
+        return false;
+    };
+    if !dir.is_dir() {
+        return false;
+    }
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {
+            tracing::warn!(
+                uuid = claude_session_uuid,
+                "Force-cleared claude session-env lock left by a dead child (post-failure retry)"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                uuid = claude_session_uuid,
+                error = %e,
+                "Failed to force-clear claude session-env lock"
+            );
+            false
+        }
+    }
+}
+
 /// Walk a claude session jsonl content and return the `input`
 /// payload of the **last** `tool_use` block whose `name` matches
 /// any of `tool_names`. Returns `None` when no matching tool_use
@@ -535,6 +571,44 @@ mod tests {
         // No dir at all → idempotent no-op, returns false.
         let absent_uuid = "22222222-2222-4222-8222-222222222222";
         assert!(!super::sweep_orphan_session_env_lock(absent_uuid));
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn force_clear_removes_a_non_empty_lock() {
+        let prev = std::env::var_os("HOME");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: env mutation in tests is serialized via `home_env`.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        let session_env = tmp.path().join(".claude/session-env");
+        std::fs::create_dir_all(&session_env).unwrap();
+
+        // A non-empty lock (the quota-killed-child case) — empty-only sweep
+        // skips it, but force-clear removes it so a fresh retry can proceed.
+        let uuid = "33333333-3333-4333-8333-333333333333";
+        let held = session_env.join(uuid);
+        std::fs::create_dir(&held).unwrap();
+        std::fs::write(held.join("env.json"), "{}").unwrap();
+        assert!(
+            !super::sweep_orphan_session_env_lock(uuid),
+            "empty-only sweep skips it"
+        );
+        assert!(
+            super::force_clear_session_env_lock(uuid),
+            "force-clear removes it"
+        );
+        assert!(!held.exists());
+        // Absent → idempotent no-op.
+        assert!(!super::force_clear_session_env_lock(uuid));
 
         unsafe {
             match prev {

@@ -28,6 +28,7 @@ pub mod brand;
 pub mod cli;
 pub mod config;
 pub mod control_plane;
+pub mod conversation;
 #[cfg(feature = "audit")]
 pub mod crypto;
 pub mod events;
