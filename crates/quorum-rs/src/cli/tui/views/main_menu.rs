@@ -516,7 +516,6 @@ impl MainMenuView {
                         effort_override,
                         thread_id: None,
                         conversation_id: None,
-                        new_turn: None,
                         messages: Vec::new(),
                     })
                 }
@@ -540,7 +539,6 @@ impl MainMenuView {
                         effort_override,
                         thread_id: None,
                         conversation_id: None,
-                        new_turn: None,
                         messages: Vec::new(),
                     })
                 }
@@ -807,7 +805,6 @@ mod tests {
                 effort_override: Some(0.7),
                 thread_id: None,
                 conversation_id: None,
-                new_turn: None,
                 messages: Vec::new(),
             })
         );
@@ -1057,7 +1054,6 @@ mod tests {
                 effort_override: Some(0.7),
                 thread_id: None,
                 conversation_id: None,
-                new_turn: None,
                 messages: Vec::new(),
             })
         );

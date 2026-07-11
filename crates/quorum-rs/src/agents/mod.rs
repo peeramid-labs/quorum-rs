@@ -64,21 +64,11 @@ pub struct AgentContext {
     /// the stable thread id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
-    /// The new turn only (this job's incremental user message), when the thread's
-    /// prior turns already live in the resumed claude session. Used as the delta
-    /// prompt's task on a resumed session so we don't re-send the whole flattened
-    /// `task_description` (which the session already holds). `None` → the delta
-    /// falls back to `task_description` (fresh session / non-thread paths).
-    ///
-    /// DEPRECATED — superseded by `messages`. Kept during the migration so old
-    /// payloads still resume correctly.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub new_turn: Option<String>,
     /// The conversation as an ordered, role-tagged message array (the native
     /// representation). Each provider renders it to what it can send via
     /// [`crate::conversation::render`]: a resumed claude session gets only the
     /// newest turn, everything else gets the whole thing flattened. Empty on the
-    /// legacy path, where `task_description`/`new_turn` are used instead.
+    /// legacy path, where `task_description` is used instead.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<crate::conversation::Message>,
     /// Structured feedback from previous round's evaluations (Phase 2 context pipeline).
@@ -148,23 +138,13 @@ impl AgentContext {
             .or(self.session_id.as_deref())
     }
 
-    /// The task text a *resumed* session's delta prompt should carry: the new
-    /// turn only when set (the prior turns already live in the session), else the
-    /// full `task_description` (fresh session / non-thread paths). This is what
-    /// stops a resumed thread from re-sending its whole flattened history.
-    pub fn delta_task(&self) -> &str {
-        self.new_turn.as_deref().unwrap_or(&self.task_description)
-    }
-
     /// The task string a provider should send this call, given whether its
     /// session is resumed. Prefers the native `messages` array (rendered per
     /// resume state via [`crate::conversation::render`]); falls back to the
-    /// legacy `new_turn`/`task_description` strings while payloads migrate.
+    /// legacy `task_description` string while payloads migrate.
     pub fn task(&self, resumed: bool) -> String {
         if !self.messages.is_empty() {
             crate::conversation::render(&self.messages, resumed)
-        } else if resumed {
-            self.delta_task().to_string()
         } else {
             self.task_description.clone()
         }
@@ -2053,7 +2033,6 @@ mod tests {
             phase_budget_remaining_secs: 42.5,
             session_id: Some("sess-123".to_string()),
             conversation_id: None,
-            new_turn: None,
             messages: Vec::new(),
             structured_feedback: Some(StructuredFeedback {
                 contested_claims: vec![],
@@ -3106,36 +3085,11 @@ mod tests {
             "[user] t1\n\n[assistant] a1\n\n[user] t2 newest"
         );
         assert_eq!(ctx.task(true), "t2 newest"); // resumed → newest only
-        // Legacy path: no messages → the old strings.
+        // Legacy path: no messages → the flat `task_description`, regardless of resume.
         let mut legacy = ctx_with_session(Some("thread-y"));
         legacy.task_description = "FULL HISTORY".into();
-        legacy.new_turn = Some("DELTA".into());
         assert_eq!(legacy.task(false), "FULL HISTORY");
-        assert_eq!(legacy.task(true), "DELTA");
-    }
-
-    #[test]
-    fn delta_task_uses_new_turn_on_resume_and_is_bounded_vs_thread_length() {
-        // A resumed thread turn: the flattened history is huge and grows every
-        // turn; `new_turn` is just the incremental message.
-        let huge_history = "[user] t1\n[assistant] ...\n".repeat(2000); // ~grows with thread
-        let mut ctx = ctx_with_session(Some("thread-x"));
-        ctx.task_description = huge_history.clone();
-        ctx.new_turn = Some("[user] latest turn".into());
-        // Resume → delta carries only the new turn, NOT the flattened history.
-        assert_eq!(ctx.delta_task(), "[user] latest turn");
-        assert!(
-            !ctx.delta_task().contains("t1"),
-            "prior turns must not re-send"
-        );
-        // Bounded: independent of how long the thread got.
-        assert!(
-            ctx.delta_task().len() < 40,
-            "delta stays small as the thread grows"
-        );
-        // Fresh (no new_turn) → full history (a fresh session needs the context).
-        ctx.new_turn = None;
-        assert_eq!(ctx.delta_task(), huge_history);
+        assert_eq!(legacy.task(true), "FULL HISTORY");
     }
 
     #[test]

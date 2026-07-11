@@ -36,14 +36,9 @@ pub struct DeliberationRequest {
     /// (and the TUI surfaces it + posts the answer back).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_tools: Option<Vec<crate::agents::UserToolDefinition>>,
-    /// The new turn only (this send's message). Sent so a resumed thread session's
-    /// delta prompt carries just this instead of the whole flattened `user_query`
-    /// (which the session already holds). `None` for the first turn / non-thread.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub new_turn: Option<String>,
     /// The conversation as a role-tagged message array (the native form). The
-    /// agent renders it per session-resume state; supersedes `user_query` +
-    /// `new_turn`. Empty on non-thread / ad-hoc runs.
+    /// agent renders it per session-resume state; supersedes `user_query`.
+    /// Empty on non-thread / ad-hoc runs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<crate::conversation::Message>,
 }
@@ -101,7 +96,6 @@ pub fn build_request_raw_policy_id(policy_id: &str, task: &str) -> DeliberationR
         scope: None,
         timeout_seconds: None,
         user_tools: Some(vec![ask_user_tool()]),
-        new_turn: None,
         messages: Vec::new(),
     }
 }
@@ -159,7 +153,6 @@ pub fn build_request(
         scope: None,
         timeout_seconds,
         user_tools: Some(vec![ask_user_tool()]),
-        new_turn: None,
         messages: Vec::new(),
     })
 }

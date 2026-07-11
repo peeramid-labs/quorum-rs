@@ -49,12 +49,8 @@ pub enum ViewAction {
         /// the claude session so a linear branch resumes and a fork gets a fresh
         /// session. `None` falls back to the room id (one-shot / non-thread).
         conversation_id: Option<String>,
-        /// The new turn only (this send's message). Sent so a resumed session's
-        /// delta prompt carries just this, not the whole flattened `task`. `None`
-        /// for the first turn (fresh — needs the full task).
-        new_turn: Option<String>,
         /// The conversation as a role-tagged message array — the native form the
-        /// agent renders per session-resume state (supersedes task + new_turn).
+        /// agent renders per session-resume state (supersedes the flat `task`).
         messages: Vec<crate::conversation::Message>,
     },
     /// Apply a config mutation to nsed.yaml.

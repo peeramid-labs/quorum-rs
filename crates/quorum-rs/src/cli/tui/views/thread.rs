@@ -571,10 +571,6 @@ impl ThreadView {
         let task = self
             .thread
             .to_deliberation_query_from(parent_id.as_deref(), &msg);
-        // The new turn only — sent so a resumed session's delta prompt carries
-        // just this, not the whole flattened `task`. The agent ignores it on a
-        // fresh session (uses the full task), so it's always safe to send.
-        let new_turn = Some(msg.clone());
         // The native representation: the root→parent path + this new turn as a
         // role-tagged message array. The agent renders it per resume state.
         let messages = self.thread.to_messages_from(parent_id.as_deref(), &msg);
@@ -601,7 +597,6 @@ impl ThreadView {
             effort_override: self.effort,
             thread_id: Some(self.thread.id.clone()),
             conversation_id,
-            new_turn,
             messages,
         })
     }

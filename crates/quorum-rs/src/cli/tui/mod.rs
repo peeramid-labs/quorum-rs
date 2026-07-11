@@ -578,7 +578,6 @@ fn launch_thread_job(
     effort_override: Option<f32>,
     thread_id: Option<&str>,
     conversation_id: Option<&str>,
-    new_turn: Option<&str>,
     messages: Vec<crate::conversation::Message>,
 ) {
     let Some(label) = resolve_thread_policy(&app.config, policy) else {
@@ -613,9 +612,6 @@ fn launch_thread_job(
                     // per-branch conversation_id so forks don't share a session.
                     if let Some(cid) = conversation_id {
                         req.conversation_id = Some(cid.to_string());
-                    }
-                    if let Some(nt) = new_turn {
-                        req.new_turn = Some(nt.to_string());
                     }
                     req.messages = messages.clone();
                     if pc.roles.is_some() {
@@ -822,7 +818,6 @@ fn handle_action(
             effort_override,
             thread_id,
             conversation_id,
-            new_turn,
             messages,
         } => {
             // Resolve room → policy from config
@@ -840,7 +835,6 @@ fn handle_action(
                         *effort_override,
                         thread_id.as_deref(),
                         conversation_id.as_deref(),
-                        new_turn.as_deref(),
                         messages.clone(),
                     );
                     return;
@@ -1202,7 +1196,6 @@ mod tests {
                 effort_override: None,
                 thread_id: Some("thread-x".into()),
                 conversation_id: None,
-                new_turn: None,
                 messages: Vec::new(),
             },
             Path::new("/tmp/test.yaml"),
@@ -1236,7 +1229,6 @@ mod tests {
                 effort_override: None,
                 thread_id: Some("thread-42".into()),
                 conversation_id: None,
-                new_turn: None,
                 messages: Vec::new(),
             },
             Path::new("/tmp/test.yaml"),
@@ -1418,7 +1410,6 @@ mod tests {
                 effort_override: None,
                 thread_id: None,
                 conversation_id: None,
-                new_turn: None,
                 messages: Vec::new(),
             },
             Path::new("/tmp/test.yaml"),
@@ -1459,7 +1450,6 @@ mod tests {
                 effort_override: None,
                 thread_id: None,
                 conversation_id: None,
-                new_turn: None,
                 messages: Vec::new(),
             },
             Path::new("/tmp/test.yaml"),
@@ -1492,7 +1482,6 @@ mod tests {
                 effort_override: None,
                 thread_id: None,
                 conversation_id: None,
-                new_turn: None,
                 messages: Vec::new(),
             },
             Path::new("/tmp/test.yaml"),
