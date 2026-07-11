@@ -53,6 +53,9 @@ pub enum ViewAction {
         /// delta prompt carries just this, not the whole flattened `task`. `None`
         /// for the first turn (fresh — needs the full task).
         new_turn: Option<String>,
+        /// The conversation as a role-tagged message array — the native form the
+        /// agent renders per session-resume state (supersedes task + new_turn).
+        messages: Vec<crate::conversation::Message>,
     },
     /// Apply a config mutation to nsed.yaml.
     WriteConfig(ConfigMutation),

@@ -283,6 +283,39 @@ impl Thread {
         let tip = self.tip().map(|m| m.id.clone());
         self.to_deliberation_query_from(tip.as_deref(), new_user_message)
     }
+
+    /// The same root→parent path + new turn as [`to_deliberation_query_from`],
+    /// but as the native role-tagged [`Message`](crate::conversation::Message)
+    /// array. The subject (when set) leads the first message so a fresh render
+    /// still frames the conversation; a resumed render (newest turn only) drops
+    /// it, since the session already holds it.
+    pub fn to_messages_from(
+        &self,
+        parent_id: Option<&str>,
+        new_user_message: &str,
+    ) -> Vec<crate::conversation::Message> {
+        use crate::conversation::{Message, Role};
+        let path = parent_id.map(|p| self.path_to_root(p)).unwrap_or_default();
+        let mut msgs: Vec<Message> = path
+            .iter()
+            .map(|m| Message {
+                role: if m.role == "assistant" {
+                    Role::Noosphera
+                } else {
+                    Role::User
+                },
+                content: m.content.clone(),
+            })
+            .collect();
+        msgs.push(Message::user(new_user_message));
+        let subject = self.subject.trim();
+        if !subject.is_empty()
+            && let Some(first) = msgs.first_mut()
+        {
+            first.content = format!("Subject: {subject}\n\n{}", first.content);
+        }
+        msgs
+    }
 }
 
 /// Filesystem-backed store of threads.
@@ -844,6 +877,27 @@ mod tests {
     fn to_deliberation_query_first_turn_is_bare() {
         let s = Thread::new(""); // no subject → no prefix, tests flatten only
         assert_eq!(s.to_deliberation_query("hello?"), "hello?");
+    }
+
+    #[test]
+    fn to_messages_from_builds_role_tagged_array_with_subject() {
+        use crate::conversation::Role;
+        let mut t = Thread::new("My Subject");
+        let a = t.reply(None, "user", "first");
+        let b = t.reply(Some(&a), "assistant", "answer");
+        let msgs = t.to_messages_from(Some(&b), "new turn");
+        // Root path (a, b) + the new turn = 3 messages, roles mapped.
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].role, Role::User);
+        assert!(msgs[0].content.starts_with("Subject: My Subject\n\nfirst"));
+        assert_eq!(msgs[1].role, Role::Noosphera); // assistant → noosphera
+        assert_eq!(msgs[2].role, Role::User);
+        assert_eq!(msgs[2].content, "new turn");
+        // Fresh render carries the whole conversation; resumed render is just the
+        // newest turn (bare) — the token win.
+        let fresh = crate::conversation::render(&msgs, false);
+        assert!(fresh.contains("first") && fresh.contains("answer") && fresh.contains("new turn"));
+        assert_eq!(crate::conversation::render(&msgs, true), "new turn");
     }
 
     #[test]

@@ -575,6 +575,9 @@ impl ThreadView {
         // just this, not the whole flattened `task`. The agent ignores it on a
         // fresh session (uses the full task), so it's always safe to send.
         let new_turn = Some(msg.clone());
+        // The native representation: the root→parent path + this new turn as a
+        // role-tagged message array. The agent renders it per resume state.
+        let messages = self.thread.to_messages_from(parent_id.as_deref(), &msg);
         let uid = self.thread.reply(parent_id.as_deref(), "user", msg);
         // The new turn's branch is the per-branch conversation_id (a fork under
         // a non-leaf node got a fresh branch; a leaf reply kept the parent's).
@@ -599,6 +602,7 @@ impl ThreadView {
             thread_id: Some(self.thread.id.clone()),
             conversation_id,
             new_turn,
+            messages,
         })
     }
 

@@ -579,6 +579,7 @@ fn launch_thread_job(
     thread_id: Option<&str>,
     conversation_id: Option<&str>,
     new_turn: Option<&str>,
+    messages: Vec<crate::conversation::Message>,
 ) {
     let Some(label) = resolve_thread_policy(&app.config, policy) else {
         app.status_message = Some((
@@ -616,6 +617,7 @@ fn launch_thread_job(
                     if let Some(nt) = new_turn {
                         req.new_turn = Some(nt.to_string());
                     }
+                    req.messages = messages.clone();
                     if pc.roles.is_some() {
                         tui_client.push_policy_and_submit(
                             remote,
@@ -821,6 +823,7 @@ fn handle_action(
             thread_id,
             conversation_id,
             new_turn,
+            messages,
         } => {
             // Resolve room → policy from config
             let room_name = match room {
@@ -838,6 +841,7 @@ fn handle_action(
                         thread_id.as_deref(),
                         conversation_id.as_deref(),
                         new_turn.as_deref(),
+                        messages.clone(),
                     );
                     return;
                 }
@@ -1199,6 +1203,7 @@ mod tests {
                 thread_id: Some("thread-x".into()),
                 conversation_id: None,
                 new_turn: None,
+                messages: Vec::new(),
             },
             Path::new("/tmp/test.yaml"),
         );
@@ -1232,6 +1237,7 @@ mod tests {
                 thread_id: Some("thread-42".into()),
                 conversation_id: None,
                 new_turn: None,
+                messages: Vec::new(),
             },
             Path::new("/tmp/test.yaml"),
         );
@@ -1413,6 +1419,7 @@ mod tests {
                 thread_id: None,
                 conversation_id: None,
                 new_turn: None,
+                messages: Vec::new(),
             },
             Path::new("/tmp/test.yaml"),
         );
@@ -1453,6 +1460,7 @@ mod tests {
                 thread_id: None,
                 conversation_id: None,
                 new_turn: None,
+                messages: Vec::new(),
             },
             Path::new("/tmp/test.yaml"),
         );
@@ -1485,6 +1493,7 @@ mod tests {
                 thread_id: None,
                 conversation_id: None,
                 new_turn: None,
+                messages: Vec::new(),
             },
             Path::new("/tmp/test.yaml"),
         );

@@ -517,6 +517,7 @@ impl MainMenuView {
                         thread_id: None,
                         conversation_id: None,
                         new_turn: None,
+                        messages: Vec::new(),
                     })
                 }
                 // Local room: submit via the orchestrator pinned in nsed.yaml.
@@ -540,6 +541,7 @@ impl MainMenuView {
                         thread_id: None,
                         conversation_id: None,
                         new_turn: None,
+                        messages: Vec::new(),
                     })
                 }
                 None => Some(ViewAction::SetStatus(
@@ -806,6 +808,7 @@ mod tests {
                 thread_id: None,
                 conversation_id: None,
                 new_turn: None,
+                messages: Vec::new(),
             })
         );
         assert!(!view.task_input_active);
@@ -1055,6 +1058,7 @@ mod tests {
                 thread_id: None,
                 conversation_id: None,
                 new_turn: None,
+                messages: Vec::new(),
             })
         );
     }
