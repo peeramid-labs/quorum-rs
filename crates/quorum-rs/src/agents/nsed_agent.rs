@@ -1099,8 +1099,11 @@ impl NsedAgent for ProposerEvaluatorAgent {
     async fn propose(&self, context: &AgentContext) -> Result<Proposal> {
         info!("🤖 Agent is starting the proposal generation process.");
 
+        // OpenAI-compat is stateless (no session resume) → always the full
+        // conversation, rendered from `messages` (or the legacy string).
+        let task = context.task(false);
         let prompt = self.prompt_set.get_proposer_prompt(
-            &context.task_description,
+            &task,
             context.previous_round_matrix.clone(),
             context.previous_own_proposal.as_ref(),
             context.previous_own_score,
@@ -1301,8 +1304,9 @@ impl NsedAgent for ProposerEvaluatorAgent {
             },
         };
 
+        let task = context.task(false); // stateless → full conversation
         let prompt = self.prompt_set.get_batch_evaluator_prompt(
-            &context.task_description,
+            &task,
             &context.candidates,
             context.previous_own_proposal.as_ref(),
             context.round_number as usize,

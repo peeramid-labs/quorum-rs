@@ -2340,13 +2340,15 @@ fn extract_evaluate_args(
 #[async_trait]
 impl NsedAgent for ClaudeAgent {
     async fn propose(&self, context: &AgentContext) -> Result<Proposal> {
-        // Delta prompt for resumed sessions (omits task + general instructions).
-        // On a resumed thread turn the prior turns already live in the session, so
-        // the round-1 fallback carries only `new_turn` — not the whole flattened
-        // history. Fresh sessions use the full prompt below.
-        let delta_task = context.delta_task();
+        // Delta prompt for a resumed session (omits the task + general
+        // instructions): its round-1 fallback carries only the newest turn — the
+        // resumed session already holds the rest. The full prompt (fresh session /
+        // fallback) carries the whole conversation. `task(resumed)` renders both
+        // from the `messages` array (or the legacy strings while migrating).
+        let delta_task = context.task(true);
+        let full_task = context.task(false);
         let prompt = self.prompt_set.get_proposer_delta_prompt(
-            delta_task,
+            &delta_task,
             context.previous_round_matrix.clone(),
             context.previous_own_proposal.as_ref(),
             context.previous_own_score,
@@ -2357,7 +2359,7 @@ impl NsedAgent for ClaudeAgent {
 
         // Full prompt for session fallback (includes everything)
         let full_prompt = self.prompt_set.get_proposer_prompt(
-            &context.task_description,
+            &full_task,
             context.previous_round_matrix.clone(),
             context.previous_own_proposal.as_ref(),
             context.previous_own_score,
@@ -2386,11 +2388,12 @@ impl NsedAgent for ClaudeAgent {
     }
 
     async fn evaluate(&self, context: &AgentContext) -> Result<Vec<(String, Evaluation)>> {
-        // Delta prompt for resumed sessions — carries only `new_turn` on the
-        // round-1 fallback (the flattened history is already in the session).
-        let delta_task = context.delta_task();
+        // Delta prompt for a resumed session — its round-1 fallback carries only
+        // the newest turn (the flattened history is already in the session).
+        let delta_task = context.task(true);
+        let full_task = context.task(false);
         let prompt = self.prompt_set.get_evaluator_delta_prompt(
-            delta_task,
+            &delta_task,
             &context.candidates,
             context.previous_own_proposal.as_ref(),
             context.round_number as usize,
@@ -2399,7 +2402,7 @@ impl NsedAgent for ClaudeAgent {
 
         // Full prompt for session fallback
         let full_prompt = self.prompt_set.get_batch_evaluator_prompt(
-            &context.task_description,
+            &full_task,
             &context.candidates,
             context.previous_own_proposal.as_ref(),
             context.round_number as usize,
