@@ -1,13 +1,87 @@
-//! Canonical conversation → task-string flattening.
+//! Canonical conversation model + rendering.
 //!
-//! A deliberation consumes a single task *string*, not a message array (agents
-//! are N proposers/evaluators, provider-agnostic — see
-//! `docs/explanation/policy-as-model-and-sessions.md`). Both the server's
-//! OpenAI-compat layer (which starts from `messages[]`) and the interactive
-//! client (which starts from stored thread messages) must render a multi-turn
-//! conversation into that one string **identically**, or a resumed thread reads
-//! differently depending on which side assembled it. This module is the single
-//! source of truth for that rendering so the two can never drift.
+//! The deliberation's native representation is an ordered, role-tagged
+//! [`Message`] array (an extended-OpenAI shape with a Mixture-of-Minds
+//! `noosphera` consensus role). Providers can't all consume that array — the
+//! OpenAI-compat and exec backends take a single task *string* and don't resume
+//! a session — so each provider **renders** the array to what it can send via
+//! [`render`]: a resumed claude session gets only the newest turn (it already
+//! holds the rest), while a fresh session / stateless backend gets the whole
+//! conversation flattened. [`flatten_conversation`] is the shared, stable
+//! string primitive both the client and the server's OpenAI-compat layer render
+//! through, so a resumed thread can never read differently depending on which
+//! side assembled it.
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+/// A role in a deliberation conversation — the standard user/assistant pair
+/// extended with the Mixture-of-Minds consensus role (`noosphera`) and an
+/// operator mid-deliberation injection.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    /// The operator's turn.
+    User,
+    /// The deliberation's consensus reply (the assistant, on the wire).
+    Noosphera,
+    /// An operator message injected mid-deliberation.
+    UserInjection,
+}
+
+impl Role {
+    /// The wire label used when flattening to the task string. `Noosphera` maps
+    /// to `assistant` so the flattened form stays OpenAI-legible.
+    pub fn label(self) -> &'static str {
+        match self {
+            Role::User => "user",
+            Role::Noosphera => "assistant",
+            Role::UserInjection => "user_injection",
+        }
+    }
+}
+
+/// One turn of a deliberation conversation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
+pub struct Message {
+    pub role: Role,
+    pub content: String,
+}
+
+impl Message {
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            content: content.into(),
+        }
+    }
+    pub fn noosphera(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Noosphera,
+            content: content.into(),
+        }
+    }
+}
+
+/// Render the conversation to the single task string a provider sends this call.
+///
+/// - `resumed == true`: only the **newest** turn — the resumed claude session
+///   already holds the earlier turns, so re-sending them is pure token waste.
+/// - `resumed == false`: the **whole** conversation flattened — a fresh session
+///   or a stateless backend (OpenAI-compat / exec) has no prior context.
+///
+/// Both paths go through [`flatten_conversation`] so the string form is
+/// identical regardless of how much of the array is sent.
+pub fn render(messages: &[Message], resumed: bool) -> String {
+    let slice = if resumed {
+        &messages[messages.len().saturating_sub(1)..]
+    } else {
+        messages
+    };
+    flatten_conversation(slice.iter().map(|m| (m.role.label(), m.content.as_str())))
+}
 
 /// Flatten an ordered, role-tagged conversation into the single `user_query`
 /// string the deliberation API takes.
@@ -87,5 +161,36 @@ mod tests {
             flatten_conversation([("user", ""), ("assistant", "  ")]),
             ""
         );
+    }
+
+    #[test]
+    fn render_fresh_flattens_the_whole_conversation() {
+        let msgs = vec![
+            Message::user("q1"),
+            Message::noosphera("a1"),
+            Message::user("q2"),
+        ];
+        assert_eq!(
+            render(&msgs, false),
+            "[user] q1\n\n[assistant] a1\n\n[user] q2"
+        );
+    }
+
+    #[test]
+    fn render_resumed_sends_only_the_newest_turn_bounded_by_length() {
+        let mut msgs: Vec<Message> = (0..50)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::user(format!("turn {i}"))
+                } else {
+                    Message::noosphera(format!("reply {i}"))
+                }
+            })
+            .collect();
+        msgs.push(Message::user("the newest question"));
+        // Resumed → only the last turn (a lone user turn renders bare), so the
+        // output is independent of how long the thread grew.
+        assert_eq!(render(&msgs, true), "the newest question");
+        assert!(!render(&msgs, true).contains("turn 0"));
     }
 }

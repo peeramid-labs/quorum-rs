@@ -69,8 +69,18 @@ pub struct AgentContext {
     /// prompt's task on a resumed session so we don't re-send the whole flattened
     /// `task_description` (which the session already holds). `None` → the delta
     /// falls back to `task_description` (fresh session / non-thread paths).
+    ///
+    /// DEPRECATED — superseded by `messages`. Kept during the migration so old
+    /// payloads still resume correctly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_turn: Option<String>,
+    /// The conversation as an ordered, role-tagged message array (the native
+    /// representation). Each provider renders it to what it can send via
+    /// [`crate::conversation::render`]: a resumed claude session gets only the
+    /// newest turn, everything else gets the whole thing flattened. Empty on the
+    /// legacy path, where `task_description`/`new_turn` are used instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<crate::conversation::Message>,
     /// Structured feedback from previous round's evaluations (Phase 2 context pipeline).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_feedback: Option<StructuredFeedback>,
@@ -144,6 +154,20 @@ impl AgentContext {
     /// stops a resumed thread from re-sending its whole flattened history.
     pub fn delta_task(&self) -> &str {
         self.new_turn.as_deref().unwrap_or(&self.task_description)
+    }
+
+    /// The task string a provider should send this call, given whether its
+    /// session is resumed. Prefers the native `messages` array (rendered per
+    /// resume state via [`crate::conversation::render`]); falls back to the
+    /// legacy `new_turn`/`task_description` strings while payloads migrate.
+    pub fn task(&self, resumed: bool) -> String {
+        if !self.messages.is_empty() {
+            crate::conversation::render(&self.messages, resumed)
+        } else if resumed {
+            self.delta_task().to_string()
+        } else {
+            self.task_description.clone()
+        }
     }
 
     /// Build a [`TelemetryContext`](crate::telemetry::TelemetryContext)
@@ -2030,6 +2054,7 @@ mod tests {
             session_id: Some("sess-123".to_string()),
             conversation_id: None,
             new_turn: None,
+            messages: Vec::new(),
             structured_feedback: Some(StructuredFeedback {
                 contested_claims: vec![],
                 verified_claims: vec!["claim A".to_string()],
@@ -3064,6 +3089,29 @@ mod tests {
             phase: DeliberationPhase::Evaluating,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn task_prefers_messages_else_falls_back_to_legacy_strings() {
+        use crate::conversation::Message;
+        // Native path: the messages array renders per resume state.
+        let mut ctx = ctx_with_session(Some("thread-x"));
+        ctx.messages = vec![
+            Message::user("t1"),
+            Message::noosphera("a1"),
+            Message::user("t2 newest"),
+        ];
+        assert_eq!(
+            ctx.task(false),
+            "[user] t1\n\n[assistant] a1\n\n[user] t2 newest"
+        );
+        assert_eq!(ctx.task(true), "t2 newest"); // resumed → newest only
+        // Legacy path: no messages → the old strings.
+        let mut legacy = ctx_with_session(Some("thread-y"));
+        legacy.task_description = "FULL HISTORY".into();
+        legacy.new_turn = Some("DELTA".into());
+        assert_eq!(legacy.task(false), "FULL HISTORY");
+        assert_eq!(legacy.task(true), "DELTA");
     }
 
     #[test]
