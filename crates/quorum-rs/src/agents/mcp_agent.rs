@@ -211,6 +211,67 @@ impl NsedMcpServer {
             tool_router: Self::tool_router(),
         }
     }
+
+    /// The operator/middleware-declared user tools (e.g. `ask_user`), advertised
+    /// as `user_<name>` MCP tools so the claude agent can call them mid-round.
+    /// Empty when no handler is wired — the tools are inert without one, and this
+    /// is the wiring the MCP path was missing (only the OpenAI path had it), so
+    /// claude agents could never surface an `ask_user` question to the operator.
+    fn user_tools(&self) -> Vec<rmcp::model::Tool> {
+        if self.context.user_tool_handler.is_none() {
+            return Vec::new();
+        }
+        self.context
+            .user_tools
+            .iter()
+            .map(|def| {
+                let schema: rmcp::model::JsonObject = def
+                    .parameters
+                    .as_ref()
+                    .and_then(|p| p.as_object().cloned())
+                    .unwrap_or_default();
+                rmcp::model::Tool::new(
+                    format!("user_{}", def.name),
+                    def.description.clone(),
+                    Arc::new(schema),
+                )
+            })
+            .collect()
+    }
+
+    /// Dispatch a `user_<name>` tool call to the operator via the user-tool
+    /// handler (posts a pending question, blocks until answered), returning the
+    /// answer. `None` when the name isn't a declared user tool, so the caller
+    /// falls through to the static tool router.
+    async fn dispatch_user_tool(
+        &self,
+        name: &str,
+        arguments: &Option<rmcp::model::JsonObject>,
+    ) -> Option<String> {
+        let handler = self.context.user_tool_handler.as_ref()?;
+        if !self
+            .context
+            .user_tools
+            .iter()
+            .any(|d| format!("user_{}", d.name) == name)
+        {
+            return None;
+        }
+        let args_json = arguments
+            .as_ref()
+            .map(|a| serde_json::to_string(a).unwrap_or_default())
+            .unwrap_or_else(|| "{}".to_string());
+        Some(
+            handler
+                .handle_call(
+                    name,
+                    &args_json,
+                    self.context.round_number,
+                    self.context.phase,
+                )
+                .await,
+        )
+    }
 }
 
 #[tool_router]
@@ -527,6 +588,9 @@ impl ServerHandler for NsedMcpServer {
                 }
             }
         }
+        // Advertise the operator-declared user tools (e.g. `ask_user`) alongside
+        // the static protocol tools so the claude agent can call them.
+        tools.extend(self.user_tools());
         Ok(rmcp::model::ListToolsResult {
             tools,
             ..Default::default()
@@ -538,6 +602,16 @@ impl ServerHandler for NsedMcpServer {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        // A `user_<name>` call goes to the operator via the user-tool handler and
+        // returns their answer; anything else falls through to the static router.
+        if let Some(answer) = self
+            .dispatch_user_tool(&request.name, &request.arguments)
+            .await
+        {
+            return Ok(rmcp::model::CallToolResult::success(vec![
+                rmcp::model::Content::text(answer),
+            ]));
+        }
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tcc).await
     }
@@ -4223,6 +4297,89 @@ mod tests {
         assert!(
             !cmd_r.iter().any(|a| a.contains("<context_file")),
             "resumed session should not include context files"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_server_advertises_and_dispatches_user_tools() {
+        use crate::agents::{DeliberationPhase, UserToolDefinition, UserToolHandlerTrait};
+
+        #[derive(Debug)]
+        struct MockHandler;
+        #[async_trait::async_trait]
+        impl UserToolHandlerTrait for MockHandler {
+            async fn handle_call(
+                &self,
+                tool_name: &str,
+                args: &str,
+                _round: u32,
+                _phase: DeliberationPhase,
+            ) -> String {
+                format!("answered:{tool_name}:{args}")
+            }
+        }
+
+        let mut ctx = minimal_context();
+        ctx.round_number = 2;
+        ctx.user_tools = vec![UserToolDefinition {
+            name: "ask_user".into(),
+            description: "Ask the operator a clarifying question".into(),
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "question": { "type": "string" } },
+                "required": ["question"]
+            })),
+            strict: Some(false),
+        }];
+        ctx.user_tool_handler = Some(std::sync::Arc::new(MockHandler));
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let server = NsedMcpServer::new(ctx, ActivePhase::Proposing, None, tx);
+
+        // The whole bug: the claude/MCP agent never advertised user tools. It must now.
+        let tools = server.user_tools();
+        assert!(
+            tools.iter().any(|t| t.name == "user_ask_user"),
+            "ask_user must be advertised to the claude agent"
+        );
+
+        // A `user_` call reaches the operator handler and returns its answer.
+        let ans = server
+            .dispatch_user_tool("user_ask_user", &Some(serde_json::Map::new()))
+            .await;
+        assert_eq!(ans.as_deref(), Some("answered:user_ask_user:{}"));
+
+        // A protocol tool is not a user tool → None (falls through to the router).
+        assert!(
+            server
+                .dispatch_user_tool("nsed_propose", &None)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_server_user_tools_inert_without_handler() {
+        use crate::agents::UserToolDefinition;
+        let mut ctx = minimal_context();
+        ctx.user_tools = vec![UserToolDefinition {
+            name: "ask_user".into(),
+            description: "x".into(),
+            parameters: None,
+            strict: None,
+        }];
+        ctx.user_tool_handler = None; // declared but no handler → inert
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let server = NsedMcpServer::new(ctx, ActivePhase::Proposing, None, tx);
+        assert!(
+            server.user_tools().is_empty(),
+            "no handler → nothing advertised (the tool can't be answered)"
+        );
+        assert!(
+            server
+                .dispatch_user_tool("user_ask_user", &None)
+                .await
+                .is_none()
         );
     }
 
