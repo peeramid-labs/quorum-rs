@@ -269,6 +269,20 @@ impl NsedMcpServer {
                     )]));
                 }
             };
+        // Enforce the middleware-declared schema the advertised `input_schema`
+        // can't (rmcp's `ProposeInput` swallows any shape). A prose/XML blob or a
+        // wrong-typed `ops` is rejected here so Claude re-calls in-session with a
+        // conforming envelope, instead of an unparseable proposal entering
+        // deliberation (→ 0 ops applied, the turn silently discarded).
+        if let Some(schema) = self.context.forced_proposal_schema.as_ref() {
+            if let Err(reason) = validate_proposal_against_schema(&content, schema) {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "nsed_propose args did not match the required schema: {reason}. Re-emit the \
+                     call as a single JSON object with the schema's fields (e.g. \
+                     `{{\"reply\": \"…\", \"ops\": [ … ]}}`) — no prose or XML outside the JSON."
+                ))]));
+            }
+        }
         let result = McpResult::Proposal {
             thought_process,
             content,
@@ -1752,7 +1766,12 @@ impl ClaudeAgent {
         let malformed_override: Option<super::claude_recovery::LastFailureKind> =
             if let Some(uuid) = claude_session_uuid {
                 use super::claude_recovery::{LastFailureKind, RecoveryOutcome};
-                match self.try_recover_terminal_call(uuid, phase, recovery_offset) {
+                match self.try_recover_terminal_call(
+                    uuid,
+                    phase,
+                    recovery_offset,
+                    ctx.forced_proposal_schema.as_ref(),
+                ) {
                     RecoveryOutcome::Recovered(result) => {
                         tracing::warn!(
                             agent = %self.name,
@@ -1863,6 +1882,7 @@ impl ClaudeAgent {
         claude_session_uuid: &str,
         phase: &str,
         after_offset: u64,
+        forced_schema: Option<&serde_json::Value>,
     ) -> super::claude_recovery::RecoveryOutcome<super::mcp_tools::McpResult> {
         use super::claude_recovery::{
             RecoveryOutcome, recover_from_session_after, unwrap_recovered_input,
@@ -1890,7 +1910,7 @@ impl ClaudeAgent {
                 after_offset,
             ) {
                 None => RecoveryOutcome::NotFound,
-                Some(raw) => extract_propose_args(unwrap_recovered_input(raw)),
+                Some(raw) => extract_propose_args(unwrap_recovered_input(raw), forced_schema),
             },
             "evaluate" => match recover_from_session_after(
                 &working_dir,
@@ -2186,13 +2206,103 @@ fn resolve_proposal_content(args: &serde_json::Value) -> Option<(String, String)
     }
 }
 
+/// The JSON type name of a value, for schema-mismatch messages.
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Does `v` satisfy a JSON-schema primitive `type` name?
+fn json_type_matches(v: &serde_json::Value, ty: &str) -> bool {
+    match ty {
+        "object" => v.is_object(),
+        "array" => v.is_array(),
+        "string" => v.is_string(),
+        "number" => v.is_number(),
+        "integer" => v.is_i64() || v.is_u64(),
+        "boolean" => v.is_boolean(),
+        "null" => v.is_null(),
+        // Unknown / compound (e.g. type arrays) — don't reject on type alone.
+        _ => true,
+    }
+}
+
+/// Structurally validate a resolved proposal `content` string against a
+/// middleware-declared `schema` (e.g. the patch-deliberation `{reply, ops[]}`
+/// envelope). Minimal check: `content` must parse as JSON, be an object when the
+/// schema is `type: object`, carry every `required` key, and match each declared
+/// top-level property `type`. Returns `Err(reason)` on the first violation.
+///
+/// This supplies the enforcement the *advertised* schema lacks: rmcp deserializes
+/// `nsed_propose` args into a permissive `ProposeInput` whose `#[serde(flatten)]
+/// extra` swallows any shape, so a model that emits prose/XML, or `ops` as a
+/// string instead of an array, is otherwise accepted verbatim (→ 0 ops applied,
+/// the turn silently discarded). Validating here routes such a submission into
+/// the existing `MalformedArgs` retry with a targeted directive instead.
+fn validate_proposal_against_schema(
+    content: &str,
+    schema: &serde_json::Value,
+) -> Result<(), String> {
+    // Only structurally validate object schemas — a non-object schema (or none)
+    // leaves the historical accept-anything behaviour untouched.
+    if schema.get("type").and_then(|t| t.as_str()) != Some("object") {
+        return Ok(());
+    }
+    let val: serde_json::Value = serde_json::from_str(content).map_err(|e| {
+        format!(
+            "the proposal must be a single JSON object matching the tool schema, not prose \
+             or XML — no `<reply>`/`<ops>` tags, no markdown fences (parse error: {e})"
+        )
+    })?;
+    let obj = val.as_object().ok_or_else(|| {
+        format!(
+            "the proposal must be a JSON object with the schema's fields, not a bare {}",
+            json_type_name(&val)
+        )
+    })?;
+    if let Some(reqs) = schema.get("required").and_then(|r| r.as_array()) {
+        for k in reqs.iter().filter_map(|r| r.as_str()) {
+            if !obj.contains_key(k) {
+                return Err(format!("missing required field `{k}`"));
+            }
+        }
+    }
+    if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+        for (k, pschema) in props {
+            if let (Some(v), Some(ty)) = (obj.get(k), pschema.get("type").and_then(|t| t.as_str()))
+            {
+                if !json_type_matches(v, ty) {
+                    return Err(format!(
+                        "field `{k}` must be a JSON {ty}, not a {}",
+                        json_type_name(v)
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate + map a recovered, already-unwrapped `nsed_propose`
 /// `input` Value into a `RecoveryOutcome<McpResult>`. Pure
 /// function; no filesystem I/O. Used by
 /// `ClaudeAgent::try_recover_terminal_call` after the session-
 /// jsonl scrape and `unwrap_recovered_input` step.
+///
+/// When a `forced_schema` is supplied (the middleware-declared proposal
+/// envelope), the resolved content is validated against it — a scraped
+/// prose/XML blob or a wrong-typed `ops` is surfaced as `Malformed` so the
+/// retry feedback tells the model exactly what to fix, rather than entering
+/// deliberation as an unparseable proposal (0 ops applied).
 fn extract_propose_args(
     raw: serde_json::Value,
+    forced_schema: Option<&serde_json::Value>,
 ) -> super::claude_recovery::RecoveryOutcome<super::mcp_tools::McpResult> {
     use super::claude_recovery::RecoveryOutcome;
     use super::mcp_tools::McpResult;
@@ -2200,10 +2310,17 @@ fn extract_propose_args(
     // Same resolver as the live handler — recovery accepts exactly what the handler
     // would (any middleware envelope), and rejects the same empty submissions.
     match resolve_proposal_content(&raw) {
-        Some((thought_process, content)) => RecoveryOutcome::Recovered(McpResult::Proposal {
-            thought_process,
-            content,
-        }),
+        Some((thought_process, content)) => {
+            if let Some(schema) = forced_schema {
+                if let Err(reason) = validate_proposal_against_schema(&content, schema) {
+                    return RecoveryOutcome::Malformed(reason);
+                }
+            }
+            RecoveryOutcome::Recovered(McpResult::Proposal {
+                thought_process,
+                content,
+            })
+        }
         // tool_use was emitted but carried no substance (missing/blank content and
         // no envelope fields) — surface as Malformed so the retry feedback explains
         // exactly what was wrong (CR PR #349 finding 1535).
@@ -3639,7 +3756,7 @@ mod tests {
             "thought_process": "tp",
             "content": "the proposal body",
         });
-        match extract_propose_args(raw) {
+        match extract_propose_args(raw, None) {
             RecoveryOutcome::Recovered(McpResult::Proposal {
                 thought_process,
                 content,
@@ -3657,7 +3774,7 @@ mod tests {
 
         // missing field → Malformed with a reason mentioning content
         let raw = serde_json::json!({"thought_process": "tp"});
-        match extract_propose_args(raw) {
+        match extract_propose_args(raw, None) {
             RecoveryOutcome::Malformed(reason) => {
                 assert!(
                     reason.contains("content"),
@@ -3670,7 +3787,7 @@ mod tests {
         // present-but-blank content also Malformed (whitespace only).
         let blank = serde_json::json!({"content": "   "});
         assert!(matches!(
-            extract_propose_args(blank),
+            extract_propose_args(blank, None),
             RecoveryOutcome::Malformed(_)
         ));
     }
@@ -3713,7 +3830,7 @@ mod tests {
         use super::super::mcp_tools::McpResult;
         // A middleware envelope has no `content` field — recover the whole args.
         let raw = serde_json::json!({"rationale": "r", "ops": [{"op": "write", "path": "a.md", "content": "x"}]});
-        match extract_propose_args(raw) {
+        match extract_propose_args(raw, None) {
             RecoveryOutcome::Recovered(McpResult::Proposal { content, .. }) => {
                 assert!(
                     content.contains("rationale"),
@@ -3725,6 +3842,89 @@ mod tests {
                 );
             }
             other => panic!("expected Recovered envelope, got {other:?}"),
+        }
+    }
+
+    fn propose_schema() -> serde_json::Value {
+        // The patch-deliberation forced envelope: {reply: string, ops: array}.
+        serde_json::json!({
+            "type": "object",
+            "properties": { "reply": {"type": "string"}, "ops": {"type": "array"} },
+            "required": ["reply", "ops"]
+        })
+    }
+
+    #[test]
+    fn validate_proposal_accepts_conforming_envelope() {
+        let s = propose_schema();
+        assert!(
+            super::validate_proposal_against_schema(r#"{"reply":"hi","ops":[]}"#, &s).is_ok(),
+            "a valid {{reply, ops[]}} envelope passes"
+        );
+    }
+
+    #[test]
+    fn validate_proposal_rejects_prose_and_xml() {
+        // PropductBot's real failure: <reply>/<ops> XML + prose, not JSON.
+        let s = propose_schema();
+        let blob = "Here is my answer.</reply>\n<ops\">[{\"op\":\"create\"}]";
+        let err = super::validate_proposal_against_schema(blob, &s).unwrap_err();
+        assert!(err.contains("JSON"), "explains it must be JSON: {err}");
+    }
+
+    #[test]
+    fn validate_proposal_rejects_wrong_typed_ops() {
+        // `ops` sent as a string instead of an array.
+        let s = propose_schema();
+        let err =
+            super::validate_proposal_against_schema(r#"{"reply":"hi","ops":"whole file"}"#, &s)
+                .unwrap_err();
+        assert!(
+            err.contains("ops") && err.contains("array"),
+            "names the field+type: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_proposal_rejects_missing_required_and_bare_values() {
+        let s = propose_schema();
+        assert!(
+            super::validate_proposal_against_schema(r#"{"reply":"hi"}"#, &s)
+                .unwrap_err()
+                .contains("ops"),
+            "missing required ops"
+        );
+        // A bare JSON string (not an object) is rejected.
+        assert!(super::validate_proposal_against_schema(r#""just text""#, &s).is_err());
+        // A non-object schema disables structural validation (accept-anything).
+        let none_schema = serde_json::json!({"type": "string"});
+        assert!(super::validate_proposal_against_schema("anything at all", &none_schema).is_ok());
+    }
+
+    #[test]
+    fn extract_propose_args_rejects_schema_violation_for_retry() {
+        use super::super::claude_recovery::RecoveryOutcome;
+        // A recovered tool_use whose `ops` is a string (not an array) must be
+        // surfaced as Malformed so the retry feedback is targeted, not accepted
+        // as a 0-op proposal.
+        let raw = serde_json::json!({"reply": "hi", "ops": "a whole file as a string"});
+        match extract_propose_args(raw, Some(&propose_schema())) {
+            RecoveryOutcome::Malformed(r) => {
+                assert!(r.contains("ops"), "reason names the offending field: {r}")
+            }
+            other => panic!("expected Malformed on schema violation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_propose_args_without_schema_stays_permissive() {
+        use super::super::claude_recovery::RecoveryOutcome;
+        use super::super::mcp_tools::McpResult;
+        // No forced schema → historical accept-anything behaviour is preserved.
+        let raw = serde_json::json!({"reply": "hi", "ops": "not an array"});
+        match extract_propose_args(raw, None) {
+            RecoveryOutcome::Recovered(McpResult::Proposal { .. }) => {}
+            other => panic!("expected Recovered with no schema, got {other:?}"),
         }
     }
 
