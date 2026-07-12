@@ -1250,6 +1250,39 @@ impl ClaudeAgent {
         None
     }
 
+    /// Reap a claude child that slammed its stdin shut before reading the prompt.
+    /// A rate-limit / usage-window exit terminates the CLI instantly, closing the
+    /// read end of its stdin pipe — so our `write_all` fails with `BrokenPipe`
+    /// *before* the normal post-write stderr drain runs. Without this, the failure
+    /// bubbles up as a bare "broken pipe" and is misclassified as a transient
+    /// transport error (fast retries), while claude's actual rate-limit report —
+    /// which it wrote to stderr + the exit code on the way out — is discarded.
+    ///
+    /// Read that stderr, capture the exit code, and fold the stderr into the error
+    /// message so the rate-limit loop (which substring-matches the bubbled
+    /// `{err:?}`) detects the limit and backs off through the usage window instead.
+    /// Returns `(error_with_stderr, stderr, exit_code)`.
+    async fn reap_stdin_write_failure(
+        child: &mut tokio::process::Child,
+        write_err: std::io::Error,
+        agent: &str,
+    ) -> (anyhow::Error, String, i32) {
+        let stderr_str = match child.stderr.take() {
+            Some(mut s) => {
+                let mut buf = String::new();
+                let _ = tokio::io::AsyncReadExt::read_to_string(&mut s, &mut buf).await;
+                buf
+            }
+            None => String::new(),
+        };
+        let exit_code = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1);
+        let err = anyhow::Error::from(write_err).context(format!(
+            "claude agent '{agent}': exited before reading the prompt (exit {exit_code}): {}",
+            stderr_str.trim()
+        ));
+        (err, stderr_str, exit_code)
+    }
+
     /// Detect rate-limit / overloaded / usage-window errors in claude
     /// CLI stderr (or in any text-form bubble of the same — `to_string`
     /// of the anyhow error from `execute_phase_attempt` carries the
@@ -1620,10 +1653,16 @@ impl ClaudeAgent {
         };
 
         let mut stdin = child.stdin.take().expect("stdin piped");
-        stdin
-            .write_all(prompt.as_bytes())
-            .await
-            .map_err(|e| (e.into(), String::new(), -1, None))?;
+        if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+            // Claude exited before reading the prompt (typically a rate-limit /
+            // usage-window exit that slams the pipe shut). Reap it and read the
+            // stderr it printed so the rate-limit loop can classify it, instead of
+            // fast-failing on a bare broken pipe.
+            drop(stdin);
+            let (err, stderr, exit_code) =
+                Self::reap_stdin_write_failure(&mut child, e, &self.name).await;
+            return Err((err, stderr, exit_code, None));
+        }
         drop(stdin);
 
         let mut stdout_pipe = child.stdout.take().expect("stdout piped");
@@ -2954,9 +2993,15 @@ impl super::ChatCapable for ClaudeAgent {
 
         // Pipe prompt to stdin
         let mut stdin = child.stdin.take().expect("stdin piped");
-        stdin.write_all(prompt.as_bytes()).await.with_context(|| {
-            format!("claude agent '{}': failed to write chat prompt", self.name)
-        })?;
+        if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+            // Claude exited before reading the prompt (e.g. a rate-limit exit).
+            // Reap + fold its stderr into the error so a rate-limit isn't lost
+            // behind a bare broken pipe.
+            drop(stdin);
+            let (err, _stderr, _code) =
+                Self::reap_stdin_write_failure(&mut child, e, &self.name).await;
+            return Err(err);
+        }
         drop(stdin);
 
         // Read stdout and stderr concurrently
@@ -4085,6 +4130,66 @@ mod tests {
                 "structural signature should default to 45 min: {stderr:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn reap_stdin_write_failure_folds_rate_limit_stderr_for_classification() {
+        // A claude that exits immediately with a rate-limit error on stderr — the
+        // shape that broke the stdin pipe in prod (job _8cbe03e). Reaping it must
+        // capture that stderr and fold it into the error, so the rate-limit loop's
+        // detector fires on the bubbled message instead of a bare broken pipe
+        // (which fast-fails as a transient transport error).
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("echo 'rate_limit_error: usage limit reached' >&2; exit 1")
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn mock claude");
+
+        // The EPIPE our `write_all` sees once claude has already exited.
+        let epipe =
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Broken pipe (os error 32)");
+        let (err, stderr, code) =
+            ClaudeAgent::reap_stdin_write_failure(&mut child, epipe, "TestBot").await;
+
+        assert!(
+            stderr.contains("rate_limit_error"),
+            "claude's stderr must be captured on the broken-pipe path: {stderr:?}"
+        );
+        let bubbled = format!("{err:?}");
+        assert!(
+            bubbled.contains("rate_limit_error"),
+            "stderr must be folded into the error message: {bubbled}"
+        );
+        assert_eq!(code, 1, "the real exit code is surfaced, not -1");
+        // The payoff: the rate-limit loop's detector now fires on this error,
+        // routing it to the long-backoff path instead of a fast transient fail.
+        assert!(
+            ClaudeAgent::is_rate_limited(&bubbled, code).is_some(),
+            "a rate-limit reaped from a broken-pipe exit must be detectable"
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_stdin_write_failure_stays_transient_for_non_rate_limit_exit() {
+        // A non-rate-limit instant exit (e.g. a crash) must NOT be mistaken for a
+        // rate limit — it stays unclassified so the transient path handles it.
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("echo 'segfault: core dumped' >&2; exit 139")
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn mock claude");
+        let epipe =
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Broken pipe (os error 32)");
+        let (err, _stderr, code) =
+            ClaudeAgent::reap_stdin_write_failure(&mut child, epipe, "TestBot").await;
+        assert!(
+            ClaudeAgent::is_rate_limited(&format!("{err:?}"), code).is_none(),
+            "a non-rate-limit crash must not be classified as rate-limited"
+        );
     }
 
     #[test]
