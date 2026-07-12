@@ -350,8 +350,16 @@ async fn setup_and_run(
         // job id. Falls through so JobDetail still renders completion.
         {
             let store = crate::cli::thread::ThreadStore::new();
-            if record_thread_terminal(&store, &mut app.job_thread, &app_event) == Some(true) {
-                app.status_message = Some(("Reply saved to thread".into(), StatusLevel::Success));
+            match record_thread_terminal(&store, &mut app.job_thread, &app_event) {
+                ThreadTerminal::ReplySaved => {
+                    app.status_message =
+                        Some(("Reply saved to thread".into(), StatusLevel::Success));
+                }
+                ThreadTerminal::Failed(reason) => {
+                    app.status_message =
+                        Some((format!("Deliberation failed: {reason}"), StatusLevel::Error));
+                }
+                ThreadTerminal::NotTracked => {}
             }
         }
 
@@ -522,16 +530,46 @@ fn build_remote(app: &App, name: &str) -> Result<RemoteOrchestrator, String> {
 
 /// On a deliberation's completion, record its answer back into the thread that
 /// launched it — attributed by the completing **`job_id`**, so a different job
-/// finishing while this thread waits can never steal the slot. The reply is
-/// saved only for a successful, non-empty result; the `job_thread` entry is
-/// removed either way. Returns `None` when the event isn't a completion of a
-/// tracked thread job, `Some(true)` when a reply was saved, `Some(false)` when
-/// the job was this thread's but failed / was empty.
+/// Outcome of a tracked thread's terminal job event.
+#[derive(Debug, PartialEq, Eq)]
+enum ThreadTerminal {
+    /// A successful, non-empty reply was appended to the thread.
+    ReplySaved,
+    /// The job was this thread's but ended without a usable reply (server-side
+    /// failure or empty result). Carries the reason to surface to the operator —
+    /// otherwise the "deliberating…" spinner just vanishes with no explanation.
+    Failed(String),
+    /// Not a completion of a tracked thread job (unrelated job / non-terminal).
+    NotTracked,
+}
+
+/// Human-readable failure reason for a non-success terminal job. The server sets
+/// `status` to `"failed: <reason>"`; strip the prefix for display. A `success`
+/// status here means the content was empty (the only other non-usable case).
+fn failure_reason(status: &str) -> String {
+    let s = status.trim();
+    if s.eq_ignore_ascii_case("success") {
+        return "empty result".to_string();
+    }
+    match s.split_once(':') {
+        Some((head, reason))
+            if head.trim().eq_ignore_ascii_case("failed") && !reason.trim().is_empty() =>
+        {
+            reason.trim().to_string()
+        }
+        _ => s.to_string(),
+    }
+}
+
+/// Record a thread's terminal job event. The reply is saved only for a
+/// successful, non-empty result; the `job_thread` entry is removed either way so
+/// a later unrelated `JobComplete` can never steal the slot. A failure returns
+/// its reason so the loop can surface it instead of silently dropping the spinner.
 fn record_thread_terminal(
     store: &crate::cli::thread::ThreadStore,
     job_thread: &mut std::collections::HashMap<String, String>,
     event: &AppEvent,
-) -> Option<bool> {
+) -> ThreadTerminal {
     let AppEvent::Data(DataEvent::SseEvent(event::SseEvent::JobComplete {
         job_id,
         status,
@@ -539,13 +577,19 @@ fn record_thread_terminal(
         ..
     })) = event
     else {
-        return None;
+        return ThreadTerminal::NotTracked;
     };
-    let thread_id = job_thread.remove(job_id)?;
+    let Some(thread_id) = job_thread.remove(job_id) else {
+        return ThreadTerminal::NotTracked;
+    };
     if !status.eq_ignore_ascii_case("success") || best_proposal_content.trim().is_empty() {
-        return Some(false);
+        return ThreadTerminal::Failed(failure_reason(status));
     }
-    Some(store.append_reply(&thread_id, best_proposal_content, job_id, None))
+    if store.append_reply(&thread_id, best_proposal_content, job_id, None) {
+        ThreadTerminal::ReplySaved
+    } else {
+        ThreadTerminal::Failed("could not save reply to the thread store".to_string())
+    }
 }
 
 /// Resolve the policy label for a roomless (thread) launch: the explicit policy
@@ -1320,7 +1364,7 @@ mod tests {
             &mut map,
             &job_complete_event("job-1", "success", "ans"),
         );
-        assert_eq!(saved, Some(true));
+        assert_eq!(saved, ThreadTerminal::ReplySaved);
         assert!(map.is_empty(), "mapping consumed");
         let reloaded = store.load(&tid).unwrap();
         assert_eq!(reloaded.messages.len(), 2);
@@ -1337,7 +1381,11 @@ mod tests {
             &mut map,
             &job_complete_event("job-OTHER", "success", "not yours"),
         );
-        assert_eq!(out, None, "unrelated job id → no attribution");
+        assert_eq!(
+            out,
+            ThreadTerminal::NotTracked,
+            "unrelated job id → no attribution"
+        );
         assert!(map.contains_key("job-thread"), "our mapping is untouched");
         assert_eq!(
             store.load(&tid).unwrap().messages.len(),
@@ -1349,14 +1397,19 @@ mod tests {
     #[test]
     fn terminal_completion_failed_status_removes_mapping_without_appending() {
         // Bug 3 guard: a failed deliberation's leftover content is not the answer.
+        // The reason is surfaced (stripped of the "failed:" prefix) so the operator
+        // sees WHY, instead of the spinner silently vanishing.
         let tmp = tempfile::TempDir::new().unwrap();
         let (store, tid, mut map) = seeded(tmp.path(), "job-1");
         let out = record_thread_terminal(
             &store,
             &mut map,
-            &job_complete_event("job-1", "failed", "stale proposal"),
+            &job_complete_event("job-1", "failed: no proposals to select from", "stale"),
         );
-        assert_eq!(out, Some(false));
+        assert_eq!(
+            out,
+            ThreadTerminal::Failed("no proposals to select from".to_string())
+        );
         assert!(map.is_empty());
         assert_eq!(
             store.load(&tid).unwrap().messages.len(),
@@ -1366,7 +1419,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_completion_empty_content_no_append() {
+    fn terminal_completion_empty_content_reports_empty_result() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (store, tid, mut map) = seeded(tmp.path(), "job-1");
         let out = record_thread_terminal(
@@ -1374,8 +1427,15 @@ mod tests {
             &mut map,
             &job_complete_event("job-1", "success", "   "),
         );
-        assert_eq!(out, Some(false));
+        assert_eq!(out, ThreadTerminal::Failed("empty result".to_string()));
         assert_eq!(store.load(&tid).unwrap().messages.len(), 1);
+    }
+
+    #[test]
+    fn failure_reason_strips_failed_prefix() {
+        assert_eq!(failure_reason("failed: rate-limited"), "rate-limited");
+        assert_eq!(failure_reason("failed"), "failed");
+        assert_eq!(failure_reason("success"), "empty result");
     }
 
     #[test]
@@ -1385,7 +1445,7 @@ mod tests {
         let mut map = HashMap::from([("job-1".to_string(), "thread-x".to_string())]);
         assert_eq!(
             record_thread_terminal(&store, &mut map, &AppEvent::Tick),
-            None
+            ThreadTerminal::NotTracked
         );
         assert!(
             map.contains_key("job-1"),
