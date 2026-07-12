@@ -379,6 +379,9 @@ impl ThreadView {
         match self.selected {
             Some(r) if r + 1 < n => self.selected = Some(r + 1),
             Some(_) => self.selected = None,
+            // From nothing, ↓ selects the top row (symmetric with ↑) so the cursor
+            // appears on the first keypress instead of being a no-op.
+            None if n > 0 => self.selected = Some(0),
             None => {}
         }
         self.ensure_visible();
@@ -655,11 +658,21 @@ impl ThreadView {
             if picked {
                 style = style.add_modifier(Modifier::REVERSED);
             }
-            // Leftmost mark: cursor when selected, else a root dot on a thread
-            // origin (no parent) so you can see where the thread starts, else blank.
+            // Leftmost mark: cursor when selected, else a ● on a thread origin OR
+            // any branch-off (a message whose branch_id differs from its parent's)
+            // so a nested sub-thread reads as its own thread — its own circle, and
+            // it's already indented by fork depth. A plain in-branch continuation
+            // stays blank.
+            let is_branch_root = match m.parent_id.as_deref() {
+                None => true,
+                Some(pid) => self
+                    .thread
+                    .get(pid)
+                    .is_none_or(|p| p.branch_id != m.branch_id),
+            };
             let mark = if picked {
                 "❯"
-            } else if m.parent_id.is_none() {
+            } else if is_branch_root {
                 "●"
             } else {
                 " "
@@ -687,34 +700,34 @@ impl ThreadView {
             } else {
                 String::new()
             };
-            // The `re:` earns its place only for a fork whose parent isn't obvious
-            // from position: skip it when the parent is the row right below (linear
-            // chain) or is a pinned root (always visible at the top).
-            let parent_below =
-                m.parent_id.as_deref() == ordered.get(row + 1).map(|n| n.id.as_str());
-            let parent_is_root = m
-                .parent_id
-                .as_deref()
-                .and_then(|p| self.thread.get(p))
-                .is_some_and(|p| p.parent_id.is_none());
-            let re = if parent_below || parent_is_root {
-                String::new()
-            } else {
-                self.re_tag(m)
-            };
             // Role as a plain, padded, colour-coded word (no brackets) — "you" for
             // the operator, "noosphera" for the consensus reply.
             let role_word = display_role(&m.role);
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "{mark} {fold} {} {role_word:<9} {indent}{preview}{branch}{re}{detail}",
-                    fmt_ts(m.ts),
+            // Timestamp is a dim, fixed-width LEADING column so it aligns down the
+            // left edge and recedes; the tree indents to its right. The fork
+            // `indent` goes at the FRONT of the body so a whole nested row shifts
+            // right — making the branch structure visible instead of jamming the
+            // markers into a flat left block.
+            let ts_style = if picked {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{} ", fmt_ts(m.ts)), ts_style),
+                Span::styled(
+                    format!("{indent}{mark} {fold} {role_word:<9} {preview}{branch}{detail}"),
+                    style,
                 ),
-                style,
-            )));
+            ]));
             if expanded {
+                // Align continuation under the node: past the timestamp column
+                // (13 + a space) + the row's fork indent.
+                let cont_pad = format!("{}{indent}     ", " ".repeat(14));
                 for content_line in m.content.lines() {
-                    lines.push(Line::from(format!("{indent}      {content_line}")));
+                    lines.push(Line::from(format!("{cont_pad}{content_line}")));
                 }
                 lines.push(Line::from(""));
             }
@@ -1595,11 +1608,15 @@ impl View for ThreadView {
         }
         // A draft saved before the TUI closed comes back into the compose box.
         self.restore_draft();
-        // Returning to an existing thread lands in the reader at the newest turn.
+        // Returning to an existing thread lands in the reader at the newest turn,
+        // with the cursor already ON it — row 0 is the pinned root, row 1 (when it
+        // exists) is the newest turn. Starting at `None` left no visible cursor, so
+        // the reader had to press ↑ then ↓ before anything highlighted.
         if self.has_subject() {
             self.mode = Mode::Read;
             self.scroll = 0;
-            self.selected = None;
+            let rows = self.display_order().len();
+            self.selected = (rows > 0).then(|| rows.min(2).saturating_sub(1));
             self.unseen_reply = false;
             self.full_view = None;
         }
@@ -1793,26 +1810,27 @@ mod tests {
     }
 
     #[test]
-    fn re_tag_shows_only_for_a_fork_where_the_parent_is_not_adjacent() {
+    fn a_fork_reads_as_its_own_branch_root_no_re_tag() {
         let (_t, mut v) = view();
         let root = v.thread.reply(None, "user", "root question");
         let mid = v.thread.reply(Some(&root), "assistant", "an answer");
         let _tip = v.thread.reply(Some(&mid), "user", "a follow up");
-        // Fork off `mid` (a non-root, non-tip node) — its parent isn't the row
-        // below and isn't the pinned root, so the re: earns its place.
+        // A second reply under `mid` forks a new branch. It should read as its own
+        // sub-thread: its own ● circle (+ indent), NOT a redundant `↳ re:` tag —
+        // the tree structure is now carried by indent + branch circles.
         let _fork = v.thread.reply(Some(&mid), "user", "different angle");
         let rendered: Vec<String> = v.message_lines().iter().map(line_text).collect();
+        let fork_line = rendered
+            .iter()
+            .find(|l| l.contains("different angle"))
+            .expect("fork rendered");
         assert!(
-            rendered
-                .iter()
-                .any(|l| l.contains("different angle") && l.contains("↳ re: an answer")),
-            "fork shows its non-adjacent parent: {rendered:?}"
+            fork_line.contains('●'),
+            "a branch-off is marked as its own branch root: {fork_line:?}"
         );
-        // Exactly one re: — linear replies and root-children omit it.
-        assert_eq!(
-            rendered.iter().filter(|l| l.contains("↳ re:")).count(),
-            1,
-            "only the fork carries a re:: {rendered:?}"
+        assert!(
+            !rendered.iter().any(|l| l.contains("↳ re:")),
+            "the re: tag is retired — indent + branch circle convey parentage: {rendered:?}"
         );
     }
 
@@ -2525,6 +2543,32 @@ mod tests {
             }
             other => panic!("expected ReconcileThread fetch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn on_enter_places_cursor_on_a_visible_row() {
+        // Regression: the cursor started at `None` on entry, so nothing was
+        // highlighted until the reader pressed ↑ then ↓. It must land ON a row.
+        let mut t = Thread::new("s");
+        let root = t.reply(None, "user", "root question");
+        t.reply(Some(&root), "assistant", "the newest turn");
+        let (_tmp, _s, mut v) = view_over(t);
+        v.on_enter();
+        assert!(
+            v.selected.is_some(),
+            "cursor must be visible on entry, not None"
+        );
+    }
+
+    #[test]
+    fn select_down_from_nothing_selects_the_top_row() {
+        // ↓ from an empty selection used to be a no-op (the "press ↑ first" bug);
+        // it now selects the top row so the first keypress moves the cursor.
+        let (_t, mut v) = view();
+        v.thread.reply(None, "user", "root");
+        v.selected = None;
+        v.select_down();
+        assert_eq!(v.selected, Some(0));
     }
 
     #[test]
