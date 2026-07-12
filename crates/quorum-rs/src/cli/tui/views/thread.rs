@@ -658,11 +658,21 @@ impl ThreadView {
             if picked {
                 style = style.add_modifier(Modifier::REVERSED);
             }
-            // Leftmost mark: cursor when selected, else a root dot on a thread
-            // origin (no parent) so you can see where the thread starts, else blank.
+            // Leftmost mark: cursor when selected, else a ● on a thread origin OR
+            // any branch-off (a message whose branch_id differs from its parent's)
+            // so a nested sub-thread reads as its own thread — its own circle, and
+            // it's already indented by fork depth. A plain in-branch continuation
+            // stays blank.
+            let is_branch_root = match m.parent_id.as_deref() {
+                None => true,
+                Some(pid) => self
+                    .thread
+                    .get(pid)
+                    .is_none_or(|p| p.branch_id != m.branch_id),
+            };
             let mark = if picked {
                 "❯"
-            } else if m.parent_id.is_none() {
+            } else if is_branch_root {
                 "●"
             } else {
                 " "
@@ -690,21 +700,6 @@ impl ThreadView {
             } else {
                 String::new()
             };
-            // The `re:` earns its place only for a fork whose parent isn't obvious
-            // from position: skip it when the parent is the row right below (linear
-            // chain) or is a pinned root (always visible at the top).
-            let parent_below =
-                m.parent_id.as_deref() == ordered.get(row + 1).map(|n| n.id.as_str());
-            let parent_is_root = m
-                .parent_id
-                .as_deref()
-                .and_then(|p| self.thread.get(p))
-                .is_some_and(|p| p.parent_id.is_none());
-            let re = if parent_below || parent_is_root {
-                String::new()
-            } else {
-                self.re_tag(m)
-            };
             // Role as a plain, padded, colour-coded word (no brackets) — "you" for
             // the operator, "noosphera" for the consensus reply.
             let role_word = display_role(&m.role);
@@ -723,7 +718,7 @@ impl ThreadView {
             lines.push(Line::from(vec![
                 Span::styled(format!("{} ", fmt_ts(m.ts)), ts_style),
                 Span::styled(
-                    format!("{indent}{mark} {fold} {role_word:<9} {preview}{branch}{re}{detail}"),
+                    format!("{indent}{mark} {fold} {role_word:<9} {preview}{branch}{detail}"),
                     style,
                 ),
             ]));
@@ -1815,26 +1810,27 @@ mod tests {
     }
 
     #[test]
-    fn re_tag_shows_only_for_a_fork_where_the_parent_is_not_adjacent() {
+    fn a_fork_reads_as_its_own_branch_root_no_re_tag() {
         let (_t, mut v) = view();
         let root = v.thread.reply(None, "user", "root question");
         let mid = v.thread.reply(Some(&root), "assistant", "an answer");
         let _tip = v.thread.reply(Some(&mid), "user", "a follow up");
-        // Fork off `mid` (a non-root, non-tip node) — its parent isn't the row
-        // below and isn't the pinned root, so the re: earns its place.
+        // A second reply under `mid` forks a new branch. It should read as its own
+        // sub-thread: its own ● circle (+ indent), NOT a redundant `↳ re:` tag —
+        // the tree structure is now carried by indent + branch circles.
         let _fork = v.thread.reply(Some(&mid), "user", "different angle");
         let rendered: Vec<String> = v.message_lines().iter().map(line_text).collect();
+        let fork_line = rendered
+            .iter()
+            .find(|l| l.contains("different angle"))
+            .expect("fork rendered");
         assert!(
-            rendered
-                .iter()
-                .any(|l| l.contains("different angle") && l.contains("↳ re: an answer")),
-            "fork shows its non-adjacent parent: {rendered:?}"
+            fork_line.contains('●'),
+            "a branch-off is marked as its own branch root: {fork_line:?}"
         );
-        // Exactly one re: — linear replies and root-children omit it.
-        assert_eq!(
-            rendered.iter().filter(|l| l.contains("↳ re:")).count(),
-            1,
-            "only the fork carries a re:: {rendered:?}"
+        assert!(
+            !rendered.iter().any(|l| l.contains("↳ re:")),
+            "the re: tag is retired — indent + branch circle convey parentage: {rendered:?}"
         );
     }
 
