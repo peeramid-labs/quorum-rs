@@ -379,6 +379,9 @@ impl ThreadView {
         match self.selected {
             Some(r) if r + 1 < n => self.selected = Some(r + 1),
             Some(_) => self.selected = None,
+            // From nothing, ↓ selects the top row (symmetric with ↑) so the cursor
+            // appears on the first keypress instead of being a no-op.
+            None if n > 0 => self.selected = Some(0),
             None => {}
         }
         self.ensure_visible();
@@ -705,16 +708,31 @@ impl ThreadView {
             // Role as a plain, padded, colour-coded word (no brackets) — "you" for
             // the operator, "noosphera" for the consensus reply.
             let role_word = display_role(&m.role);
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "{mark} {fold} {} {role_word:<9} {indent}{preview}{branch}{re}{detail}",
-                    fmt_ts(m.ts),
+            // Timestamp is a dim, fixed-width LEADING column so it aligns down the
+            // left edge and recedes; the tree indents to its right. The fork
+            // `indent` goes at the FRONT of the body so a whole nested row shifts
+            // right — making the branch structure visible instead of jamming the
+            // markers into a flat left block.
+            let ts_style = if picked {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{} ", fmt_ts(m.ts)), ts_style),
+                Span::styled(
+                    format!("{indent}{mark} {fold} {role_word:<9} {preview}{branch}{re}{detail}"),
+                    style,
                 ),
-                style,
-            )));
+            ]));
             if expanded {
+                // Align continuation under the node: past the timestamp column
+                // (13 + a space) + the row's fork indent.
+                let cont_pad = format!("{}{indent}     ", " ".repeat(14));
                 for content_line in m.content.lines() {
-                    lines.push(Line::from(format!("{indent}      {content_line}")));
+                    lines.push(Line::from(format!("{cont_pad}{content_line}")));
                 }
                 lines.push(Line::from(""));
             }
@@ -1595,11 +1613,15 @@ impl View for ThreadView {
         }
         // A draft saved before the TUI closed comes back into the compose box.
         self.restore_draft();
-        // Returning to an existing thread lands in the reader at the newest turn.
+        // Returning to an existing thread lands in the reader at the newest turn,
+        // with the cursor already ON it — row 0 is the pinned root, row 1 (when it
+        // exists) is the newest turn. Starting at `None` left no visible cursor, so
+        // the reader had to press ↑ then ↓ before anything highlighted.
         if self.has_subject() {
             self.mode = Mode::Read;
             self.scroll = 0;
-            self.selected = None;
+            let rows = self.display_order().len();
+            self.selected = (rows > 0).then(|| rows.min(2).saturating_sub(1));
             self.unseen_reply = false;
             self.full_view = None;
         }
@@ -2525,6 +2547,32 @@ mod tests {
             }
             other => panic!("expected ReconcileThread fetch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn on_enter_places_cursor_on_a_visible_row() {
+        // Regression: the cursor started at `None` on entry, so nothing was
+        // highlighted until the reader pressed ↑ then ↓. It must land ON a row.
+        let mut t = Thread::new("s");
+        let root = t.reply(None, "user", "root question");
+        t.reply(Some(&root), "assistant", "the newest turn");
+        let (_tmp, _s, mut v) = view_over(t);
+        v.on_enter();
+        assert!(
+            v.selected.is_some(),
+            "cursor must be visible on entry, not None"
+        );
+    }
+
+    #[test]
+    fn select_down_from_nothing_selects_the_top_row() {
+        // ↓ from an empty selection used to be a no-op (the "press ↑ first" bug);
+        // it now selects the top row so the first keypress moves the cursor.
+        let (_t, mut v) = view();
+        v.thread.reply(None, "user", "root");
+        v.selected = None;
+        v.select_down();
+        assert_eq!(v.selected, Some(0));
     }
 
     #[test]
