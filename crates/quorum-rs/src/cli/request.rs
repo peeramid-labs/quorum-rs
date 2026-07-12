@@ -50,12 +50,15 @@ pub struct DeliberationRequest {
 pub fn ask_user_tool() -> crate::agents::UserToolDefinition {
     crate::agents::UserToolDefinition {
         name: "ask_user".to_string(),
-        description: "Ask the human operator a clarifying question when you \
-             genuinely need their input to proceed — ambiguous requirements, a \
-             decision only they can make, or missing context. Optionally include \
-             a short `options` list for a quick choice; they may also answer \
-             freely. Use sparingly: only when their answer materially changes the \
-             result."
+        description: "Ask the human operator a question and WAIT for their answer. \
+             This tool is the ONLY channel to the operator — a question written \
+             anywhere else (your proposal `reply`, a commit message, prose) is never \
+             delivered and never answered, so you must call THIS tool to actually ask. \
+             Use it when you genuinely need their input to proceed: ambiguous \
+             requirements, a decision only they can make, or missing context. \
+             Optionally pass a short `options` list for a quick choice; they may also \
+             answer freely. Use sparingly — only when their answer materially changes \
+             your output."
             .to_string(),
         parameters: Some(serde_json::json!({
             "type": "object",

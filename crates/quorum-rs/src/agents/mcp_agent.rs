@@ -272,6 +272,36 @@ impl NsedMcpServer {
                 .await,
         )
     }
+
+    /// The exact tool list an MCP client (the claude subprocess) receives from
+    /// `list_tools`: the static protocol tools — with `nsed_propose`'s schema
+    /// overridden by any middleware-declared proposal schema during the propose
+    /// phase — PLUS the operator-declared user tools (e.g. `ask_user`). Kept sync
+    /// and self-contained so the set claude actually sees is testable without an
+    /// MCP client / `RequestContext`.
+    fn advertised_tools(&self) -> Vec<rmcp::model::Tool> {
+        let mut tools = self.tool_router.list_all();
+        if self.phase == ActivePhase::Proposing {
+            if let Some(schema) = self
+                .context
+                .forced_proposal_schema
+                .as_ref()
+                .and_then(|s| s.as_object())
+            {
+                for t in tools.iter_mut() {
+                    if t.name == "nsed_propose" {
+                        t.input_schema = std::sync::Arc::new(schema.clone());
+                        tracing::info!(
+                            schema_keys = ?schema.keys().collect::<Vec<_>>(),
+                            "nsed_propose input_schema overridden with middleware-declared schema"
+                        );
+                    }
+                }
+            }
+        }
+        tools.extend(self.user_tools());
+        tools
+    }
 }
 
 #[tool_router]
@@ -569,30 +599,8 @@ impl ServerHandler for NsedMcpServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
-        let mut tools = self.tool_router.list_all();
-        if self.phase == ActivePhase::Proposing {
-            if let Some(schema) = self
-                .context
-                .forced_proposal_schema
-                .as_ref()
-                .and_then(|s| s.as_object())
-            {
-                for t in tools.iter_mut() {
-                    if t.name == "nsed_propose" {
-                        t.input_schema = std::sync::Arc::new(schema.clone());
-                        tracing::info!(
-                            schema_keys = ?schema.keys().collect::<Vec<_>>(),
-                            "nsed_propose input_schema overridden with middleware-declared schema"
-                        );
-                    }
-                }
-            }
-        }
-        // Advertise the operator-declared user tools (e.g. `ask_user`) alongside
-        // the static protocol tools so the claude agent can call them.
-        tools.extend(self.user_tools());
         Ok(rmcp::model::ListToolsResult {
-            tools,
+            tools: self.advertised_tools(),
             ..Default::default()
         })
     }
@@ -4298,6 +4306,75 @@ mod tests {
             !cmd_r.iter().any(|a| a.contains("<context_file")),
             "resumed session should not include context files"
         );
+    }
+
+    #[tokio::test]
+    async fn claude_path_advertises_ask_user_via_list_tools() {
+        // Integration: build the MCP server exactly as the CLAUDE agent does — via
+        // SharedMcpState/from_shared with the agent context the worker prepares —
+        // and assert the tool set `list_tools` hands the claude subprocess includes
+        // BOTH the static protocol tool AND user_ask_user. This is the real path
+        // that was silently dropping the operator's tools (agents asked in prose).
+        use crate::agents::{DeliberationPhase, UserToolDefinition, UserToolHandlerTrait};
+
+        #[derive(Debug)]
+        struct H;
+        #[async_trait::async_trait]
+        impl UserToolHandlerTrait for H {
+            async fn handle_call(
+                &self,
+                name: &str,
+                args: &str,
+                _r: u32,
+                _p: DeliberationPhase,
+            ) -> String {
+                format!("ANSWER:{name}:{args}")
+            }
+        }
+
+        let mut ctx = minimal_context();
+        ctx.forced_proposal_schema = Some(serde_json::json!({"type":"object"}));
+        ctx.user_tools = vec![UserToolDefinition {
+            name: "ask_user".into(),
+            description: "ask the operator".into(),
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "question": { "type": "string" } },
+                "required": ["question"]
+            })),
+            strict: Some(false),
+        }];
+        ctx.user_tool_handler = Some(std::sync::Arc::new(H));
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let shared = std::sync::Arc::new(SharedMcpState {
+            context: ctx,
+            phase: ActivePhase::Proposing,
+            store: None,
+            result_tx: std::sync::Arc::new(Mutex::new(Some(tx))),
+        });
+        let server = NsedMcpServer::from_shared(&shared);
+
+        // The exact set claude receives from list_tools.
+        let names: Vec<String> = server
+            .advertised_tools()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "nsed_propose"),
+            "static protocol tool present: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "user_ask_user"),
+            "ask_user must be advertised to the claude subprocess: {names:?}"
+        );
+
+        // And calling it routes to the operator handler (blocks + returns the answer).
+        let ans = server
+            .dispatch_user_tool("user_ask_user", &Some(serde_json::Map::new()))
+            .await;
+        assert_eq!(ans.as_deref(), Some("ANSWER:user_ask_user:{}"));
     }
 
     #[tokio::test]
