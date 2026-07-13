@@ -1620,26 +1620,29 @@ impl View for ThreadView {
             self.unseen_reply = false;
             self.full_view = None;
         }
+        // Ask the orchestrator which of the caller's jobs are running so ^D / stop
+        // resolve this thread's live job from the server, not local state.
+        let mut actions = vec![ViewAction::Fetch(FetchRequest::RefreshThreadJobs {
+            orchestrator: self.orchestrator.clone(),
+        })];
         // A pending job whose reply never landed (the TUI was closed when the
         // deliberation finished) — reconcile it against the server.
         if let Some(job_id) = self.thread.pending_job.clone()
             && self.awaiting_reply()
         {
-            return vec![
-                ViewAction::Fetch(FetchRequest::ReconcileThread {
-                    orchestrator: self.orchestrator.clone(),
-                    job_id: job_id.clone(),
-                    thread_id: self.thread.id.clone(),
-                }),
-                // Recover any ask_user question that fired while we were away.
-                ViewAction::Fetch(FetchRequest::PendingToolCalls {
-                    orchestrator: self.orchestrator.clone(),
-                    job_id,
-                    thread_id: self.thread.id.clone(),
-                }),
-            ];
+            actions.push(ViewAction::Fetch(FetchRequest::ReconcileThread {
+                orchestrator: self.orchestrator.clone(),
+                job_id: job_id.clone(),
+                thread_id: self.thread.id.clone(),
+            }));
+            // Recover any ask_user question that fired while we were away.
+            actions.push(ViewAction::Fetch(FetchRequest::PendingToolCalls {
+                orchestrator: self.orchestrator.clone(),
+                job_id,
+                thread_id: self.thread.id.clone(),
+            }));
         }
-        Vec::new()
+        actions
     }
 }
 
@@ -2531,17 +2534,42 @@ mod tests {
         (tmp, store, v)
     }
 
+    fn reconciles(actions: &[ViewAction]) -> bool {
+        actions
+            .iter()
+            .any(|a| matches!(a, ViewAction::Fetch(FetchRequest::ReconcileThread { .. })))
+    }
+
+    fn refreshes_jobs(actions: &[ViewAction]) -> bool {
+        actions
+            .iter()
+            .any(|a| matches!(a, ViewAction::Fetch(FetchRequest::RefreshThreadJobs { .. })))
+    }
+
+    #[test]
+    fn on_enter_always_refreshes_thread_jobs() {
+        // So ^D / stop resolve the thread's running job from the server, even
+        // when nothing is locally recorded as pending.
+        let mut t = Thread::new("s");
+        t.push_message(Message::now("user", "q"));
+        let (_tmp, _s, mut v) = view_over(t);
+        assert!(refreshes_jobs(&v.on_enter()));
+    }
+
     #[test]
     fn on_enter_reconciles_a_pending_job() {
         let mut t = Thread::new("s");
         t.push_message(Message::now("user", "q")); // awaiting a reply
         t.pending_job = Some("job-9".into());
         let (_tmp, _s, mut v) = view_over(t);
-        match v.on_enter().into_iter().next() {
-            Some(ViewAction::Fetch(FetchRequest::ReconcileThread { job_id, .. })) => {
-                assert_eq!(job_id, "job-9")
-            }
-            other => panic!("expected ReconcileThread fetch, got {other:?}"),
+        let actions = v.on_enter();
+        assert!(refreshes_jobs(&actions));
+        match actions.iter().find_map(|a| match a {
+            ViewAction::Fetch(FetchRequest::ReconcileThread { job_id, .. }) => Some(job_id),
+            _ => None,
+        }) {
+            Some(job_id) => assert_eq!(job_id, "job-9"),
+            None => panic!("expected a ReconcileThread fetch, got {actions:?}"),
         }
     }
 
@@ -2573,21 +2601,26 @@ mod tests {
 
     #[test]
     fn on_enter_skips_reconcile_without_a_pending_job() {
-        // Awaiting a reply but no recorded job id → nothing to reconcile against.
+        // Awaiting a reply but no recorded job id → nothing to reconcile against
+        // (but the job refresh still fires).
         let mut t = Thread::new("s");
         t.push_message(Message::now("user", "q"));
         let (_tmp, _s, mut v) = view_over(t);
-        assert!(v.on_enter().is_empty());
+        let actions = v.on_enter();
+        assert!(refreshes_jobs(&actions));
+        assert!(!reconciles(&actions));
     }
 
     #[test]
     fn on_enter_skips_reconcile_when_reply_already_present() {
-        // A completed turn (last message is the reply) → not awaiting, no fetch.
+        // A completed turn (last message is the reply) → not awaiting, no reconcile.
         let mut t = Thread::new("s");
         t.push_message(Message::now("user", "q"));
         t.push_message(Message::now("assistant", "a"));
         let (_tmp, _s, mut v) = view_over(t);
-        assert!(v.on_enter().is_empty());
+        let actions = v.on_enter();
+        assert!(refreshes_jobs(&actions));
+        assert!(!reconciles(&actions));
     }
 
     #[test]

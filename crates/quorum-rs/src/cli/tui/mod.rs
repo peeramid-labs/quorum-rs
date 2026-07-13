@@ -309,6 +309,10 @@ async fn setup_and_run(
             }
             continue;
         }
+        if let AppEvent::Data(DataEvent::ThreadJobsLoaded { ref jobs }) = app_event {
+            merge_thread_jobs(&mut app.job_thread, jobs);
+            continue;
+        }
         if let AppEvent::Data(DataEvent::MessageInjected {
             ref job_id,
             sequence,
@@ -398,11 +402,10 @@ async fn setup_and_run(
                     ref thread_id,
                     ref orchestrator,
                 } => {
-                    let job = resolve_thread_job(
-                        &crate::cli::thread::ThreadStore::new(),
-                        &mut app.job_thread,
-                        thread_id,
-                    );
+                    // The job↔thread map is populated by the /deliberations query
+                    // (RefreshThreadJobs), so the orchestrator — not local disk —
+                    // is the source of truth for what's running.
+                    let job = job_for_thread(&app.job_thread, thread_id);
                     match job {
                         Some(job_id) => {
                             app.push_view(ViewId::JobDetail {
@@ -601,25 +604,54 @@ fn on_job_submitted(
     }
 }
 
-/// Resolve a thread's in-flight job id: the in-memory job↔thread map first (this
-/// session's launch), else the thread's persisted `pending_job` — which survives
-/// a TUI restart, so a deliberation left running can still be opened and stopped.
-/// A store hit seeds the map so a later completion is attributed to the thread.
-fn resolve_thread_job(
-    store: &crate::cli::thread::ThreadStore,
-    job_thread: &mut std::collections::HashMap<String, String>,
+/// Find a thread's in-flight job in the in-memory job↔thread map (populated by
+/// the `/deliberations` query — the orchestrator is the source of truth).
+fn job_for_thread(
+    job_thread: &std::collections::HashMap<String, String>,
     thread_id: &str,
 ) -> Option<String> {
-    if let Some(job_id) = job_thread
+    job_thread
         .iter()
         .find(|(_, tid)| tid.as_str() == thread_id)
         .map(|(jid, _)| jid.clone())
-    {
-        return Some(job_id);
+}
+
+/// The thread a job belongs to: a thread launch's job id is `<thread_id>_<hash>`
+/// (thread ids are `thread-<hex>`, hashes are hex — the only `_` is the
+/// separator). `None` for a non-thread (room/ad-hoc) job.
+fn thread_id_of(job_id: &str) -> Option<String> {
+    if !job_id.starts_with("thread-") {
+        return None;
     }
-    let job_id = store.load(thread_id)?.pending_job?;
-    job_thread.insert(job_id.clone(), thread_id.to_string());
-    Some(job_id)
+    job_id.rsplit_once('_').map(|(t, _)| t.to_string())
+}
+
+/// A job status (from `/deliberations`) that means the job is still alive and can
+/// be opened / stopped — i.e. not a terminal `completed`/`failed`.
+fn job_is_active(status: &str) -> bool {
+    matches!(status, "pending" | "claimed" | "running")
+}
+
+/// Merge server-resolved job↔thread pairs into the in-memory map without
+/// clobbering an existing binding (this session's launch wins over the query).
+fn merge_thread_jobs(
+    job_thread: &mut std::collections::HashMap<String, String>,
+    jobs: &std::collections::HashMap<String, String>,
+) {
+    for (job_id, thread_id) in jobs {
+        job_thread
+            .entry(job_id.clone())
+            .or_insert_with(|| thread_id.clone());
+    }
+}
+
+/// Build a job↔thread map from the caller's `/deliberations` list: active,
+/// thread-scoped jobs only. Keyed job_id → thread_id.
+fn thread_jobs_from_list(jobs: &[(String, String)]) -> std::collections::HashMap<String, String> {
+    jobs.iter()
+        .filter(|(_, status)| job_is_active(status))
+        .filter_map(|(job_id, _)| thread_id_of(job_id).map(|tid| (job_id.clone(), tid)))
+        .collect()
 }
 
 /// Resolve the policy label for a roomless (thread) launch: the explicit policy
@@ -796,6 +828,13 @@ fn handle_action(
                     });
                     (name, result)
                 }
+                FetchRequest::RefreshThreadJobs { orchestrator } => {
+                    let orch_name = orchestrator.clone();
+                    let result = build_remote(app, &orch_name).map(|remote| {
+                        tui_client.refresh_thread_jobs(remote);
+                    });
+                    (orch_name, result)
+                }
                 FetchRequest::ReconcileThread {
                     orchestrator,
                     job_id,
@@ -871,6 +910,7 @@ fn handle_action(
                         | FetchRequest::CreateRoom { .. }
                         | FetchRequest::DeleteRoom { .. } => "rooms",
                         FetchRequest::StartSseStream { .. } => "sse_stream",
+                        FetchRequest::RefreshThreadJobs { .. } => "refresh_jobs",
                         FetchRequest::ReconcileThread { .. } => "reconcile",
                         FetchRequest::CancelJob { .. } => "cancel",
                         FetchRequest::RespondToolCall { .. } => "answer",
@@ -1416,46 +1456,59 @@ mod tests {
     }
 
     #[test]
-    fn resolve_thread_job_falls_back_to_persisted_pending_job() {
-        // TUI restart: the in-memory map is empty, but the thread persisted its
-        // pending job — a running deliberation must still be resolvable.
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = crate::cli::thread::ThreadStore::with_dir(dir.path().to_path_buf());
-        let mut t = crate::cli::thread::Thread::new("t");
-        store.save(&t).unwrap();
-        store.set_pending_job(&t.id, "job-alive");
-        t.pending_job = Some("job-alive".into());
-
-        let mut map = HashMap::new();
-        let job = resolve_thread_job(&store, &mut map, &t.id);
-
-        assert_eq!(job.as_deref(), Some("job-alive"));
-        // Seeded so a later completion is attributed to the thread.
+    fn thread_id_of_strips_the_job_hash_suffix() {
         assert_eq!(
-            map.get("job-alive").map(String::as_str),
-            Some(t.id.as_str())
+            thread_id_of("thread-f04a077b49424e7b93746291a8e0015d_b6ca7284b646f9de").as_deref(),
+            Some("thread-f04a077b49424e7b93746291a8e0015d")
         );
+        // Non-thread (room / ad-hoc) job → not thread-scoped.
+        assert!(thread_id_of("pl_fast_397de8a1fcad55cb").is_none());
+        assert!(thread_id_of("some-room-job").is_none());
     }
 
     #[test]
-    fn resolve_thread_job_prefers_the_in_memory_map() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = crate::cli::thread::ThreadStore::with_dir(dir.path().to_path_buf());
-        let mut map = HashMap::from([("job-mem".to_string(), "thread-9".to_string())]);
-        assert_eq!(
-            resolve_thread_job(&store, &mut map, "thread-9").as_deref(),
-            Some("job-mem")
-        );
+    fn job_is_active_excludes_terminal_states() {
+        assert!(job_is_active("running"));
+        assert!(job_is_active("pending"));
+        assert!(job_is_active("claimed"));
+        assert!(!job_is_active("completed"));
+        assert!(!job_is_active("failed"));
+        assert!(!job_is_active("unknown"));
     }
 
     #[test]
-    fn resolve_thread_job_none_when_no_pending() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = crate::cli::thread::ThreadStore::with_dir(dir.path().to_path_buf());
-        let t = crate::cli::thread::Thread::new("t");
-        store.save(&t).unwrap();
-        let mut map = HashMap::new();
-        assert!(resolve_thread_job(&store, &mut map, &t.id).is_none());
+    fn merge_thread_jobs_adds_without_clobbering_existing() {
+        let mut map = HashMap::from([("job-mem".to_string(), "thread-launched".to_string())]);
+        let loaded = HashMap::from([
+            ("job-mem".to_string(), "thread-OTHER".to_string()), // must not overwrite
+            ("job-srv".to_string(), "thread-srv".to_string()),   // new → added
+        ]);
+        merge_thread_jobs(&mut map, &loaded);
+        assert_eq!(
+            map.get("job-mem").map(String::as_str),
+            Some("thread-launched")
+        );
+        assert_eq!(map.get("job-srv").map(String::as_str), Some("thread-srv"));
+    }
+
+    #[test]
+    fn thread_jobs_from_list_keeps_only_active_thread_jobs() {
+        let jobs = vec![
+            ("thread-aaa_111".to_string(), "running".to_string()),
+            ("thread-bbb_222".to_string(), "completed".to_string()), // terminal → dropped
+            ("pl_fast_333".to_string(), "running".to_string()),      // not a thread → dropped
+        ];
+        let map = thread_jobs_from_list(&jobs);
+        assert_eq!(
+            map.get("thread-aaa_111").map(String::as_str),
+            Some("thread-aaa")
+        );
+        assert_eq!(map.len(), 1, "only the active thread job is mapped");
+        // The map resolves a thread → its live job for ^D / stop.
+        assert_eq!(
+            job_for_thread(&map, "thread-aaa").as_deref(),
+            Some("thread-aaa_111")
+        );
     }
 
     #[test]

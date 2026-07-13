@@ -60,6 +60,12 @@ pub enum DataEvent {
     ThreadReconciled {
         thread_id: String,
     },
+    /// The caller's active deliberations (`GET /deliberations`), mapped job_id →
+    /// thread_id. Merged into the in-memory job↔thread map so `^D`/stop resolve a
+    /// thread's running job from the orchestrator.
+    ThreadJobsLoaded {
+        jobs: std::collections::HashMap<String, String>,
+    },
     /// A reopened thread's pending `ask_user` questions, fetched to recover one
     /// that fired while the view wasn't focused. The view shows the first.
     ToolCallsLoaded {

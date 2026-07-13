@@ -453,6 +453,42 @@ impl RemoteOrchestrator {
             .map_err(|e| RemoteError::ParseError(format!("agents: {e}")))
     }
 
+    /// The caller's own deliberations — `GET /deliberations` (server filters to
+    /// jobs the caller owns). Returns `(job_id, status)` pairs so a thin client
+    /// can map a thread → its running job without local job state.
+    pub async fn deliberations(&self) -> Result<Vec<(String, String)>, RemoteError> {
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            job_id: String,
+            status: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            jobs: Vec<Entry>,
+        }
+        let url = format!("{}/deliberations", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RemoteError::ApiError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let r: Resp = resp
+            .json()
+            .await
+            .map_err(|e| RemoteError::ParseError(format!("deliberations: {e}")))?;
+        Ok(r.jobs.into_iter().map(|e| (e.job_id, e.status)).collect())
+    }
+
     /// Job status — `GET /deliberation/{id}/result`.
     pub async fn result(&self, job_id: &str) -> Result<JobResult, RemoteError> {
         let url = format!("{}/deliberation/{}/result", self.base_url, job_id);
@@ -1400,6 +1436,44 @@ mod tests {
         assert!(tracker.proposed.is_empty());
         assert!(tracker.evaluating.is_empty());
         assert!(tracker.evaluated.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deliberations_returns_job_id_status_pairs() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/deliberations"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jobs": [
+                    {"job_id": "thread-aaa_111", "status": "running"},
+                    {"job_id": "pl_fast_222", "status": "completed"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = RemoteOrchestrator::new(&server.uri(), "test-token").unwrap();
+        let jobs = client.deliberations().await.unwrap();
+        assert_eq!(
+            jobs,
+            vec![
+                ("thread-aaa_111".to_string(), "running".to_string()),
+                ("pl_fast_222".to_string(), "completed".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn deliberations_surfaces_an_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/deliberations"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(r#"{"error":"unauthorized"}"#))
+            .mount(&server)
+            .await;
+        let client = RemoteOrchestrator::new(&server.uri(), "test-token").unwrap();
+        assert!(client.deliberations().await.is_err());
     }
 
     #[tokio::test]

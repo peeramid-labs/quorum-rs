@@ -106,6 +106,12 @@ pub enum FetchRequest {
         orchestrator: String,
         job_id: String,
     },
+    /// Query the caller's own deliberations (`GET /deliberations`) and populate
+    /// the in-memory job↔thread map — so `^D`/stop find a thread's running job
+    /// from the orchestrator (source of truth), not local disk state.
+    RefreshThreadJobs {
+        orchestrator: String,
+    },
     /// Reconcile a reopened thread's pending job — fetch its result and append
     /// the reply if the deliberation has finished (recovers replies that landed
     /// while the TUI was closed).

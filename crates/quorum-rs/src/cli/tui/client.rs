@@ -131,6 +131,20 @@ impl TuiClient {
         });
     }
 
+    /// Query the caller's active deliberations and map each thread-scoped job to
+    /// its thread, so `^D`/stop resolve a thread's running job from the server.
+    pub fn refresh_thread_jobs(&self, remote: RemoteOrchestrator) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            if let Ok(jobs) = remote.deliberations().await {
+                let jobs = super::thread_jobs_from_list(&jobs);
+                if !jobs.is_empty() {
+                    let _ = tx.send(DataEvent::ThreadJobsLoaded { jobs });
+                }
+            }
+        });
+    }
+
     /// Cancel a thread's running deliberation. On success, clears the thread's
     /// pending marker (so a follow-up can send) and signals a reload.
     pub fn cancel_job(&self, remote: RemoteOrchestrator, job_id: String, thread_id: String) {
@@ -535,6 +549,41 @@ mod tests {
     fn tui_client_creation() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let _client = TuiClient::new(tx);
+    }
+
+    #[tokio::test]
+    async fn refresh_thread_jobs_maps_active_thread_jobs() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/deliberations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jobs": [
+                    {"job_id": "thread-aaa_111", "status": "running"},
+                    {"job_id": "thread-bbb_222", "status": "completed"}, // terminal → dropped
+                    {"job_id": "pl_fast_333", "status": "running"}       // not a thread → dropped
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let client = TuiClient::new(tx);
+        let remote = RemoteOrchestrator::new(&server.uri(), "tok").unwrap();
+        client.refresh_thread_jobs(remote);
+
+        match rx.recv().await.unwrap() {
+            DataEvent::ThreadJobsLoaded { jobs } => {
+                assert_eq!(
+                    jobs.get("thread-aaa_111").map(String::as_str),
+                    Some("thread-aaa")
+                );
+                assert_eq!(jobs.len(), 1, "only the active thread job is mapped");
+            }
+            other => panic!("expected ThreadJobsLoaded, got {other:?}"),
+        }
     }
 
     #[test]
