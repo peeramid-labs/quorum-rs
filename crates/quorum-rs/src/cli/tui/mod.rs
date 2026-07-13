@@ -398,12 +398,11 @@ async fn setup_and_run(
                     ref thread_id,
                     ref orchestrator,
                 } => {
-                    // Resolve the thread's in-flight job and open its detail.
-                    let job = app
-                        .job_thread
-                        .iter()
-                        .find(|(_, tid)| *tid == thread_id)
-                        .map(|(jid, _)| jid.clone());
+                    let job = resolve_thread_job(
+                        &crate::cli::thread::ThreadStore::new(),
+                        &mut app.job_thread,
+                        thread_id,
+                    );
                     match job {
                         Some(job_id) => {
                             app.push_view(ViewId::JobDetail {
@@ -600,6 +599,27 @@ fn on_job_submitted(
         job_id: job_id.to_string(),
         orchestrator: orchestrator.to_string(),
     }
+}
+
+/// Resolve a thread's in-flight job id: the in-memory job↔thread map first (this
+/// session's launch), else the thread's persisted `pending_job` — which survives
+/// a TUI restart, so a deliberation left running can still be opened and stopped.
+/// A store hit seeds the map so a later completion is attributed to the thread.
+fn resolve_thread_job(
+    store: &crate::cli::thread::ThreadStore,
+    job_thread: &mut std::collections::HashMap<String, String>,
+    thread_id: &str,
+) -> Option<String> {
+    if let Some(job_id) = job_thread
+        .iter()
+        .find(|(_, tid)| tid.as_str() == thread_id)
+        .map(|(jid, _)| jid.clone())
+    {
+        return Some(job_id);
+    }
+    let job_id = store.load(thread_id)?.pending_job?;
+    job_thread.insert(job_id.clone(), thread_id.to_string());
+    Some(job_id)
 }
 
 /// Resolve the policy label for a roomless (thread) launch: the explicit policy
@@ -1393,6 +1413,49 @@ mod tests {
             Some("job-7"),
             "pending job persisted for crash recovery"
         );
+    }
+
+    #[test]
+    fn resolve_thread_job_falls_back_to_persisted_pending_job() {
+        // TUI restart: the in-memory map is empty, but the thread persisted its
+        // pending job — a running deliberation must still be resolvable.
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::cli::thread::ThreadStore::with_dir(dir.path().to_path_buf());
+        let mut t = crate::cli::thread::Thread::new("t");
+        store.save(&t).unwrap();
+        store.set_pending_job(&t.id, "job-alive");
+        t.pending_job = Some("job-alive".into());
+
+        let mut map = HashMap::new();
+        let job = resolve_thread_job(&store, &mut map, &t.id);
+
+        assert_eq!(job.as_deref(), Some("job-alive"));
+        // Seeded so a later completion is attributed to the thread.
+        assert_eq!(
+            map.get("job-alive").map(String::as_str),
+            Some(t.id.as_str())
+        );
+    }
+
+    #[test]
+    fn resolve_thread_job_prefers_the_in_memory_map() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::cli::thread::ThreadStore::with_dir(dir.path().to_path_buf());
+        let mut map = HashMap::from([("job-mem".to_string(), "thread-9".to_string())]);
+        assert_eq!(
+            resolve_thread_job(&store, &mut map, "thread-9").as_deref(),
+            Some("job-mem")
+        );
+    }
+
+    #[test]
+    fn resolve_thread_job_none_when_no_pending() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::cli::thread::ThreadStore::with_dir(dir.path().to_path_buf());
+        let t = crate::cli::thread::Thread::new("t");
+        store.save(&t).unwrap();
+        let mut map = HashMap::new();
+        assert!(resolve_thread_job(&store, &mut map, &t.id).is_none());
     }
 
     #[test]
