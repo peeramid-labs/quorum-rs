@@ -280,40 +280,27 @@ async fn setup_and_run(
             ref orchestrator,
         }) = app_event
         {
-            // A thread launch's job id is now known — bind it so the reply is
-            // attributed to that thread (and not to whichever job finishes first).
-            if let Some(thread_id) = app.pending_thread_launch.take() {
-                app.job_thread.insert(job_id.clone(), thread_id.clone());
-                // Persist the launched job id on the thread so a completion that
-                // lands while the TUI is closed is recoverable on reopen.
-                crate::cli::thread::ThreadStore::new().set_pending_job(&thread_id, job_id);
-                // Stay in the thread — the reply lands inline. Don't hijack the
-                // screen with the deliberation detail (open it with Ctrl-D). But
-                // still open the SSE stream so completion events flow and the
-                // reply is recorded + reloaded (JobDetail's on_enter used to do
-                // this; without it no JobComplete would ever arrive).
-                app.status_message = Some(("Deliberating…".into(), StatusLevel::Info));
-                handle_action(
-                    &mut app,
-                    &mut tui_client,
-                    &data_tx,
-                    &ViewAction::Fetch(FetchRequest::StartSseStream {
-                        orchestrator: orchestrator.clone(),
-                        job_id: job_id.clone(),
-                    }),
-                    config_path,
-                );
-                continue;
-            }
-            // Room / ad-hoc launch: jump to the live deliberation detail.
-            app.status_message = Some((
-                format!("Job {} submitted", &job_id[..job_id.len().min(12)]),
-                StatusLevel::Success,
-            ));
-            let view_id = ViewId::JobDetail {
-                job_id: job_id.clone(),
-                orchestrator: orchestrator.clone(),
-            };
+            // Both thread launches and room/ad-hoc launches jump to the live
+            // deliberation detail. A thread launch also binds job→thread so the
+            // reply is attributed and recoverable on reopen. JobDetail's on_enter
+            // opens the SSE stream, so completion events flow and the reply is
+            // recorded even after the user Escapes back to the thread.
+            let bound = app.pending_thread_launch.is_some();
+            let view_id = on_job_submitted(
+                &crate::cli::thread::ThreadStore::new(),
+                app.pending_thread_launch.take(),
+                &mut app.job_thread,
+                job_id,
+                orchestrator,
+            );
+            app.status_message = Some(if bound {
+                ("Deliberating…".into(), StatusLevel::Info)
+            } else {
+                (
+                    format!("Job {} submitted", &job_id[..job_id.len().min(12)]),
+                    StatusLevel::Success,
+                )
+            });
             app.push_view(view_id);
             current_view = create_view(app.current_view().unwrap(), &app);
             let actions = current_view.on_enter();
@@ -592,6 +579,29 @@ fn record_thread_terminal(
     }
 }
 
+/// On JobSubmitted, bind a thread launch's job id to its thread (and persist the
+/// pending job so a completion is recoverable on reopen), then return the
+/// JobDetail view to open. Both thread launches and room/ad-hoc launches now open
+/// the live deliberation detail automatically — a thread launch just additionally
+/// records the job↔thread mapping. `pending_thread_launch` is `None` for a
+/// room/ad-hoc launch.
+fn on_job_submitted(
+    store: &crate::cli::thread::ThreadStore,
+    pending_thread_launch: Option<String>,
+    job_thread: &mut std::collections::HashMap<String, String>,
+    job_id: &str,
+    orchestrator: &str,
+) -> ViewId {
+    if let Some(thread_id) = pending_thread_launch {
+        job_thread.insert(job_id.to_string(), thread_id.clone());
+        store.set_pending_job(&thread_id, job_id);
+    }
+    ViewId::JobDetail {
+        job_id: job_id.to_string(),
+        orchestrator: orchestrator.to_string(),
+    }
+}
+
 /// Resolve the policy label for a roomless (thread) launch: the explicit policy
 /// if given, else the default room's policy, else any configured room's policy.
 /// `None` when nothing is configured to fall back to.
@@ -784,7 +794,15 @@ fn handle_action(
                     thread_id,
                 } => {
                     let name = orchestrator.clone();
-                    let (job_id, thread_id) = (job_id.clone(), thread_id.clone());
+                    let job_id = job_id.clone();
+                    // JobDetail sends an empty thread_id (it doesn't track the
+                    // thread); resolve it from the job↔thread map so the thread's
+                    // pending job is cleared on cancel.
+                    let thread_id = if thread_id.is_empty() {
+                        app.job_thread.get(&job_id).cloned().unwrap_or_default()
+                    } else {
+                        thread_id.clone()
+                    };
                     let result = build_remote(app, &name).map(|remote| {
                         tui_client.cancel_job(remote, job_id, thread_id);
                     });
@@ -1353,6 +1371,40 @@ mod tests {
         store.save(&t).unwrap();
         let map = HashMap::from([(job_id.to_string(), t.id.clone())]);
         (store, t.id, map)
+    }
+
+    #[test]
+    fn thread_launch_opens_detail_and_binds_job() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::cli::thread::ThreadStore::with_dir(dir.path().to_path_buf());
+        let t = crate::cli::thread::Thread::new("t");
+        store.save(&t).unwrap();
+        let mut map = HashMap::new();
+
+        let view = on_job_submitted(&store, Some(t.id.clone()), &mut map, "job-7", "prod");
+
+        assert!(
+            matches!(&view, ViewId::JobDetail { job_id, .. } if job_id == "job-7"),
+            "thread launch must auto-open the deliberation detail"
+        );
+        assert_eq!(map.get("job-7").map(String::as_str), Some(t.id.as_str()));
+        assert_eq!(
+            store.load(&t.id).unwrap().pending_job.as_deref(),
+            Some("job-7"),
+            "pending job persisted for crash recovery"
+        );
+    }
+
+    #[test]
+    fn adhoc_launch_opens_detail_without_binding() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::cli::thread::ThreadStore::with_dir(dir.path().to_path_buf());
+        let mut map = HashMap::new();
+
+        let view = on_job_submitted(&store, None, &mut map, "job-x", "prod");
+
+        assert!(matches!(&view, ViewId::JobDetail { job_id, .. } if job_id == "job-x"));
+        assert!(map.is_empty(), "ad-hoc launch binds no thread");
     }
 
     #[test]

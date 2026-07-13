@@ -1417,7 +1417,7 @@ fn next_char_boundary(s: &str, i: usize) -> usize {
 }
 
 /// Start of the word before `i`: skip whitespace back, then the word.
-fn prev_word_boundary(s: &str, i: usize) -> usize {
+pub(crate) fn prev_word_boundary(s: &str, i: usize) -> usize {
     let head = &s[..i.min(s.len())];
     let trimmed = head.trim_end_matches(char::is_whitespace);
     trimmed
@@ -1427,7 +1427,7 @@ fn prev_word_boundary(s: &str, i: usize) -> usize {
 }
 
 /// End of the word after `i`: skip whitespace forward, then the word.
-fn next_word_boundary(s: &str, i: usize) -> usize {
+pub(crate) fn next_word_boundary(s: &str, i: usize) -> usize {
     if i >= s.len() {
         return s.len();
     }

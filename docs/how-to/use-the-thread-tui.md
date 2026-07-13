@@ -35,8 +35,9 @@ see the latest exchange without opening it.
 
 1. Press `n`. The compose box opens.
 2. Type a **subject**, `Tab` to the message, type your first turn.
-3. `Enter` sends. The subject is fixed once set; the deliberation runs
-   and its answer lands as a `[noosphera]` turn.
+3. `Enter` sends. The subject is fixed once set; the **live deliberation detail
+   opens automatically** so you can watch the rounds. `Esc` returns to the
+   thread — the run keeps going and its answer lands as a `[noosphera]` turn.
 
 ## Read a thread
 
@@ -68,10 +69,19 @@ The turn you compose roots under wherever the cursor is:
 - **Start a fresh line** — press `n` inside a thread. A new root turn
   under the same subject, rooted at nothing.
 
+## Steer a running deliberation
+
+In the deliberation detail, press `/` to open the steering input and inject a
+message into the live rounds. It's a line editor: `^←`/`^→` jump by word,
+`Home`/`End` snap to the ends, and a **paste inserts at the caret** (multi-line
+kept). Press `^F` for a full-screen editor when the message is large; `Esc`
+leaves full-screen, then closes the input. `Enter` sends.
+
 ## Stop a runaway deliberation
 
-While a turn is deliberating, `^C` cancels it (a compliance kill-switch
-too). The turn is left unanswered; write a follow-up to continue.
+`^C` cancels the running deliberation — from the reader or the detail view (a
+compliance kill-switch too). The turn is left unanswered; write a follow-up to
+continue.
 
 ## Swap the model or effort
 

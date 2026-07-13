@@ -57,6 +57,37 @@ on send.
 
 `↑` / `↓` / `PgUp` / `PgDn` / `Home` scroll; `Esc` / `q` returns to the reader.
 
+### Deliberation detail
+
+Opened automatically when a turn is sent (and via `^D` from the reader). Shows
+the live rounds — proposals, evaluations, convergence.
+
+| Key | Action |
+|---|---|
+| `Tab` | Cycle panels |
+| `↑` / `↓` | Scroll the active panel |
+| `d` / `Enter` | Open the selected proposal/evaluation detail |
+| `←` / `→` / `PgUp` / `PgDn` | Step through rounds (`=` back to live) |
+| `t` | Toggle thought process |
+| `/` | Steer — open the injection input (running only) |
+| `^C` | Stop (cancel) the running deliberation |
+| `Esc` / `q` | Back to the thread |
+
+#### Steer (injection input)
+
+Activated with `/` while the job runs. A line editor:
+
+| Key | Action |
+|---|---|
+| `Enter` | Send the steering message into the deliberation |
+| `^F` | Toggle a full-screen editor (room for a large / multi-line paste) |
+| `←` / `→` | Move the caret by character |
+| `^←` / `^→` | Move the caret by word |
+| `Home` / `End` | Caret to start / end |
+| `Backspace` | Delete the char before the caret |
+| paste | Bracketed paste inserts at the caret (newlines preserved) |
+| `Esc` | Leave full-screen, then close the input |
+
 ## Line formats
 
 Reader order: each thread **root is pinned at the top** (oldest first), then its

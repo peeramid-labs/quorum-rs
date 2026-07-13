@@ -3,10 +3,11 @@ use std::collections::HashMap;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 
 use super::common::{ListState, render_key_hints, truncate};
+use super::thread::{next_word_boundary, prev_word_boundary};
 use super::{FetchRequest, View, ViewAction};
 use crate::cli::tui::event::{self, AgentPhaseStatus, AppEvent, DataEvent, PhaseTracker, SseEvent};
 
@@ -78,6 +79,11 @@ pub struct JobDetailView {
     pub show_justifications: bool,
     pub inject_input_active: bool,
     pub inject_text: String,
+    /// Caret byte offset into `inject_text` (always on a char boundary).
+    pub inject_cursor: usize,
+    /// Full-screen compose overlay for the injection draft — room to read/edit
+    /// a large or multi-line pasted message.
+    pub inject_fullscreen: bool,
     pub injection_count: usize,
     /// Which round the user is currently browsing. `None` = follow the
     /// live round (auto-advance as new rounds start). `Some(n)` = pin
@@ -128,6 +134,8 @@ impl JobDetailView {
             show_justifications: false,
             inject_input_active: false,
             inject_text: String::new(),
+            inject_cursor: 0,
+            inject_fullscreen: false,
             injection_count: 0,
             viewed_round: None,
             show_result: true,
@@ -355,39 +363,146 @@ impl JobDetailView {
         self.convergence_scores.last().copied()
     }
 
-    /// Handle keyboard input when injection text input is active.
+    fn clear_inject(&mut self) {
+        self.inject_text.clear();
+        self.inject_cursor = 0;
+        self.inject_fullscreen = false;
+    }
+
+    /// Handle keyboard input when injection text input is active. A small line
+    /// editor: caret movement (char + word), Home/End, insert/delete at the
+    /// caret, bracketed paste, and a `^F` full-screen toggle. `Enter` sends.
     fn update_inject_input(&mut self, event: &crossterm::event::Event) -> Option<ViewAction> {
+        use crossterm::event::{Event, KeyCode, KeyEventKind};
+
         if event::is_escape(event) {
-            self.inject_input_active = false;
+            // Esc leaves full-screen first, then closes the input.
+            if self.inject_fullscreen {
+                self.inject_fullscreen = false;
+            } else {
+                self.inject_input_active = false;
+            }
+            return None;
+        }
+        if event::is_ctrl(event, 'f') {
+            self.inject_fullscreen = !self.inject_fullscreen;
             return None;
         }
         if event::is_enter(event) && !self.inject_text.is_empty() {
             self.inject_input_active = false;
             if self.status != JobStatus::Running {
-                self.inject_text.clear();
+                self.clear_inject();
                 return None;
             }
-            let message = self.inject_text.clone();
-            self.inject_text.clear();
+            let message = std::mem::take(&mut self.inject_text);
+            self.clear_inject();
             return Some(ViewAction::InjectMessage {
                 orchestrator: self.orchestrator.clone(),
                 job_id: self.job_id.clone(),
                 message,
             });
         }
-        if let crossterm::event::Event::Key(key) = event
-            && key.kind == crossterm::event::KeyEventKind::Press
+        // Bracketed paste: the terminal delivers the whole clipboard as one
+        // Event::Paste, not per-char Key events. Terminals send line breaks as
+        // CR/CRLF — normalize so multi-line pastes keep their newlines. Inserted
+        // at the caret.
+        if let Event::Paste(text) = event {
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            self.inject_text.insert_str(self.inject_cursor, &normalized);
+            self.inject_cursor += normalized.len();
+            return None;
+        }
+        // Word jumps — check before the plain arrows (which ignore modifiers).
+        if event::is_ctrl_left(event) {
+            self.inject_cursor = prev_word_boundary(&self.inject_text, self.inject_cursor);
+            return None;
+        }
+        if event::is_ctrl_right(event) {
+            self.inject_cursor = next_word_boundary(&self.inject_text, self.inject_cursor);
+            return None;
+        }
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
         {
             match key.code {
-                crossterm::event::KeyCode::Char(c) => self.inject_text.push(c),
-                crossterm::event::KeyCode::Backspace => {
-                    self.inject_text.pop();
+                KeyCode::Left => {
+                    self.inject_cursor = prev_char(&self.inject_text, self.inject_cursor)
+                }
+                KeyCode::Right => {
+                    self.inject_cursor = next_char(&self.inject_text, self.inject_cursor)
+                }
+                KeyCode::Home => self.inject_cursor = 0,
+                KeyCode::End => self.inject_cursor = self.inject_text.len(),
+                KeyCode::Char(c) => {
+                    self.inject_text.insert(self.inject_cursor, c);
+                    self.inject_cursor += c.len_utf8();
+                }
+                KeyCode::Backspace if self.inject_cursor > 0 => {
+                    let prev = prev_char(&self.inject_text, self.inject_cursor);
+                    self.inject_text.replace_range(prev..self.inject_cursor, "");
+                    self.inject_cursor = prev;
                 }
                 _ => {}
             }
         }
         None
     }
+}
+
+/// Previous UTF-8 char boundary before byte offset `i` (0 at the start).
+fn prev_char(s: &str, i: usize) -> usize {
+    s[..i.min(s.len())]
+        .char_indices()
+        .next_back()
+        .map(|(j, _)| j)
+        .unwrap_or(0)
+}
+
+/// Next UTF-8 char boundary after byte offset `i` (len at the end).
+fn next_char(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    s[i..]
+        .char_indices()
+        .nth(1)
+        .map(|(j, _)| i + j)
+        .unwrap_or(s.len())
+}
+
+/// Render `text` as multi-line `Text` with a reversed caret block at byte
+/// offset `cursor` — a block over the char under the caret, or a trailing
+/// block at end-of-line.
+fn caret_text(text: &str, cursor: usize) -> Text<'static> {
+    let cur = cursor.min(text.len());
+    let mut lines = Vec::new();
+    let mut line_start = 0usize;
+    for seg in text.split('\n') {
+        let seg_end = line_start + seg.len();
+        if cur >= line_start && cur <= seg_end {
+            lines.push(caret_line_from(seg, cur - line_start));
+        } else {
+            lines.push(Line::from(seg.to_string()));
+        }
+        line_start = seg_end + 1; // skip the '\n'
+    }
+    Text::from(lines)
+}
+
+/// One line with a reversed caret block at byte column `col`.
+fn caret_line_from(seg: &str, col: usize) -> Line<'static> {
+    let col = col.min(seg.len());
+    let before = seg[..col].to_string();
+    let at = seg[col..].chars().next();
+    let caret = Style::default().add_modifier(Modifier::REVERSED);
+    let (at_span, after) = match at {
+        Some(c) => (
+            Span::styled(c.to_string(), caret),
+            seg[col + c.len_utf8()..].to_string(),
+        ),
+        None => (Span::styled(" ", caret), String::new()),
+    };
+    Line::from(vec![Span::raw(before), at_span, Span::raw(after)])
 }
 
 impl View for JobDetailView {
@@ -409,6 +524,17 @@ impl View for JobDetailView {
                 // Injection input mode
                 if self.inject_input_active {
                     return self.update_inject_input(event);
+                }
+
+                // Ctrl-C stops (cancels) a running deliberation. The loop
+                // resolves the empty thread_id from its job↔thread map so a
+                // thread's pending job is cleared too.
+                if event::is_ctrl(event, 'c') && self.status == JobStatus::Running {
+                    return Some(ViewAction::Fetch(FetchRequest::CancelJob {
+                        orchestrator: self.orchestrator.clone(),
+                        job_id: self.job_id.clone(),
+                        thread_id: String::new(),
+                    }));
                 }
 
                 // Detail mode for evaluations
@@ -494,7 +620,7 @@ impl View for JobDetailView {
                     // at the bottom while the job is running — this just
                     // routes keystrokes into it.
                     self.inject_input_active = true;
-                    self.inject_text.clear();
+                    self.clear_inject();
                 } else if (event::is_enter(event) || event::is_key(event, 'd'))
                     && self.active_panel == Panel::Evaluations
                 {
@@ -568,7 +694,9 @@ impl View for JobDetailView {
         self.draw_header(frame, chunks[0]);
 
         // Detail views take over the panels area
-        if self.eval_detail_target.is_some() {
+        if self.inject_input_active && self.inject_fullscreen {
+            self.draw_inject_fullscreen(frame, chunks[1]);
+        } else if self.eval_detail_target.is_some() {
             self.draw_eval_detail(frame, chunks[1]);
         } else if self.proposal_detail_visible {
             self.draw_proposal_detail(frame, chunks[1]);
@@ -585,7 +713,12 @@ impl View for JobDetailView {
         } else if self.final_result.is_some() && self.show_result {
             vec![("Tab", "Details"), ("t", "Thoughts"), ("Esc", "Back")]
         } else if self.inject_input_active {
-            vec![("Enter", "Send"), ("Esc", "Cancel"), ("PgUp/PgDn", "Round")]
+            vec![
+                ("Enter", "Send"),
+                ("^F", "Full screen"),
+                ("^←→", "Word"),
+                ("Esc", "Cancel"),
+            ]
         } else {
             let mut h = vec![("Tab", "Panel"), ("↑↓", "Scroll")];
             if self.active_panel == Panel::Proposals || self.active_panel == Panel::Evaluations {
@@ -598,6 +731,7 @@ impl View for JobDetailView {
             h.push(("PgUp/PgDn", "Round"));
             if self.status == JobStatus::Running {
                 h.push(("/", "Steer"));
+                h.push(("^C", "Stop"));
             }
             h.push(("Esc", "Back"));
             h
@@ -653,20 +787,20 @@ impl JobDetailView {
     /// printable character that isn't a registered hotkey) activates
     /// input mode; Enter sends; Esc cancels.
     fn draw_chat_input(&self, frame: &mut Frame, area: Rect) {
-        let (text, title, style) = if self.inject_input_active {
+        let (body, title, style) = if self.inject_input_active {
             (
-                self.inject_text.clone(),
-                " ✉ steering (Enter=send · Esc=cancel) ",
+                caret_text(&self.inject_text, self.inject_cursor),
+                " ✉ steering (Enter=send · ^F=full screen · Esc=cancel) ",
                 Style::default().fg(Color::Yellow),
             )
         } else {
             (
-                String::from("press / to steer the deliberation…"),
+                Text::from("press / to steer the deliberation…"),
                 " ✉ ",
                 Style::default().fg(Color::DarkGray),
             )
         };
-        let input = Paragraph::new(text).style(style).block(
+        let input_bar = Paragraph::new(body).style(style).block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(title)
@@ -676,7 +810,22 @@ impl JobDetailView {
                     Style::default().fg(Color::DarkGray)
                 }),
         );
-        frame.render_widget(input, area);
+        frame.render_widget(input_bar, area);
+    }
+
+    /// Full-screen steering editor — room to read/edit a large or multi-line
+    /// pasted message. Replaces the panels area while `^F` full-screen is on.
+    fn draw_inject_fullscreen(&self, frame: &mut Frame, area: Rect) {
+        let body = Paragraph::new(caret_text(&self.inject_text, self.inject_cursor))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::White))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" ✉ steering — full screen (Enter=send · ^F/Esc=exit · ^←→ word) ")
+                    .border_style(Style::default().fg(Color::Yellow)),
+            );
+        frame.render_widget(body, area);
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
@@ -2199,5 +2348,167 @@ mod tests {
         for window in bgs.windows(2) {
             assert_ne!(window[0], window[1], "palette buckets collapsed: {bgs:?}");
         }
+    }
+
+    fn make_paste(text: &str) -> AppEvent {
+        AppEvent::Terminal(Event::Paste(text.into()))
+    }
+
+    fn make_ctrl(code: KeyCode) -> AppEvent {
+        AppEvent::Terminal(Event::Key(KeyEvent {
+            code,
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }))
+    }
+
+    fn active_inject() -> JobDetailView {
+        let mut v = new_view();
+        v.status = JobStatus::Running;
+        v.inject_input_active = true;
+        v
+    }
+
+    #[test]
+    fn inject_inserts_at_caret_not_only_at_end() {
+        let mut v = active_inject();
+        v.inject_text = "ac".into();
+        v.inject_cursor = 1; // between a and c
+        v.update(&make_key(KeyCode::Char('b')));
+        assert_eq!(v.inject_text, "abc");
+        assert_eq!(v.inject_cursor, 2);
+    }
+
+    #[test]
+    fn inject_ctrl_arrows_jump_by_word() {
+        let mut v = active_inject();
+        v.inject_text = "hello world foo".into();
+        v.inject_cursor = v.inject_text.len();
+        v.update(&make_ctrl(KeyCode::Left));
+        assert_eq!(&v.inject_text[v.inject_cursor..], "foo");
+        v.update(&make_ctrl(KeyCode::Left));
+        assert_eq!(&v.inject_text[v.inject_cursor..], "world foo");
+        v.update(&make_ctrl(KeyCode::Right));
+        assert_eq!(&v.inject_text[..v.inject_cursor], "hello world");
+    }
+
+    #[test]
+    fn inject_home_end_and_backspace_at_caret() {
+        let mut v = active_inject();
+        v.inject_text = "abcd".into();
+        v.inject_cursor = 4;
+        v.update(&make_key(KeyCode::Home));
+        assert_eq!(v.inject_cursor, 0);
+        v.update(&make_key(KeyCode::End));
+        assert_eq!(v.inject_cursor, 4);
+        v.inject_cursor = 2; // between b and c
+        v.update(&make_key(KeyCode::Backspace));
+        assert_eq!(v.inject_text, "acd");
+        assert_eq!(v.inject_cursor, 1);
+    }
+
+    #[test]
+    fn inject_paste_inserts_at_caret() {
+        let mut v = active_inject();
+        v.inject_text = "ad".into();
+        v.inject_cursor = 1;
+        v.update(&make_paste("bc"));
+        assert_eq!(v.inject_text, "abcd");
+        assert_eq!(v.inject_cursor, 3);
+    }
+
+    #[test]
+    fn inject_fullscreen_toggle_and_escape_layering() {
+        let mut v = active_inject();
+        v.update(&make_ctrl(KeyCode::Char('f')));
+        assert!(v.inject_fullscreen);
+        // Esc leaves full-screen but keeps the input open.
+        v.update(&make_key(KeyCode::Esc));
+        assert!(!v.inject_fullscreen);
+        assert!(v.inject_input_active);
+        // A second Esc closes the input.
+        v.update(&make_key(KeyCode::Esc));
+        assert!(!v.inject_input_active);
+    }
+
+    #[test]
+    fn inject_send_resets_caret_and_fullscreen() {
+        let mut v = active_inject();
+        v.inject_text = "hi".into();
+        v.inject_cursor = 2;
+        v.inject_fullscreen = true;
+        let action = v.update(&make_key(KeyCode::Enter));
+        assert!(matches!(action, Some(ViewAction::InjectMessage { .. })));
+        assert_eq!(v.inject_cursor, 0);
+        assert!(!v.inject_fullscreen);
+        assert!(v.inject_text.is_empty());
+    }
+
+    #[test]
+    fn caret_text_places_block_on_the_cursor_line() {
+        let t = caret_text("ab\ncd", 4); // 2nd line, before 'd'
+        assert_eq!(t.lines.len(), 2, "one Line per source line");
+        let l2 = &t.lines[1];
+        let rendered: String = l2.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(rendered, "cd");
+        let caret = l2
+            .spans
+            .iter()
+            .find(|s| s.style.add_modifier.contains(Modifier::REVERSED))
+            .expect("a reversed caret block");
+        assert_eq!(caret.content.as_ref(), "d");
+    }
+
+    #[test]
+    fn ctrl_c_stops_the_running_deliberation() {
+        let mut view = new_view();
+        view.status = JobStatus::Running;
+        let action = view.update(&make_ctrl(KeyCode::Char('c')));
+        assert!(
+            matches!(
+                &action,
+                Some(ViewAction::Fetch(FetchRequest::CancelJob { job_id, .. }))
+                    if job_id == "test-job-123"
+            ),
+            "Ctrl-C in the detail view must cancel the job, got {action:?}"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_ignored_when_not_running() {
+        let mut view = new_view();
+        view.status = JobStatus::Complete;
+        assert!(view.update(&make_ctrl(KeyCode::Char('c'))).is_none());
+    }
+
+    #[test]
+    fn inject_input_accepts_bracketed_paste() {
+        let mut view = new_view();
+        view.status = JobStatus::Running;
+        view.inject_input_active = true;
+        // A bracketed paste arrives as one Event::Paste, not per-char Key events.
+        let action = view.update(&make_paste("pasted steering text"));
+        assert!(action.is_none());
+        assert_eq!(view.inject_text, "pasted steering text");
+        assert!(view.inject_input_active, "paste must not close the input");
+    }
+
+    #[test]
+    fn inject_paste_normalizes_crlf() {
+        let mut view = new_view();
+        view.inject_input_active = true;
+        view.update(&make_paste("line1\r\nline2\r"));
+        assert_eq!(view.inject_text, "line1\nline2\n");
+    }
+
+    #[test]
+    fn inject_paste_appends_to_typed_text() {
+        let mut view = new_view();
+        view.inject_input_active = true;
+        view.inject_text = "typed ".into();
+        view.inject_cursor = view.inject_text.len();
+        view.update(&make_paste("pasted"));
+        assert_eq!(view.inject_text, "typed pasted");
     }
 }
