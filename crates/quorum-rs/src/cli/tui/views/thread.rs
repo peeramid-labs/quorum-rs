@@ -1331,8 +1331,10 @@ impl ThreadView {
 
 /// True when `ev` is a Ctrl+`c` key press.
 fn is_ctrl(ev: &crossterm::event::Event, c: char) -> bool {
+    // No Press-only gate — tmux / non-kitty terminals can deliver Ctrl+key with a
+    // non-Press kind, which the gate silently dropped (^C did nothing).
     matches!(ev, crossterm::event::Event::Key(k)
-        if k.kind == crossterm::event::KeyEventKind::Press
+        if k.kind != crossterm::event::KeyEventKind::Release
             && k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
             && k.code == crossterm::event::KeyCode::Char(c))
 }

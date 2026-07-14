@@ -900,8 +900,14 @@ fn handle_action(
                     // job but not the thread. Fill the missing half from the
                     // job↔thread map (populated by the /deliberations query).
                     let result = match resolve_cancel_target(&app.job_thread, job_id, thread_id) {
-                        Some((job_id, thread_id)) => build_remote(app, &name)
-                            .map(|remote| tui_client.cancel_job(remote, job_id, thread_id)),
+                        Some((job_id, thread_id)) => {
+                            app.status_message = Some((
+                                format!("Stopping {}…", &job_id[..job_id.len().min(20)]),
+                                StatusLevel::Info,
+                            ));
+                            build_remote(app, &name)
+                                .map(|remote| tui_client.cancel_job(remote, job_id, thread_id))
+                        }
                         None => {
                             app.status_message =
                                 Some(("No running deliberation to stop".into(), StatusLevel::Info));
