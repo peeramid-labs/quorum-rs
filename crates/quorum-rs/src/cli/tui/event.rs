@@ -334,14 +334,10 @@ pub fn is_key(event: &Event, c: char) -> bool {
 
 /// True when `event` is a Ctrl+`c` key press (any letter, case-insensitive).
 pub fn is_ctrl(event: &Event, c: char) -> bool {
-    // No `kind == Press` filter — under tmux / terminals without the kitty
-    // keyboard protocol, Ctrl+key can arrive with a non-Press kind, and the Press
-    // gate silently dropped it (^C did nothing). The other key helpers don't
-    // filter kind either; a Release double-fire on a cancel is idempotent.
     matches!(
         event,
         Event::Key(k)
-            if k.kind != KeyEventKind::Release
+            if k.kind == KeyEventKind::Press
                 && k.modifiers.contains(KeyModifiers::CONTROL)
                 && k.code == KeyCode::Char(c)
     )

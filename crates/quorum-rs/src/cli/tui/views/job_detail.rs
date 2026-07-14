@@ -526,11 +526,12 @@ impl View for JobDetailView {
                     return self.update_inject_input(event);
                 }
 
-                // Ctrl-C stops (cancels) the deliberation while it's non-terminal.
-                // Not gated on `Running`: a job the SSE stream hasn't advanced yet
-                // (still Connecting) or a wedged one must still be cancellable. The
-                // loop resolves the empty thread_id from its job↔thread map.
-                if event::is_ctrl(event, 'c')
+                // Stop (cancel) the deliberation while it's non-terminal. `x` is
+                // the tmux-proof alias for `^C` (some terminals/tmux never deliver
+                // Ctrl+C as a key event). Not gated on `Running`: a job the SSE
+                // stream hasn't advanced yet (still Connecting) or a wedged one must
+                // still be cancellable. The loop resolves the thread from its map.
+                if (event::is_ctrl(event, 'c') || event::is_key(event, 'x'))
                     && !matches!(self.status, JobStatus::Complete | JobStatus::Failed)
                 {
                     return Some(ViewAction::Fetch(FetchRequest::CancelJob {
@@ -734,7 +735,7 @@ impl View for JobDetailView {
             h.push(("PgUp/PgDn", "Round"));
             if self.status == JobStatus::Running {
                 h.push(("/", "Steer"));
-                h.push(("^C", "Stop"));
+                h.push(("^C/x", "Stop"));
             }
             h.push(("Esc", "Back"));
             h
@@ -2483,6 +2484,28 @@ mod tests {
         let mut view = new_view();
         view.status = JobStatus::Complete;
         assert!(view.update(&make_ctrl(KeyCode::Char('c'))).is_none());
+    }
+
+    #[test]
+    fn plain_x_also_stops_the_deliberation() {
+        // tmux-proof alias for ^C (some terminals never deliver Ctrl+C as a key).
+        let mut view = new_view();
+        view.status = JobStatus::Running;
+        assert!(matches!(
+            view.update(&make_key(KeyCode::Char('x'))),
+            Some(ViewAction::Fetch(FetchRequest::CancelJob { .. }))
+        ));
+    }
+
+    #[test]
+    fn ctrl_c_stops_even_while_connecting() {
+        // A mid-flight job the SSE stream hasn't advanced yet is still cancellable.
+        let mut view = new_view();
+        view.status = JobStatus::Connecting;
+        assert!(matches!(
+            view.update(&make_ctrl(KeyCode::Char('c'))),
+            Some(ViewAction::Fetch(FetchRequest::CancelJob { .. }))
+        ));
     }
 
     #[test]

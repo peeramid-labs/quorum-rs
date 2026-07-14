@@ -947,6 +947,16 @@ impl ThreadView {
         if event::is_escape(ev) {
             return Some(ViewAction::Pop);
         }
+        // `x` stops the thread's running deliberation — a tmux-proof alias for ^C
+        // (some terminals never deliver Ctrl+C as a key event). Read-mode only, so
+        // it never eats a literal `x` while composing.
+        if event::is_key(ev, 'x') {
+            return Some(ViewAction::Fetch(FetchRequest::CancelJob {
+                orchestrator: self.orchestrator.clone(),
+                job_id: self.thread.pending_job.clone().unwrap_or_default(),
+                thread_id: self.thread.id.clone(),
+            }));
+        }
         if event::is_up(ev) {
             self.select_up();
             return None;
@@ -1331,10 +1341,8 @@ impl ThreadView {
 
 /// True when `ev` is a Ctrl+`c` key press.
 fn is_ctrl(ev: &crossterm::event::Event, c: char) -> bool {
-    // No Press-only gate — tmux / non-kitty terminals can deliver Ctrl+key with a
-    // non-Press kind, which the gate silently dropped (^C did nothing).
     matches!(ev, crossterm::event::Event::Key(k)
-        if k.kind != crossterm::event::KeyEventKind::Release
+        if k.kind == crossterm::event::KeyEventKind::Press
             && k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
             && k.code == crossterm::event::KeyCode::Char(c))
 }
@@ -2252,6 +2260,19 @@ mod tests {
                 crossterm::event::KeyModifiers::CONTROL,
             ),
         ))
+    }
+
+    #[test]
+    fn read_mode_x_stops_the_deliberation_tmux_proof_alias() {
+        // `x` in the reader emits the same thread-keyed cancel as ^C, for
+        // terminals/tmux that never deliver Ctrl+C as a key event.
+        let (_t, mut v) = view();
+        match v.update(&plain(crossterm::event::KeyCode::Char('x'))) {
+            Some(ViewAction::Fetch(FetchRequest::CancelJob { thread_id, .. })) => {
+                assert_eq!(thread_id, v.thread.id)
+            }
+            other => panic!("expected a thread-keyed CancelJob, got {other:?}"),
+        }
     }
 
     fn arrow(up: bool) -> AppEvent {
