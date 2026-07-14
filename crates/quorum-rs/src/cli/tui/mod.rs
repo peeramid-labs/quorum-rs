@@ -280,45 +280,42 @@ async fn setup_and_run(
             ref orchestrator,
         }) = app_event
         {
-            // A thread launch's job id is now known — bind it so the reply is
-            // attributed to that thread (and not to whichever job finishes first).
-            if let Some(thread_id) = app.pending_thread_launch.take() {
-                app.job_thread.insert(job_id.clone(), thread_id.clone());
-                // Persist the launched job id on the thread so a completion that
-                // lands while the TUI is closed is recoverable on reopen.
-                crate::cli::thread::ThreadStore::new().set_pending_job(&thread_id, job_id);
-                // Stay in the thread — the reply lands inline. Don't hijack the
-                // screen with the deliberation detail (open it with Ctrl-D). But
-                // still open the SSE stream so completion events flow and the
-                // reply is recorded + reloaded (JobDetail's on_enter used to do
-                // this; without it no JobComplete would ever arrive).
-                app.status_message = Some(("Deliberating…".into(), StatusLevel::Info));
-                handle_action(
-                    &mut app,
-                    &mut tui_client,
-                    &data_tx,
-                    &ViewAction::Fetch(FetchRequest::StartSseStream {
-                        orchestrator: orchestrator.clone(),
-                        job_id: job_id.clone(),
-                    }),
-                    config_path,
-                );
-                continue;
-            }
-            // Room / ad-hoc launch: jump to the live deliberation detail.
-            app.status_message = Some((
-                format!("Job {} submitted", &job_id[..job_id.len().min(12)]),
-                StatusLevel::Success,
-            ));
-            let view_id = ViewId::JobDetail {
-                job_id: job_id.clone(),
-                orchestrator: orchestrator.clone(),
-            };
+            // Both thread launches and room/ad-hoc launches jump to the live
+            // deliberation detail. A thread launch also binds job→thread so the
+            // reply is attributed and recoverable on reopen. JobDetail's on_enter
+            // opens the SSE stream, so completion events flow and the reply is
+            // recorded even after the user Escapes back to the thread.
+            let bound = app.pending_thread_launch.is_some();
+            let view_id = on_job_submitted(
+                &crate::cli::thread::ThreadStore::new(),
+                app.pending_thread_launch.take(),
+                &mut app.job_thread,
+                job_id,
+                orchestrator,
+            );
+            app.status_message = Some(if bound {
+                ("Deliberating…".into(), StatusLevel::Info)
+            } else {
+                (
+                    format!("Job {} submitted", &job_id[..job_id.len().min(12)]),
+                    StatusLevel::Success,
+                )
+            });
             app.push_view(view_id);
             current_view = create_view(app.current_view().unwrap(), &app);
             let actions = current_view.on_enter();
             for a in actions {
                 handle_action(&mut app, &mut tui_client, &data_tx, &a, config_path);
+            }
+            continue;
+        }
+        if let AppEvent::Data(DataEvent::ThreadJobsLoaded { ref jobs }) = app_event {
+            merge_thread_jobs(&mut app.job_thread, jobs);
+            if !jobs.is_empty() {
+                app.status_message = Some((
+                    "Deliberation running — ^D for the live detail".into(),
+                    StatusLevel::Info,
+                ));
             }
             continue;
         }
@@ -339,12 +336,36 @@ async fn setup_and_run(
             ));
             // Fall through so the view can also process this event
         }
-        // A submit failed — the pending thread launch produced no job, so drop
-        // it before some later `JobSubmitted` could adopt the stale thread id.
-        if let AppEvent::Data(DataEvent::FetchError { context, .. }) = &app_event
+        // A submit failed — the orchestrator rejected the job (e.g. no agents
+        // online). Roll back the optimistically-added turn so the thread doesn't
+        // show a phantom "deliberating" turn with no job behind it, and surface
+        // why. Drop the pending launch first so no later JobSubmitted adopts it.
+        if let AppEvent::Data(DataEvent::FetchError { context, error }) = &app_event
             && context == "submit"
         {
-            app.pending_thread_launch = None;
+            let err = error.clone();
+            if let Some(thread_id) = app.pending_thread_launch.take() {
+                let store = crate::cli::thread::ThreadStore::new();
+                if let Some(mut t) = store.load(&thread_id)
+                    && t.rollback_last_user_turn()
+                {
+                    let _ = store.save(&t);
+                }
+                // Reload the active view so the rolled-back turn + "deliberating"
+                // state disappear immediately.
+                if let Some(view_id) = app.current_view() {
+                    current_view = create_view(view_id, &app);
+                    let actions = current_view.on_enter();
+                    for a in actions {
+                        handle_action(&mut app, &mut tui_client, &data_tx, &a, config_path);
+                    }
+                }
+            }
+            app.status_message = Some((
+                format!("⚠ Deliberation not started — {err} (no turn added)"),
+                StatusLevel::Error,
+            ));
+            continue;
         }
         // A thread's deliberation completed — record the reply, attributed by
         // job id. Falls through so JobDetail still renders completion.
@@ -411,12 +432,10 @@ async fn setup_and_run(
                     ref thread_id,
                     ref orchestrator,
                 } => {
-                    // Resolve the thread's in-flight job and open its detail.
-                    let job = app
-                        .job_thread
-                        .iter()
-                        .find(|(_, tid)| *tid == thread_id)
-                        .map(|(jid, _)| jid.clone());
+                    // The job↔thread map is populated by the /deliberations query
+                    // (RefreshThreadJobs), so the orchestrator — not local disk —
+                    // is the source of truth for what's running.
+                    let job = job_for_thread(&app.job_thread, thread_id);
                     match job {
                         Some(job_id) => {
                             app.push_view(ViewId::JobDetail {
@@ -431,8 +450,10 @@ async fn setup_and_run(
                         }
                         None => {
                             app.status_message = Some((
-                                "No deliberation running for this thread".into(),
-                                StatusLevel::Info,
+                                "⚠ No running deliberation — the last turn has finished (write a \
+                                 follow-up with w, or ↑ then w to fork)"
+                                    .into(),
+                                StatusLevel::Error,
                             ))
                         }
                     }
@@ -590,6 +611,115 @@ fn record_thread_terminal(
     } else {
         ThreadTerminal::Failed("could not save reply to the thread store".to_string())
     }
+}
+
+/// On JobSubmitted, bind a thread launch's job id to its thread (and persist the
+/// pending job so a completion is recoverable on reopen), then return the
+/// JobDetail view to open. Both thread launches and room/ad-hoc launches now open
+/// the live deliberation detail automatically — a thread launch just additionally
+/// records the job↔thread mapping. `pending_thread_launch` is `None` for a
+/// room/ad-hoc launch.
+fn on_job_submitted(
+    store: &crate::cli::thread::ThreadStore,
+    pending_thread_launch: Option<String>,
+    job_thread: &mut std::collections::HashMap<String, String>,
+    job_id: &str,
+    orchestrator: &str,
+) -> ViewId {
+    if let Some(thread_id) = pending_thread_launch {
+        job_thread.insert(job_id.to_string(), thread_id.clone());
+        store.set_pending_job(&thread_id, job_id);
+    }
+    ViewId::JobDetail {
+        job_id: job_id.to_string(),
+        orchestrator: orchestrator.to_string(),
+    }
+}
+
+/// A foreground data load (an operator opened a list) — worth a "Fetching…"
+/// footer. Background fetches (SSE stream, thread-job refresh, reconcile, tool-call
+/// poll, cancel) run silently so they don't pin a stale "Fetching…" in the footer.
+fn is_foreground_fetch(request: &FetchRequest) -> bool {
+    matches!(
+        request,
+        FetchRequest::Agents { .. }
+            | FetchRequest::Policies { .. }
+            | FetchRequest::Rooms { .. }
+            | FetchRequest::CreateRoom { .. }
+            | FetchRequest::DeleteRoom { .. }
+            | FetchRequest::Health { .. }
+    )
+}
+
+/// Resolve the `(job_id, thread_id)` to cancel, filling whichever half the caller
+/// left empty from the job↔thread map: reader ^C supplies only the thread,
+/// JobDetail ^C only the job. `None` when no job can be resolved (nothing to stop).
+fn resolve_cancel_target(
+    job_thread: &std::collections::HashMap<String, String>,
+    job_id: &str,
+    thread_id: &str,
+) -> Option<(String, String)> {
+    let job = if job_id.is_empty() {
+        job_for_thread(job_thread, thread_id)?
+    } else {
+        job_id.to_string()
+    };
+    let thread = if thread_id.is_empty() {
+        job_thread.get(&job).cloned().unwrap_or_default()
+    } else {
+        thread_id.to_string()
+    };
+    Some((job, thread))
+}
+
+/// Find a thread's in-flight job in the in-memory job↔thread map (populated by
+/// the `/deliberations` query — the orchestrator is the source of truth).
+fn job_for_thread(
+    job_thread: &std::collections::HashMap<String, String>,
+    thread_id: &str,
+) -> Option<String> {
+    job_thread
+        .iter()
+        .find(|(_, tid)| tid.as_str() == thread_id)
+        .map(|(jid, _)| jid.clone())
+}
+
+/// The thread a job belongs to: a thread launch's job id is `<thread_id>_<hash>`
+/// (thread ids are `thread-<hex>`, hashes are hex — the only `_` is the
+/// separator). `None` for a non-thread (room/ad-hoc) job.
+fn thread_id_of(job_id: &str) -> Option<String> {
+    if !job_id.starts_with("thread-") {
+        return None;
+    }
+    job_id.rsplit_once('_').map(|(t, _)| t.to_string())
+}
+
+/// A job status (from `/deliberations`) that means the job is still alive and can
+/// be opened / stopped — i.e. not a terminal `completed`/`failed`.
+fn job_is_active(status: &str) -> bool {
+    matches!(status, "pending" | "claimed" | "running")
+}
+
+/// Merge server-resolved job↔thread pairs into the in-memory map without
+/// clobbering an existing binding (this session's launch wins over the query).
+fn merge_thread_jobs(
+    job_thread: &mut std::collections::HashMap<String, String>,
+    jobs: &std::collections::HashMap<String, String>,
+) {
+    for (job_id, thread_id) in jobs {
+        job_thread
+            .entry(job_id.clone())
+            .or_insert_with(|| thread_id.clone());
+    }
+}
+
+/// Build a job↔thread map from the caller's `/deliberations` list: active,
+/// thread-scoped jobs only. Keyed job_id → thread_id.
+fn thread_jobs_from_list(jobs: &[(String, String)]) -> std::collections::HashMap<String, String> {
+    jobs.iter()
+        .filter(|(_, status)| job_is_active(status))
+        .filter_map(|(job_id, _)| thread_id_of(job_id).map(|tid| (job_id.clone(), tid)))
+        .collect()
 }
 
 /// Resolve the policy label for a roomless (thread) launch: the explicit policy
@@ -766,6 +896,13 @@ fn handle_action(
                     });
                     (name, result)
                 }
+                FetchRequest::RefreshThreadJobs { orchestrator } => {
+                    let orch_name = orchestrator.clone();
+                    let result = build_remote(app, &orch_name).map(|remote| {
+                        tui_client.refresh_thread_jobs(remote);
+                    });
+                    (orch_name, result)
+                }
                 FetchRequest::ReconcileThread {
                     orchestrator,
                     job_id,
@@ -784,10 +921,25 @@ fn handle_action(
                     thread_id,
                 } => {
                     let name = orchestrator.clone();
-                    let (job_id, thread_id) = (job_id.clone(), thread_id.clone());
-                    let result = build_remote(app, &name).map(|remote| {
-                        tui_client.cancel_job(remote, job_id, thread_id);
-                    });
+                    // Either side may be empty: the reader ^C knows the thread but
+                    // not the job (no persisted pending_job); JobDetail ^C knows the
+                    // job but not the thread. Fill the missing half from the
+                    // job↔thread map (populated by the /deliberations query).
+                    let result = match resolve_cancel_target(&app.job_thread, job_id, thread_id) {
+                        Some((job_id, thread_id)) => {
+                            app.status_message = Some((
+                                format!("Stopping {}…", &job_id[..job_id.len().min(20)]),
+                                StatusLevel::Info,
+                            ));
+                            build_remote(app, &name)
+                                .map(|remote| tui_client.cancel_job(remote, job_id, thread_id))
+                        }
+                        None => {
+                            app.status_message =
+                                Some(("No running deliberation to stop".into(), StatusLevel::Info));
+                            Ok(())
+                        }
+                    };
                     (name, result)
                 }
                 FetchRequest::RespondToolCall {
@@ -819,8 +971,14 @@ fn handle_action(
             };
             match dispatch_result {
                 Ok(()) => {
-                    app.status_message =
-                        Some((format!("Fetching from {orch_name}..."), StatusLevel::Info));
+                    // Only foreground list loads flash "Fetching…". Background
+                    // fetches (SSE stream, thread-job refresh, reconcile, tool-call
+                    // poll) must stay silent — else opening a thread leaves a stale
+                    // "Fetching from remote…" pinned in the footer forever.
+                    if is_foreground_fetch(request) {
+                        app.status_message =
+                            Some((format!("Fetching from {orch_name}..."), StatusLevel::Info));
+                    }
                 }
                 Err(ref e) => {
                     // Send error through data channel so the view can
@@ -833,6 +991,7 @@ fn handle_action(
                         | FetchRequest::CreateRoom { .. }
                         | FetchRequest::DeleteRoom { .. } => "rooms",
                         FetchRequest::StartSseStream { .. } => "sse_stream",
+                        FetchRequest::RefreshThreadJobs { .. } => "refresh_jobs",
                         FetchRequest::ReconcileThread { .. } => "reconcile",
                         FetchRequest::CancelJob { .. } => "cancel",
                         FetchRequest::RespondToolCall { .. } => "answer",
@@ -1353,6 +1512,143 @@ mod tests {
         store.save(&t).unwrap();
         let map = HashMap::from([(job_id.to_string(), t.id.clone())]);
         (store, t.id, map)
+    }
+
+    #[test]
+    fn thread_launch_opens_detail_and_binds_job() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::cli::thread::ThreadStore::with_dir(dir.path().to_path_buf());
+        let t = crate::cli::thread::Thread::new("t");
+        store.save(&t).unwrap();
+        let mut map = HashMap::new();
+
+        let view = on_job_submitted(&store, Some(t.id.clone()), &mut map, "job-7", "prod");
+
+        assert!(
+            matches!(&view, ViewId::JobDetail { job_id, .. } if job_id == "job-7"),
+            "thread launch must auto-open the deliberation detail"
+        );
+        assert_eq!(map.get("job-7").map(String::as_str), Some(t.id.as_str()));
+        assert_eq!(
+            store.load(&t.id).unwrap().pending_job.as_deref(),
+            Some("job-7"),
+            "pending job persisted for crash recovery"
+        );
+    }
+
+    #[test]
+    fn thread_id_of_strips_the_job_hash_suffix() {
+        assert_eq!(
+            thread_id_of("thread-f04a077b49424e7b93746291a8e0015d_b6ca7284b646f9de").as_deref(),
+            Some("thread-f04a077b49424e7b93746291a8e0015d")
+        );
+        // Non-thread (room / ad-hoc) job → not thread-scoped.
+        assert!(thread_id_of("pl_fast_397de8a1fcad55cb").is_none());
+        assert!(thread_id_of("some-room-job").is_none());
+    }
+
+    #[test]
+    fn job_is_active_excludes_terminal_states() {
+        assert!(job_is_active("running"));
+        assert!(job_is_active("pending"));
+        assert!(job_is_active("claimed"));
+        assert!(!job_is_active("completed"));
+        assert!(!job_is_active("failed"));
+        assert!(!job_is_active("unknown"));
+    }
+
+    #[test]
+    fn resolve_cancel_target_fills_the_missing_half() {
+        let map = HashMap::from([("thread-aaa_111".to_string(), "thread-aaa".to_string())]);
+        // Reader ^C: only the thread → resolves the job.
+        assert_eq!(
+            resolve_cancel_target(&map, "", "thread-aaa"),
+            Some(("thread-aaa_111".to_string(), "thread-aaa".to_string()))
+        );
+        // JobDetail ^C: only the job → resolves the thread.
+        assert_eq!(
+            resolve_cancel_target(&map, "thread-aaa_111", ""),
+            Some(("thread-aaa_111".to_string(), "thread-aaa".to_string()))
+        );
+        // Both known → passthrough.
+        assert_eq!(
+            resolve_cancel_target(&map, "job-x", "thread-x"),
+            Some(("job-x".to_string(), "thread-x".to_string()))
+        );
+        // Thread with no running job → nothing to cancel.
+        assert_eq!(resolve_cancel_target(&map, "", "thread-unknown"), None);
+    }
+
+    #[test]
+    fn only_foreground_list_loads_flash_fetching() {
+        let o = || "orch".to_string();
+        // Foreground list loads → "Fetching…" is appropriate.
+        assert!(is_foreground_fetch(&FetchRequest::Agents {
+            orchestrator: o()
+        }));
+        assert!(is_foreground_fetch(&FetchRequest::Rooms {
+            orchestrator: o()
+        }));
+        // Background reconcile/stream/poll → silent (no stale footer).
+        assert!(!is_foreground_fetch(&FetchRequest::RefreshThreadJobs {
+            orchestrator: o()
+        }));
+        assert!(!is_foreground_fetch(&FetchRequest::StartSseStream {
+            orchestrator: o(),
+            job_id: "j".into(),
+        }));
+        assert!(!is_foreground_fetch(&FetchRequest::ReconcileThread {
+            orchestrator: o(),
+            job_id: "j".into(),
+            thread_id: "t".into(),
+        }));
+    }
+
+    #[test]
+    fn merge_thread_jobs_adds_without_clobbering_existing() {
+        let mut map = HashMap::from([("job-mem".to_string(), "thread-launched".to_string())]);
+        let loaded = HashMap::from([
+            ("job-mem".to_string(), "thread-OTHER".to_string()), // must not overwrite
+            ("job-srv".to_string(), "thread-srv".to_string()),   // new → added
+        ]);
+        merge_thread_jobs(&mut map, &loaded);
+        assert_eq!(
+            map.get("job-mem").map(String::as_str),
+            Some("thread-launched")
+        );
+        assert_eq!(map.get("job-srv").map(String::as_str), Some("thread-srv"));
+    }
+
+    #[test]
+    fn thread_jobs_from_list_keeps_only_active_thread_jobs() {
+        let jobs = vec![
+            ("thread-aaa_111".to_string(), "running".to_string()),
+            ("thread-bbb_222".to_string(), "completed".to_string()), // terminal → dropped
+            ("pl_fast_333".to_string(), "running".to_string()),      // not a thread → dropped
+        ];
+        let map = thread_jobs_from_list(&jobs);
+        assert_eq!(
+            map.get("thread-aaa_111").map(String::as_str),
+            Some("thread-aaa")
+        );
+        assert_eq!(map.len(), 1, "only the active thread job is mapped");
+        // The map resolves a thread → its live job for ^D / stop.
+        assert_eq!(
+            job_for_thread(&map, "thread-aaa").as_deref(),
+            Some("thread-aaa_111")
+        );
+    }
+
+    #[test]
+    fn adhoc_launch_opens_detail_without_binding() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::cli::thread::ThreadStore::with_dir(dir.path().to_path_buf());
+        let mut map = HashMap::new();
+
+        let view = on_job_submitted(&store, None, &mut map, "job-x", "prod");
+
+        assert!(matches!(&view, ViewId::JobDetail { job_id, .. } if job_id == "job-x"));
+        assert!(map.is_empty(), "ad-hoc launch binds no thread");
     }
 
     #[test]

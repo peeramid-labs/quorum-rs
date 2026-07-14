@@ -15,6 +15,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use super::text_edit::{next_word_boundary, prev_word_boundary};
 use super::{FetchRequest, StatusLevel, View, ViewAction};
 use crate::cli::thread::{Message, Thread, ThreadStore};
 use crate::cli::tui::event::{self, AppEvent};
@@ -947,6 +948,16 @@ impl ThreadView {
         if event::is_escape(ev) {
             return Some(ViewAction::Pop);
         }
+        // `x` stops the thread's running deliberation — a tmux-proof alias for ^C
+        // (some terminals never deliver Ctrl+C as a key event). Read-mode only, so
+        // it never eats a literal `x` while composing.
+        if event::is_key(ev, 'x') {
+            return Some(ViewAction::Fetch(FetchRequest::CancelJob {
+                orchestrator: self.orchestrator.clone(),
+                job_id: self.thread.pending_job.clone().unwrap_or_default(),
+                thread_id: self.thread.id.clone(),
+            }));
+        }
         if event::is_up(ev) {
             self.select_up();
             return None;
@@ -966,7 +977,9 @@ impl ThreadView {
                     self.unseen_reply = false;
                 }
                 KeyCode::End => self.scroll = u16::MAX, // clamped in draw
-                // Expand/collapse the selected message's full content.
+                // While deliberating, Enter drills into the live detail; otherwise
+                // it expands/collapses the selected message.
+                KeyCode::Enter if self.awaiting_reply() => return Some(self.open_detail()),
                 KeyCode::Enter => self.toggle_expand(None),
                 KeyCode::Right => self.toggle_expand(Some(true)),
                 KeyCode::Left => self.toggle_expand(Some(false)),
@@ -1416,30 +1429,6 @@ fn next_char_boundary(s: &str, i: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-/// Start of the word before `i`: skip whitespace back, then the word.
-fn prev_word_boundary(s: &str, i: usize) -> usize {
-    let head = &s[..i.min(s.len())];
-    let trimmed = head.trim_end_matches(char::is_whitespace);
-    trimmed
-        .rfind(char::is_whitespace)
-        .map(|j| j + 1)
-        .unwrap_or(0)
-}
-
-/// End of the word after `i`: skip whitespace forward, then the word.
-fn next_word_boundary(s: &str, i: usize) -> usize {
-    if i >= s.len() {
-        return s.len();
-    }
-    let rest = &s[i..];
-    let ws = rest.len() - rest.trim_start_matches(char::is_whitespace).len();
-    let after_ws = i + ws;
-    s[after_ws..]
-        .find(char::is_whitespace)
-        .map(|j| after_ws + j)
-        .unwrap_or(s.len())
-}
-
 impl View for ThreadView {
     fn update(&mut self, app_event: &AppEvent) -> Option<ViewAction> {
         // A deliberation finished (live JobComplete) or a reopened thread's
@@ -1525,13 +1514,13 @@ impl View for ThreadView {
         if is_ctrl(ev, 'd') {
             return Some(self.open_detail());
         }
-        // Ctrl-C stops (kills) the thread's running deliberation, if any.
-        if is_ctrl(ev, 'c')
-            && let Some(job_id) = self.thread.pending_job.clone()
-        {
+        // Ctrl-C stops (kills) the thread's running deliberation. Emit with the
+        // thread id even when no pending_job is recorded — the loop resolves the
+        // job from the /deliberations-populated map (the orchestrator is truth).
+        if is_ctrl(ev, 'c') {
             return Some(ViewAction::Fetch(FetchRequest::CancelJob {
                 orchestrator: self.orchestrator.clone(),
-                job_id,
+                job_id: self.thread.pending_job.clone().unwrap_or_default(),
                 thread_id: self.thread.id.clone(),
             }));
         }
@@ -1620,26 +1609,29 @@ impl View for ThreadView {
             self.unseen_reply = false;
             self.full_view = None;
         }
+        // Ask the orchestrator which of the caller's jobs are running so ^D / stop
+        // resolve this thread's live job from the server, not local state.
+        let mut actions = vec![ViewAction::Fetch(FetchRequest::RefreshThreadJobs {
+            orchestrator: self.orchestrator.clone(),
+        })];
         // A pending job whose reply never landed (the TUI was closed when the
         // deliberation finished) — reconcile it against the server.
         if let Some(job_id) = self.thread.pending_job.clone()
             && self.awaiting_reply()
         {
-            return vec![
-                ViewAction::Fetch(FetchRequest::ReconcileThread {
-                    orchestrator: self.orchestrator.clone(),
-                    job_id: job_id.clone(),
-                    thread_id: self.thread.id.clone(),
-                }),
-                // Recover any ask_user question that fired while we were away.
-                ViewAction::Fetch(FetchRequest::PendingToolCalls {
-                    orchestrator: self.orchestrator.clone(),
-                    job_id,
-                    thread_id: self.thread.id.clone(),
-                }),
-            ];
+            actions.push(ViewAction::Fetch(FetchRequest::ReconcileThread {
+                orchestrator: self.orchestrator.clone(),
+                job_id: job_id.clone(),
+                thread_id: self.thread.id.clone(),
+            }));
+            // Recover any ask_user question that fired while we were away.
+            actions.push(ViewAction::Fetch(FetchRequest::PendingToolCalls {
+                orchestrator: self.orchestrator.clone(),
+                job_id,
+                thread_id: self.thread.id.clone(),
+            }));
         }
-        Vec::new()
+        actions
     }
 }
 
@@ -2249,6 +2241,46 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn enter_opens_the_detail_while_deliberating() {
+        // A turn awaiting its reply → Enter drills into the live deliberation.
+        let mut t = Thread::new("s");
+        t.push_message(Message::now("user", "q"));
+        t.pending_job = Some("job-x".into()); // deliberating
+        let (_tmp, _s, mut v) = view_over(t);
+        v.mode = Mode::Read;
+        assert!(v.awaiting_reply());
+        match v.update(&plain(crossterm::event::KeyCode::Enter)) {
+            Some(ViewAction::OpenThreadJob { thread_id, .. }) => assert_eq!(thread_id, v.thread.id),
+            other => panic!("expected OpenThreadJob while deliberating, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_expands_when_not_deliberating() {
+        // A replied turn → Enter keeps its expand/collapse meaning (no drill-in).
+        let mut t = Thread::new("s");
+        t.push_message(Message::now("user", "q"));
+        t.push_message(Message::now("assistant", "a"));
+        let (_tmp, _s, mut v) = view_over(t);
+        v.mode = Mode::Read;
+        assert!(!v.awaiting_reply());
+        assert!(v.update(&plain(crossterm::event::KeyCode::Enter)).is_none());
+    }
+
+    #[test]
+    fn read_mode_x_stops_the_deliberation_tmux_proof_alias() {
+        // `x` in the reader emits the same thread-keyed cancel as ^C, for
+        // terminals/tmux that never deliver Ctrl+C as a key event.
+        let (_t, mut v) = view();
+        match v.update(&plain(crossterm::event::KeyCode::Char('x'))) {
+            Some(ViewAction::Fetch(FetchRequest::CancelJob { thread_id, .. })) => {
+                assert_eq!(thread_id, v.thread.id)
+            }
+            other => panic!("expected a thread-keyed CancelJob, got {other:?}"),
+        }
+    }
+
     fn arrow(up: bool) -> AppEvent {
         let code = if up {
             crossterm::event::KeyCode::Up
@@ -2531,17 +2563,42 @@ mod tests {
         (tmp, store, v)
     }
 
+    fn reconciles(actions: &[ViewAction]) -> bool {
+        actions
+            .iter()
+            .any(|a| matches!(a, ViewAction::Fetch(FetchRequest::ReconcileThread { .. })))
+    }
+
+    fn refreshes_jobs(actions: &[ViewAction]) -> bool {
+        actions
+            .iter()
+            .any(|a| matches!(a, ViewAction::Fetch(FetchRequest::RefreshThreadJobs { .. })))
+    }
+
+    #[test]
+    fn on_enter_always_refreshes_thread_jobs() {
+        // So ^D / stop resolve the thread's running job from the server, even
+        // when nothing is locally recorded as pending.
+        let mut t = Thread::new("s");
+        t.push_message(Message::now("user", "q"));
+        let (_tmp, _s, mut v) = view_over(t);
+        assert!(refreshes_jobs(&v.on_enter()));
+    }
+
     #[test]
     fn on_enter_reconciles_a_pending_job() {
         let mut t = Thread::new("s");
         t.push_message(Message::now("user", "q")); // awaiting a reply
         t.pending_job = Some("job-9".into());
         let (_tmp, _s, mut v) = view_over(t);
-        match v.on_enter().into_iter().next() {
-            Some(ViewAction::Fetch(FetchRequest::ReconcileThread { job_id, .. })) => {
-                assert_eq!(job_id, "job-9")
-            }
-            other => panic!("expected ReconcileThread fetch, got {other:?}"),
+        let actions = v.on_enter();
+        assert!(refreshes_jobs(&actions));
+        match actions.iter().find_map(|a| match a {
+            ViewAction::Fetch(FetchRequest::ReconcileThread { job_id, .. }) => Some(job_id),
+            _ => None,
+        }) {
+            Some(job_id) => assert_eq!(job_id, "job-9"),
+            None => panic!("expected a ReconcileThread fetch, got {actions:?}"),
         }
     }
 
@@ -2573,21 +2630,26 @@ mod tests {
 
     #[test]
     fn on_enter_skips_reconcile_without_a_pending_job() {
-        // Awaiting a reply but no recorded job id → nothing to reconcile against.
+        // Awaiting a reply but no recorded job id → nothing to reconcile against
+        // (but the job refresh still fires).
         let mut t = Thread::new("s");
         t.push_message(Message::now("user", "q"));
         let (_tmp, _s, mut v) = view_over(t);
-        assert!(v.on_enter().is_empty());
+        let actions = v.on_enter();
+        assert!(refreshes_jobs(&actions));
+        assert!(!reconciles(&actions));
     }
 
     #[test]
     fn on_enter_skips_reconcile_when_reply_already_present() {
-        // A completed turn (last message is the reply) → not awaiting, no fetch.
+        // A completed turn (last message is the reply) → not awaiting, no reconcile.
         let mut t = Thread::new("s");
         t.push_message(Message::now("user", "q"));
         t.push_message(Message::now("assistant", "a"));
         let (_tmp, _s, mut v) = view_over(t);
-        assert!(v.on_enter().is_empty());
+        let actions = v.on_enter();
+        assert!(refreshes_jobs(&actions));
+        assert!(!reconciles(&actions));
     }
 
     #[test]
@@ -2749,9 +2811,24 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_is_a_noop_without_a_running_job() {
+    fn ctrl_c_emits_cancel_keyed_by_thread_even_without_a_pending_job() {
+        // No recorded pending_job: the view still emits a cancel keyed by the
+        // thread id; the loop resolves the job from the /deliberations map (or
+        // no-ops with a status if none is running). Previously this was a
+        // view-level no-op, which stranded jobs whose JobSubmitted was lost.
         let (_t, mut v) = view();
-        assert!(v.update(&ctrl('c')).is_none());
+        match v.update(&ctrl('c')) {
+            Some(ViewAction::Fetch(FetchRequest::CancelJob {
+                job_id, thread_id, ..
+            })) => {
+                assert!(
+                    job_id.is_empty(),
+                    "no pending job → empty, resolved loop-side"
+                );
+                assert_eq!(thread_id, v.thread.id);
+            }
+            other => panic!("expected a thread-keyed CancelJob, got {other:?}"),
+        }
     }
 
     #[test]

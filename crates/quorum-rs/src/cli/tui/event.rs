@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
 
 use crate::cli::remote::{AgentInfo, DiscoveredRoom, HealthResponse};
@@ -59,6 +59,12 @@ pub enum DataEvent {
     /// reloads to show it.
     ThreadReconciled {
         thread_id: String,
+    },
+    /// The caller's active deliberations (`GET /deliberations`), mapped job_id →
+    /// thread_id. Merged into the in-memory job↔thread map so `^D`/stop resolve a
+    /// thread's running job from the orchestrator.
+    ThreadJobsLoaded {
+        jobs: std::collections::HashMap<String, String>,
     },
     /// A reopened thread's pending `ask_user` questions, fetched to recover one
     /// that fired while the view wasn't focused. The view shows the first.
@@ -323,6 +329,35 @@ pub fn is_key(event: &Event, c: char) -> bool {
             modifiers: KeyModifiers::NONE,
             ..
         }) if *ch == c
+    )
+}
+
+/// True when `event` is a Ctrl+`c` key press (any letter, case-insensitive).
+pub fn is_ctrl(event: &Event, c: char) -> bool {
+    matches!(
+        event,
+        Event::Key(k)
+            if k.kind == KeyEventKind::Press
+                && k.modifiers.contains(KeyModifiers::CONTROL)
+                && k.code == KeyCode::Char(c)
+    )
+}
+
+/// True when `event` is Ctrl+Left — jump one word left (vim `b`).
+pub fn is_ctrl_left(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(KeyEvent { code: KeyCode::Left, modifiers, .. })
+            if modifiers.contains(KeyModifiers::CONTROL)
+    )
+}
+
+/// True when `event` is Ctrl+Right — jump one word right (vim `w`).
+pub fn is_ctrl_right(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(KeyEvent { code: KeyCode::Right, modifiers, .. })
+            if modifiers.contains(KeyModifiers::CONTROL)
     )
 }
 

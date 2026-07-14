@@ -213,6 +213,32 @@ impl Thread {
         id
     }
 
+    /// Roll back the most recently added turn — used when the orchestrator
+    /// rejects a just-sent turn (e.g. no agents online) so the thread doesn't
+    /// keep a phantom "deliberating" turn with no job behind it. Removes the last
+    /// message only if it's a childless `user` turn (the optimistic send) and
+    /// clears `pending_job`. Returns whether a turn was removed.
+    pub fn rollback_last_user_turn(&mut self) -> bool {
+        let Some(last) = self.messages.last() else {
+            return false;
+        };
+        if last.role != "user" {
+            return false;
+        }
+        let last_id = last.id.clone();
+        // Never drop a turn that already has a reply/child hanging off it.
+        if self
+            .messages
+            .iter()
+            .any(|m| m.parent_id.as_deref() == Some(last_id.as_str()))
+        {
+            return false;
+        }
+        self.messages.pop();
+        self.pending_job = None;
+        true
+    }
+
     /// Backfill tree fields on a pre-tree (linear) thread: assign ids, chain
     /// each message under the previous one, and share a single branch. A no-op
     /// once every message already carries an id.
@@ -476,6 +502,31 @@ fn user_suffix() -> String {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn rollback_removes_a_childless_user_turn() {
+        let mut t = Thread::new("s");
+        t.reply(None, "user", "q");
+        t.pending_job = Some("job-x".into());
+        assert!(t.rollback_last_user_turn());
+        assert!(t.messages.is_empty(), "the optimistic turn is gone");
+        assert!(t.pending_job.is_none(), "phantom pending job cleared");
+    }
+
+    #[test]
+    fn rollback_keeps_an_answered_turn() {
+        let mut t = Thread::new("s");
+        let uid = t.reply(None, "user", "q");
+        t.reply(Some(&uid), "assistant", "a"); // has a reply → not optimistic
+        assert!(!t.rollback_last_user_turn());
+        assert_eq!(t.messages.len(), 2);
+    }
+
+    #[test]
+    fn rollback_is_a_noop_on_an_empty_thread() {
+        let mut t = Thread::new("s");
+        assert!(!t.rollback_last_user_turn());
+    }
 
     fn store_in(dir: &Path) -> ThreadStore {
         ThreadStore {
