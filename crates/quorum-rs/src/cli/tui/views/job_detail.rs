@@ -7,7 +7,10 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 
 use super::common::{ListState, render_key_hints, truncate};
-use super::thread::{next_word_boundary, prev_word_boundary};
+use super::text_edit::{
+    caret_text, input_box_rows, input_scroll, next_char, next_word_boundary, prev_char,
+    prev_word_boundary,
+};
 use super::{FetchRequest, View, ViewAction};
 use crate::cli::tui::event::{self, AgentPhaseStatus, AppEvent, DataEvent, PhaseTracker, SseEvent};
 
@@ -449,62 +452,6 @@ impl JobDetailView {
     }
 }
 
-/// Previous UTF-8 char boundary before byte offset `i` (0 at the start).
-fn prev_char(s: &str, i: usize) -> usize {
-    s[..i.min(s.len())]
-        .char_indices()
-        .next_back()
-        .map(|(j, _)| j)
-        .unwrap_or(0)
-}
-
-/// Next UTF-8 char boundary after byte offset `i` (len at the end).
-fn next_char(s: &str, i: usize) -> usize {
-    if i >= s.len() {
-        return s.len();
-    }
-    s[i..]
-        .char_indices()
-        .nth(1)
-        .map(|(j, _)| i + j)
-        .unwrap_or(s.len())
-}
-
-/// Render `text` as multi-line `Text` with a reversed caret block at byte
-/// offset `cursor` — a block over the char under the caret, or a trailing
-/// block at end-of-line.
-fn caret_text(text: &str, cursor: usize) -> Text<'static> {
-    let cur = cursor.min(text.len());
-    let mut lines = Vec::new();
-    let mut line_start = 0usize;
-    for seg in text.split('\n') {
-        let seg_end = line_start + seg.len();
-        if cur >= line_start && cur <= seg_end {
-            lines.push(caret_line_from(seg, cur - line_start));
-        } else {
-            lines.push(Line::from(seg.to_string()));
-        }
-        line_start = seg_end + 1; // skip the '\n'
-    }
-    Text::from(lines)
-}
-
-/// One line with a reversed caret block at byte column `col`.
-fn caret_line_from(seg: &str, col: usize) -> Line<'static> {
-    let col = col.min(seg.len());
-    let before = seg[..col].to_string();
-    let at = seg[col..].chars().next();
-    let caret = Style::default().add_modifier(Modifier::REVERSED);
-    let (at_span, after) = match at {
-        Some(c) => (
-            Span::styled(c.to_string(), caret),
-            seg[col + c.len_utf8()..].to_string(),
-        ),
-        None => (Span::styled(" ", caret), String::new()),
-    };
-    Line::from(vec![Span::raw(before), at_span, Span::raw(after)])
-}
-
 impl View for JobDetailView {
     fn on_enter(&mut self) -> Vec<ViewAction> {
         if !self.stream_started {
@@ -680,12 +627,18 @@ impl View for JobDetailView {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        // Chat-style input is always visible while the job is running.
-        // 3 rows: top + bottom border + 1 line of text.
-        let chat_height = if self.status == JobStatus::Running {
-            3
-        } else {
+        // Chat-style input is visible while the job is running. It's one line
+        // idle, but grows (wrapped, up to MAX_INJECT_ROWS) while composing a
+        // steering message so a long / multi-line prompt is readable inline —
+        // the render scrolls to keep the tail (caret) visible.
+        const MAX_INJECT_ROWS: u16 = 8;
+        let chat_height = if self.status != JobStatus::Running {
             0
+        } else if self.inject_input_active && !self.inject_fullscreen {
+            let text_w = area.width.saturating_sub(2).max(1);
+            input_box_rows(&self.inject_text, text_w, MAX_INJECT_ROWS) + 2 // + borders
+        } else {
+            3
         };
         let chunks = Layout::vertical([
             Constraint::Length(3),           // header bar
@@ -804,7 +757,9 @@ impl JobDetailView {
                 Style::default().fg(Color::DarkGray),
             )
         };
-        let input_bar = Paragraph::new(body).style(style).block(
+        // Wrap while composing so a long / multi-line message is readable, and
+        // scroll so the tail (where the caret is) stays visible past the box.
+        let mut input_bar = Paragraph::new(body).style(style).block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(title)
@@ -814,6 +769,12 @@ impl JobDetailView {
                     Style::default().fg(Color::DarkGray)
                 }),
         );
+        if self.inject_input_active {
+            let text_w = area.width.saturating_sub(2).max(1);
+            let rows = area.height.saturating_sub(2).max(1);
+            let scroll_y = input_scroll(&self.inject_text, text_w, rows);
+            input_bar = input_bar.wrap(Wrap { trim: false }).scroll((scroll_y, 0));
+        }
         frame.render_widget(input_bar, area);
     }
 

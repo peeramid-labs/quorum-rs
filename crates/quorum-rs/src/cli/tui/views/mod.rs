@@ -7,6 +7,7 @@ pub mod policies;
 pub mod rooms;
 pub mod settings;
 pub mod settings_menu;
+pub mod text_edit;
 pub mod thread;
 pub mod thread_list;
 

@@ -15,6 +15,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use super::text_edit::{next_word_boundary, prev_word_boundary};
 use super::{FetchRequest, StatusLevel, View, ViewAction};
 use crate::cli::thread::{Message, Thread, ThreadStore};
 use crate::cli::tui::event::{self, AppEvent};
@@ -1425,30 +1426,6 @@ fn next_char_boundary(s: &str, i: usize) -> usize {
         .char_indices()
         .nth(1)
         .map(|(j, _)| i + j)
-        .unwrap_or(s.len())
-}
-
-/// Start of the word before `i`: skip whitespace back, then the word.
-pub(crate) fn prev_word_boundary(s: &str, i: usize) -> usize {
-    let head = &s[..i.min(s.len())];
-    let trimmed = head.trim_end_matches(char::is_whitespace);
-    trimmed
-        .rfind(char::is_whitespace)
-        .map(|j| j + 1)
-        .unwrap_or(0)
-}
-
-/// End of the word after `i`: skip whitespace forward, then the word.
-pub(crate) fn next_word_boundary(s: &str, i: usize) -> usize {
-    if i >= s.len() {
-        return s.len();
-    }
-    let rest = &s[i..];
-    let ws = rest.len() - rest.trim_start_matches(char::is_whitespace).len();
-    let after_ws = i + ws;
-    s[after_ws..]
-        .find(char::is_whitespace)
-        .map(|j| after_ws + j)
         .unwrap_or(s.len())
 }
 
