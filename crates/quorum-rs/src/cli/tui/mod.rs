@@ -336,12 +336,36 @@ async fn setup_and_run(
             ));
             // Fall through so the view can also process this event
         }
-        // A submit failed — the pending thread launch produced no job, so drop
-        // it before some later `JobSubmitted` could adopt the stale thread id.
-        if let AppEvent::Data(DataEvent::FetchError { context, .. }) = &app_event
+        // A submit failed — the orchestrator rejected the job (e.g. no agents
+        // online). Roll back the optimistically-added turn so the thread doesn't
+        // show a phantom "deliberating" turn with no job behind it, and surface
+        // why. Drop the pending launch first so no later JobSubmitted adopts it.
+        if let AppEvent::Data(DataEvent::FetchError { context, error }) = &app_event
             && context == "submit"
         {
-            app.pending_thread_launch = None;
+            let err = error.clone();
+            if let Some(thread_id) = app.pending_thread_launch.take() {
+                let store = crate::cli::thread::ThreadStore::new();
+                if let Some(mut t) = store.load(&thread_id)
+                    && t.rollback_last_user_turn()
+                {
+                    let _ = store.save(&t);
+                }
+                // Reload the active view so the rolled-back turn + "deliberating"
+                // state disappear immediately.
+                if let Some(view_id) = app.current_view() {
+                    current_view = create_view(view_id, &app);
+                    let actions = current_view.on_enter();
+                    for a in actions {
+                        handle_action(&mut app, &mut tui_client, &data_tx, &a, config_path);
+                    }
+                }
+            }
+            app.status_message = Some((
+                format!("⚠ Deliberation not started — {err} (no turn added)"),
+                StatusLevel::Error,
+            ));
+            continue;
         }
         // A thread's deliberation completed — record the reply, attributed by
         // job id. Falls through so JobDetail still renders completion.
