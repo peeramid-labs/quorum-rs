@@ -311,6 +311,12 @@ async fn setup_and_run(
         }
         if let AppEvent::Data(DataEvent::ThreadJobsLoaded { ref jobs }) = app_event {
             merge_thread_jobs(&mut app.job_thread, jobs);
+            if !jobs.is_empty() {
+                app.status_message = Some((
+                    "Deliberation running — ^D for the live detail".into(),
+                    StatusLevel::Info,
+                ));
+            }
             continue;
         }
         if let AppEvent::Data(DataEvent::MessageInjected {
@@ -602,6 +608,21 @@ fn on_job_submitted(
         job_id: job_id.to_string(),
         orchestrator: orchestrator.to_string(),
     }
+}
+
+/// A foreground data load (an operator opened a list) — worth a "Fetching…"
+/// footer. Background fetches (SSE stream, thread-job refresh, reconcile, tool-call
+/// poll, cancel) run silently so they don't pin a stale "Fetching…" in the footer.
+fn is_foreground_fetch(request: &FetchRequest) -> bool {
+    matches!(
+        request,
+        FetchRequest::Agents { .. }
+            | FetchRequest::Policies { .. }
+            | FetchRequest::Rooms { .. }
+            | FetchRequest::CreateRoom { .. }
+            | FetchRequest::DeleteRoom { .. }
+            | FetchRequest::Health { .. }
+    )
 }
 
 /// Find a thread's in-flight job in the in-memory job↔thread map (populated by
@@ -896,8 +917,14 @@ fn handle_action(
             };
             match dispatch_result {
                 Ok(()) => {
-                    app.status_message =
-                        Some((format!("Fetching from {orch_name}..."), StatusLevel::Info));
+                    // Only foreground list loads flash "Fetching…". Background
+                    // fetches (SSE stream, thread-job refresh, reconcile, tool-call
+                    // poll) must stay silent — else opening a thread leaves a stale
+                    // "Fetching from remote…" pinned in the footer forever.
+                    if is_foreground_fetch(request) {
+                        app.status_message =
+                            Some((format!("Fetching from {orch_name}..."), StatusLevel::Info));
+                    }
                 }
                 Err(ref e) => {
                     // Send error through data channel so the view can
@@ -1474,6 +1501,31 @@ mod tests {
         assert!(!job_is_active("completed"));
         assert!(!job_is_active("failed"));
         assert!(!job_is_active("unknown"));
+    }
+
+    #[test]
+    fn only_foreground_list_loads_flash_fetching() {
+        let o = || "orch".to_string();
+        // Foreground list loads → "Fetching…" is appropriate.
+        assert!(is_foreground_fetch(&FetchRequest::Agents {
+            orchestrator: o()
+        }));
+        assert!(is_foreground_fetch(&FetchRequest::Rooms {
+            orchestrator: o()
+        }));
+        // Background reconcile/stream/poll → silent (no stale footer).
+        assert!(!is_foreground_fetch(&FetchRequest::RefreshThreadJobs {
+            orchestrator: o()
+        }));
+        assert!(!is_foreground_fetch(&FetchRequest::StartSseStream {
+            orchestrator: o(),
+            job_id: "j".into(),
+        }));
+        assert!(!is_foreground_fetch(&FetchRequest::ReconcileThread {
+            orchestrator: o(),
+            job_id: "j".into(),
+            thread_id: "t".into(),
+        }));
     }
 
     #[test]
