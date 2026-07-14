@@ -625,6 +625,27 @@ fn is_foreground_fetch(request: &FetchRequest) -> bool {
     )
 }
 
+/// Resolve the `(job_id, thread_id)` to cancel, filling whichever half the caller
+/// left empty from the job↔thread map: reader ^C supplies only the thread,
+/// JobDetail ^C only the job. `None` when no job can be resolved (nothing to stop).
+fn resolve_cancel_target(
+    job_thread: &std::collections::HashMap<String, String>,
+    job_id: &str,
+    thread_id: &str,
+) -> Option<(String, String)> {
+    let job = if job_id.is_empty() {
+        job_for_thread(job_thread, thread_id)?
+    } else {
+        job_id.to_string()
+    };
+    let thread = if thread_id.is_empty() {
+        job_thread.get(&job).cloned().unwrap_or_default()
+    } else {
+        thread_id.to_string()
+    };
+    Some((job, thread))
+}
+
 /// Find a thread's in-flight job in the in-memory job↔thread map (populated by
 /// the `/deliberations` query — the orchestrator is the source of truth).
 fn job_for_thread(
@@ -874,18 +895,19 @@ fn handle_action(
                     thread_id,
                 } => {
                     let name = orchestrator.clone();
-                    let job_id = job_id.clone();
-                    // JobDetail sends an empty thread_id (it doesn't track the
-                    // thread); resolve it from the job↔thread map so the thread's
-                    // pending job is cleared on cancel.
-                    let thread_id = if thread_id.is_empty() {
-                        app.job_thread.get(&job_id).cloned().unwrap_or_default()
-                    } else {
-                        thread_id.clone()
+                    // Either side may be empty: the reader ^C knows the thread but
+                    // not the job (no persisted pending_job); JobDetail ^C knows the
+                    // job but not the thread. Fill the missing half from the
+                    // job↔thread map (populated by the /deliberations query).
+                    let result = match resolve_cancel_target(&app.job_thread, job_id, thread_id) {
+                        Some((job_id, thread_id)) => build_remote(app, &name)
+                            .map(|remote| tui_client.cancel_job(remote, job_id, thread_id)),
+                        None => {
+                            app.status_message =
+                                Some(("No running deliberation to stop".into(), StatusLevel::Info));
+                            Ok(())
+                        }
                     };
-                    let result = build_remote(app, &name).map(|remote| {
-                        tui_client.cancel_job(remote, job_id, thread_id);
-                    });
                     (name, result)
                 }
                 FetchRequest::RespondToolCall {
@@ -1501,6 +1523,28 @@ mod tests {
         assert!(!job_is_active("completed"));
         assert!(!job_is_active("failed"));
         assert!(!job_is_active("unknown"));
+    }
+
+    #[test]
+    fn resolve_cancel_target_fills_the_missing_half() {
+        let map = HashMap::from([("thread-aaa_111".to_string(), "thread-aaa".to_string())]);
+        // Reader ^C: only the thread → resolves the job.
+        assert_eq!(
+            resolve_cancel_target(&map, "", "thread-aaa"),
+            Some(("thread-aaa_111".to_string(), "thread-aaa".to_string()))
+        );
+        // JobDetail ^C: only the job → resolves the thread.
+        assert_eq!(
+            resolve_cancel_target(&map, "thread-aaa_111", ""),
+            Some(("thread-aaa_111".to_string(), "thread-aaa".to_string()))
+        );
+        // Both known → passthrough.
+        assert_eq!(
+            resolve_cancel_target(&map, "job-x", "thread-x"),
+            Some(("job-x".to_string(), "thread-x".to_string()))
+        );
+        // Thread with no running job → nothing to cancel.
+        assert_eq!(resolve_cancel_target(&map, "", "thread-unknown"), None);
     }
 
     #[test]

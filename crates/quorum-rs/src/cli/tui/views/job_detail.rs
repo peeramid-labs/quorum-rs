@@ -526,10 +526,13 @@ impl View for JobDetailView {
                     return self.update_inject_input(event);
                 }
 
-                // Ctrl-C stops (cancels) a running deliberation. The loop
-                // resolves the empty thread_id from its job↔thread map so a
-                // thread's pending job is cleared too.
-                if event::is_ctrl(event, 'c') && self.status == JobStatus::Running {
+                // Ctrl-C stops (cancels) the deliberation while it's non-terminal.
+                // Not gated on `Running`: a job the SSE stream hasn't advanced yet
+                // (still Connecting) or a wedged one must still be cancellable. The
+                // loop resolves the empty thread_id from its job↔thread map.
+                if event::is_ctrl(event, 'c')
+                    && !matches!(self.status, JobStatus::Complete | JobStatus::Failed)
+                {
                     return Some(ViewAction::Fetch(FetchRequest::CancelJob {
                         orchestrator: self.orchestrator.clone(),
                         job_id: self.job_id.clone(),

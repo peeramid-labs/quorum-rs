@@ -1525,13 +1525,13 @@ impl View for ThreadView {
         if is_ctrl(ev, 'd') {
             return Some(self.open_detail());
         }
-        // Ctrl-C stops (kills) the thread's running deliberation, if any.
-        if is_ctrl(ev, 'c')
-            && let Some(job_id) = self.thread.pending_job.clone()
-        {
+        // Ctrl-C stops (kills) the thread's running deliberation. Emit with the
+        // thread id even when no pending_job is recorded — the loop resolves the
+        // job from the /deliberations-populated map (the orchestrator is truth).
+        if is_ctrl(ev, 'c') {
             return Some(ViewAction::Fetch(FetchRequest::CancelJob {
                 orchestrator: self.orchestrator.clone(),
-                job_id,
+                job_id: self.thread.pending_job.clone().unwrap_or_default(),
                 thread_id: self.thread.id.clone(),
             }));
         }
@@ -2782,9 +2782,24 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_is_a_noop_without_a_running_job() {
+    fn ctrl_c_emits_cancel_keyed_by_thread_even_without_a_pending_job() {
+        // No recorded pending_job: the view still emits a cancel keyed by the
+        // thread id; the loop resolves the job from the /deliberations map (or
+        // no-ops with a status if none is running). Previously this was a
+        // view-level no-op, which stranded jobs whose JobSubmitted was lost.
         let (_t, mut v) = view();
-        assert!(v.update(&ctrl('c')).is_none());
+        match v.update(&ctrl('c')) {
+            Some(ViewAction::Fetch(FetchRequest::CancelJob {
+                job_id, thread_id, ..
+            })) => {
+                assert!(
+                    job_id.is_empty(),
+                    "no pending job → empty, resolved loop-side"
+                );
+                assert_eq!(thread_id, v.thread.id);
+            }
+            other => panic!("expected a thread-keyed CancelJob, got {other:?}"),
+        }
     }
 
     #[test]
