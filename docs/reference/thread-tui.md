@@ -24,15 +24,16 @@ A live preview pane shows the selected thread's newest turns.
 | Key | Action |
 |---|---|
 | `↑` / `↓` | Select a message |
-| `Enter` / `→` | Expand the selected message's full content inline |
+| `Enter` | While deliberating: open the live detail. Otherwise: expand the selected message inline |
+| `→` | Expand the selected message inline |
 | `←` | Collapse it |
 | `o` | Open the selected message full-screen |
 | `w` / `r` / `i` | Compose a reply under the selected turn (else the tip) |
 | `n` | Compose a new root turn (fresh line under the subject) |
 | `PgUp` / `PgDn` | Scroll the transcript |
 | `Home` / `End` | Scroll to newest / oldest |
-| `^D` | Open the selected turn's deliberation detail |
-| `^C` | Cancel the running deliberation |
+| `^D` | Open the selected turn's deliberation detail (`Enter` while deliberating does the same; some terminals/tmux don't deliver Ctrl keys) |
+| `^C` / `x` | Cancel the running deliberation (`x` is a tmux-proof alias) |
 | `^P` / `/model` | Pick the policy (model) |
 | `^E` | Cycle the effort |
 | `Esc` | Back to the inbox |
@@ -70,7 +71,7 @@ the live rounds — proposals, evaluations, convergence.
 | `←` / `→` / `PgUp` / `PgDn` | Step through rounds (`=` back to live) |
 | `t` | Toggle thought process |
 | `/` | Steer — open the injection input (running only) |
-| `^C` | Stop (cancel) the running deliberation |
+| `^C` / `x` | Stop (cancel) the deliberation (`x` is a tmux-proof alias) |
 | `Esc` / `q` | Back to the thread |
 
 #### Steer (injection input)

@@ -976,7 +976,9 @@ impl ThreadView {
                     self.unseen_reply = false;
                 }
                 KeyCode::End => self.scroll = u16::MAX, // clamped in draw
-                // Expand/collapse the selected message's full content.
+                // While deliberating, Enter drills into the live detail; otherwise
+                // it expands/collapses the selected message.
+                KeyCode::Enter if self.awaiting_reply() => return Some(self.open_detail()),
                 KeyCode::Enter => self.toggle_expand(None),
                 KeyCode::Right => self.toggle_expand(Some(true)),
                 KeyCode::Left => self.toggle_expand(Some(false)),
@@ -2260,6 +2262,33 @@ mod tests {
                 crossterm::event::KeyModifiers::CONTROL,
             ),
         ))
+    }
+
+    #[test]
+    fn enter_opens_the_detail_while_deliberating() {
+        // A turn awaiting its reply → Enter drills into the live deliberation.
+        let mut t = Thread::new("s");
+        t.push_message(Message::now("user", "q"));
+        t.pending_job = Some("job-x".into()); // deliberating
+        let (_tmp, _s, mut v) = view_over(t);
+        v.mode = Mode::Read;
+        assert!(v.awaiting_reply());
+        match v.update(&plain(crossterm::event::KeyCode::Enter)) {
+            Some(ViewAction::OpenThreadJob { thread_id, .. }) => assert_eq!(thread_id, v.thread.id),
+            other => panic!("expected OpenThreadJob while deliberating, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_expands_when_not_deliberating() {
+        // A replied turn → Enter keeps its expand/collapse meaning (no drill-in).
+        let mut t = Thread::new("s");
+        t.push_message(Message::now("user", "q"));
+        t.push_message(Message::now("assistant", "a"));
+        let (_tmp, _s, mut v) = view_over(t);
+        v.mode = Mode::Read;
+        assert!(!v.awaiting_reply());
+        assert!(v.update(&plain(crossterm::event::KeyCode::Enter)).is_none());
     }
 
     #[test]

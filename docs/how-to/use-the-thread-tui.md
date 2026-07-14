@@ -79,9 +79,10 @@ leaves full-screen, then closes the input. `Enter` sends.
 
 ## Stop a runaway deliberation
 
-`^C` cancels the running deliberation — from the reader or the detail view (a
-compliance kill-switch too). The turn is left unanswered; write a follow-up to
-continue.
+`^C` (or `x`, if your terminal/tmux swallows Ctrl keys) cancels the running
+deliberation — from the reader or the detail view (a compliance kill-switch too).
+The turn is left unanswered; write a follow-up to continue. When a turn has
+already finished with no answer, `^D`/`Enter` shows `⚠ No running deliberation`.
 
 ## Swap the model or effort
 

@@ -426,8 +426,10 @@ async fn setup_and_run(
                         }
                         None => {
                             app.status_message = Some((
-                                "No deliberation running for this thread".into(),
-                                StatusLevel::Info,
+                                "⚠ No running deliberation — the last turn has finished (write a \
+                                 follow-up with w, or ↑ then w to fork)"
+                                    .into(),
+                                StatusLevel::Error,
                             ))
                         }
                     }
