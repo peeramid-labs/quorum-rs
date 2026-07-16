@@ -1598,10 +1598,10 @@ impl NatsNsedWorker {
                     }
                 }
                 // A middleware may declare a per-job worktree (e.g. patch-deliberation
-                // `pd_worktree`) — run the agent subprocess with cwd = that dir
+                // `agent_working_dir`) — run the agent subprocess with cwd = that dir
                 // instead of the stale launch dir, so bare git + relative reads hit
                 // the frozen job-scoped tree.
-                if let Some(wt) = new.get("pd_worktree").and_then(|v| v.as_str()) {
+                if let Some(wt) = new.get("agent_working_dir").and_then(|v| v.as_str()) {
                     context.working_dir_override = Some(std::path::PathBuf::from(wt));
                 }
             }

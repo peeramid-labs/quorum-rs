@@ -82,10 +82,10 @@ pub struct AgentContext {
     #[schema(ignore)]
     #[schemars(skip)]
     pub forced_proposal_schema: Option<serde_json::Value>,
-    /// A per-job working directory a `before_prompt` middleware declared (e.g. the
-    /// patch-deliberation `pd_worktree`). When set, the agent subprocess runs with
-    /// cwd = this dir instead of the process launch dir — so bare git + relative
-    /// reads/writes hit the frozen, job-scoped tree. Overrides the agent's static
+    /// A per-task working directory a `before_prompt` middleware declared (via the
+    /// `agent_working_dir` key on its content). When set, the agent subprocess runs
+    /// with cwd = this dir instead of the process launch dir, so relative reads/writes
+    /// land where the middleware prepared them. Overrides the agent's static
     /// `working_dir`. Runtime-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(ignore)]

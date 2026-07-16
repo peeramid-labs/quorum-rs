@@ -1065,7 +1065,7 @@ impl ClaudeAgent {
         // Context files: only inject on fresh sessions (already in session on resume).
         if !resumed {
             // Resolve relative context-file paths against the same cwd the agent
-            // subprocess runs in: a per-job override (pd_worktree) wins over the
+            // subprocess runs in: a per-job override (agent_working_dir) wins over the
             // static config, so bare `docs/x.md` hits the frozen worktree.
             let effective_wd = ctx
                 .working_dir_override
@@ -1586,11 +1586,11 @@ impl ClaudeAgent {
         lower.contains("session id") && lower.contains("already in use")
     }
 
-    /// Effective cwd for the claude phase subprocess: a per-job override declared
-    /// by a `before_prompt` middleware (e.g. patch-deliberation `pd_worktree`) wins
-    /// over the agent's static `working_dir`, falling back to the process cwd. Used
-    /// for the spawn AND the `--resume` session-jsonl recovery paths so both stay
-    /// consistent with where claude actually runs.
+    /// Effective cwd for the claude phase subprocess: a per-task override declared
+    /// by a `before_prompt` middleware (the `agent_working_dir` key) wins over the
+    /// agent's static `working_dir`, falling back to the process cwd. Used for the
+    /// spawn AND the `--resume` session-jsonl recovery paths so both stay consistent
+    /// with where claude actually runs.
     fn phase_working_dir(&self, ctx: &AgentContext) -> std::path::PathBuf {
         ctx.working_dir_override
             .clone()
@@ -1685,7 +1685,7 @@ impl ClaudeAgent {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
-        // Always set cwd from the resolver so a per-job override (pd_worktree) wins
+        // Always set cwd from the resolver so a per-job override (agent_working_dir) wins
         // over the static config and the process launch dir.
         cmd.current_dir(self.phase_working_dir(ctx));
         for (k, v) in &self.claude_config.env {
@@ -3615,7 +3615,7 @@ mod tests {
         };
         let agent = ClaudeAgent::new(agent_cfg, claude_cfg, stub_prompt_set());
 
-        // A per-job override (e.g. pd_worktree) wins over the static config.
+        // A per-job override (e.g. agent_working_dir) wins over the static config.
         let mut ctx = minimal_context();
         ctx.working_dir_override = Some(std::path::PathBuf::from("/job/worktree"));
         assert_eq!(
@@ -4886,7 +4886,7 @@ mod tests {
 
     #[test]
     fn claude_context_files_resolved_from_working_dir_override() {
-        // The per-job override (pd_worktree) wins over the static config dir for
+        // The per-job override (agent_working_dir) wins over the static config dir for
         // relative context-file resolution — so `docs/x.md` hits the job worktree.
         let cfg_dir = tempfile::tempdir().unwrap(); // static config dir (no file)
         let job_dir = tempfile::tempdir().unwrap(); // per-job override dir
