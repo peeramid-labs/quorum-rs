@@ -13,6 +13,7 @@ Read these away from the keyboard when you want to understand a design decision 
 | [Agent ranking](agent-ranking.md) | Capability declaration + how agents earn rank through deliberation outcomes. |
 | [NATS topology](nats-topology.md) | Subjects, JetStream streams, JWT scopes, dispatch model. |
 | [Middleware system](middleware.md) | Pluggable validation/moderation pipeline and the design rationale behind it. |
+| [Agent working-directory override](agent-working-directory.md) | Why `AgentContext.working_dir_override` exists, how a `before_prompt` middleware sets it via `pd_worktree`, and what a custom agent must do with it. |
 | [About telemetry design](telemetry-design.md) | Principles, trace correlation, retention, and what is intentionally *not* emitted. |
 | [About scoped `read_file`](scoped-read-file.md) | Sandbox semantics for non-Claude agents reading from configured roots. |
 | [About LLM context-window guards](llm-context-window-guards.md) | Why the shrink-guard counts tool schemas and why `max_tokens` isn't capped defensively. |
