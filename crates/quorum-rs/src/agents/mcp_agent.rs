@@ -1064,6 +1064,13 @@ impl ClaudeAgent {
 
         // Context files: only inject on fresh sessions (already in session on resume).
         if !resumed {
+            // Resolve relative context-file paths against the same cwd the agent
+            // subprocess runs in: a per-job override (pd_worktree) wins over the
+            // static config, so bare `docs/x.md` hits the frozen worktree.
+            let effective_wd = ctx
+                .working_dir_override
+                .as_ref()
+                .or(self.claude_config.working_dir.as_ref());
             let expanded_files: Vec<std::path::PathBuf> = self
                 .claude_config
                 .context_files
@@ -1075,7 +1082,7 @@ impl ClaudeAgent {
                     // exist (including when resolved against working_dir).
                     let exists_as_is = if p.is_absolute() {
                         p.exists()
-                    } else if let Some(ref wd) = self.claude_config.working_dir {
+                    } else if let Some(wd) = effective_wd {
                         wd.join(p).exists() || p.exists()
                     } else {
                         p.exists()
@@ -1099,7 +1106,7 @@ impl ClaudeAgent {
             for file_path in &expanded_files {
                 let resolved = if file_path.is_absolute() {
                     file_path.clone()
-                } else if let Some(ref wd) = self.claude_config.working_dir {
+                } else if let Some(wd) = effective_wd {
                     wd.join(file_path)
                 } else {
                     file_path.clone()
@@ -1586,6 +1593,18 @@ impl ClaudeAgent {
     /// guidance about what its previous attempt did wrong (issue
     /// #347 Option 2 — failure-feedback-on-retry).
     #[allow(clippy::too_many_arguments)]
+    /// Effective cwd for the claude phase subprocess: a per-job override declared
+    /// by a `before_prompt` middleware (e.g. patch-deliberation `pd_worktree`) wins
+    /// over the agent's static `working_dir`, falling back to the process cwd. Used
+    /// for the spawn AND the `--resume` session-jsonl recovery paths so both stay
+    /// consistent with where claude actually runs.
+    fn phase_working_dir(&self, ctx: &AgentContext) -> std::path::PathBuf {
+        ctx.working_dir_override
+            .clone()
+            .or_else(|| self.claude_config.working_dir.clone())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()))
+    }
+
     async fn execute_phase_attempt(
         &self,
         command: &[String],
@@ -1616,11 +1635,7 @@ impl ClaudeAgent {
         // `claude_recovery::session_jsonl_size` for the rationale.
         let recovery_offset: u64 = match claude_session_uuid {
             Some(uuid) => {
-                let working_dir: std::path::PathBuf = self
-                    .claude_config
-                    .working_dir
-                    .clone()
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+                let working_dir = self.phase_working_dir(ctx);
                 super::claude_recovery::session_jsonl_size(&working_dir, uuid)
             }
             None => 0,
@@ -1636,10 +1651,7 @@ impl ClaudeAgent {
         let prior_lock_age_secs: u64 = if lock_present_at_spawn {
             claude_session_uuid
                 .and_then(|uuid| {
-                    let working_dir: std::path::PathBuf =
-                        self.claude_config.working_dir.clone().unwrap_or_else(|| {
-                            std::env::current_dir().unwrap_or_else(|_| ".".into())
-                        });
+                    let working_dir = self.phase_working_dir(ctx);
                     super::claude_recovery::session_jsonl_path(&working_dir, uuid)
                 })
                 .and_then(|p| std::fs::metadata(&p).ok())
@@ -1673,9 +1685,9 @@ impl ClaudeAgent {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
-        if let Some(ref dir) = self.claude_config.working_dir {
-            cmd.current_dir(dir);
-        }
+        // Always set cwd from the resolver so a per-job override (pd_worktree) wins
+        // over the static config and the process launch dir.
+        cmd.current_dir(self.phase_working_dir(ctx));
         for (k, v) in &self.claude_config.env {
             cmd.env(k, v);
         }
@@ -3595,6 +3607,43 @@ mod tests {
     }
 
     #[test]
+    fn phase_working_dir_override_beats_config_and_cwd() {
+        let agent_cfg = minimal_agent_config("test");
+        let claude_cfg = crate::agents::config::ClaudeProviderConfig {
+            working_dir: Some(std::path::PathBuf::from("/static/cfg")),
+            ..Default::default()
+        };
+        let agent = ClaudeAgent::new(agent_cfg, claude_cfg, stub_prompt_set());
+
+        // A per-job override (e.g. pd_worktree) wins over the static config.
+        let mut ctx = minimal_context();
+        ctx.working_dir_override = Some(std::path::PathBuf::from("/job/worktree"));
+        assert_eq!(
+            agent.phase_working_dir(&ctx),
+            std::path::PathBuf::from("/job/worktree")
+        );
+
+        // No override → the agent's static working_dir.
+        let ctx_no_override = minimal_context();
+        assert_eq!(
+            agent.phase_working_dir(&ctx_no_override),
+            std::path::PathBuf::from("/static/cfg")
+        );
+    }
+
+    #[test]
+    fn phase_working_dir_falls_back_to_cwd() {
+        let agent_cfg = minimal_agent_config("test");
+        let claude_cfg = crate::agents::config::ClaudeProviderConfig::default(); // working_dir: None
+        let agent = ClaudeAgent::new(agent_cfg, claude_cfg, stub_prompt_set());
+        let ctx = minimal_context(); // no override
+        assert_eq!(
+            agent.phase_working_dir(&ctx),
+            std::env::current_dir().unwrap_or_else(|_| ".".into())
+        );
+    }
+
+    #[test]
     fn claude_readonly_merges_user_disallowed() {
         let agent_cfg = minimal_agent_config("test");
         let claude_cfg = crate::agents::config::ClaudeProviderConfig {
@@ -4833,6 +4882,36 @@ mod tests {
             .expect("context file should be injected");
         assert!(cmd[idx].contains("Spec content"));
         assert!(cmd[idx].contains("spec.md"));
+    }
+
+    #[test]
+    fn claude_context_files_resolved_from_working_dir_override() {
+        // The per-job override (pd_worktree) wins over the static config dir for
+        // relative context-file resolution — so `docs/x.md` hits the job worktree.
+        let cfg_dir = tempfile::tempdir().unwrap(); // static config dir (no file)
+        let job_dir = tempfile::tempdir().unwrap(); // per-job override dir
+        std::fs::write(job_dir.path().join("spec.md"), "Worktree spec").unwrap();
+
+        let agent_cfg = minimal_agent_config("test");
+        let claude_cfg = crate::agents::config::ClaudeProviderConfig {
+            working_dir: Some(cfg_dir.path().to_path_buf()),
+            context_files: vec![std::path::PathBuf::from("spec.md")],
+            ..Default::default()
+        };
+        let agent = ClaudeAgent::new(agent_cfg, claude_cfg, stub_prompt_set());
+        let mut ctx = minimal_context();
+        ctx.working_dir_override = Some(job_dir.path().to_path_buf());
+
+        let (cmd, _sandbox) = agent.build_command_fresh(&ctx, &dummy_mcp_config());
+        let idx = cmd
+            .iter()
+            .position(|a| a.contains("<context_file"))
+            .expect("context file resolved from the override dir should be injected");
+        assert!(
+            cmd[idx].contains("Worktree spec"),
+            "override dir wins over static config dir: {}",
+            cmd[idx]
+        );
     }
 
     #[test]
