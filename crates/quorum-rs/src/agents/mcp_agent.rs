@@ -1586,13 +1586,6 @@ impl ClaudeAgent {
         lower.contains("session id") && lower.contains("already in use")
     }
 
-    /// Execute a single phase attempt with the given command args.
-    ///
-    /// `retry_feedback`, when present, is spliced in as a final
-    /// `--append-system-prompt` block so claude sees explicit
-    /// guidance about what its previous attempt did wrong (issue
-    /// #347 Option 2 — failure-feedback-on-retry).
-    #[allow(clippy::too_many_arguments)]
     /// Effective cwd for the claude phase subprocess: a per-job override declared
     /// by a `before_prompt` middleware (e.g. patch-deliberation `pd_worktree`) wins
     /// over the agent's static `working_dir`, falling back to the process cwd. Used
@@ -1605,6 +1598,13 @@ impl ClaudeAgent {
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()))
     }
 
+    /// Execute a single phase attempt with the given command args.
+    ///
+    /// `retry_feedback`, when present, is spliced in as a final
+    /// `--append-system-prompt` block so claude sees explicit
+    /// guidance about what its previous attempt did wrong (issue
+    /// #347 Option 2 — failure-feedback-on-retry).
+    #[allow(clippy::too_many_arguments)]
     async fn execute_phase_attempt(
         &self,
         command: &[String],
