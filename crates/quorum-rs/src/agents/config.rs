@@ -131,6 +131,13 @@ pub struct AgentConfig {
     pub max_scratchpad_size: Option<i32>,
     #[serde(default = "default_max_retries")]
     pub max_retries: Option<i32>,
+    /// Max jobs this agent runs concurrently. Enforced as the pull consumer's
+    /// `max_ack_pending`, so the broker withholds the next task until an
+    /// in-flight one finishes. Set to `1` for agents whose jobs mutate shared
+    /// state (e.g. a git repo a middleware resets per job) to prevent races.
+    /// `None` (default) leaves it unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_jobs: Option<usize>,
     #[serde(default)]
     pub supports_native_thinking: bool,
     #[serde(default)]
@@ -951,6 +958,7 @@ impl Default for AgentConfig {
             max_react_iterations: default_max_react_iterations(),
             max_scratchpad_size: default_max_scratchpad_size(),
             max_retries: default_max_retries(),
+            max_concurrent_jobs: None,
             supports_native_thinking: false,
             frequency_penalty: None,
             presence_penalty: default_presence_penalty(),
@@ -2005,6 +2013,15 @@ provider_config:
         );
         let persona = parse_agent_persona(&yaml);
         assert_eq!(persona.as_deref(), Some("lead\n\nfrom-md\n\n\ntail"));
+    }
+
+    #[test]
+    fn max_concurrent_jobs_parses_and_defaults_none() {
+        let with =
+            serde_yaml::from_str::<AgentConfig>("name: a\nmax_concurrent_jobs: 1\n").unwrap();
+        assert_eq!(with.max_concurrent_jobs, Some(1));
+        let without = serde_yaml::from_str::<AgentConfig>("name: a\n").unwrap();
+        assert_eq!(without.max_concurrent_jobs, None);
     }
 
     /// Missing md file → parse error naming the path. Operators see

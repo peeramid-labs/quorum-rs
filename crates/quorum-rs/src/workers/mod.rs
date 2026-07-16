@@ -151,6 +151,12 @@ pub struct WorkerConfig {
     pub scratchpad_retention_secs: u64,
     /// Optional NATS authentication credentials.
     pub nats_auth: Option<NatsAuth>,
+    /// Max jobs this agent processes concurrently. Enforced as the pull
+    /// consumer's `max_ack_pending` — the server won't deliver the next task
+    /// until an in-flight one is acked. `None` leaves it unbounded (server
+    /// default). Set to `1` for agents whose jobs share mutable state (e.g. a
+    /// git repo a middleware resets per job) so concurrent jobs can't race.
+    pub max_concurrent_jobs: Option<usize>,
 }
 
 impl WorkerConfig {
@@ -164,6 +170,7 @@ impl WorkerConfig {
             api_prefix: "sphera".to_string(),
             scratchpad_retention_secs: 86400 * 7,
             nats_auth: None,
+            max_concurrent_jobs: None,
         }
     }
 
@@ -189,6 +196,20 @@ impl WorkerConfig {
     pub fn with_nats_auth(mut self, auth: NatsAuth) -> Self {
         self.nats_auth = Some(auth);
         self
+    }
+
+    /// Caps how many jobs this agent processes concurrently (see
+    /// [`WorkerConfig::max_concurrent_jobs`]).
+    pub fn with_max_concurrent_jobs(mut self, n: usize) -> Self {
+        self.max_concurrent_jobs = Some(n);
+        self
+    }
+
+    /// The pull-consumer `max_ack_pending` implied by `max_concurrent_jobs`:
+    /// the cap when set, else `0` (server default = unbounded). Extracted so the
+    /// mapping is unit-testable without a live NATS.
+    fn max_ack_pending(&self) -> i64 {
+        self.max_concurrent_jobs.map(|n| n as i64).unwrap_or(0)
     }
 }
 
@@ -729,6 +750,9 @@ impl NatsNsedWorker {
                     durable_name: Some(self.config.consumer_name.clone()),
                     filter_subject: task_filter,
                     ack_wait: std::time::Duration::from_secs(30), // short — heartbeats extend
+                    // Bound concurrent in-flight jobs for this agent (0 = unbounded).
+                    // The server withholds the next task until an in-flight one acks.
+                    max_ack_pending: self.config.max_ack_pending(),
                     ..Default::default()
                 },
             )
@@ -2938,6 +2962,29 @@ mod tests {
         assert_eq!(config.subject_prefix, "nsed");
         assert_eq!(config.api_prefix, "sphera");
         assert_eq!(config.scratchpad_retention_secs, 86400 * 7);
+        // Unbounded by default → max_ack_pending 0 (server default).
+        assert_eq!(config.max_concurrent_jobs, None);
+        assert_eq!(config.max_ack_pending(), 0);
+    }
+
+    #[test]
+    fn test_worker_config_max_concurrent_jobs_maps_to_ack_pending() {
+        let serialized = WorkerConfig::new(
+            "nats://localhost:4222".to_string(),
+            "s".to_string(),
+            "c".to_string(),
+        )
+        .with_max_concurrent_jobs(1);
+        assert_eq!(serialized.max_concurrent_jobs, Some(1));
+        assert_eq!(
+            serialized.max_ack_pending(),
+            1,
+            "1 job → serialized in-flight"
+        );
+
+        let capped =
+            WorkerConfig::new("u".into(), "s".into(), "c".into()).with_max_concurrent_jobs(4);
+        assert_eq!(capped.max_ack_pending(), 4);
     }
 
     #[test]

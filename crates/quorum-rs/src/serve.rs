@@ -272,6 +272,9 @@ pub async fn build_worker(
     if let Some(auth) = nats_auth {
         worker_config = worker_config.with_nats_auth(auth.clone());
     }
+    if let Some(n) = agent_config.max_concurrent_jobs {
+        worker_config = worker_config.with_max_concurrent_jobs(n);
+    }
 
     // Dispatch is now a single registry lookup. Each provider arm
     // lives in a `ProviderFactory` (see `crate::providers::builtins`);
