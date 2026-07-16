@@ -82,6 +82,15 @@ pub struct AgentContext {
     #[schema(ignore)]
     #[schemars(skip)]
     pub forced_proposal_schema: Option<serde_json::Value>,
+    /// A per-task working directory a `before_prompt` middleware declared (via the
+    /// `agent_working_dir` key on its content). When set, the agent subprocess runs
+    /// with cwd = this dir instead of the process launch dir, so relative reads/writes
+    /// land where the middleware prepared them. Overrides the agent's static
+    /// `working_dir`. Runtime-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(ignore)]
+    #[schemars(skip)]
+    pub working_dir_override: Option<std::path::PathBuf>,
     /// Runtime-only: handler for user tool calls (injected by agent worker, not serialized).
     /// The concrete type is supplied via [`UserToolHandlerFactory`](crate::workers::UserToolHandlerFactory);
     /// this field holds an opaque Arc wrapper.
@@ -2038,6 +2047,7 @@ mod tests {
                 category_breakdown: None,
             }),
             forced_proposal_schema: None,
+            working_dir_override: None,
             user_tool_handler: None, // serde(skip)
             role: Some("security".to_string()),
             role_context: Some("Per-role context content".to_string()),
