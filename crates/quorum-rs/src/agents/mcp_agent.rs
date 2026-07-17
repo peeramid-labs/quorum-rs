@@ -1586,6 +1586,24 @@ impl ClaudeAgent {
         lower.contains("session id") && lower.contains("already in use")
     }
 
+    /// Whether a session-collision retry must start a **fresh** session (losing
+    /// claude's cached context) or may **resume** the existing one (keeping it).
+    ///
+    /// A session killed mid-call by a quota/rate limit leaves its transcript
+    /// jsonl on disk — that session is recoverable, so we `--resume` it to reuse
+    /// the cache (cheaper, and correct while already rate-limited). The
+    /// `is_session_not_found` heuristic (`exit 1` + empty stderr) *also* fires on
+    /// such a kill, which is why the old `restart_fresh = not_found || in_use`
+    /// wrongly discarded a recoverable session. Only start fresh when the
+    /// transcript is genuinely gone (`session_recoverable == false`).
+    fn restart_fresh_on_collision(
+        session_not_found: bool,
+        already_in_use: bool,
+        session_recoverable: bool,
+    ) -> bool {
+        (session_not_found || already_in_use) && !session_recoverable
+    }
+
     /// Effective cwd for the claude phase subprocess: a per-task override declared
     /// by a `before_prompt` middleware (the `agent_working_dir` key) wins over the
     /// agent's static `working_dir`, falling back to the process cwd. Used for the
@@ -2189,15 +2207,42 @@ impl ClaudeAgent {
                 // dead process — force-clear it even if non-empty. This
                 // is the fix for the quota-kills-resume → non-empty
                 // orphan → fresh spawn "already in use" hard-fail cascade.
-                let restart_fresh = is_session_not_found || is_already_in_use;
-                if restart_fresh {
+                // A quota/rate-limit kill exits `1` with empty stderr (→
+                // is_session_not_found) and orphans the session-env lock (→
+                // is_already_in_use), but leaves the transcript jsonl on disk. If
+                // it's there, RESUME to reuse claude's cache instead of discarding
+                // it with a fresh start (which re-reads all context — wasteful
+                // while already rate-limited). Only start fresh if it's truly gone.
+                let session_recoverable = super::claude_recovery::session_jsonl_path(
+                    &self.phase_working_dir(ctx),
+                    &claude_session_uuid,
+                )
+                .map(|p| p.exists())
+                .unwrap_or(false);
+                let restart_fresh = Self::restart_fresh_on_collision(
+                    is_session_not_found,
+                    is_already_in_use,
+                    session_recoverable,
+                );
+                let had_session_collision = is_session_not_found || is_already_in_use;
+                if had_session_collision {
+                    // Either recovery path needs a clean lock: the dead child
+                    // orphaned session-env/<uuid>/ — force-clear even if non-empty.
+                    // Log its outcome (was the lock actually present + removed?) so
+                    // the session-lock race is visible in the live log.
+                    let lock_cleared =
+                        super::claude_recovery::force_clear_session_env_lock(&claude_session_uuid);
                     tracing::info!(
                         agent = %self.name,
                         phase = %phase,
+                        session_uuid = %claude_session_uuid,
                         already_in_use = is_already_in_use,
-                        "Restarting claude with a fresh persistent session"
+                        session_recoverable,
+                        restart_fresh,
+                        lock_cleared,
+                        "Recovering claude session after collision ({})",
+                        if restart_fresh { "fresh — transcript gone" } else { "resume — keeps cache" }
                     );
-                    super::claude_recovery::force_clear_session_env_lock(&claude_session_uuid);
                 } else {
                     tracing::warn!(
                         agent = %self.name,
@@ -2276,6 +2321,20 @@ impl ClaudeAgent {
                     )
                     .await;
                 server_ct2.cancel();
+                // Make the recovery retry's fate explicit in the log — a bare
+                // worker-level "Task Execution Failed" hides that this was a
+                // post-collision respawn and whether it hit the lock race again.
+                if let Err((ref e, ref stderr, exit_code, _)) = attempt_result {
+                    tracing::error!(
+                        agent = %self.name,
+                        phase = %phase,
+                        exit_code,
+                        restart_fresh,
+                        session_recoverable,
+                        already_in_use_again = Self::is_session_already_in_use(stderr),
+                        "Claude recovery respawn FAILED (surfacing to worker): {e:#}"
+                    );
+                }
                 attempt_result.map_err(|(e, _, _, _)| e)
             }
         }
@@ -3921,6 +3980,46 @@ mod tests {
         assert!(!ClaudeAgent::is_session_already_in_use(
             "session id provided"
         )); // missing "already in use"
+    }
+
+    #[test]
+    fn quota_kill_with_intact_transcript_resumes_not_fresh() {
+        // The core regression: a claude child killed mid-call by a quota/rate
+        // limit exits `1` with empty stderr → is_session_not_found fires, and the
+        // orphaned lock → is_already_in_use may fire too. But the transcript
+        // survives on disk (session_recoverable = true), so we must RESUME to
+        // reuse claude's cache — NOT restart fresh (which re-reads all context,
+        // burning more tokens while already rate-limited).
+        assert!(
+            !ClaudeAgent::restart_fresh_on_collision(true, false, true),
+            "not-found + intact transcript → resume"
+        );
+        assert!(
+            !ClaudeAgent::restart_fresh_on_collision(false, true, true),
+            "already-in-use + intact transcript → resume"
+        );
+        assert!(
+            !ClaudeAgent::restart_fresh_on_collision(true, true, true),
+            "both signatures + intact transcript → resume"
+        );
+    }
+
+    #[test]
+    fn genuinely_missing_transcript_restarts_fresh() {
+        // Transcript gone (session_recoverable = false) → nothing to resume, so a
+        // fresh session is correct.
+        assert!(ClaudeAgent::restart_fresh_on_collision(true, false, false));
+        assert!(ClaudeAgent::restart_fresh_on_collision(false, true, false));
+    }
+
+    #[test]
+    fn no_collision_never_restarts_fresh() {
+        // Neither collision signature (this path is only reached for retry-kind
+        // failures, which resume with feedback) → never fresh.
+        assert!(!ClaudeAgent::restart_fresh_on_collision(
+            false, false, false
+        ));
+        assert!(!ClaudeAgent::restart_fresh_on_collision(false, false, true));
     }
 
     #[test]
