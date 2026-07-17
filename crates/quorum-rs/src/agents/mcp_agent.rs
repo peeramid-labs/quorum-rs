@@ -2226,17 +2226,23 @@ impl ClaudeAgent {
                 );
                 let had_session_collision = is_session_not_found || is_already_in_use;
                 if had_session_collision {
+                    // Either recovery path needs a clean lock: the dead child
+                    // orphaned session-env/<uuid>/ — force-clear even if non-empty.
+                    // Log its outcome (was the lock actually present + removed?) so
+                    // the session-lock race is visible in the live log.
+                    let lock_cleared =
+                        super::claude_recovery::force_clear_session_env_lock(&claude_session_uuid);
                     tracing::info!(
                         agent = %self.name,
                         phase = %phase,
+                        session_uuid = %claude_session_uuid,
                         already_in_use = is_already_in_use,
                         session_recoverable,
                         restart_fresh,
-                        "Recovering claude session after collision (resume keeps cache)"
+                        lock_cleared,
+                        "Recovering claude session after collision ({})",
+                        if restart_fresh { "fresh — transcript gone" } else { "resume — keeps cache" }
                     );
-                    // Either recovery path needs a clean lock: the dead child
-                    // orphaned session-env/<uuid>/ — force-clear even if non-empty.
-                    super::claude_recovery::force_clear_session_env_lock(&claude_session_uuid);
                 } else {
                     tracing::warn!(
                         agent = %self.name,
@@ -2315,6 +2321,20 @@ impl ClaudeAgent {
                     )
                     .await;
                 server_ct2.cancel();
+                // Make the recovery retry's fate explicit in the log — a bare
+                // worker-level "Task Execution Failed" hides that this was a
+                // post-collision respawn and whether it hit the lock race again.
+                if let Err((ref e, ref stderr, exit_code, _)) = attempt_result {
+                    tracing::error!(
+                        agent = %self.name,
+                        phase = %phase,
+                        exit_code,
+                        restart_fresh,
+                        session_recoverable,
+                        already_in_use_again = Self::is_session_already_in_use(stderr),
+                        "Claude recovery respawn FAILED (surfacing to worker): {e:#}"
+                    );
+                }
                 attempt_result.map_err(|(e, _, _, _)| e)
             }
         }
