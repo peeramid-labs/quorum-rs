@@ -26,19 +26,33 @@ Each middleware returns one of three verdicts:
 | `warn` | Proceed but annotate for audit trail |
 | `block` | Reject — entry stays in buffer, API returns 422 |
 
-### ReAct retry on a `on_provider_response` block
+### Reviewer block feeds the agent's react loop
 
-A `block` at the `on_provider_response` stage of a **propose** task is not fatal:
-the worker re-prompts the agent with the block reason appended to the task and
-tries again, up to `MAX_BLOCK_RETRIES` (2) extra attempts. This lets a reviewer
-(e.g. patch-deliberation rejecting a proposal that applies **zero** changes) hand
-the agent actionable feedback instead of failing the whole round.
+A `block` at the `on_provider_response` stage of a **propose** task is not fatal.
+The worker injects the `on_provider_response` pipeline as the agent's
+`submission_validator`, so it runs **inside the react loop** on every
+`submit_proposal`. A block converts the accepted submission into a retry, feeding
+the reason back to the model as a `SYSTEM ERROR` — reusing the **same** retry
+budget (`max_retries`) that handles malformed submissions, not a separate one.
+This lets a reviewer (e.g. patch-deliberation rejecting a proposal that applies
+**zero** changes, or leaves any op unresolved) hand the agent actionable feedback
+in-loop.
 
-The retry is transactional: a block leaves no commit and a clean worktree
-(patch-deliberation's guards return before committing), so each re-prompt
-re-applies from a clean base. Only after the extra attempts are exhausted does the
-block surface as a task error. Non-block errors (transport, logic) propagate at
-once to the transient-retry loop.
+The validation is idempotent: patch-deliberation's `provider_response` discards
+any uncommitted residue at the start, so running it per attempt inside the loop
+**and** once more for the accepted proposal's commit + content transform composes
+correctly. Only when the react loop exhausts `max_retries` does the block surface
+as a task error.
+
+```mermaid
+flowchart LR
+    A[LLM submit_proposal] --> B{parse ok?}
+    B -- no --> R[feed error back<br/>retry within max_retries]
+    B -- yes --> V[submission_validator<br/>= provider_response]
+    V -- block --> R
+    V -- pass --> D[accept → commit + transform]
+    R --> A
+```
 
 ## Configuration
 

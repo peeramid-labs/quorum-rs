@@ -134,6 +134,15 @@ pub struct AgentContext {
     #[schema(ignore)]
     #[schemars(skip)]
     pub telemetry: Option<crate::telemetry::TelemetryEmitterMux>,
+    /// Runtime-only: validates a `submit_proposal` submission inside the react
+    /// loop. Injected by the agent worker from the `provider_response` middleware
+    /// so a reviewer block (e.g. patch-deliberation "applied ZERO changes") feeds
+    /// the reason back through the SAME retry that handles parse failures — no
+    /// separate retry budget. Mirrors the `user_tool_handler` runtime-only pattern.
+    #[serde(skip)]
+    #[schema(ignore)]
+    #[schemars(skip)]
+    pub submission_validator: Option<Arc<dyn SubmissionValidator>>,
 }
 
 impl AgentContext {
@@ -852,6 +861,17 @@ pub trait ChatCapable: Send + Sync {
 /// Trait for user tool call handling. The reference implementation is
 /// [`UserToolHandler`]; this trait lets `AgentContext`
 /// hold a handler without leaking NATS internals into the public type.
+/// Validates a proposal submission inside the agent's react loop. A `Some(reason)`
+/// return rejects the submission — [`generate_structured_output`](crate::agents)
+/// feeds `reason` back to the model as a retry (reusing the parse-failure retry
+/// budget), exactly as a malformed submission is retried. The reference
+/// implementation wraps the `provider_response` middleware pipeline.
+#[async_trait]
+pub trait SubmissionValidator: Send + Sync + Debug {
+    /// Return `Some(reason)` to reject `content` (fed back to the model), `None` to accept.
+    async fn validate(&self, content: &str) -> Option<String>;
+}
+
 #[async_trait]
 pub trait UserToolHandlerTrait: Send + Sync + Debug {
     /// Handle a user tool call: publish to KV, wait for response, return result string.
@@ -2051,7 +2071,8 @@ mod tests {
             user_tool_handler: None, // serde(skip)
             role: Some("security".to_string()),
             role_context: Some("Per-role context content".to_string()),
-            telemetry: None, // serde(skip)
+            telemetry: None,            // serde(skip)
+            submission_validator: None, // serde(skip)
             agent_id: String::new(),
             task_publish_ts: Some(1_776_790_000_000),
         };

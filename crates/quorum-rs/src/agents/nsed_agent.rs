@@ -1457,6 +1457,31 @@ fn force_tool_choice(
     }
 }
 
+/// Run the injected [`SubmissionValidator`](crate::agents::SubmissionValidator) on
+/// a parsed proposal's `solution_content`, returning `Some(reason)` when rejected.
+/// Only `submit_proposal` submissions are validated; without a validator or on any
+/// other terminal tool it returns `None`. Free fn so the react loop's rejection
+/// gate is unit-testable with a mock validator — no LLM needed.
+async fn run_submission_validator<T: serde::Serialize>(
+    parsed: &T,
+    terminal_tool_name: &str,
+    validator: Option<&dyn crate::agents::SubmissionValidator>,
+) -> Option<String> {
+    if terminal_tool_name != "submit_proposal" {
+        return None;
+    }
+    let validator = validator?;
+    let content = serde_json::to_value(parsed)
+        .ok()
+        .and_then(|v| {
+            v.get("solution_content")
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    validator.validate(&content).await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn generate_structured_output<T>(
     llm_client: &dyn AiModel,
@@ -1810,6 +1835,31 @@ where
             // error type we need without paying the parse.
             let synth_err: serde_json::Error =
                 serde_json::from_str::<serde_json::Value>("not-json-prompt-exposure-block")
+                    .expect_err("invalid JSON always errors");
+            parse_result = Err(synth_err);
+        }
+
+        // Submission validator — a reviewer (patch-deliberation provider_response,
+        // injected by the worker) inspects the parsed proposal's content and may
+        // reject it (e.g. ops that applied ZERO changes). A rejection converts the
+        // Ok into an Err carrying the reason, so this SAME loop re-prompts within
+        // `max_retries` — no separate retry budget. Proposal submissions only.
+        if let Ok(ref parsed) = parse_result
+            && let Some(reason) = run_submission_validator(
+                parsed,
+                terminal_tool_name,
+                context.submission_validator.as_deref(),
+            )
+            .await
+        {
+            warn!(
+                agent_name = %agent_config.name,
+                attempt = attempts,
+                "submission validator rejected the proposal; triggering retry."
+            );
+            cleaned_json = format!("proposal rejected by reviewer: {reason}");
+            let synth_err: serde_json::Error =
+                serde_json::from_str::<serde_json::Value>("not-json-reviewer-block")
                     .expect_err("invalid JSON always errors");
             parse_result = Err(synth_err);
         }
@@ -3543,6 +3593,51 @@ fn resolve_finalize_window(raw: Option<&str>) -> usize {
 
 #[cfg(test)]
 mod tests {
+    // Echoes the content it was handed as the "reason" so a test can assert what
+    // solution_content the react loop extracted; `reject=false` accepts (None).
+    #[derive(Debug)]
+    struct EchoValidator {
+        reject: bool,
+    }
+    #[async_trait::async_trait]
+    impl crate::agents::SubmissionValidator for EchoValidator {
+        async fn validate(&self, content: &str) -> Option<String> {
+            self.reject.then(|| content.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_submission_validator_extracts_content_and_gates_on_tool() {
+        use super::run_submission_validator;
+        let proposal = serde_json::json!({
+            "thought_process": "t",
+            "solution_content": "the edits",
+        });
+        let reject = EchoValidator { reject: true };
+        // submit_proposal + rejecting validator → Some(reason), reason IS the
+        // extracted solution_content (proves the field is threaded to the reviewer).
+        assert_eq!(
+            run_submission_validator(&proposal, "submit_proposal", Some(&reject)).await,
+            Some("the edits".to_string())
+        );
+        // A different terminal tool (evaluation) is never validated.
+        assert_eq!(
+            run_submission_validator(&proposal, "submit_batch_evaluation", Some(&reject)).await,
+            None
+        );
+        // No validator injected → accept.
+        assert_eq!(
+            run_submission_validator(&proposal, "submit_proposal", None).await,
+            None
+        );
+        // Validator that accepts → None even for a proposal.
+        let accept = EchoValidator { reject: false };
+        assert_eq!(
+            run_submission_validator(&proposal, "submit_proposal", Some(&accept)).await,
+            None
+        );
+    }
+
     #[test]
     fn force_tool_choice_only_when_schema_and_tools() {
         use super::force_tool_choice;
