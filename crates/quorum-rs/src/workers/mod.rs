@@ -14,7 +14,7 @@ pub mod buffer;
 
 use crate::agents::{
     AgentConfig, AgentContext, AgentHeartbeat, AgentLiveStatus, ChatCapable, NsedAgent,
-    PersistenceStore, ProposalRecord, UserToolHandlerTrait,
+    PersistenceStore, Proposal, ProposalRecord, UserToolHandlerTrait,
 };
 use crate::nats_utils::{NatsAuth, connect_nats, ensure_kv_bucket, sanitize_subject_component};
 use crate::status::{SharedAgentStatus, TaskLogEntry, new_shared_status};
@@ -1645,30 +1645,19 @@ impl NatsNsedWorker {
                 let result = async {
                     match action {
                         "propose" => {
-                            let mut proposal = self.agent.propose(&context).await?;
-                            // on_provider_response hook — transform the proposal
-                            // content before it is serialized / buffered / published.
-                            // NOTE: this runs inside the transient-error retry loop,
-                            // so it re-executes once per LLM attempt — middleware here
-                            // must be idempotent / side-effect-safe across retries.
-                            if self.provider_response_mw.is_some() {
-                                if let Some(new) = self
-                                    .run_stage_mw(
-                                        &self.provider_response_mw,
-                                        "propose",
-                                        &session_id,
-                                        context.round_number,
-                                        crate::middleware::MiddlewareStage::ProviderResponse,
-                                        serde_json::json!(proposal.content),
-                                        serde_json::json!({}),
-                                    )
-                                    .await?
-                                {
-                                    if let Some(c) = new.as_str() {
-                                        proposal.content = c.to_string();
-                                    }
-                                }
-                            }
+                            // propose → provider_response review, with a bounded ReAct
+                            // retry: a reviewer block (e.g. "applied ZERO changes") re-prompts
+                            // the agent with the reason instead of failing the task. The
+                            // provider_response hook runs inside the transient-error retry
+                            // loop too, so middleware here must be idempotent across retries.
+                            let mut proposal = propose_with_react_retry(
+                                &self.agent,
+                                &self.provider_response_mw,
+                                &mut context,
+                                &self.agent_id,
+                                &session_id,
+                            )
+                            .await?;
                             proposal.published_at_ms = chrono::Utc::now().timestamp_millis();
                             serde_json::to_vec(&proposal).map_err(|e| anyhow::anyhow!(e))
                         }
@@ -2436,6 +2425,24 @@ impl Clone for NatsNsedWorker {
     }
 }
 
+/// A middleware `Blocked` verdict surfaced as a typed error so the propose loop
+/// can tell a re-promptable reviewer rejection (e.g. patch-deliberation
+/// "applied ZERO changes") apart from a transport or logic failure. Its `Display`
+/// is kept identical to the pre-typed message so log output is unchanged.
+#[derive(Debug)]
+struct MiddlewareBlocked {
+    category: String,
+    reason: String,
+}
+
+impl std::fmt::Display for MiddlewareBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "middleware blocked ({}): {}", self.category, self.reason)
+    }
+}
+
+impl std::error::Error for MiddlewareBlocked {}
+
 /// Run a middleware pipeline for a hook point and return the (possibly
 /// transformed) `content`, or an `Err` when a middleware blocks. Free fn so it's
 /// unit-testable with a mock pipeline — no worker / NATS needed.
@@ -2463,9 +2470,81 @@ async fn run_stage_pipeline(
     match pipeline.run(&mut ctx).await {
         crate::middleware::pipeline::PipelineResult::Blocked {
             category, reason, ..
-        } => Err(anyhow::anyhow!("middleware blocked ({category}): {reason}")),
+        } => Err(anyhow::Error::new(MiddlewareBlocked { category, reason })),
         _ => Ok(ctx.content),
     }
+}
+
+/// Build the re-prompt task text after a reviewer block: the original task plus
+/// the reviewer's reason and a directive to resubmit a corrected proposal.
+fn react_reprompt(base_task: &str, reason: &str, attempt: u32) -> String {
+    format!(
+        "{base_task}\n\n[Attempt {attempt}: your previous proposal was rejected by the \
+         reviewer:\n{reason}\nRevise and resubmit a corrected proposal that applies real \
+         changes to files.]"
+    )
+}
+
+/// Extra propose attempts a reviewer block earns before the block fails the task.
+const MAX_BLOCK_RETRIES: u32 = 2;
+
+/// Propose, then run the provider-response review; on a [`MiddlewareBlocked`]
+/// verdict re-prompt the agent with the block reason (via [`react_reprompt`])
+/// appended to the task and try again, up to [`MAX_BLOCK_RETRIES`] extra attempts.
+/// Returns the accepted proposal with its content transformed by the review.
+///
+/// A block leaves no commit and a clean worktree (patch-deliberation's guards
+/// return before committing), and its `reset_prior_round` no-ops when HEAD is not
+/// this round's marker — so each re-prompt re-applies from a clean base with no
+/// residue. Non-block errors (transport/logic) propagate immediately for the
+/// caller's transient-retry loop to handle.
+async fn propose_with_react_retry(
+    agent: &Arc<dyn NsedAgent>,
+    provider_response_mw: &Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
+    context: &mut AgentContext,
+    agent_id: &str,
+    session_id: &str,
+) -> Result<Proposal> {
+    let base_task = context.task_description.clone();
+    for attempt in 0..=MAX_BLOCK_RETRIES {
+        let mut proposal = agent.propose(context).await?;
+        let Some(pipeline) = provider_response_mw else {
+            return Ok(proposal); // no reviewer — accept as-is
+        };
+        let reviewed = run_stage_pipeline(
+            pipeline,
+            agent_id,
+            "propose",
+            session_id,
+            context.round_number,
+            crate::middleware::MiddlewareStage::ProviderResponse,
+            serde_json::json!(proposal.content),
+            serde_json::json!({}),
+        )
+        .await;
+        let blocked = match reviewed {
+            Ok(v) => {
+                if let Some(c) = v.as_str() {
+                    proposal.content = c.to_string();
+                }
+                return Ok(proposal);
+            }
+            // A non-block error is not a reviewer rejection — propagate it verbatim.
+            Err(e) => e.downcast::<MiddlewareBlocked>()?,
+        };
+        if attempt == MAX_BLOCK_RETRIES {
+            return Err(anyhow::Error::new(blocked));
+        }
+        warn!(
+            agent = %agent_id,
+            attempt = attempt + 1,
+            max = MAX_BLOCK_RETRIES,
+            reason = %blocked.reason,
+            "provider_response blocked the proposal — re-prompting the agent with the block reason"
+        );
+        context.task_description = react_reprompt(&base_task, &blocked.reason, attempt + 1);
+    }
+    unreachable!("loop returns on accept, non-block error, or the final block")
 }
 
 /// Extract the session id from a result-event subject shaped like
@@ -2883,6 +2962,209 @@ mod tests {
         assert_eq!(out["action"], "job_complete");
         assert_eq!(out["stage"], "JobComplete");
         assert_eq!(out["meta"]["winner"], "AgentA");
+    }
+
+    // --- ReAct reviewer-block retry (propose_with_react_retry) ---
+
+    #[tokio::test]
+    async fn run_stage_pipeline_block_downcasts_to_typed_error() {
+        let p = MiddlewarePipeline::new(vec![Box::new(BlockingMock)]);
+        let e = run_stage_pipeline(
+            &p,
+            "A",
+            "propose",
+            "j",
+            0,
+            MiddlewareStage::ProviderResponse,
+            serde_json::json!("x"),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+        let b = e
+            .downcast_ref::<MiddlewareBlocked>()
+            .expect("a Blocked verdict must surface as a typed MiddlewareBlocked error");
+        assert_eq!(b.category, "mock_block");
+        assert_eq!(b.reason, "rejected by mock middleware");
+    }
+
+    #[test]
+    fn react_reprompt_carries_reason_and_resubmit_directive() {
+        let out = react_reprompt("Solve X", "applied ZERO changes", 1);
+        assert!(out.starts_with("Solve X"), "keeps the original task: {out}");
+        assert!(
+            out.contains("applied ZERO changes"),
+            "carries the reason: {out}"
+        );
+        assert!(out.contains("resubmit"), "directs a resubmit: {out}");
+        assert!(out.contains("Attempt 1"), "labels the attempt: {out}");
+    }
+
+    // Passes only when the proposal content equals `accept`; blocks otherwise.
+    #[derive(Debug)]
+    struct AcceptOnlyMock {
+        accept: String,
+    }
+    #[async_trait::async_trait]
+    impl AgentMiddleware for AcceptOnlyMock {
+        async fn execute(&self, ctx: &MiddlewareContext) -> MiddlewareVerdict {
+            if ctx.content.as_str() == Some(self.accept.as_str()) {
+                MiddlewareVerdict::pass()
+            } else {
+                MiddlewareVerdict::block("mock_block", "applied ZERO changes")
+            }
+        }
+        fn name(&self) -> &str {
+            "accept-only-mock"
+        }
+        fn stages(&self) -> Vec<MiddlewareStage> {
+            all_stages()
+        }
+    }
+
+    // Returns "good" once the task carries the reviewer feedback, "bad" before it;
+    // counts propose calls so a test can assert the number of attempts.
+    #[derive(Debug, Clone)]
+    struct ScriptedAgent {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl NsedAgent for ScriptedAgent {
+        async fn propose(&self, ctx: &AgentContext) -> Result<Proposal> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let content = if ctx.task_description.contains("rejected by the") {
+                "good"
+            } else {
+                "bad"
+            };
+            Ok(Proposal {
+                content: content.to_string(),
+                ..Default::default()
+            })
+        }
+        async fn evaluate(
+            &self,
+            _ctx: &AgentContext,
+        ) -> Result<Vec<(String, crate::agents::Evaluation)>> {
+            unreachable!("evaluate not exercised")
+        }
+        fn name(&self) -> String {
+            "scripted".to_string()
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ErrAgent;
+    #[async_trait::async_trait]
+    impl NsedAgent for ErrAgent {
+        async fn propose(&self, _ctx: &AgentContext) -> Result<Proposal> {
+            Err(anyhow::anyhow!("connection reset"))
+        }
+        async fn evaluate(
+            &self,
+            _ctx: &AgentContext,
+        ) -> Result<Vec<(String, crate::agents::Evaluation)>> {
+            unreachable!("evaluate not exercised")
+        }
+        fn name(&self) -> String {
+            "err".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn react_retry_reprompts_then_succeeds() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent: Arc<dyn NsedAgent> = Arc::new(ScriptedAgent {
+            calls: calls.clone(),
+        });
+        let mw = Some(Arc::new(MiddlewarePipeline::new(vec![Box::new(
+            AcceptOnlyMock {
+                accept: "good".to_string(),
+            },
+        )])));
+        let mut ctx = AgentContext {
+            task_description: "Solve X".to_string(),
+            ..Default::default()
+        };
+        let p = propose_with_react_retry(&agent, &mw, &mut ctx, "AgentA", "job1")
+            .await
+            .expect("second attempt must be accepted");
+        assert_eq!(p.content, "good", "accepted proposal is the corrected one");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one re-prompt: propose called twice"
+        );
+        assert!(
+            ctx.task_description.contains("applied ZERO changes"),
+            "task_description carries the block reason on the retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn react_retry_exhausts_and_returns_blocked() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent: Arc<dyn NsedAgent> = Arc::new(ScriptedAgent {
+            calls: calls.clone(),
+        });
+        // Accepts only "never", which the agent never produces → every attempt blocks.
+        let mw = Some(Arc::new(MiddlewarePipeline::new(vec![Box::new(
+            AcceptOnlyMock {
+                accept: "never".to_string(),
+            },
+        )])));
+        let mut ctx = AgentContext {
+            task_description: "Solve X".to_string(),
+            ..Default::default()
+        };
+        let e = propose_with_react_retry(&agent, &mw, &mut ctx, "AgentA", "job1")
+            .await
+            .unwrap_err();
+        assert!(
+            e.downcast_ref::<MiddlewareBlocked>().is_some(),
+            "exhausted retries surface the typed block error"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            (MAX_BLOCK_RETRIES + 1) as usize,
+            "one initial attempt + MAX_BLOCK_RETRIES re-prompts"
+        );
+    }
+
+    #[tokio::test]
+    async fn react_retry_propagates_non_block_propose_error() {
+        let agent: Arc<dyn NsedAgent> = Arc::new(ErrAgent);
+        let mw = Some(Arc::new(MiddlewarePipeline::new(vec![Box::new(
+            AcceptOnlyMock {
+                accept: "good".to_string(),
+            },
+        )])));
+        let mut ctx = AgentContext::default();
+        let e = propose_with_react_retry(&agent, &mw, &mut ctx, "AgentA", "job1")
+            .await
+            .unwrap_err();
+        assert!(
+            e.downcast_ref::<MiddlewareBlocked>().is_none(),
+            "a transport/logic error must NOT be treated as a reviewer block"
+        );
+        assert!(e.to_string().contains("connection reset"));
+    }
+
+    #[tokio::test]
+    async fn react_retry_passes_through_without_provider_mw() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent: Arc<dyn NsedAgent> = Arc::new(ScriptedAgent {
+            calls: calls.clone(),
+        });
+        let mut ctx = AgentContext::default();
+        let p = propose_with_react_retry(&agent, &None, &mut ctx, "AgentA", "job1")
+            .await
+            .unwrap();
+        assert_eq!(
+            p.content, "bad",
+            "no reviewer → first proposal accepted as-is"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -26,6 +26,20 @@ Each middleware returns one of three verdicts:
 | `warn` | Proceed but annotate for audit trail |
 | `block` | Reject — entry stays in buffer, API returns 422 |
 
+### ReAct retry on a `on_provider_response` block
+
+A `block` at the `on_provider_response` stage of a **propose** task is not fatal:
+the worker re-prompts the agent with the block reason appended to the task and
+tries again, up to `MAX_BLOCK_RETRIES` (2) extra attempts. This lets a reviewer
+(e.g. patch-deliberation rejecting a proposal that applies **zero** changes) hand
+the agent actionable feedback instead of failing the whole round.
+
+The retry is transactional: a block leaves no commit and a clean worktree
+(patch-deliberation's guards return before committing), so each re-prompt
+re-applies from a clean base. Only after the extra attempts are exhausted does the
+block surface as a task error. Non-block errors (transport, logic) propagate at
+once to the transient-retry loop.
+
 ## Configuration
 
 ```yaml
