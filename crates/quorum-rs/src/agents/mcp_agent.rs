@@ -1693,6 +1693,19 @@ impl ClaudeAgent {
 
         let spawn_instant = std::time::Instant::now();
 
+        // Opt-in prompt dump (NSED_DUMP_PROMPTS_DIR) — the exact CLI invocation +
+        // stdin prompt, for token-efficiency analysis. Best-effort; spawn unchanged.
+        crate::dump_prompts::dump(
+            &crate::dump_prompts::Meta {
+                agent: &self.name,
+                round: Some(ctx.round_number),
+                phase: Some(phase),
+            },
+            "claude",
+            "txt",
+            &crate::dump_prompts::render_claude(command, prompt),
+        );
+
         let mut cmd = Command::new(&command[0]);
         cmd.args(&command[1..]);
         if let Some(feedback) = retry_feedback {
