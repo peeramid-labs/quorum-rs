@@ -1108,6 +1108,16 @@ impl NsedAgent for ProposerEvaluatorAgent {
             &context.user_injections,
             context.structured_feedback.as_ref(),
         );
+        // Dynamic round + phase go in the user message; the system message is static
+        // for prompt-cache reuse.
+        let prompt = format!(
+            "{}{prompt}",
+            self.prompt_set.get_turn_header(
+                context.round_number as usize,
+                context.total_rounds as usize,
+                context.phase,
+            )
+        );
 
         // A `before_prompt` middleware may constrain the submission to its own
         // JSON schema (structured output); otherwise the default thought/solution.
@@ -1307,6 +1317,15 @@ impl NsedAgent for ProposerEvaluatorAgent {
             context.previous_own_proposal.as_ref(),
             context.round_number as usize,
             &context.user_injections,
+        );
+        // Dynamic round + phase → user message (static system prompt for cache reuse).
+        let prompt = format!(
+            "{}{prompt}",
+            self.prompt_set.get_turn_header(
+                context.round_number as usize,
+                context.total_rounds as usize,
+                context.phase,
+            )
         );
 
         let all_tools = self.aggregate_tools(context);

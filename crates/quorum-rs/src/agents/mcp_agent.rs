@@ -965,55 +965,39 @@ impl ClaudeAgent {
             }
         }
 
-        // Always inject phase-specific system prompts and tool instructions —
-        // even on resumed sessions — because the phase_tag (nsed_propose /
-        // nsed_evaluate) changes per call, and round numbers advance. Without
-        // re-injecting, resumed sessions would keep the original phase's
-        // tools in their system prompt and call the wrong nsed_* tool.
-        // Static, expensive inputs (context files) stay gated on `resumed`.
-        {
-            // NSED system message (role context, round info)
+        // System prompt is set ONCE, on the fresh spawn, and NOTHING is appended on
+        // resume — so the resumed session's system-prompt prefix stays byte-identical
+        // and the KV / prompt cache is reused instead of re-billed every turn. The
+        // system message is static (both phases' strategies + both tool names); the
+        // per-turn round + phase + which-tool go in the user prompt (`get_turn_header`,
+        // prepended below), so re-injecting on resume is no longer needed.
+        if !resumed {
             let system_msg = self.prompt_set.get_system_message(
                 &self.name,
                 ctx.round_number as usize,
                 ctx.total_rounds as usize,
                 ctx.phase,
             );
-            // On fresh sessions, set as the base system prompt; on resumed
-            // sessions, append so we don't clobber Claude's persistent context.
-            if resumed {
-                command.extend(["--append-system-prompt".into(), system_msg]);
-            } else {
-                command.extend(["--system-prompt".into(), system_msg]);
-            }
+            command.extend(["--system-prompt".into(), system_msg]);
 
-            // MCP tool usage instructions (phase-specific tool name)
-            let phase_tag = ctx.phase.as_str();
-            let tool_instructions = format!(
-                "<tool_instructions>\n\
+            // MCP tool usage — static: names both submit tools; the user message
+            // states the current phase's tool.
+            let tool_instructions = "<tool_instructions>\n\
                  You have access to NSED deliberation tools via MCP.\n\
                  - Call `nsed_get_context` to retrieve the full deliberation context.\n\
-                 - You MUST call `nsed_{phase_tag}` to submit your result. \
+                 - Submit your result with the tool for the CURRENT phase (named at the top of \
+                 the user message): `nsed_propose` when Proposing, `nsed_evaluate` when Evaluating. \
                  This is the ONLY way to deliver your output. Do NOT just print text.\n\
                  - Your response is NOT captured from stdout — only the tool call result counts.\n\
                  </tool_instructions>"
-            );
+                .to_string();
             command.extend(["--append-system-prompt".into(), tool_instructions]);
 
-            // Persona + user override are static per-agent, so they only need
-            // to enter the Claude session on the initial fresh spawn — they
-            // persist across resumes automatically. Re-appending on every
-            // resumed call would waste context tokens.
-            if !resumed {
-                // Persona appended to system prompt
-                if let Some(ref persona) = self.agent_config.persona {
-                    command.extend(["--append-system-prompt".into(), persona.clone()]);
-                }
-
-                // User-level system prompt override (appended, not replacing NSED prompt)
-                if let Some(ref sp) = self.agent_config.system_prompt_override {
-                    command.extend(["--append-system-prompt".into(), sp.clone()]);
-                }
+            if let Some(ref persona) = self.agent_config.persona {
+                command.extend(["--append-system-prompt".into(), persona.clone()]);
+            }
+            if let Some(ref sp) = self.agent_config.system_prompt_override {
+                command.extend(["--append-system-prompt".into(), sp.clone()]);
             }
         }
 
@@ -2688,6 +2672,16 @@ impl NsedAgent for ClaudeAgent {
             context.structured_feedback.as_ref(),
         );
 
+        // Dynamic per-turn state lives in the user message (the system prompt is
+        // static for cache reuse) — prepend it to both the delta and full prompts.
+        let turn = self.prompt_set.get_turn_header(
+            context.round_number as usize,
+            context.total_rounds as usize,
+            context.phase,
+        );
+        let prompt = format!("{turn}{prompt}");
+        let full_prompt = format!("{turn}{full_prompt}");
+
         let mcp_result = self
             .run_phase_with_rate_limit_retry("propose", &prompt, &full_prompt, context)
             .await?;
@@ -2727,6 +2721,15 @@ impl NsedAgent for ClaudeAgent {
             context.round_number as usize,
             &context.user_injections,
         );
+
+        // Per-turn state → user message (static system prompt for cache reuse).
+        let turn = self.prompt_set.get_turn_header(
+            context.round_number as usize,
+            context.total_rounds as usize,
+            context.phase,
+        );
+        let prompt = format!("{turn}{prompt}");
+        let full_prompt = format!("{turn}{full_prompt}");
 
         let mcp_result = self
             .run_phase_with_rate_limit_retry("evaluate", &prompt, &full_prompt, context)
@@ -3588,21 +3591,21 @@ mod tests {
         assert!(cmd.contains(&"--print".to_string()));
         assert!(cmd.contains(&"--model".to_string()));
         assert!(cmd.contains(&"--permission-mode".to_string()));
-        // Resumed: no base --system-prompt (Claude's persistent context holds
-        // the original), but phase-specific instructions are appended each
-        // call so the correct nsed_propose/nsed_evaluate tool is advertised.
+        // Resumed: nothing is (re)added to the system prompt — neither the base
+        // --system-prompt nor any --append-system-prompt. The original static system
+        // prompt persists in the session, so the prefix stays byte-identical every
+        // turn (cache reuse). Per-turn phase/tool now rides the user message.
         assert!(
             !cmd.contains(&"--system-prompt".to_string()),
-            "resumed session should not include --system-prompt"
+            "resumed session should not re-send --system-prompt"
         );
         assert!(
-            cmd.contains(&"--append-system-prompt".to_string()),
-            "resumed session should include --append-system-prompt for phase-specific tool instructions"
+            !cmd.contains(&"--append-system-prompt".to_string()),
+            "resumed session must NOT append to the system prompt (cache-stable prefix)"
         );
-        // Confirm tool_instructions block is appended
         assert!(
-            cmd.iter().any(|s| s.contains("<tool_instructions>")),
-            "resumed session should include tool_instructions block"
+            !cmd.iter().any(|s| s.contains("<tool_instructions>")),
+            "resumed session must not re-inject tool_instructions"
         );
         assert!(
             cmd.contains(&"--resume".to_string()),
@@ -4607,19 +4610,20 @@ mod tests {
             "user override should be in --append-system-prompt"
         );
 
-        // Resumed session: no base --system-prompt (persistent context holds
-        // it), and user override is NOT re-appended (static per-agent, it
-        // already lives in the persisted Claude session from the fresh
-        // spawn). Only phase-specific tool_instructions are re-appended.
+        // Resumed session: nothing is re-added to the system prompt at all — no base
+        // --system-prompt and no --append-system-prompt. The static system prompt
+        // (persona, override, tool_instructions) persists from the fresh spawn, so
+        // the prefix stays byte-identical for cache reuse; per-turn state rides the
+        // user message.
         let (cmd_r, _) = agent.build_command(&ctx, &dummy_mcp_config());
         assert!(!cmd_r.contains(&"--system-prompt".to_string()));
         assert!(
-            cmd_r.contains(&"--append-system-prompt".to_string()),
-            "resumed session still appends phase-specific tool_instructions"
+            !cmd_r.contains(&"--append-system-prompt".to_string()),
+            "resumed session must not append to the system prompt (cache-stable prefix)"
         );
         assert!(
             !cmd_r.contains(&"You are a reviewer".to_string()),
-            "user override should not be re-appended on resumed sessions (already in persistent context)"
+            "user override not re-appended on resume (already in persistent context)"
         );
     }
 

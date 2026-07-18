@@ -20,6 +20,9 @@ use crate::agents::{
 /// to be injected into an agent.
 pub trait PromptSet: Send + Sync + Debug + DynClone {
     /// Returns the general system message that sets the agent's overall context.
+    /// Implementations MUST keep this static across a session (no per-turn round /
+    /// phase) so the system-prompt prefix stays cache-stable; the dynamic per-turn
+    /// state belongs in [`PromptSet::get_turn_header`], prepended to the user message.
     fn get_system_message(
         &self,
         agent_name: &str,
@@ -27,6 +30,30 @@ pub trait PromptSet: Send + Sync + Debug + DynClone {
         round_numbers: usize,
         phase: DeliberationPhase,
     ) -> String;
+
+    /// The dynamic per-turn header prepended to the user message: the current round,
+    /// the phase, and the tool to call, pointing back to the static `<strategy>`
+    /// block in the system prompt. Kept OUT of the system message so that prefix
+    /// stays byte-identical every turn (KV / prompt-cache reuse).
+    fn get_turn_header(
+        &self,
+        current_round: usize,
+        round_numbers: usize,
+        phase: DeliberationPhase,
+    ) -> String {
+        let (label, strategy, tool) = match phase {
+            DeliberationPhase::Proposing => ("Proposing", "proposing", "nsed_propose"),
+            DeliberationPhase::Evaluating => ("Evaluating", "evaluating", "nsed_evaluate"),
+            DeliberationPhase::ConsensusCheck => ("Consensus Check", "evaluating", "nsed_evaluate"),
+        };
+        format!(
+            "<turn>\n\
+             Round {current_round} of {round_numbers}. Phase: {label}.\n\
+             Follow the `<strategy phase=\"{strategy}\">` block in your system prompt and \
+             submit your result via `{tool}`.\n\
+             </turn>\n\n"
+        )
+    }
 
     /// Returns the prompt for the Proposer module.
     ///
