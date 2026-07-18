@@ -1631,6 +1631,18 @@ impl NatsNsedWorker {
             }
         }
 
+        // Inject the reviewer as the react loop's submission validator so a
+        // provider_response block (e.g. patch-deliberation "applied ZERO changes")
+        // re-prompts the agent in-loop, reusing the loop's own retry budget instead
+        // of a second one. Proposals only — evaluations have no provider_response.
+        context.submission_validator = build_submission_validator(
+            action,
+            &self.provider_response_mw,
+            &self.agent_id,
+            &session_id,
+            context.round_number,
+        );
+
         let task_start = Instant::now();
         // Retry loop for transient transport errors (broken pipe, connection reset, etc.).
         // Wraps the full propose/evaluate call because the SDK cannot pinpoint where inside
@@ -1645,12 +1657,12 @@ impl NatsNsedWorker {
                 let result = async {
                     match action {
                         "propose" => {
+                            // The agent's react loop already validated the submission via
+                            // the injected `submission_validator` (a reviewer block re-prompts
+                            // in-loop, reusing its retry budget). This provider_response call
+                            // is the accepted proposal's commit + content transform; it is
+                            // idempotent (self-cleaning) with the in-loop validation run.
                             let mut proposal = self.agent.propose(&context).await?;
-                            // on_provider_response hook — transform the proposal
-                            // content before it is serialized / buffered / published.
-                            // NOTE: this runs inside the transient-error retry loop,
-                            // so it re-executes once per LLM attempt — middleware here
-                            // must be idempotent / side-effect-safe across retries.
                             if self.provider_response_mw.is_some() {
                                 if let Some(new) = self
                                     .run_stage_mw(
@@ -2436,6 +2448,24 @@ impl Clone for NatsNsedWorker {
     }
 }
 
+/// A middleware `Blocked` verdict surfaced as a typed error so the propose loop
+/// can tell a re-promptable reviewer rejection (e.g. patch-deliberation
+/// "applied ZERO changes") apart from a transport or logic failure. Its `Display`
+/// is kept identical to the pre-typed message so log output is unchanged.
+#[derive(Debug)]
+struct MiddlewareBlocked {
+    category: String,
+    reason: String,
+}
+
+impl std::fmt::Display for MiddlewareBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "middleware blocked ({}): {}", self.category, self.reason)
+    }
+}
+
+impl std::error::Error for MiddlewareBlocked {}
+
 /// Run a middleware pipeline for a hook point and return the (possibly
 /// transformed) `content`, or an `Err` when a middleware blocks. Free fn so it's
 /// unit-testable with a mock pipeline — no worker / NATS needed.
@@ -2463,8 +2493,68 @@ async fn run_stage_pipeline(
     match pipeline.run(&mut ctx).await {
         crate::middleware::pipeline::PipelineResult::Blocked {
             category, reason, ..
-        } => Err(anyhow::anyhow!("middleware blocked ({category}): {reason}")),
+        } => Err(anyhow::Error::new(MiddlewareBlocked { category, reason })),
         _ => Ok(ctx.content),
+    }
+}
+
+/// Adapts the `provider_response` middleware into a [`SubmissionValidator`] the
+/// agent's react loop runs on each `submit_proposal`. It runs the pipeline on the
+/// proposal content and maps a [`MiddlewareBlocked`] verdict to the reason string
+/// the loop feeds back to the model; a pass (or non-block error) returns `None`
+/// (accept). The pipeline run is idempotent (patch-deliberation self-cleans the
+/// worktree), so running it here per attempt AND once more for the accepted
+/// proposal's commit/transform composes correctly.
+#[derive(Debug)]
+struct MiddlewareSubmissionValidator {
+    pipeline: Arc<crate::middleware::pipeline::MiddlewarePipeline>,
+    agent_id: String,
+    session_id: String,
+    round: u32,
+}
+
+/// Build the react loop's submission validator for a task: a reviewer wrapping the
+/// `provider_response` pipeline, but only for `propose` (evaluations have no
+/// provider_response) and only when a pipeline is configured — else `None`.
+fn build_submission_validator(
+    action: &str,
+    provider_response_mw: &Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
+    agent_id: &str,
+    session_id: &str,
+    round: u32,
+) -> Option<Arc<dyn crate::agents::SubmissionValidator>> {
+    if action != "propose" {
+        return None;
+    }
+    let pipeline = provider_response_mw.clone()?;
+    Some(Arc::new(MiddlewareSubmissionValidator {
+        pipeline,
+        agent_id: agent_id.to_string(),
+        session_id: session_id.to_string(),
+        round,
+    }))
+}
+
+#[async_trait::async_trait]
+impl crate::agents::SubmissionValidator for MiddlewareSubmissionValidator {
+    async fn validate(&self, content: &str) -> Option<String> {
+        match run_stage_pipeline(
+            &self.pipeline,
+            &self.agent_id,
+            "propose",
+            &self.session_id,
+            self.round,
+            crate::middleware::MiddlewareStage::ProviderResponse,
+            serde_json::json!(content),
+            serde_json::json!({}),
+        )
+        .await
+        {
+            Err(e) => e
+                .downcast_ref::<MiddlewareBlocked>()
+                .map(|b| b.reason.clone()),
+            Ok(_) => None,
+        }
     }
 }
 
@@ -2883,6 +2973,83 @@ mod tests {
         assert_eq!(out["action"], "job_complete");
         assert_eq!(out["stage"], "JobComplete");
         assert_eq!(out["meta"]["winner"], "AgentA");
+    }
+
+    // --- ReAct reviewer-block retry (propose_with_react_retry) ---
+
+    #[tokio::test]
+    async fn run_stage_pipeline_block_downcasts_to_typed_error() {
+        let p = MiddlewarePipeline::new(vec![Box::new(BlockingMock)]);
+        let e = run_stage_pipeline(
+            &p,
+            "A",
+            "propose",
+            "j",
+            0,
+            MiddlewareStage::ProviderResponse,
+            serde_json::json!("x"),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+        let b = e
+            .downcast_ref::<MiddlewareBlocked>()
+            .expect("a Blocked verdict must surface as a typed MiddlewareBlocked error");
+        assert_eq!(b.category, "mock_block");
+        assert_eq!(b.reason, "rejected by mock middleware");
+    }
+
+    use crate::agents::SubmissionValidator;
+
+    #[tokio::test]
+    async fn submission_validator_maps_block_to_reason() {
+        let v = MiddlewareSubmissionValidator {
+            pipeline: Arc::new(MiddlewarePipeline::new(vec![Box::new(BlockingMock)])),
+            agent_id: "AgentA".to_string(),
+            session_id: "job1".to_string(),
+            round: 0,
+        };
+        assert_eq!(
+            v.validate("anything").await.as_deref(),
+            Some("rejected by mock middleware"),
+            "a Blocked verdict surfaces its reason for the react loop to feed back"
+        );
+    }
+
+    #[test]
+    fn build_submission_validator_only_for_propose_with_pipeline() {
+        let mw = Some(Arc::new(MiddlewarePipeline::new(vec![Box::new(
+            BlockingMock,
+        )])));
+        assert!(
+            build_submission_validator("propose", &mw, "A", "j", 0).is_some(),
+            "propose + configured pipeline → a validator"
+        );
+        assert!(
+            build_submission_validator("evaluate", &mw, "A", "j", 0).is_none(),
+            "evaluations have no provider_response → no validator"
+        );
+        assert!(
+            build_submission_validator("propose", &None, "A", "j", 0).is_none(),
+            "no pipeline configured → no validator"
+        );
+    }
+
+    #[tokio::test]
+    async fn submission_validator_passes_clean_content() {
+        let v = MiddlewareSubmissionValidator {
+            pipeline: Arc::new(MiddlewarePipeline::new(vec![Box::new(ContentReplaceMock(
+                serde_json::json!("transformed"),
+            ))])),
+            agent_id: "AgentA".to_string(),
+            session_id: "job1".to_string(),
+            round: 0,
+        };
+        assert_eq!(
+            v.validate("ok").await,
+            None,
+            "a passing pipeline accepts the submission (None)"
+        );
     }
 
     #[test]
