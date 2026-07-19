@@ -143,6 +143,13 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn run(cmd: &mut Command) -> Result<String> {
+    // Clear inherited git env so every op targets the replica by path, never an
+    // ambient `GIT_DIR`. `GIT_DIR` overrides `-C`, so without this a caller running
+    // under a git hook (GIT_DIR set) — or a test in a pre-commit run — would operate
+    // on the wrong repo (e.g. `init --bare` reinitialising it as bare).
+    cmd.env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE");
     let out = cmd.output()?;
     if !out.status.success() {
         bail!(
@@ -196,7 +203,12 @@ mod tests {
     }
 
     fn g(dir: &Path, args: &[&str]) {
+        // Same git-env isolation as `run` — a pre-commit test run inherits GIT_DIR,
+        // which would override `-C` and hit the real repo.
         let o = Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -207,6 +219,19 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&o.stderr)
         );
+    }
+
+    fn rev(dir: &Path) -> String {
+        let o = Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
     }
 
     #[test]
@@ -233,15 +258,7 @@ mod tests {
         g(&work, &["add", "-A"]);
         g(&work, &["commit", "-qm", "A"]);
         g(&work, &["push", "-q", "origin", "main"]);
-        let a = {
-            let o = Command::new("git")
-                .arg("-C")
-                .arg(&work)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        };
+        let a = rev(&work);
 
         // Client replica: clone from origin, land at A.
         let r = replica("proj", &origin, &sbx.join("replica"));
@@ -255,15 +272,7 @@ mod tests {
         g(&work, &["add", "-A"]);
         g(&work, &["commit", "-qm", "B"]);
         g(&work, &["push", "-q", "origin", "main"]);
-        let b = {
-            let o = Command::new("git")
-                .arg("-C")
-                .arg(&work)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        };
+        let b = rev(&work);
 
         let synced = r.on_event(&adv("proj", Some(&b))).unwrap();
         assert_eq!(synced.as_deref(), Some(b.as_str()), "on_event pulled to B");
