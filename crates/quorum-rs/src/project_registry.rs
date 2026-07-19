@@ -52,6 +52,25 @@ impl ProjectAdvertisement {
     }
 }
 
+/// The NATS subject + payload for a `project_advanced` signal carried in a
+/// `job_complete` verdict content — the "epic advanced, pull now" notification a
+/// worker republishes so clients holding the project sync. Subject:
+/// `<prefix>.project.<project_id>.advanced`, payload = the `{project_id, head}` object.
+/// `None` when the content carries no `project_advanced` (an ordinary completion).
+pub fn advanced_notification(
+    content: &serde_json::Value,
+    subject_prefix: &str,
+) -> Option<(String, Vec<u8>)> {
+    let adv = content.get("project_advanced")?;
+    let project_id = adv.get("project_id").and_then(|v| v.as_str())?;
+    if project_id.is_empty() {
+        return None;
+    }
+    let subject = format!("{subject_prefix}.project.{project_id}.advanced");
+    let payload = serde_json::to_vec(adv).ok()?;
+    Some((subject, payload))
+}
+
 /// A registered holder of a project, with the last time it was seen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectAgent {
@@ -221,6 +240,27 @@ mod tests {
         // No project_id (non-patch-deliberation turn) → nothing to advertise.
         let none = serde_json::json!({"task_description": "just a prompt"});
         assert!(ProjectAdvertisement::from_verdict(&none, "A", None).is_none());
+    }
+
+    #[test]
+    fn advanced_notification_builds_subject_and_payload() {
+        let content = serde_json::json!({
+            "project_advanced": { "project_id": "root-sha", "head": "head-sha" }
+        });
+        let (subject, payload) = advanced_notification(&content, "nsed").unwrap();
+        assert_eq!(subject, "nsed.project.root-sha.advanced");
+        let back: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(back["head"], "head-sha");
+        assert_eq!(back["project_id"], "root-sha");
+        // Ordinary completion (no signal) / empty id → nothing to publish.
+        assert!(advanced_notification(&serde_json::json!({"note": "ok"}), "nsed").is_none());
+        assert!(
+            advanced_notification(
+                &serde_json::json!({"project_advanced": {"project_id": ""}}),
+                "nsed"
+            )
+            .is_none()
+        );
     }
 
     #[test]

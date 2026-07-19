@@ -1156,7 +1156,7 @@ impl NatsNsedWorker {
 
         let session_id = session_id_from_subject(msg.subject.as_str(), &self.config.subject_prefix);
         let (content, meta) = job_complete_payload(&event);
-        if let Err(e) = self
+        match self
             .run_stage_mw(
                 &self.job_complete_mw,
                 "job_complete",
@@ -1168,7 +1168,28 @@ impl NatsNsedWorker {
             )
             .await
         {
-            warn!(agent_id = %self.agent_id, error = %e, "on_job_complete middleware error");
+            // A clean winner consensus surfaces `project_advanced {project_id, head}`
+            // in the verdict content — republish it as the "epic advanced, pull now"
+            // notification so clients holding the project sync.
+            Ok(Some(verdict_content)) => {
+                if let Some((subject, payload)) = crate::project_registry::advanced_notification(
+                    &verdict_content,
+                    &self.config.subject_prefix,
+                ) {
+                    match self.nats.publish(subject.clone(), payload.into()).await {
+                        Ok(()) => {
+                            tracing::debug!(agent_id = %self.agent_id, subject = %subject, "published project_advanced")
+                        }
+                        Err(e) => {
+                            warn!(agent_id = %self.agent_id, subject = %subject, error = %e, "failed to publish project_advanced")
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(agent_id = %self.agent_id, error = %e, "on_job_complete middleware error")
+            }
         }
         Ok(())
     }
