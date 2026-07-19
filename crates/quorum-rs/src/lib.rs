@@ -44,6 +44,7 @@ pub mod multi_agent;
 pub mod nats_utils;
 pub mod orchestrator_registry;
 pub mod project_registry;
+pub mod project_sync;
 pub mod prompts;
 pub mod providers;
 pub mod scheduling;
