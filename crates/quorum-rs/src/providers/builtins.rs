@@ -95,6 +95,19 @@ impl ProviderFactory for McpFactory {
     }
 }
 
+/// Detect the silent model-override trap: `claude.model` set to something other
+/// than a non-empty `model_name`. Returns the `(claude_model, model_name)` pair to
+/// warn about, or `None` when there is no ambiguity. Pure, so it's unit-testable.
+fn model_field_conflict<'a>(
+    claude_model: Option<&'a str>,
+    model_name: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    match claude_model {
+        Some(m) if !model_name.is_empty() && model_name != m => Some((m, model_name)),
+        _ => None,
+    }
+}
+
 /// `claude` — Claude Code CLI subprocess.
 ///
 /// Config resolution — also the reference for the generic
@@ -128,6 +141,19 @@ impl ProviderFactory for ClaudeFactory {
                 })?,
             None => ClaudeProviderConfig::default(),
         };
+        // Disambiguate the two model fields: `claude.model` wins, `model_name` is the
+        // fallback. A silent divergence (e.g. `model_name: haiku` shadowed by
+        // `claude.model: opus`) is a config trap — surface it loudly.
+        if let Some((claude_model, model_name)) =
+            model_field_conflict(claude_cfg.model.as_deref(), &agent_config.model_name)
+        {
+            tracing::warn!(
+                agent = %agent_config.name,
+                %claude_model,
+                %model_name,
+                "claude.model overrides model_name — model_name is IGNORED for this claude agent; set them equal or drop one to resolve the ambiguity"
+            );
+        }
         Ok(Some(Arc::new(ClaudeAgent::new(
             agent_config.clone(),
             claude_cfg,
@@ -214,6 +240,21 @@ impl ProviderFactory for OpenAiCompatibleFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_field_conflict_flags_only_a_silent_override() {
+        // Both set + differ → the trap (haiku shadowed by opus).
+        assert_eq!(
+            model_field_conflict(Some("opus"), "haiku"),
+            Some(("opus", "haiku"))
+        );
+        // Equal → no ambiguity.
+        assert_eq!(model_field_conflict(Some("haiku"), "haiku"), None);
+        // claude.model unset → model_name is authoritative, no conflict.
+        assert_eq!(model_field_conflict(None, "haiku"), None);
+        // model_name empty → nothing to shadow.
+        assert_eq!(model_field_conflict(Some("opus"), ""), None);
+    }
 
     #[test]
     fn resolve_openai_base_url_rules() {

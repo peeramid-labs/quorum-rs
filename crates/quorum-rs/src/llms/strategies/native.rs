@@ -284,6 +284,19 @@ impl ChatStrategy for NativeStrategy {
             debug!("NativeStrategy Prepared Body: {}", v);
         }
 
+        // Opt-in request dump (NSED_DUMP_PROMPTS_DIR) — the final Chat Completions
+        // request JSON as sent, for token-efficiency analysis. Best-effort.
+        crate::dump_prompts::dump(
+            &crate::dump_prompts::Meta {
+                agent: &agent.name,
+                round: None,
+                phase: None,
+            },
+            self.engine.as_deref().unwrap_or("openai"),
+            "json",
+            &serde_json::to_string_pretty(&v).unwrap_or_default(),
+        );
+
         Ok(v)
     }
 

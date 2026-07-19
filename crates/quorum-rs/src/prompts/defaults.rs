@@ -68,19 +68,19 @@ impl DefaultPromptSet {
 }
 
 impl PromptSet for DefaultPromptSet {
+    // The system message is deliberately 100% static across a session: the current
+    // round + phase (the only per-turn variance) are NOT here — they go at the top of
+    // each user message (`get_turn_header`). This keeps the system-prompt prefix
+    // byte-identical every turn so the KV / prompt cache is reused instead of
+    // re-billed. `round_numbers` (total rounds) is fixed for a session, so it is
+    // safe to keep; `_current_round` / `_phase` are ignored on purpose.
     fn get_system_message(
         &self,
         agent_name: &str,
-        current_round: usize,
+        _current_round: usize,
         round_numbers: usize,
-        phase: DeliberationPhase,
+        _phase: DeliberationPhase,
     ) -> String {
-        let role_description = match phase {
-            DeliberationPhase::Proposing => "Proposing",
-            DeliberationPhase::Evaluating => "Evaluating",
-            DeliberationPhase::ConsensusCheck => "Consensus Check",
-        };
-
         let mut message = String::new();
 
         // 1. Context & Goal
@@ -106,41 +106,36 @@ impl PromptSet for DefaultPromptSet {
         }
         message.push_str("</identity>\n");
 
-        // 3. Protocol & Rules
+        // 3. Protocol & Rules — structure only. The current round + phase are stated
+        //    at the top of each user message (see `get_turn_header`), keeping this
+        //    prefix static; follow the `<strategy>` block matching the phase named there.
         message.push_str(&format!(
             "\n<protocol>\n\
-            - **Structure**: The deliberation has {round_numbers} rounds. Each round has two phases: Proposing (submit solution) and Evaluating (critique peers).\n\
-            - **Current Status**: Round {current_round} of {round_numbers}. Phase: {role_description}.\n\
+            - **Structure**: The deliberation has {round_numbers} rounds. Each round has two phases: Proposing (submit a solution via `nsed_propose`) and Evaluating (critique peers via `nsed_evaluate`).\n\
+            - **Your current round and phase are stated at the top of each user message** — follow the matching `<strategy>` block below and call the tool named there.\n\
             </protocol>\n"
         ));
 
-        // 4. PHASE-SPECIFIC STRATEGY
-        match phase {
-            DeliberationPhase::Proposing => {
-                message.push_str(
-                    "\n<strategy phase=\"proposing\">\n\
-                    1. **Plan First**: You MUST write your plan to the scratchpad before solving.\n\
-                    2. **Step-by-Step**: Solve incrementally. Verify intermediate results.\n\
-                    3. **Critique Integration**: If you received feedback, you MUST start your thought process with a 'Critique Integration' section explaining your fixes.\n\
-                    </strategy>\n"
-                );
-            }
-            DeliberationPhase::Evaluating => {
-                message.push_str(
-                    "\n<strategy phase=\"evaluating\">\n\
-                    You are a Judge. Your default stance is SKEPTICISM. Do not be sycophantic.\n\
-                    Use the Vector Alignment protocol:\n\
-                    1. **Decompose**: Break each candidate's argument into discrete claims. Identify the 2-3 claims that most determine correctness.\n\
-                    2. **Anchor**: Trust your own solution unless proven wrong.\n\
-                    3. **Delta**: Identify EXACTLY where a peer diverges from you on those pivotal claims.\n\
-                    4. **Verification**: Verify ONLY the divergent claims. If they are wrong, reject them ruthlessly. If they are right, accept the correction.\n\
-                    5. **Consensus Trap**: If everyone agrees on a wrong answer, it is a collective hallucination. Be the one who spots the error.\n\
-                    6. **Harsh Scoring**: Penalize unverified claims. Agreement without verification is worth 0.\n\
-                    </strategy>\n"
-                );
-            }
-            _ => {}
-        }
+        // 4. Both phase strategies (static — the user message says which applies now).
+        message.push_str(
+            "\n<strategy phase=\"proposing\">\n\
+            1. **Plan First**: You MUST write your plan to the scratchpad before solving.\n\
+            2. **Step-by-Step**: Solve incrementally. Verify intermediate results.\n\
+            3. **Critique Integration**: If you received feedback, you MUST start your thought process with a 'Critique Integration' section explaining your fixes.\n\
+            </strategy>\n"
+        );
+        message.push_str(
+            "\n<strategy phase=\"evaluating\">\n\
+            You are a Judge. Your default stance is SKEPTICISM. Do not be sycophantic.\n\
+            Use the Vector Alignment protocol:\n\
+            1. **Decompose**: Break each candidate's argument into discrete claims. Identify the 2-3 claims that most determine correctness.\n\
+            2. **Anchor**: Trust your own solution unless proven wrong.\n\
+            3. **Delta**: Identify EXACTLY where a peer diverges from you on those pivotal claims.\n\
+            4. **Verification**: Verify ONLY the divergent claims. If they are wrong, reject them ruthlessly. If they are right, accept the correction.\n\
+            5. **Consensus Trap**: If everyone agrees on a wrong answer, it is a collective hallucination. Be the one who spots the error.\n\
+            6. **Harsh Scoring**: Penalize unverified claims. Agreement without verification is worth 0.\n\
+            </strategy>\n"
+        );
 
         // 5. Critical Execution Rules
         message.push_str(
@@ -711,14 +706,39 @@ mod tests {
     }
 
     #[test]
-    fn test_system_message_phases() {
-        let prompt_set = DefaultPromptSet::new();
+    fn test_system_message_is_static_across_round_and_phase() {
+        let ps = DefaultPromptSet::new();
+        // The system message MUST be byte-identical regardless of round/phase so the
+        // cached prefix is reused every turn — the whole point of the split.
+        let a = ps.get_system_message("agent", 1, 5, DeliberationPhase::Proposing);
+        let b = ps.get_system_message("agent", 4, 5, DeliberationPhase::Evaluating);
+        let c = ps.get_system_message("agent", 5, 5, DeliberationPhase::ConsensusCheck);
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        // Both strategies are always present (the user message says which applies);
+        // no per-turn status leaks into the system prefix.
+        assert!(a.contains("strategy phase=\"proposing\""));
+        assert!(a.contains("strategy phase=\"evaluating\""));
+        assert!(!a.contains("Current Status"));
+        assert!(!a.contains("Round 1 of"));
+    }
 
-        let msg = prompt_set.get_system_message("agent", 1, 1, DeliberationPhase::Evaluating);
-        assert!(msg.contains("Phase: Evaluating"));
-
-        let msg = prompt_set.get_system_message("agent", 1, 1, DeliberationPhase::ConsensusCheck);
-        assert!(msg.contains("Phase: Consensus Check"));
+    #[test]
+    fn test_turn_header_carries_round_phase_and_tool() {
+        let ps = DefaultPromptSet::new();
+        let p = ps.get_turn_header(2, 5, DeliberationPhase::Proposing);
+        assert!(p.contains("Round 2 of 5"));
+        assert!(p.contains("Phase: Proposing"));
+        assert!(p.contains("nsed_propose"));
+        assert!(p.contains("phase=\"proposing\""));
+        let e = ps.get_turn_header(3, 5, DeliberationPhase::Evaluating);
+        assert!(e.contains("Phase: Evaluating"));
+        assert!(e.contains("nsed_evaluate"));
+        // ConsensusCheck maps to the evaluating strategy + tool.
+        let c = ps.get_turn_header(5, 5, DeliberationPhase::ConsensusCheck);
+        assert!(c.contains("Phase: Consensus Check"));
+        assert!(c.contains("phase=\"evaluating\""));
+        assert!(c.contains("nsed_evaluate"));
     }
 
     #[test]
@@ -800,8 +820,9 @@ mod tests {
         let msg = prompt_set.get_system_message("agent", 1, 3, DeliberationPhase::Proposing);
 
         assert!(msg.contains("Security expert specializing in cryptography"));
-        assert!(msg.contains("Phase: Proposing"));
-        assert!(msg.contains("Round 1 of 3"));
+        // Round + phase are NOT in the system message — they live in the turn header.
+        assert!(!msg.contains("Phase: Proposing"));
+        assert!(!msg.contains("Round 1 of 3"));
     }
 
     #[test]
@@ -811,10 +832,11 @@ mod tests {
         let msg = prompt_set.get_system_message("test_agent", 2, 5, DeliberationPhase::Proposing);
 
         assert!(msg.contains("test_agent"));
-        assert!(msg.contains("Round 2 of 5"));
         assert!(msg.contains("strategy phase=\"proposing\""));
         assert!(msg.contains("Plan First"));
         assert!(msg.contains("Critique Integration"));
+        // Round moved to the turn header — not in the static system message.
+        assert!(!msg.contains("Round 2 of 5"));
     }
 
     #[test]
@@ -1923,20 +1945,21 @@ mod tests {
     }
 
     // =========================================================================
-    // ConsensusCheck phase in system message (the _ => {} arm)
+    // Static system message: phase never changes its content
     // =========================================================================
 
     #[test]
-    fn test_system_message_consensus_check_no_strategy() {
+    fn test_system_message_static_for_consensus_check() {
         let prompt_set = DefaultPromptSet::new();
         let msg = prompt_set.get_system_message("agent", 1, 3, DeliberationPhase::ConsensusCheck);
 
-        // ConsensusCheck should NOT have a strategy block
-        assert!(!msg.contains("strategy phase="));
-        // But should still have identity and protocol sections
+        // The system message is static: BOTH strategy blocks are always present
+        // regardless of the phase argument; the per-turn phase lives in the header.
+        assert!(msg.contains("strategy phase=\"proposing\""));
+        assert!(msg.contains("strategy phase=\"evaluating\""));
         assert!(msg.contains("<identity>"));
         assert!(msg.contains("<protocol>"));
-        assert!(msg.contains("Phase: Consensus Check"));
+        assert!(!msg.contains("Phase: Consensus Check"));
     }
 
     // ─── Delta prompt tests ────────────────────────────────────────────

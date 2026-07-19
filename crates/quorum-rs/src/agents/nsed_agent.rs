@@ -1108,6 +1108,16 @@ impl NsedAgent for ProposerEvaluatorAgent {
             &context.user_injections,
             context.structured_feedback.as_ref(),
         );
+        // Dynamic round + phase go in the user message; the system message is static
+        // for prompt-cache reuse.
+        let prompt = format!(
+            "{}{prompt}",
+            self.prompt_set.get_turn_header(
+                context.round_number as usize,
+                context.total_rounds as usize,
+                context.phase,
+            )
+        );
 
         // A `before_prompt` middleware may constrain the submission to its own
         // JSON schema (structured output); otherwise the default thought/solution.
@@ -1308,6 +1318,15 @@ impl NsedAgent for ProposerEvaluatorAgent {
             context.round_number as usize,
             &context.user_injections,
         );
+        // Dynamic round + phase → user message (static system prompt for cache reuse).
+        let prompt = format!(
+            "{}{prompt}",
+            self.prompt_set.get_turn_header(
+                context.round_number as usize,
+                context.total_rounds as usize,
+                context.phase,
+            )
+        );
 
         let all_tools = self.aggregate_tools(context);
 
@@ -1458,12 +1477,20 @@ fn force_tool_choice(
 }
 
 /// Run the injected [`SubmissionValidator`](crate::agents::SubmissionValidator) on
-/// a parsed proposal's `solution_content`, returning `Some(reason)` when rejected.
-/// Only `submit_proposal` submissions are validated; without a validator or on any
+/// the proposal `content`, returning `Some(reason)` when rejected. Only
+/// `submit_proposal` submissions are validated; without a validator or on any
 /// other terminal tool it returns `None`. Free fn so the react loop's rejection
 /// gate is unit-testable with a mock validator — no LLM needed.
-async fn run_submission_validator<T: serde::Serialize>(
-    parsed: &T,
+///
+/// `content` MUST be the same bytes that become `Proposal.content` — for a
+/// middleware forced-schema proposal that is the raw tool-args envelope
+/// (`{textual_response_to_user, ops}`), NOT the default schema's `solution_content`
+/// (which is absent → empty for forced schema). Validating the wrong field made the
+/// in-loop validator a no-op for patch-deliberation, so every provider_response
+/// block skipped the react retry and surfaced to the orchestrator via the
+/// post-generation hook instead.
+async fn run_submission_validator(
+    content: &str,
     terminal_tool_name: &str,
     validator: Option<&dyn crate::agents::SubmissionValidator>,
 ) -> Option<String> {
@@ -1471,15 +1498,7 @@ async fn run_submission_validator<T: serde::Serialize>(
         return None;
     }
     let validator = validator?;
-    let content = serde_json::to_value(parsed)
-        .ok()
-        .and_then(|v| {
-            v.get("solution_content")
-                .and_then(|s| s.as_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_default();
-    validator.validate(&content).await
+    validator.validate(content).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1844,9 +1863,13 @@ where
         // reject it (e.g. ops that applied ZERO changes). A rejection converts the
         // Ok into an Err carrying the reason, so this SAME loop re-prompts within
         // `max_retries` — no separate retry budget. Proposal submissions only.
-        if let Ok(ref parsed) = parse_result
+        // Validate the SAME bytes the post-generation hook will see — the raw
+        // forced-schema envelope (`agent_response.content`), which is what becomes
+        // `Proposal.content`. Extracting `solution_content` here (absent for forced
+        // schema) made this a no-op, so blocks bypassed the in-loop retry.
+        if parse_result.is_ok()
             && let Some(reason) = run_submission_validator(
-                parsed,
+                &agent_response.content,
                 terminal_tool_name,
                 context.submission_validator.as_deref(),
             )
@@ -3607,33 +3630,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_submission_validator_extracts_content_and_gates_on_tool() {
+    async fn run_submission_validator_forwards_content_and_gates_on_tool() {
         use super::run_submission_validator;
-        let proposal = serde_json::json!({
-            "thought_process": "t",
-            "solution_content": "the edits",
-        });
+        // The forced-schema envelope (patch-deliberation): ops live here, there is
+        // NO `solution_content`. The old extract-`solution_content` logic passed the
+        // validator an empty string → always accepted → blocks bypassed the retry.
+        // The validator must now receive the WHOLE envelope verbatim.
+        let envelope = r#"{"textual_response_to_user":"did the edit","ops":[{"op":"str_replace","path":"a.md","old":"x","new":"y"}]}"#;
         let reject = EchoValidator { reject: true };
-        // submit_proposal + rejecting validator → Some(reason), reason IS the
-        // extracted solution_content (proves the field is threaded to the reviewer).
         assert_eq!(
-            run_submission_validator(&proposal, "submit_proposal", Some(&reject)).await,
-            Some("the edits".to_string())
+            run_submission_validator(envelope, "submit_proposal", Some(&reject)).await,
+            Some(envelope.to_string()),
+            "the full forced-schema envelope must reach the validator, not an empty string"
         );
         // A different terminal tool (evaluation) is never validated.
         assert_eq!(
-            run_submission_validator(&proposal, "submit_batch_evaluation", Some(&reject)).await,
+            run_submission_validator(envelope, "submit_batch_evaluation", Some(&reject)).await,
             None
         );
         // No validator injected → accept.
         assert_eq!(
-            run_submission_validator(&proposal, "submit_proposal", None).await,
+            run_submission_validator(envelope, "submit_proposal", None).await,
             None
         );
-        // Validator that accepts → None even for a proposal.
+        // Validator that accepts → None.
         let accept = EchoValidator { reject: false };
         assert_eq!(
-            run_submission_validator(&proposal, "submit_proposal", Some(&accept)).await,
+            run_submission_validator(envelope, "submit_proposal", Some(&accept)).await,
             None
         );
     }
