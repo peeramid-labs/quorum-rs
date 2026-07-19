@@ -1649,6 +1649,29 @@ impl NatsNsedWorker {
                 if let Some(wt) = new.get("agent_working_dir").and_then(|v| v.as_str()) {
                     context.working_dir_override = Some(std::path::PathBuf::from(wt));
                 }
+                // Advertise this agent under its epic — project_id (+ epic_head) come
+                // from the verdict (patch-deliberation surfaces them). Lets the fleet
+                // route reads/discovery to a live holder of the project regardless of
+                // each node's local path. No-op when there's no project_id.
+                if let Some(adv) = crate::project_registry::ProjectAdvertisement::from_verdict(
+                    &new,
+                    &self.agent_id,
+                    std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()),
+                ) {
+                    let subject =
+                        crate::project_registry::advert_subject(&self.config.subject_prefix);
+                    match serde_json::to_vec(&adv) {
+                        Ok(payload) => {
+                            if let Err(e) = self.nats.publish(subject.clone(), payload.into()).await
+                            {
+                                tracing::warn!(agent_id = %self.agent_id, subject = %subject, error = %e, "failed to publish project advertisement");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(agent_id = %self.agent_id, error = %e, "failed to serialize project advertisement")
+                        }
+                    }
+                }
             }
         }
 

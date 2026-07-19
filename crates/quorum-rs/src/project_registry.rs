@@ -52,6 +52,14 @@ impl ProjectAdvertisement {
     }
 }
 
+/// The subject workers publish [`ProjectAdvertisement`]s on; a discovery consumer
+/// subscribes here (plain subscribe, not a queue group — it wants every advert) to
+/// build the `project_id → agents` map. The payload carries `project_id`, so one
+/// subject serves all projects.
+pub fn advert_subject(subject_prefix: &str) -> String {
+    format!("{subject_prefix}.project.advert")
+}
+
 /// The NATS subject + payload for a `project_advanced` signal carried in a
 /// `job_complete` verdict content — the "epic advanced, pull now" notification a
 /// worker republishes so clients holding the project sync. Subject:
@@ -240,6 +248,11 @@ mod tests {
         // No project_id (non-patch-deliberation turn) → nothing to advertise.
         let none = serde_json::json!({"task_description": "just a prompt"});
         assert!(ProjectAdvertisement::from_verdict(&none, "A", None).is_none());
+    }
+
+    #[test]
+    fn advert_subject_is_stable() {
+        assert_eq!(advert_subject("nsed"), "nsed.project.advert");
     }
 
     #[test]
