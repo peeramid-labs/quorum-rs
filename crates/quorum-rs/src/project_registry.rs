@@ -29,6 +29,29 @@ pub struct ProjectAdvertisement {
     pub host: Option<String>,
 }
 
+impl ProjectAdvertisement {
+    /// Build an advertisement from a `before_prompt` verdict `content` object — the
+    /// dylib surfaces `project_id` (+ optional `epic_head`) onto it. `None` when there
+    /// is no `project_id` (a non-patch-deliberation turn advertises nothing).
+    pub fn from_verdict(
+        content: &serde_json::Value,
+        agent: &str,
+        host: Option<String>,
+    ) -> Option<Self> {
+        let project_id = content.get("project_id")?.as_str()?.to_string();
+        let epic_head = content
+            .get("epic_head")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        Some(Self {
+            project_id,
+            agent: agent.to_string(),
+            epic_head,
+            host,
+        })
+    }
+}
+
 /// A registered holder of a project, with the last time it was seen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectAgent {
@@ -174,6 +197,30 @@ mod tests {
             vec!["epic"],
             "emptied project removed entirely"
         );
+    }
+
+    #[test]
+    fn advertisement_from_verdict_extracts_project_and_head() {
+        // Full: project_id + epic_head surfaced by the dylib.
+        let content = serde_json::json!({
+            "task_description": "…", "project_id": "root-sha", "epic_head": "head-sha"
+        });
+        let a = ProjectAdvertisement::from_verdict(&content, "AgentA", Some("h1".into())).unwrap();
+        assert_eq!(a.project_id, "root-sha");
+        assert_eq!(a.agent, "AgentA");
+        assert_eq!(a.epic_head.as_deref(), Some("head-sha"));
+        assert_eq!(a.host.as_deref(), Some("h1"));
+        // project_id but no epic_head → still advertises, head None.
+        let no_head = serde_json::json!({"project_id": "root-sha"});
+        assert_eq!(
+            ProjectAdvertisement::from_verdict(&no_head, "A", None)
+                .unwrap()
+                .epic_head,
+            None
+        );
+        // No project_id (non-patch-deliberation turn) → nothing to advertise.
+        let none = serde_json::json!({"task_description": "just a prompt"});
+        assert!(ProjectAdvertisement::from_verdict(&none, "A", None).is_none());
     }
 
     #[test]
