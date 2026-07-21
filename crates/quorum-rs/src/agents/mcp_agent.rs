@@ -852,13 +852,6 @@ pub struct ClaudeAgent {
 }
 
 impl ClaudeAgent {
-    /// Minimum slice (claude spawn + MCP server bring-up + at least
-    /// one round-trip with the model) reserved before the rate-limit
-    /// retry sleep clamp will run. Below this remaining budget the
-    /// retry is suppressed because it can't realistically complete
-    /// (CR review on PR #327).
-    const MIN_ATTEMPT_SLICE: Duration = Duration::from_secs(30);
-
     /// Maximum rate-limit retries per phase. Sized to outlast
     /// Anthropic's 5-hour heavy-use window: 8 attempts × structural
     /// 45min sleep (see `is_rate_limited` defaults below) yields
@@ -1478,6 +1471,19 @@ impl ClaudeAgent {
         Duration::from_secs(secs)
     }
 
+    /// How long to sleep before the next rate-limit retry: the server's
+    /// `retry-after` hint when present, else the structural [`rate_limit_backoff`].
+    /// Deliberately takes NO phase budget — an external reset wait is not the agent's
+    /// work time, so it is never shortened to fit the phase SLA (the regression that
+    /// made rate-limited jobs give up + complete early instead of waiting for reset).
+    fn rate_limit_sleep(hint: Duration, attempt: u32) -> Duration {
+        if hint.is_zero() {
+            Self::rate_limit_backoff(attempt)
+        } else {
+            hint
+        }
+    }
+
     /// Outer rate-limit retry wrapper around `run_phase`. Reads the
     /// failed attempt's anyhow message (which carries the stderr
     /// snippet in dev's recovery design) for rate-limit / overloaded
@@ -1494,14 +1500,9 @@ impl ClaudeAgent {
         full_prompt: &str,
         ctx: &AgentContext,
     ) -> Result<super::mcp_tools::McpResult> {
-        let budget = ctx.phase_budget_remaining_secs;
-        let total_timeout = if budget > 0.0 {
-            Duration::from_secs((budget.ceil() as u64).max(1))
-        } else {
-            Duration::ZERO
-        };
-        let phase_start = std::time::Instant::now();
-
+        // Note: the phase work-budget (`ctx.phase_budget_remaining_secs`) bounds the
+        // actual claude call inside `run_phase`; it deliberately does NOT bound the
+        // rate-limit wait below — an external reset is not the agent's work time.
         let mut rl_attempt: u32 = 0;
         loop {
             match self.run_phase(phase, prompt, full_prompt, ctx).await {
@@ -1532,31 +1533,22 @@ impl ClaudeAgent {
                             self.name
                         )));
                     }
-                    let backoff = Self::rate_limit_backoff(rl_attempt);
-                    let suggested = if hint.is_zero() { backoff } else { hint };
-                    let elapsed = phase_start.elapsed();
-                    let remaining = total_timeout.saturating_sub(elapsed);
-                    if remaining <= Self::MIN_ATTEMPT_SLICE {
-                        tracing::error!(
-                            agent = %self.name,
-                            phase = %phase,
-                            remaining_secs = remaining.as_secs(),
-                            "Rate-limited but no budget left for retry"
-                        );
-                        return Err(err.context(format!(
-                            "claude agent '{}': phase '{phase}' rate-limited; \
-                             phase budget exhausted before retry could run",
-                            self.name
-                        )));
-                    }
-                    let sleep = suggested.min(remaining - Self::MIN_ATTEMPT_SLICE);
+                    // A rate-limit / credit reset is EXTERNAL — waiting for it is not the
+                    // agent being slow, so the wait must NOT be clamped to the phase
+                    // work-budget (`phase_budget_remaining_secs`, ~SLA seconds). Clamping
+                    // it there turned the structural ~45min reset wait into a ~budget-sized
+                    // sleep that woke still-limited, then bailed "no budget left" → the
+                    // agent failed and the job completed with survivors instead of waiting
+                    // for the reset and continuing (regression of the #402 design: 8 ×
+                    // ~45min ≈ outlasts Anthropic's 5h window). Bound solely by
+                    // MAX_RATE_LIMIT_RETRIES (checked above); sleep the full suggested wait.
+                    let sleep = Self::rate_limit_sleep(hint, rl_attempt);
                     tracing::warn!(
                         agent = %self.name,
                         phase = %phase,
                         attempt = rl_attempt,
                         sleep_secs = sleep.as_secs(),
-                        remaining_budget_secs = remaining.as_secs(),
-                        "Claude CLI hit rate-limit / overloaded — sleeping then retrying"
+                        "Claude CLI hit rate-limit / overloaded — waiting for reset (not clamped to phase budget), then retrying"
                     );
                     tokio::time::sleep(sleep).await;
                     rl_attempt += 1;
@@ -4564,6 +4556,25 @@ mod tests {
         assert_eq!(ClaudeAgent::rate_limit_backoff(4), Duration::from_secs(240));
         assert_eq!(
             ClaudeAgent::rate_limit_backoff(99),
+            Duration::from_secs(240)
+        );
+    }
+
+    #[test]
+    fn rate_limit_sleep_uses_hint_or_backoff_never_a_phase_budget() {
+        // A server retry-after hint (e.g. a 45-min reset) is honoured VERBATIM — not
+        // shortened to fit any phase SLA. This is the fix for jobs giving up + completing
+        // early instead of waiting for the credit/rate-limit reset.
+        let reset = Duration::from_secs(45 * 60);
+        assert_eq!(ClaudeAgent::rate_limit_sleep(reset, 0), reset);
+        assert_eq!(ClaudeAgent::rate_limit_sleep(reset, 7), reset);
+        // No hint → the structural backoff (never zero, never budget-derived).
+        assert_eq!(
+            ClaudeAgent::rate_limit_sleep(Duration::ZERO, 0),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            ClaudeAgent::rate_limit_sleep(Duration::ZERO, 5),
             Duration::from_secs(240)
         );
     }
