@@ -4923,6 +4923,58 @@ mod tests {
         assert_eq!(ans.as_deref(), Some("ANSWER:user_ask_user:{}"));
     }
 
+    /// Cross-layer: the tool the TUI attaches to a live deliberation request
+    /// (`build_request` → `DeliberationRequest.user_tools`) survives the hop into the
+    /// worker's `AgentContext` and appears in the exact MCP `list_tools` set the claude
+    /// subprocess receives. Guards the whole submission→claude chain against a
+    /// `user_tools: None` drop anywhere in between (the reported "ask_user never
+    /// reaches claude" fear).
+    #[tokio::test]
+    async fn ask_user_from_build_request_reaches_the_claude_mcp_surface() {
+        use crate::agents::{DeliberationPhase, UserToolHandlerTrait};
+
+        // 1. The request the TUI actually submits carries the tool.
+        let req = crate::cli::request::build_request_raw_policy_id("nsed:fast", "audit this");
+        let submitted = req.user_tools.expect("live request ships user tools");
+        assert!(submitted.iter().any(|t| t.name == "ask_user"));
+
+        // 2. The worker maps the job's tools onto the agent context (+ handler).
+        #[derive(Debug)]
+        struct H;
+        #[async_trait::async_trait]
+        impl UserToolHandlerTrait for H {
+            async fn handle_call(
+                &self,
+                n: &str,
+                a: &str,
+                _r: u32,
+                _p: DeliberationPhase,
+            ) -> String {
+                format!("ANSWER:{n}:{a}")
+            }
+        }
+        let mut ctx = minimal_context();
+        ctx.user_tools = submitted;
+        ctx.user_tool_handler = Some(std::sync::Arc::new(H));
+
+        // 3. The set claude receives from list_tools includes it, callable.
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let server = NsedMcpServer::new(ctx, ActivePhase::Proposing, None, tx);
+        let names: Vec<String> = server
+            .advertised_tools()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "user_ask_user"),
+            "ask_user from the live request must reach claude's tool list: {names:?}"
+        );
+        let ans = server
+            .dispatch_user_tool("user_ask_user", &Some(serde_json::Map::new()))
+            .await;
+        assert_eq!(ans.as_deref(), Some("ANSWER:user_ask_user:{}"));
+    }
+
     #[tokio::test]
     async fn mcp_server_advertises_and_dispatches_user_tools() {
         use crate::agents::{DeliberationPhase, UserToolDefinition, UserToolHandlerTrait};
