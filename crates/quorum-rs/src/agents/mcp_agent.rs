@@ -927,6 +927,20 @@ impl ClaudeAgent {
         shim_mcp_config: &std::path::Path,
         resumed: bool,
     ) -> (Vec<String>, Option<tempfile::TempDir>) {
+        self.build_command_inner_with_uuid(ctx, shim_mcp_config, resumed, None)
+    }
+
+    /// Build command, optionally overriding the session uuid. The default (None)
+    /// derives the deterministic per-(agent, room) uuid; an override is used by the
+    /// post-collision fresh restart, which mints a NEW random uuid so it can't
+    /// re-collide with the still-dying prior child that holds the deterministic one.
+    fn build_command_inner_with_uuid(
+        &self,
+        ctx: &AgentContext,
+        shim_mcp_config: &std::path::Path,
+        resumed: bool,
+        uuid_override: Option<&str>,
+    ) -> (Vec<String>, Option<tempfile::TempDir>) {
         let mut command = vec!["claude".to_string()];
 
         // Non-interactive mode
@@ -950,8 +964,13 @@ impl ClaudeAgent {
         // recovery uses, so the command path and on-disk transcript path can't
         // drift (CR PR #349 nitpick).
         {
-            let claude_session =
-                Self::claude_session_uuid_for(&self.name, ctx.claude_session_key());
+            // An override (fresh-restart uuid) wins over the deterministic derivation
+            // so a post-collision respawn gets a brand-new session, not the same id
+            // the dying prior child still holds.
+            let claude_session = match uuid_override {
+                Some(u) => u.to_string(),
+                None => Self::claude_session_uuid_for(&self.name, ctx.claude_session_key()),
+            };
 
             // Note: persistence of the (session_id, agent, uuid) mapping is
             // done by the caller (`run_phase`) to keep `build_command` pure
@@ -2283,11 +2302,31 @@ impl ClaudeAgent {
                 // For retry-eligible failures we want to RESUME the
                 // same session (so context isn't lost) but with the
                 // feedback block appended to the system prompt.
+                //
+                // On a fresh restart, mint a NEW random uuid: the deterministic
+                // per-(agent, room) uuid is still held by the prior child that is
+                // dying, so reusing it re-collides ("Session ID … already in use").
+                // A v4 uuid can't collide, so the respawn always lands a clean session.
+                let fresh_uuid = if restart_fresh {
+                    Some(uuid::Uuid::new_v4().to_string())
+                } else {
+                    None
+                };
                 let (next_command, _next_sandbox) = if restart_fresh {
-                    self.build_command_inner(ctx, mcp_config_file2.path(), false)
+                    self.build_command_inner_with_uuid(
+                        ctx,
+                        mcp_config_file2.path(),
+                        false,
+                        fresh_uuid.as_deref(),
+                    )
                 } else {
                     self.build_command(ctx, mcp_config_file2.path())
                 };
+                // The attempt's uuid arg (lock/recovery telemetry) must match the
+                // command's session id — the fresh one on restart, else the original.
+                let attempt_uuid = fresh_uuid
+                    .as_deref()
+                    .unwrap_or(claude_session_uuid.as_str());
 
                 // Issue #347 Option 2: feedback varies with the
                 // classified failure kind so claude gets a targeted
@@ -2314,7 +2353,7 @@ impl ClaudeAgent {
                         &mut result_rx2,
                         &server_ct2,
                         feedback_block.as_deref(),
-                        Some(claude_session_uuid.as_str()),
+                        Some(attempt_uuid),
                     )
                     .await;
                 server_ct2.cancel();
@@ -3643,6 +3682,43 @@ mod tests {
         assert!(dt_val.contains("Write"));
         assert!(dt_val.contains("Edit"));
         assert!(dt_val.contains("NotebookEdit"));
+    }
+
+    #[test]
+    fn fresh_restart_uuid_override_replaces_the_deterministic_session_id() {
+        let agent = ClaudeAgent::new(
+            minimal_agent_config("Reviewer"),
+            crate::agents::config::ClaudeProviderConfig::default(),
+            stub_prompt_set(),
+        );
+        let ctx = minimal_context();
+        let session_arg = |cmd: &[String]| -> String {
+            let i = cmd.iter().position(|s| s == "--session-id").unwrap();
+            cmd[i + 1].clone()
+        };
+
+        // Default (no override) → the deterministic per-(agent, room) uuid.
+        let (base, _s0) =
+            agent.build_command_inner_with_uuid(&ctx, &dummy_mcp_config(), false, None);
+        let deterministic = session_arg(&base);
+        assert_eq!(
+            deterministic,
+            ClaudeAgent::claude_session_uuid_for("Reviewer", ctx.claude_session_key()),
+            "no override uses the deterministic session id"
+        );
+
+        // A fresh-restart override (a v4 uuid) REPLACES it — so a post-collision
+        // respawn can't reuse the id the dying prior child still holds.
+        let fresh = uuid::Uuid::new_v4().to_string();
+        assert_ne!(fresh, deterministic);
+        let (over, _s1) =
+            agent.build_command_inner_with_uuid(&ctx, &dummy_mcp_config(), false, Some(&fresh));
+        assert_eq!(
+            session_arg(&over),
+            fresh,
+            "override wins over the deterministic uuid"
+        );
+        assert!(over.contains(&"--session-id".to_string()));
     }
 
     #[test]
