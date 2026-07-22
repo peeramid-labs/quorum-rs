@@ -1156,7 +1156,7 @@ impl NatsNsedWorker {
 
         let session_id = session_id_from_subject(msg.subject.as_str(), &self.config.subject_prefix);
         let (content, meta) = job_complete_payload(&event);
-        if let Err(e) = self
+        match self
             .run_stage_mw(
                 &self.job_complete_mw,
                 "job_complete",
@@ -1168,7 +1168,28 @@ impl NatsNsedWorker {
             )
             .await
         {
-            warn!(agent_id = %self.agent_id, error = %e, "on_job_complete middleware error");
+            // A clean winner consensus surfaces `project_advanced {project_id, head}`
+            // in the verdict content — republish it as the "epic advanced, pull now"
+            // notification so clients holding the project sync.
+            Ok(Some(verdict_content)) => {
+                if let Some((subject, payload)) = crate::project_registry::advanced_notification(
+                    &verdict_content,
+                    &self.config.subject_prefix,
+                ) {
+                    match self.nats.publish(subject.clone(), payload.into()).await {
+                        Ok(()) => {
+                            tracing::debug!(agent_id = %self.agent_id, subject = %subject, "published project_advanced")
+                        }
+                        Err(e) => {
+                            warn!(agent_id = %self.agent_id, subject = %subject, error = %e, "failed to publish project_advanced")
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(agent_id = %self.agent_id, error = %e, "on_job_complete middleware error")
+            }
         }
         Ok(())
     }
@@ -1627,6 +1648,29 @@ impl NatsNsedWorker {
                 // the frozen job-scoped tree.
                 if let Some(wt) = new.get("agent_working_dir").and_then(|v| v.as_str()) {
                     context.working_dir_override = Some(std::path::PathBuf::from(wt));
+                }
+                // Advertise this agent under its epic — project_id (+ epic_head) come
+                // from the verdict (patch-deliberation surfaces them). Lets the fleet
+                // route reads/discovery to a live holder of the project regardless of
+                // each node's local path. No-op when there's no project_id.
+                if let Some(adv) = crate::project_registry::ProjectAdvertisement::from_verdict(
+                    &new,
+                    &self.agent_id,
+                    std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()),
+                ) {
+                    let subject =
+                        crate::project_registry::advert_subject(&self.config.subject_prefix);
+                    match serde_json::to_vec(&adv) {
+                        Ok(payload) => {
+                            if let Err(e) = self.nats.publish(subject.clone(), payload.into()).await
+                            {
+                                tracing::warn!(agent_id = %self.agent_id, subject = %subject, error = %e, "failed to publish project advertisement");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(agent_id = %self.agent_id, error = %e, "failed to serialize project advertisement")
+                        }
+                    }
                 }
             }
         }

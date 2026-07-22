@@ -852,13 +852,6 @@ pub struct ClaudeAgent {
 }
 
 impl ClaudeAgent {
-    /// Minimum slice (claude spawn + MCP server bring-up + at least
-    /// one round-trip with the model) reserved before the rate-limit
-    /// retry sleep clamp will run. Below this remaining budget the
-    /// retry is suppressed because it can't realistically complete
-    /// (CR review on PR #327).
-    const MIN_ATTEMPT_SLICE: Duration = Duration::from_secs(30);
-
     /// Maximum rate-limit retries per phase. Sized to outlast
     /// Anthropic's 5-hour heavy-use window: 8 attempts × structural
     /// 45min sleep (see `is_rate_limited` defaults below) yields
@@ -927,6 +920,20 @@ impl ClaudeAgent {
         shim_mcp_config: &std::path::Path,
         resumed: bool,
     ) -> (Vec<String>, Option<tempfile::TempDir>) {
+        self.build_command_inner_with_uuid(ctx, shim_mcp_config, resumed, None)
+    }
+
+    /// Build command, optionally overriding the session uuid. The default (None)
+    /// derives the deterministic per-(agent, room) uuid; an override is used by the
+    /// post-collision fresh restart, which mints a NEW random uuid so it can't
+    /// re-collide with the still-dying prior child that holds the deterministic one.
+    fn build_command_inner_with_uuid(
+        &self,
+        ctx: &AgentContext,
+        shim_mcp_config: &std::path::Path,
+        resumed: bool,
+        uuid_override: Option<&str>,
+    ) -> (Vec<String>, Option<tempfile::TempDir>) {
         let mut command = vec!["claude".to_string()];
 
         // Non-interactive mode
@@ -950,8 +957,13 @@ impl ClaudeAgent {
         // recovery uses, so the command path and on-disk transcript path can't
         // drift (CR PR #349 nitpick).
         {
-            let claude_session =
-                Self::claude_session_uuid_for(&self.name, ctx.claude_session_key());
+            // An override (fresh-restart uuid) wins over the deterministic derivation
+            // so a post-collision respawn gets a brand-new session, not the same id
+            // the dying prior child still holds.
+            let claude_session = match uuid_override {
+                Some(u) => u.to_string(),
+                None => Self::claude_session_uuid_for(&self.name, ctx.claude_session_key()),
+            };
 
             // Note: persistence of the (session_id, agent, uuid) mapping is
             // done by the caller (`run_phase`) to keep `build_command` pure
@@ -1459,6 +1471,19 @@ impl ClaudeAgent {
         Duration::from_secs(secs)
     }
 
+    /// How long to sleep before the next rate-limit retry: the server's
+    /// `retry-after` hint when present, else the structural [`rate_limit_backoff`].
+    /// Deliberately takes NO phase budget — an external reset wait is not the agent's
+    /// work time, so it is never shortened to fit the phase SLA (the regression that
+    /// made rate-limited jobs give up + complete early instead of waiting for reset).
+    fn rate_limit_sleep(hint: Duration, attempt: u32) -> Duration {
+        if hint.is_zero() {
+            Self::rate_limit_backoff(attempt)
+        } else {
+            hint
+        }
+    }
+
     /// Outer rate-limit retry wrapper around `run_phase`. Reads the
     /// failed attempt's anyhow message (which carries the stderr
     /// snippet in dev's recovery design) for rate-limit / overloaded
@@ -1475,14 +1500,9 @@ impl ClaudeAgent {
         full_prompt: &str,
         ctx: &AgentContext,
     ) -> Result<super::mcp_tools::McpResult> {
-        let budget = ctx.phase_budget_remaining_secs;
-        let total_timeout = if budget > 0.0 {
-            Duration::from_secs((budget.ceil() as u64).max(1))
-        } else {
-            Duration::ZERO
-        };
-        let phase_start = std::time::Instant::now();
-
+        // Note: the phase work-budget (`ctx.phase_budget_remaining_secs`) bounds the
+        // actual claude call inside `run_phase`; it deliberately does NOT bound the
+        // rate-limit wait below — an external reset is not the agent's work time.
         let mut rl_attempt: u32 = 0;
         loop {
             match self.run_phase(phase, prompt, full_prompt, ctx).await {
@@ -1513,31 +1533,22 @@ impl ClaudeAgent {
                             self.name
                         )));
                     }
-                    let backoff = Self::rate_limit_backoff(rl_attempt);
-                    let suggested = if hint.is_zero() { backoff } else { hint };
-                    let elapsed = phase_start.elapsed();
-                    let remaining = total_timeout.saturating_sub(elapsed);
-                    if remaining <= Self::MIN_ATTEMPT_SLICE {
-                        tracing::error!(
-                            agent = %self.name,
-                            phase = %phase,
-                            remaining_secs = remaining.as_secs(),
-                            "Rate-limited but no budget left for retry"
-                        );
-                        return Err(err.context(format!(
-                            "claude agent '{}': phase '{phase}' rate-limited; \
-                             phase budget exhausted before retry could run",
-                            self.name
-                        )));
-                    }
-                    let sleep = suggested.min(remaining - Self::MIN_ATTEMPT_SLICE);
+                    // A rate-limit / credit reset is EXTERNAL — waiting for it is not the
+                    // agent being slow, so the wait must NOT be clamped to the phase
+                    // work-budget (`phase_budget_remaining_secs`, ~SLA seconds). Clamping
+                    // it there turned the structural ~45min reset wait into a ~budget-sized
+                    // sleep that woke still-limited, then bailed "no budget left" → the
+                    // agent failed and the job completed with survivors instead of waiting
+                    // for the reset and continuing (regression of the #402 design: 8 ×
+                    // ~45min ≈ outlasts Anthropic's 5h window). Bound solely by
+                    // MAX_RATE_LIMIT_RETRIES (checked above); sleep the full suggested wait.
+                    let sleep = Self::rate_limit_sleep(hint, rl_attempt);
                     tracing::warn!(
                         agent = %self.name,
                         phase = %phase,
                         attempt = rl_attempt,
                         sleep_secs = sleep.as_secs(),
-                        remaining_budget_secs = remaining.as_secs(),
-                        "Claude CLI hit rate-limit / overloaded — sleeping then retrying"
+                        "Claude CLI hit rate-limit / overloaded — waiting for reset (not clamped to phase budget), then retrying"
                     );
                     tokio::time::sleep(sleep).await;
                     rl_attempt += 1;
@@ -2283,11 +2294,31 @@ impl ClaudeAgent {
                 // For retry-eligible failures we want to RESUME the
                 // same session (so context isn't lost) but with the
                 // feedback block appended to the system prompt.
+                //
+                // On a fresh restart, mint a NEW random uuid: the deterministic
+                // per-(agent, room) uuid is still held by the prior child that is
+                // dying, so reusing it re-collides ("Session ID … already in use").
+                // A v4 uuid can't collide, so the respawn always lands a clean session.
+                let fresh_uuid = if restart_fresh {
+                    Some(uuid::Uuid::new_v4().to_string())
+                } else {
+                    None
+                };
                 let (next_command, _next_sandbox) = if restart_fresh {
-                    self.build_command_inner(ctx, mcp_config_file2.path(), false)
+                    self.build_command_inner_with_uuid(
+                        ctx,
+                        mcp_config_file2.path(),
+                        false,
+                        fresh_uuid.as_deref(),
+                    )
                 } else {
                     self.build_command(ctx, mcp_config_file2.path())
                 };
+                // The attempt's uuid arg (lock/recovery telemetry) must match the
+                // command's session id — the fresh one on restart, else the original.
+                let attempt_uuid = fresh_uuid
+                    .as_deref()
+                    .unwrap_or(claude_session_uuid.as_str());
 
                 // Issue #347 Option 2: feedback varies with the
                 // classified failure kind so claude gets a targeted
@@ -2314,7 +2345,7 @@ impl ClaudeAgent {
                         &mut result_rx2,
                         &server_ct2,
                         feedback_block.as_deref(),
-                        Some(claude_session_uuid.as_str()),
+                        Some(attempt_uuid),
                     )
                     .await;
                 server_ct2.cancel();
@@ -3646,6 +3677,43 @@ mod tests {
     }
 
     #[test]
+    fn fresh_restart_uuid_override_replaces_the_deterministic_session_id() {
+        let agent = ClaudeAgent::new(
+            minimal_agent_config("Reviewer"),
+            crate::agents::config::ClaudeProviderConfig::default(),
+            stub_prompt_set(),
+        );
+        let ctx = minimal_context();
+        let session_arg = |cmd: &[String]| -> String {
+            let i = cmd.iter().position(|s| s == "--session-id").unwrap();
+            cmd[i + 1].clone()
+        };
+
+        // Default (no override) → the deterministic per-(agent, room) uuid.
+        let (base, _s0) =
+            agent.build_command_inner_with_uuid(&ctx, &dummy_mcp_config(), false, None);
+        let deterministic = session_arg(&base);
+        assert_eq!(
+            deterministic,
+            ClaudeAgent::claude_session_uuid_for("Reviewer", ctx.claude_session_key()),
+            "no override uses the deterministic session id"
+        );
+
+        // A fresh-restart override (a v4 uuid) REPLACES it — so a post-collision
+        // respawn can't reuse the id the dying prior child still holds.
+        let fresh = uuid::Uuid::new_v4().to_string();
+        assert_ne!(fresh, deterministic);
+        let (over, _s1) =
+            agent.build_command_inner_with_uuid(&ctx, &dummy_mcp_config(), false, Some(&fresh));
+        assert_eq!(
+            session_arg(&over),
+            fresh,
+            "override wins over the deterministic uuid"
+        );
+        assert!(over.contains(&"--session-id".to_string()));
+    }
+
+    #[test]
     fn claude_writable_skips_default_disallowed() {
         let agent_cfg = minimal_agent_config("test");
         let claude_cfg = crate::agents::config::ClaudeProviderConfig {
@@ -4493,6 +4561,25 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_sleep_uses_hint_or_backoff_never_a_phase_budget() {
+        // A server retry-after hint (e.g. a 45-min reset) is honoured VERBATIM — not
+        // shortened to fit any phase SLA. This is the fix for jobs giving up + completing
+        // early instead of waiting for the credit/rate-limit reset.
+        let reset = Duration::from_secs(45 * 60);
+        assert_eq!(ClaudeAgent::rate_limit_sleep(reset, 0), reset);
+        assert_eq!(ClaudeAgent::rate_limit_sleep(reset, 7), reset);
+        // No hint → the structural backoff (never zero, never budget-derived).
+        assert_eq!(
+            ClaudeAgent::rate_limit_sleep(Duration::ZERO, 0),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            ClaudeAgent::rate_limit_sleep(Duration::ZERO, 5),
+            Duration::from_secs(240)
+        );
+    }
+
+    #[test]
     fn classify_failure_for_retry_picks_correct_kind() {
         use super::super::claude_recovery::LastFailureKind;
 
@@ -4841,6 +4928,58 @@ mod tests {
         );
 
         // And calling it routes to the operator handler (blocks + returns the answer).
+        let ans = server
+            .dispatch_user_tool("user_ask_user", &Some(serde_json::Map::new()))
+            .await;
+        assert_eq!(ans.as_deref(), Some("ANSWER:user_ask_user:{}"));
+    }
+
+    /// Cross-layer: the tool the TUI attaches to a live deliberation request
+    /// (`build_request` → `DeliberationRequest.user_tools`) survives the hop into the
+    /// worker's `AgentContext` and appears in the exact MCP `list_tools` set the claude
+    /// subprocess receives. Guards the whole submission→claude chain against a
+    /// `user_tools: None` drop anywhere in between (the reported "ask_user never
+    /// reaches claude" fear).
+    #[tokio::test]
+    async fn ask_user_from_build_request_reaches_the_claude_mcp_surface() {
+        use crate::agents::{DeliberationPhase, UserToolHandlerTrait};
+
+        // 1. The request the TUI actually submits carries the tool.
+        let req = crate::cli::request::build_request_raw_policy_id("nsed:fast", "audit this");
+        let submitted = req.user_tools.expect("live request ships user tools");
+        assert!(submitted.iter().any(|t| t.name == "ask_user"));
+
+        // 2. The worker maps the job's tools onto the agent context (+ handler).
+        #[derive(Debug)]
+        struct H;
+        #[async_trait::async_trait]
+        impl UserToolHandlerTrait for H {
+            async fn handle_call(
+                &self,
+                n: &str,
+                a: &str,
+                _r: u32,
+                _p: DeliberationPhase,
+            ) -> String {
+                format!("ANSWER:{n}:{a}")
+            }
+        }
+        let mut ctx = minimal_context();
+        ctx.user_tools = submitted;
+        ctx.user_tool_handler = Some(std::sync::Arc::new(H));
+
+        // 3. The set claude receives from list_tools includes it, callable.
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let server = NsedMcpServer::new(ctx, ActivePhase::Proposing, None, tx);
+        let names: Vec<String> = server
+            .advertised_tools()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "user_ask_user"),
+            "ask_user from the live request must reach claude's tool list: {names:?}"
+        );
         let ans = server
             .dispatch_user_tool("user_ask_user", &Some(serde_json::Map::new()))
             .await;
