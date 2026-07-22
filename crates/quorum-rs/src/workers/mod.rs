@@ -1615,6 +1615,15 @@ impl NatsNsedWorker {
                 "task_description": context.task_description,
                 "user_injections": context.user_injections,
             });
+            // Thread the conversation id (top-level metadata) so patch-deliberation can
+            // key the agent worktree on the stable thread — not the per-job id — and
+            // keep the provider's cwd-scoped session resuming across turns. Top-level
+            // (not under `patch_deliberation`): the dylib config-merge is a shallow
+            // overlay that would clobber a nested key.
+            let meta = match &context.conversation_id {
+                Some(cid) => serde_json::json!({ "conversation_id": cid }),
+                None => serde_json::json!({}),
+            };
             if let Some(new) = self
                 .run_stage_mw(
                     &self.before_prompt_mw,
@@ -1623,7 +1632,7 @@ impl NatsNsedWorker {
                     context.round_number,
                     crate::middleware::MiddlewareStage::BeforePrompt,
                     content,
-                    serde_json::json!({}),
+                    meta,
                 )
                 .await?
             {
