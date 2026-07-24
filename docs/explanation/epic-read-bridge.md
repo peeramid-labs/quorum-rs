@@ -58,13 +58,34 @@ the authorization layer, on two sides:
   request, refuses any `project_id` not in its `held` map (`serve_scoped`). It answers
   only for epics it actually holds; a stray request is refused, never served from the
   wrong epic. The queue group means exactly one holder replies.
-- **Requesting side** — the client's NATS identity scopes which project subjects it may
-  publish to.
+- **Requesting side** — the client's NATS credentials scope which project subjects it may
+  publish to (see *Enforcement* below).
 
 Together these give the intended rule: **a client can read epic X iff it can reach an
 agent that holds X.** Sharing the deliberation channel with the agents *is* the grant —
 "talk to the agents that share that filesystem, by id, and you can see the dir." There
 is no separate ACL to keep in sync; the epic identity and the NATS route are the ACL.
+
+### Enforcement: NATS permissions
+
+The server-side scoping (`serve_scoped`) is code and is tested. The requesting-side scoping
+is **not** the bridge's code — it is a NATS permission on the client's User JWT, exactly
+mirroring how the `telemetry.agent.{agent_id}` subtree is JWT-bound (see
+[NATS topology](nats-topology.md)). The contract:
+
+- A **client** entitled to project `X` is issued a JWT that grants
+  `publish("<prefix>.epic.<X>.read")` — and only for the projects it took part in. Without
+  the grant the server never even sees the request; the broker rejects the publish. This is
+  what stops a client from reading an arbitrary epic just by knowing (or guessing) a
+  root-commit id.
+- A **holder node** is issued a JWT that grants `subscribe("<prefix>.epic.*.read")` (queue
+  group) — it may answer, but `serve_scoped` still bounds it to the epics it actually holds,
+  so a broad subscribe can't leak an unheld project.
+
+Minting those per-project grants is the orchestrator's credential job (the same flow as
+`issue_telemetry_jwt`), not the bridge library's — the bridge assumes the broker enforces
+them. Until that minting exists, the deployment must restrict the epic-read subject some
+other way (e.g. a dedicated account), or any authenticated client can read any held epic.
 
 ## Confinement
 

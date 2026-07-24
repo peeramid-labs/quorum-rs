@@ -23,6 +23,18 @@ epic's canonical root-commit sha — the same key `ProjectRegistry` groups agent
 subscribes the queue group only for the projects it holds; a request for an unheld project
 is answered with an `error` reply, never served from another epic.
 
+### Required NATS permissions
+
+| Role | Grant |
+|---|---|
+| Client (reads project `X`) | `publish` on `<prefix>.epic.<X>.read` — per entitled project only |
+| Holder node | `subscribe` on `<prefix>.epic.*.read` (queue group) |
+
+The client grant is the access boundary and is enforced by the broker (a client without it
+can't publish the request at all). Minting it per project is the orchestrator's credential
+job, mirroring the telemetry-JWT flow; see
+[the bridge explanation](../explanation/epic-read-bridge.md#enforcement-nats-permissions).
+
 ## Request
 
 JSON object, internally tagged by `op` (snake_case).
