@@ -9,6 +9,7 @@ Authoritative descriptions — API surface, types, schemas. Mirrors the code str
 | [Chat completions API](chat-completions.md) | OpenAI-compatible `/v1/chat/completions` request/response shapes. |
 | [Exec agent protocol](exec-agent-protocol.md) | Wire protocol for stdin/stdout subprocess agents. |
 | [MCP agent protocol](mcp-agent-protocol.md) | Wire protocol for tool-calling-aware external agents. |
+| [Epic-read bridge protocol](epic-read-protocol.md) | NATS request/reply wire protocol for reading an epic's git patch plane (files, refs, diffs) with no fs/forgejo access. |
 | [Dashboard configuration](dashboard-config.md) | `--dashboard-port` / `--dashboard-bind` flags, `dashboard_port` yaml field, `QUORUM_DASHBOARD_BIND` env var, `status-server` feature gate. |
 | [`persona` yaml shapes](persona-yaml-shapes.md) | Grammar for the inline-string and stacked-layer forms `persona:` accepts; path semantics and error modes. |
 | [Thread TUI](thread-tui.md) | `quorum` thread-TUI keymap (per screen), reader/inbox line formats, and the persisted Message/Thread data model. |
