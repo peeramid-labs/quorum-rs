@@ -32,6 +32,7 @@ pub mod conversation;
 #[cfg(feature = "audit")]
 pub mod crypto;
 pub mod dump_prompts;
+pub mod epic_read;
 pub mod events;
 /// Workspace + agent-fleet config primitives that `quorum init`
 /// composes: provider catalog, persona presets, yaml renderer,
