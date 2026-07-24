@@ -47,6 +47,21 @@ fn make_epic(uid: &str) -> PathBuf {
     dir
 }
 
+/// A one-commit epic whose base file carries `body` — distinct `body` ⇒ distinct root
+/// commit ⇒ distinct project id, so a node can hold several and they can't be confused.
+fn make_epic_named(uid: &str, body: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("qr-epicread-it-{uid}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    git(&dir, &["config", "user.email", "a@b"]);
+    git(&dir, &["config", "user.name", "a"]);
+    std::fs::write(dir.join("kpi.md"), body).unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "base"]);
+    dir
+}
+
 #[tokio::test]
 async fn epic_read_bridge_round_trip_over_real_nats() {
     let Some(client) = try_connect_nats().await else {
@@ -172,4 +187,68 @@ async fn epic_read_bridge_round_trip_over_real_nats() {
 
     svc.abort();
     let _ = std::fs::remove_dir_all(&epic);
+}
+
+/// One node holds TWO epics: the `<prefix>.epic.*.read` wildcard must demux each request
+/// to the right epic by its project id, and still refuse a third it doesn't hold. This is
+/// the "scoped by id" guarantee under a node that holds more than one project.
+#[tokio::test]
+async fn epic_read_service_demuxes_multiple_held_projects_by_id() {
+    let Some(client) = try_connect_nats().await else {
+        return;
+    };
+    let uid = unique_id();
+    let prefix = subject_prefix(&uid);
+    let epic_a = make_epic_named(&format!("{uid}-a"), "alpha\n");
+    let epic_b = make_epic_named(&format!("{uid}-b"), "bravo\n");
+    let pid_a = project_id_of(&epic_a).unwrap();
+    let pid_b = project_id_of(&epic_b).unwrap();
+    assert_ne!(pid_a, pid_b, "distinct epics → distinct project ids");
+
+    let held: HashMap<String, PathBuf> = [
+        (pid_a.clone(), epic_a.clone()),
+        (pid_b.clone(), epic_b.clone()),
+    ]
+    .into();
+    let svc = {
+        let client = client.clone();
+        let prefix = prefix.clone();
+        let group = format!("epic-read-{uid}");
+        tokio::spawn(async move {
+            let _ = run_read_service(&client, &prefix, &group, held).await;
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let read = |pid: String| {
+        let client = client.clone();
+        let prefix = prefix.clone();
+        async move {
+            request_read(
+                &client,
+                &prefix,
+                &pid,
+                &ReadRequest::FileRead {
+                    path: "kpi.md".into(),
+                    at: None,
+                },
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Each project id routes to ITS epic — no cross-talk.
+    assert_eq!(read(pid_a.clone()).await.content.as_deref(), Some("alpha"));
+    assert_eq!(read(pid_b.clone()).await.content.as_deref(), Some("bravo"));
+
+    // A third project this node does NOT hold → refused, even holding two others.
+    let refused = request_read(&client, &prefix, "unheld-project", &ReadRequest::RefsList)
+        .await
+        .unwrap();
+    assert!(refused.error.as_deref().unwrap().contains("out of scope"));
+
+    svc.abort();
+    let _ = std::fs::remove_dir_all(&epic_a);
+    let _ = std::fs::remove_dir_all(&epic_b);
 }
