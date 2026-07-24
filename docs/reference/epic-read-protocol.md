@@ -80,8 +80,10 @@ Treat it as text for display/diffing, not for hash-reconstructing the blob.
 - **Read-only.** No op writes; proposals flow through the deliberation pipeline, not here.
 - **Epic-confined.** `path` is rejected before touching git if it is absolute, starts with
   `/`, contains a `..` component, or contains a backslash. `git show <ref>:<path>` is
-  itself repo-relative. Git env (`GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE`) is scrubbed
-  per call.
+  itself repo-relative. A ref (`at` / `base` / `target`) that starts with `-` is refused
+  before git runs — git would otherwise parse it as an option (e.g. `git diff --output=<file>`
+  writes outside the epic). Git env (`GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE`) is
+  scrubbed per call.
 - **Project-scoped.** A node answers only for epics in its held map; the subject's
   `project_id` is the authorization key.
 - **Fresh.** Reads reflect the epic's current git state; a landed deliberation commit shows
@@ -96,6 +98,7 @@ Treat it as text for display/diffing, not for hash-reconstructing the blob.
 | Unheld project | `out of scope` |
 | Absolute path | `is absolute — reads are confined to the epic tree` |
 | `..` escape | `escapes the epic tree` |
+| Flag-like ref | `parsed as a git option` |
 | Malformed subject | `malformed read subject` |
 | Bad request JSON | `bad read request` |
 | Git failure | the underlying `git <args>: <stderr>` |

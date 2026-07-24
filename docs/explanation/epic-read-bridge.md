@@ -73,9 +73,18 @@ repo-relative (it resolves against the tree, never the filesystem), but the brid
 fails **closed before** touching git: `reject_unsafe_path` rejects absolute paths, a
 leading `/`, any `..` component, and backslashes. So an escape attempt (`../../etc/passwd`)
 is an explicit, tested error rather than a surprising git message — and confinement is an
-invariant the tests assert over the wire, not an accident of git's behaviour. Git env
-(`GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE`) is scrubbed on every call so an ambient
-`GIT_DIR` can't redirect a read off the epic (the same isolation `project_sync` uses).
+invariant the tests assert over the wire, not an accident of git's behaviour.
+
+Paths are not the only client-controlled input, though. The `at` / `base` / `target` refs
+are interpolated into git's argv too, and git parses any argument that starts with `-` as
+an **option**, not a revision. Left unguarded, a `base` of `--output=<file>` turns
+`git diff` into an arbitrary file **write** outside the epic — a real primitive, reproduced
+before it was fixed. So `reject_unsafe_ref` refuses any ref leading with `-` (a legitimate
+git ref can never start with one) before git runs. This is why validating the path alone is
+not enough: every position where client bytes reach git argv has to fail closed.
+
+Git env (`GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE`) is scrubbed on every call so an
+ambient `GIT_DIR` can't redirect a read off the epic (the same isolation `project_sync` uses).
 
 ## Freshness: no extra fetch
 

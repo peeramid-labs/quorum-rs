@@ -155,6 +155,22 @@ fn reject_unsafe_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject any ref/revspec (`at` / `base` / `target`) that git would parse as an OPTION.
+/// These come from the client and are interpolated into git argv, so a value leading with
+/// `-` is read as a flag, not a revision — e.g. `git diff --output=<file>..` writes a file
+/// OUTSIDE the epic (an arbitrary-write primitive). A legitimate git ref can never start
+/// with `-` (git-check-ref-format forbids it), so fail-closed on that. Empty is rejected
+/// too — an empty rev is meaningless and would shift arg positions.
+fn reject_unsafe_ref(kind: &str, r: &str) -> Result<()> {
+    if r.is_empty() {
+        bail!("{kind} ref is empty");
+    }
+    if r.starts_with('-') {
+        bail!("{kind} ref {r:?} starts with `-` — refused (would be parsed as a git option)");
+    }
+    Ok(())
+}
+
 /// Serve one read request from the fleet node's local epic clone. Read-only, and
 /// strictly confined to the epic tree (paths validated; git resolves refs only within
 /// this repo). Reads reflect the epic's CURRENT git state, so results update the moment
@@ -164,6 +180,7 @@ pub fn serve_read(epic: &Path, req: &ReadRequest) -> Result<ReadReply> {
         ReadRequest::FilesList { path, at } => {
             reject_unsafe_path(path)?;
             let at = at.as_deref().unwrap_or("HEAD");
+            reject_unsafe_ref("at", at)?;
             // `git ls-tree <at> -- <path>`; `--name-only` for the paths, `-r` NOT set
             // so a listing is one level (dirs shown as entries), matching a browser.
             let spec = if path.is_empty() {
@@ -187,6 +204,7 @@ pub fn serve_read(epic: &Path, req: &ReadRequest) -> Result<ReadReply> {
         ReadRequest::FileRead { path, at } => {
             reject_unsafe_path(path)?;
             let at = at.as_deref().unwrap_or("HEAD");
+            reject_unsafe_ref("at", at)?;
             let content = git(epic, &["show", &format!("{at}:{path}")])?;
             Ok(ReadReply {
                 content: Some(content),
@@ -220,6 +238,8 @@ pub fn serve_read(epic: &Path, req: &ReadRequest) -> Result<ReadReply> {
             })
         }
         ReadRequest::Diff { base, target } => {
+            reject_unsafe_ref("base", base)?;
+            reject_unsafe_ref("target", target)?;
             let content = git(epic, &["diff", &format!("{base}..{target}")])?;
             Ok(ReadReply {
                 content: Some(content),
@@ -548,6 +568,65 @@ mod tests {
         .unwrap();
         assert!(!ok.content.unwrap().contains("secret"));
         let _ = std::fs::remove_file(&secret);
+        let _ = std::fs::remove_dir_all(&e);
+    }
+
+    /// A client-supplied ref (`at` / `base` / `target`) is interpolated into git argv, so a
+    /// value leading with `-` is parsed as a FLAG, not a revision. `git diff --output=<file>`
+    /// then writes OUTSIDE the epic — an arbitrary-write primitive. Every ref position must
+    /// refuse such values, fail-closed, before git runs.
+    #[test]
+    fn flag_like_refs_are_refused_and_never_write_outside_the_epic() {
+        let e = epic();
+        // The write primitive: `base` as `--output=<stem>`. git would create `<stem>..HEAD`.
+        let stem = std::env::temp_dir().join(format!("qr-epicread-pwned-{}", std::process::id()));
+        let would_write = std::path::PathBuf::from(format!("{}..HEAD", stem.display()));
+        let _ = std::fs::remove_file(&would_write);
+        let diff = serve_read(
+            &e,
+            &ReadRequest::Diff {
+                base: format!("--output={}", stem.display()),
+                target: "HEAD".into(),
+            },
+        );
+        assert!(diff.is_err(), "flag-like base must be refused");
+        assert!(!would_write.exists(), "must NOT write outside the epic");
+        let _ = std::fs::remove_file(&would_write);
+
+        // `target` and `at` positions are guarded too.
+        assert!(
+            serve_read(
+                &e,
+                &ReadRequest::Diff {
+                    base: "base/job1".into(),
+                    target: "--x".into(),
+                },
+            )
+            .is_err(),
+            "flag-like target refused"
+        );
+        assert!(
+            serve_read(
+                &e,
+                &ReadRequest::FileRead {
+                    path: "docs/spec.md".into(),
+                    at: Some("--x".into()),
+                },
+            )
+            .is_err(),
+            "flag-like at (file_read) refused"
+        );
+        assert!(
+            serve_read(
+                &e,
+                &ReadRequest::FilesList {
+                    path: String::new(),
+                    at: Some("-x".into()),
+                },
+            )
+            .is_err(),
+            "flag-like at (files_list) refused"
+        );
         let _ = std::fs::remove_dir_all(&e);
     }
 

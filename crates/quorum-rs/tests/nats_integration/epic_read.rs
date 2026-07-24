@@ -185,6 +185,31 @@ async fn epic_read_bridge_round_trip_over_real_nats() {
             .contains("escapes the epic tree")
     );
 
+    // A flag-like ref (arbitrary-write primitive) is refused over the wire, no file written.
+    let stem = std::env::temp_dir().join(format!("qr-epicread-it-pwned-{uid}"));
+    let would_write = PathBuf::from(format!("{}..HEAD", stem.display()));
+    let _ = std::fs::remove_file(&would_write);
+    let flag = request_read(
+        &client,
+        &prefix,
+        &pid,
+        &ReadRequest::Diff {
+            base: format!("--output={}", stem.display()),
+            target: "HEAD".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        flag.error
+            .as_deref()
+            .unwrap()
+            .contains("parsed as a git option"),
+        "flag-like base refused over the wire: {flag:?}"
+    );
+    assert!(!would_write.exists(), "no out-of-epic write over the wire");
+    let _ = std::fs::remove_file(&would_write);
+
     svc.abort();
     let _ = std::fs::remove_dir_all(&epic);
 }
