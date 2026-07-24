@@ -45,6 +45,8 @@ pub enum ReadRequest {
 }
 
 /// A reply. `paths` for a listing, `content` for a file/diff, `refs` for RefsList.
+/// `error` (set instead of the above) carries a refusal/failure so the client gets a
+/// structured answer over NATS, never a silent timeout.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReadReply {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -53,6 +55,68 @@ pub struct ReadReply {
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ReadReply {
+    fn err(message: impl std::fmt::Display) -> Self {
+        ReadReply {
+            error: Some(message.to_string()),
+            ..Default::default()
+        }
+    }
+}
+
+/// The project id of a local epic clone — its canonical root-commit key, the SAME key
+/// `patch_deliberation::project` derives and [`ProjectRegistry`](crate::project_registry)
+/// groups on. Lets a node build its `held` map (`project_id` → path) from configured
+/// epic paths without loading the dylib. Lexicographically-smallest root for a multi-root
+/// repo, so every clone agrees.
+pub fn project_id_of(epic: &Path) -> Result<String> {
+    let roots = git(epic, &["rev-list", "--max-parents=0", "HEAD"])?;
+    roots
+        .lines()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .min()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("epic {epic:?} has no root commit"))
+}
+
+/// The subject a fleet node subscribes (queue group) to serve reads for one project,
+/// and the client addresses: `<prefix>.epic.<project_id>.read`. Project id is in the
+/// subject so authz is enforced at the NATS layer (a node subscribes only for projects
+/// it holds; the client's identity scopes which project subjects it may publish to).
+pub fn read_subject(subject_prefix: &str, project_id: &str) -> String {
+    format!("{subject_prefix}.epic.{project_id}.read")
+}
+
+/// Parse the `project_id` out of a `<prefix>.epic.<project_id>.read` subject.
+pub fn project_id_from_subject(subject_prefix: &str, subject: &str) -> Option<String> {
+    let rest = subject.strip_prefix(&format!("{subject_prefix}.epic."))?;
+    rest.strip_suffix(".read").map(str::to_string)
+}
+
+/// Handle one raw read message: parse the project from the subject, deserialize the
+/// request, serve it scoped to the node's held epics, and serialize the reply bytes.
+/// Every failure path (bad subject, bad payload, unheld project, git error) becomes a
+/// structured `ReadReply{error}` — the client always gets an answer, never a hang.
+/// Pure: no NATS, testable directly.
+pub fn handle_read_message(
+    held: &std::collections::HashMap<String, std::path::PathBuf>,
+    subject_prefix: &str,
+    subject: &str,
+    payload: &[u8],
+) -> Vec<u8> {
+    let reply = match project_id_from_subject(subject_prefix, subject) {
+        None => ReadReply::err(format!("malformed read subject {subject:?}")),
+        Some(pid) => match serde_json::from_slice::<ReadRequest>(payload) {
+            Err(e) => ReadReply::err(format!("bad read request: {e}")),
+            Ok(req) => serve_scoped(held, &pid, &req).unwrap_or_else(ReadReply::err),
+        },
+    };
+    serde_json::to_vec(&reply).unwrap_or_else(|_| b"{\"error\":\"serialize failed\"}".to_vec())
 }
 
 /// Serve a request SCOPED to a project id. The node answers only for epics it
@@ -163,6 +227,39 @@ pub fn serve_read(epic: &Path, req: &ReadRequest) -> Result<ReadReply> {
             })
         }
     }
+}
+
+/// Run the read service: a fleet node subscribes a QUEUE GROUP on
+/// `<prefix>.epic.*.read` (so exactly one holder answers each request) and replies from
+/// its local epic clones. `held` maps `project_id` → local epic path — the projects this
+/// node holds; `serve_scoped` refuses anything else. Freshness: `held` should point at
+/// the SAME clones the [`project_sync`](crate::project_sync) loop keeps current (it pulls
+/// on `project_advanced`), so reads reflect the latest deliberation commit with no extra
+/// fetch. Runs until the subscription ends; a bad message replies with a structured
+/// error, never crashes the loop.
+pub async fn run_read_service(
+    nats: &async_nats::Client,
+    subject_prefix: &str,
+    queue_group: &str,
+    held: std::collections::HashMap<String, std::path::PathBuf>,
+) -> Result<()> {
+    use futures::StreamExt;
+    let subject = format!("{subject_prefix}.epic.*.read");
+    let mut sub = nats
+        .queue_subscribe(subject.clone(), queue_group.to_string())
+        .await
+        .map_err(|e| anyhow!("queue_subscribe {subject}: {e}"))?;
+    tracing::info!(subject = %subject, group = %queue_group, projects = held.len(), "epic read service started");
+    while let Some(msg) = sub.next().await {
+        let Some(reply_to) = msg.reply.clone() else {
+            continue; // no reply subject → nothing to answer
+        };
+        let bytes = handle_read_message(&held, subject_prefix, msg.subject.as_str(), &msg.payload);
+        if let Err(e) = nats.publish(reply_to, bytes.into()).await {
+            tracing::warn!(error = %e, "epic read: reply publish failed");
+        }
+    }
+    Ok(())
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
@@ -454,6 +551,105 @@ mod tests {
         let refused = serve_scoped(&held, "some-other-project", &ReadRequest::RefsList);
         assert!(refused.is_err(), "unheld project must be refused");
         assert!(format!("{}", refused.unwrap_err()).contains("out of scope"));
+        let _ = std::fs::remove_dir_all(&e);
+    }
+
+    #[test]
+    fn project_id_of_is_the_root_commit_and_builds_the_held_map() {
+        use std::collections::HashMap;
+        let e = epic();
+        let pid = project_id_of(&e).unwrap();
+        assert_eq!(pid.len(), 40, "project id is the root-commit sha");
+        // A node builds its held map from its epic paths, then serves scoped by it.
+        let held: HashMap<String, std::path::PathBuf> = [(pid.clone(), e.clone())].into();
+        let ok = serve_scoped(
+            &held,
+            &pid,
+            &ReadRequest::FileRead {
+                path: "README.md".into(),
+                at: None,
+            },
+        );
+        assert_eq!(ok.unwrap().content.as_deref(), Some("root"));
+        let _ = std::fs::remove_dir_all(&e);
+    }
+
+    #[test]
+    fn read_subject_round_trips_the_project_id() {
+        let s = read_subject("nsed", "root-sha");
+        assert_eq!(s, "nsed.epic.root-sha.read");
+        assert_eq!(
+            project_id_from_subject("nsed", &s).as_deref(),
+            Some("root-sha")
+        );
+        // Wrong shape → None (not a read subject).
+        assert!(project_id_from_subject("nsed", "nsed.project.x.advanced").is_none());
+    }
+
+    #[test]
+    fn handle_read_message_dispatches_scoped_and_structures_every_error() {
+        use std::collections::HashMap;
+        let e = epic();
+        let root = {
+            let o = Command::new("git")
+                .arg("-C")
+                .arg(&e)
+                .args(["rev-list", "--max-parents=0", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        let mut held: HashMap<String, std::path::PathBuf> = HashMap::new();
+        held.insert(root.clone(), e.clone());
+        let subject = read_subject("nsed", &root);
+
+        // Happy path: a real request → the file content, over the wire.
+        let req = serde_json::to_vec(&ReadRequest::FileRead {
+            path: "README.md".into(),
+            at: None,
+        })
+        .unwrap();
+        let reply: ReadReply =
+            serde_json::from_slice(&handle_read_message(&held, "nsed", &subject, &req)).unwrap();
+        assert_eq!(reply.content.as_deref(), Some("root"));
+        assert!(reply.error.is_none());
+
+        // Unheld project → structured error (never a hang, never the wrong epic).
+        let other = read_subject("nsed", "not-held");
+        let r2: ReadReply =
+            serde_json::from_slice(&handle_read_message(&held, "nsed", &other, &req)).unwrap();
+        assert!(r2.error.as_deref().unwrap().contains("out of scope"));
+
+        // Malformed payload → structured error.
+        let r3: ReadReply =
+            serde_json::from_slice(&handle_read_message(&held, "nsed", &subject, b"not json"))
+                .unwrap();
+        assert!(r3.error.as_deref().unwrap().contains("bad read request"));
+
+        // Path escape over the wire → structured error (confinement holds at the edge).
+        let escape = serde_json::to_vec(&ReadRequest::FileRead {
+            path: "../../etc/passwd".into(),
+            at: None,
+        })
+        .unwrap();
+        let r4: ReadReply =
+            serde_json::from_slice(&handle_read_message(&held, "nsed", &subject, &escape)).unwrap();
+        assert!(
+            r4.error
+                .as_deref()
+                .unwrap()
+                .contains("escapes the epic tree")
+        );
+
+        // Malformed subject → structured error.
+        let r5: ReadReply =
+            serde_json::from_slice(&handle_read_message(&held, "nsed", "garbage", &req)).unwrap();
+        assert!(
+            r5.error
+                .as_deref()
+                .unwrap()
+                .contains("malformed read subject")
+        );
         let _ = std::fs::remove_dir_all(&e);
     }
 
