@@ -102,7 +102,9 @@ pub fn project_id_from_subject(subject_prefix: &str, subject: &str) -> Option<St
 /// request, serve it scoped to the node's held epics, and serialize the reply bytes.
 /// Every failure path (bad subject, bad payload, unheld project, git error) becomes a
 /// structured `ReadReply{error}` — the client always gets an answer, never a hang.
-/// Pure: no NATS, testable directly.
+///
+/// Pure: no NATS, testable directly. The oversized-reply cap is applied by the caller
+/// ([`run_read_service`] via [`cap_bytes`]) since only it knows the NATS `max_payload`.
 pub fn handle_read_message(
     held: &std::collections::HashMap<String, std::path::PathBuf>,
     subject_prefix: &str,
@@ -117,6 +119,20 @@ pub fn handle_read_message(
         },
     };
     serde_json::to_vec(&reply).unwrap_or_else(|_| b"{\"error\":\"serialize failed\"}".to_vec())
+}
+
+/// Cap a serialized reply at the NATS `max_payload`: an oversized reply can't be published
+/// (async-nats rejects it), which would hang the client on a silent timeout. Instead
+/// substitute a small structured error naming the size, which always fits.
+fn cap_bytes(reply_bytes: Vec<u8>, max_reply_bytes: usize) -> Vec<u8> {
+    if reply_bytes.len() <= max_reply_bytes {
+        return reply_bytes;
+    }
+    let capped = ReadReply::err(format!(
+        "reply {} bytes exceeds the {max_reply_bytes}-byte NATS payload limit — narrow the request (a subpath or single file)",
+        reply_bytes.len()
+    ));
+    serde_json::to_vec(&capped).unwrap_or_else(|_| b"{\"error\":\"serialize failed\"}".to_vec())
 }
 
 /// Serve a request SCOPED to a project id. The node answers only for epics it
@@ -324,12 +340,14 @@ pub async fn run_read_service(
         .queue_subscribe(subject.clone(), queue_group.to_string())
         .await
         .map_err(|e| anyhow!("queue_subscribe {subject}: {e}"))?;
-    tracing::info!(subject = %subject, group = %queue_group, projects = held.len(), "epic read service started");
+    let max_reply_bytes = nats.server_info().max_payload;
+    tracing::info!(subject = %subject, group = %queue_group, projects = held.len(), max_reply_bytes, "epic read service started");
     while let Some(msg) = sub.next().await {
         let Some(reply_to) = msg.reply.clone() else {
             continue; // no reply subject → nothing to answer
         };
         let bytes = handle_read_message(&held, subject_prefix, msg.subject.as_str(), &msg.payload);
+        let bytes = cap_bytes(bytes, max_reply_bytes);
         if let Err(e) = nats.publish(reply_to, bytes.into()).await {
             tracing::warn!(error = %e, "epic read: reply publish failed");
         }
@@ -804,6 +822,30 @@ mod tests {
                 .contains("malformed read subject")
         );
         let _ = std::fs::remove_dir_all(&e);
+    }
+
+    /// A reply larger than the NATS `max_payload` can't be published — async-nats rejects
+    /// it and the client hangs on a silent timeout. `cap_bytes` substitutes a small size
+    /// error instead, which always fits.
+    #[test]
+    fn cap_bytes_substitutes_a_size_error_when_the_reply_is_too_big() {
+        // Under the cap → bytes pass through unchanged.
+        let small = b"{\"content\":\"root\"}".to_vec();
+        assert_eq!(cap_bytes(small.clone(), 10_000), small);
+
+        // Over the cap → a structured size error naming the byte count, and it fits the cap.
+        let capped = cap_bytes(small.clone(), 10);
+        let reply: ReadReply = serde_json::from_slice(&capped).unwrap();
+        let err = reply.error.as_deref().unwrap();
+        assert!(err.contains("exceeds the 10-byte"), "size error: {err}");
+        assert!(
+            err.contains(&small.len().to_string()),
+            "names the actual size: {err}"
+        );
+        assert!(
+            reply.content.is_none(),
+            "content dropped in favour of the error"
+        );
     }
 
     #[test]

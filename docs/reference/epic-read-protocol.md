@@ -60,7 +60,10 @@ JSON object. Exactly one of `paths` / `content` / `refs` carries a success paylo
 | `error` | string | any failure or refusal |
 
 A reply always arrives — a bad subject, unparseable request, unheld project, unsafe path,
-or git failure all come back as `{"error": "..."}`, never a silent timeout.
+git failure, or a reply too large for NATS all come back as `{"error": "..."}`, never a
+silent timeout. A reply that would exceed the server's `max_payload` (the largest NATS
+message, default 1 MB) can't be published, so it is replaced with a size error naming the
+byte count — narrow the request (a subpath or a single file) and retry.
 
 ### Reply examples
 
@@ -101,4 +104,5 @@ Treat it as text for display/diffing, not for hash-reconstructing the blob.
 | Flag-like ref | `parsed as a git option` |
 | Malformed subject | `malformed read subject` |
 | Bad request JSON | `bad read request` |
+| Reply too large | `exceeds the <n>-byte NATS payload limit` |
 | Git failure | the underlying `git <args>: <stderr>` |
