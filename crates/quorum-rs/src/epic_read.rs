@@ -589,6 +589,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&e);
     }
 
+    /// A symlink committed into the epic must read back as its TARGET PATH (git stores it as
+    /// a blob holding the link string), never the CONTENTS of whatever it points at — else a
+    /// planted link would exfiltrate a file outside the epic. This pins that git behaviour so
+    /// the confinement claim can't silently regress.
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_read_as_their_target_string_never_followed_off_the_epic() {
+        let e = epic();
+        let secret = e.parent().unwrap().join("SYM-SECRET.txt");
+        std::fs::write(&secret, "TOP SECRET SYMLINK TARGET\n").unwrap();
+        std::os::unix::fs::symlink(&secret, e.join("link_abs")).unwrap();
+        std::os::unix::fs::symlink("../../../etc/hosts", e.join("link_rel")).unwrap();
+        g(&e, &["add", "-A"]);
+        g(&e, &["commit", "-qm", "add symlinks"]);
+
+        // An absolute-target link → the target PATH string, not the secret's contents.
+        let abs = serve_read(
+            &e,
+            &ReadRequest::FileRead {
+                path: "link_abs".into(),
+                at: None,
+            },
+        )
+        .unwrap();
+        let content = abs.content.unwrap();
+        assert!(
+            content.contains("SYM-SECRET.txt"),
+            "reads the link target path: {content}"
+        );
+        assert!(
+            !content.contains("TOP SECRET"),
+            "never the pointed-to file contents"
+        );
+
+        // A relative escape link → its literal target string, not `/etc/hosts` contents.
+        let rel = serve_read(
+            &e,
+            &ReadRequest::FileRead {
+                path: "link_rel".into(),
+                at: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(rel.content.as_deref(), Some("../../../etc/hosts"));
+
+        let _ = std::fs::remove_file(&secret);
+        let _ = std::fs::remove_dir_all(&e);
+    }
+
     /// A client-supplied ref (`at` / `base` / `target`) is interpolated into git argv, so a
     /// value leading with `-` is parsed as a FLAG, not a revision. `git diff --output=<file>`
     /// then writes OUTSIDE the epic — an arbitrary-write primitive. Every ref position must
