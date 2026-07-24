@@ -262,6 +262,25 @@ pub async fn run_read_service(
     Ok(())
 }
 
+/// Client side: send one read request to the fleet over NATS request/reply and decode
+/// the [`ReadReply`]. The client needs no filesystem and no forgejo — just NATS reach to
+/// a node holding the project (whichever queue-group member answers). A `reply.error`
+/// surfaces a refusal/failure; transport failure is the `Err`.
+pub async fn request_read(
+    nats: &async_nats::Client,
+    subject_prefix: &str,
+    project_id: &str,
+    req: &ReadRequest,
+) -> Result<ReadReply> {
+    let subject = read_subject(subject_prefix, project_id);
+    let payload = serde_json::to_vec(req)?;
+    let msg = nats
+        .request(subject.clone(), payload.into())
+        .await
+        .map_err(|e| anyhow!("read request {subject}: {e}"))?;
+    serde_json::from_slice(&msg.payload).map_err(|e| anyhow!("decode read reply: {e}"))
+}
+
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         // Scrub inherited git env so an ambient GIT_DIR can't redirect the read off
