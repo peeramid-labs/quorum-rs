@@ -57,6 +57,7 @@ use crate::providers::ProviderRegistry;
 use crate::tools::{ScopedGrepTool, ScopedReadFileTool, Tool};
 use crate::workers::{NatsNsedWorker, WorkerConfig};
 use anyhow::{Context, Result};
+use futures::future::OptionFuture;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -401,8 +402,64 @@ pub async fn serve_fleet(fleet: &AgentFleetConfig, opts: ServeOptions) -> Result
         );
     }
 
+    // Epic-read bridge: if any agent runs patch-deliberation on a local epic, serve those
+    // epics over NATS so an off-network app client (no filesystem, no forgejo) can browse
+    // files and reconstruct the patch plane. Queue-group scoped so exactly one holder
+    // answers per project; the same clones stay fresh via `project_sync`. The serve/no-serve
+    // decision is `plan_read_service` (pure, tested); this only runs the I/O it plans.
+    let read_task = OptionFuture::from(
+        plan_read_service(fleet, &opts.stream_name).map(|plan| spawn_read_service(&opts, plan)),
+    )
+    .await
+    .flatten();
+
     let cancel = opts.cancel.unwrap_or_default();
-    runner.run_with_cancellation(cancel).await
+    let fleet_result = runner.run_with_cancellation(cancel).await;
+    read_task.into_iter().for_each(|t| t.abort());
+    fleet_result
+}
+
+/// Whether this fleet serves any epics over the read bridge, and under what queue group.
+/// `None` when no agent holds a patch-deliberation epic. Pure so the serve/no-serve
+/// decision is unit-testable; the async connect/spawn lives in [`spawn_read_service`].
+fn plan_read_service(fleet: &AgentFleetConfig, stream_name: &str) -> Option<ReadServicePlan> {
+    let held = crate::epic_read::held_epics_from_fleet(fleet);
+    (!held.is_empty()).then(|| ReadServicePlan {
+        group: format!("{stream_name}-epic-read"),
+        held,
+    })
+}
+
+/// A planned epic-read service: the epics to serve and the queue group to serve them under.
+struct ReadServicePlan {
+    group: String,
+    held: std::collections::HashMap<String, std::path::PathBuf>,
+}
+
+/// Connect NATS and spawn [`run_read_service`](crate::epic_read::run_read_service) for a
+/// plan. `None` if the connect fails (logged) — a bridge that can't reach NATS disables
+/// itself rather than failing the fleet.
+async fn spawn_read_service(
+    opts: &ServeOptions,
+    plan: ReadServicePlan,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let client = crate::nats_utils::connect_nats(&opts.nats_url, opts.nats_auth.as_ref())
+        .await
+        .inspect_err(|e| {
+            warn!(
+                error = format!("{e:#}"),
+                "epic-read bridge disabled: NATS connect failed"
+            )
+        })
+        .ok()?;
+    let prefix = opts.api_prefix.clone();
+    let ReadServicePlan { group, held } = plan;
+    info!(projects = held.len(), "epic-read bridge serving held epics");
+    Some(tokio::spawn(async move {
+        let _ = crate::epic_read::run_read_service(&client, &prefix, &group, held)
+            .await
+            .inspect_err(|e| warn!(error = format!("{e:#}"), "epic-read service exited"));
+    }))
 }
 
 /// Suggest a useful tracing subscriber for the CLI wrapper. Library
@@ -460,6 +517,15 @@ mod tests {
     /// new field with `#[serde(default)]` just slots in.
     fn fleet_yaml(s: &str) -> AgentFleetConfig {
         serde_yaml::from_str(s).expect("fleet yaml must parse")
+    }
+
+    /// A fleet whose agents run no patch-deliberation dylib holds no epic, so the
+    /// read bridge stays off (the epic-held → serve case is covered end to end by
+    /// `epic_read`'s `held_epics_from_fleet` tests + the real-NATS integration test).
+    #[test]
+    fn plan_read_service_is_none_without_a_held_epic() {
+        let fleet = fleet_yaml("providers: {}\nagents: []\n");
+        assert!(plan_read_service(&fleet, "sphera_jobs").is_none());
     }
 
     /// Filter naming a nonexistent agent → clear "no agents

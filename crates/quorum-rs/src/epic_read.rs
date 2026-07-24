@@ -229,6 +229,61 @@ pub fn serve_read(epic: &Path, req: &ReadRequest) -> Result<ReadReply> {
     }
 }
 
+/// The epic paths one agent's dylib middleware operates on: every `patch_deliberation`
+/// dylib entry (across all pipeline stages) carries `config.patch_deliberation.upstream`,
+/// the on-disk epic root. The same upstream repeats across stages (before_prompt /
+/// on_completion / on_job_complete) — the caller dedups by project id.
+fn dylib_upstreams(agent: &crate::AgentConfig) -> Vec<std::path::PathBuf> {
+    use crate::middleware::MiddlewareEntry;
+    let mw = &agent.middleware;
+    [
+        &mw.before_prompt,
+        &mw.on_completion,
+        &mw.on_job_complete,
+        &mw.on_provider_response,
+        &mw.before_release,
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|e| match e {
+        MiddlewareEntry::Dylib { config, .. } => config
+            .get("patch_deliberation")
+            .and_then(|pd| pd.get("upstream"))
+            .and_then(|u| u.as_str())
+            .map(std::path::PathBuf::from),
+        _ => None,
+    })
+    .collect()
+}
+
+/// Discover the epics a fleet node holds: scan every agent's dylib middleware for a
+/// `patch_deliberation.upstream` path and key each by its project id (root-commit).
+/// Agents sharing one upstream collapse to a single entry. A path that isn't a readable
+/// git epic is skipped (logged) — a misconfigured upstream disables the read service for that
+/// epic rather than crashing serve. This is the `held` map [`run_read_service`] scopes to,
+/// and the same on-disk clones [`project_sync`](crate::project_sync) keeps current, so a
+/// served read reflects the latest deliberation commit with no extra fetch.
+pub fn held_epics_from_fleet(
+    fleet: &crate::config::AgentFleetConfig,
+) -> std::collections::HashMap<String, std::path::PathBuf> {
+    let mut held = std::collections::HashMap::new();
+    for path in fleet.agents.iter().flat_map(dylib_upstreams) {
+        match project_id_of(&path) {
+            Ok(pid) => {
+                held.entry(pid).or_insert(path);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    upstream = ?path,
+                    error = %e,
+                    "epic-read: skipping upstream that isn't a readable git epic"
+                );
+            }
+        }
+    }
+    held
+}
+
 /// Run the read service: a fleet node subscribes a QUEUE GROUP on
 /// `<prefix>.epic.*.read` (so exactly one holder answers each request) and replies from
 /// its local epic clones. `held` maps `project_id` → local epic path — the projects this
@@ -687,5 +742,55 @@ mod tests {
                 .unwrap()
                 .contains("\"op\":\"file_read\"")
         );
+    }
+
+    /// A fleet where two agents run the patch-deliberation dylib on the SAME epic and a
+    /// third runs nothing. `upstream` is embedded via yaml exactly as production.yml does.
+    fn fleet_holding(upstream: &Path) -> Result<crate::config::AgentFleetConfig> {
+        let u = upstream.display();
+        let y = format!(
+            "providers: {{}}\n\
+             agents:\n  \
+             - name: A\n    \
+               middleware:\n      \
+                 on_completion:\n        \
+                   - dylib: ./libpd.dylib\n          \
+                     config: {{ patch_deliberation: {{ upstream: \"{u}\" }} }}\n  \
+             - name: B\n    \
+               middleware:\n      \
+                 on_job_complete:\n        \
+                   - dylib: ./libpd.dylib\n          \
+                     config: {{ patch_deliberation: {{ upstream: \"{u}\" }} }}\n  \
+             - name: C\n"
+        );
+        Ok(serde_yaml::from_str(&y)?)
+    }
+
+    #[test]
+    fn held_map_dedups_shared_upstream() -> Result<()> {
+        let e = epic();
+        let held = held_epics_from_fleet(&fleet_holding(&e)?);
+        assert_eq!(held.len(), 1, "two agents on one epic → one held entry");
+        let pid = project_id_of(&e)?;
+        assert_eq!(
+            held.get(&pid),
+            Some(&e),
+            "keyed by project id, points at the epic"
+        );
+        let _ = std::fs::remove_dir_all(&e);
+        Ok(())
+    }
+
+    #[test]
+    fn held_map_skips_upstream_that_isnt_a_git_epic() -> Result<()> {
+        // A misconfigured upstream must disable the read service for that epic, not crash serve.
+        let bogus =
+            std::env::temp_dir().join(format!("qr-epicread-nonexistent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bogus);
+        assert!(
+            held_epics_from_fleet(&fleet_holding(&bogus)?).is_empty(),
+            "non-git upstream skipped"
+        );
+        Ok(())
     }
 }

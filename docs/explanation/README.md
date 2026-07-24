@@ -12,6 +12,7 @@ Read these away from the keyboard when you want to understand a design decision 
 | [About the provider registry](provider-registry.md) | Why `provider.type` dispatch is a registry of factories, and how a third-party crate adds a provider without forking the SDK. |
 | [Agent ranking](agent-ranking.md) | Capability declaration + how agents earn rank through deliberation outcomes. |
 | [NATS topology](nats-topology.md) | Subjects, JetStream streams, JWT scopes, dispatch model. |
+| [About the epic-read bridge](epic-read-bridge.md) | Why the app client reads the git patch plane over NATS (no fs, no forgejo), how a read stays confined to one epic, and why reaching the agents *is* the read grant. |
 | [Middleware system](middleware.md) | Pluggable validation/moderation pipeline and the design rationale behind it. |
 | [Agent working-directory override](agent-working-directory.md) | Why `AgentContext.working_dir_override` exists, how a `before_prompt` middleware sets it via `agent_working_dir`, and what a custom agent must do with it. |
 | [About telemetry design](telemetry-design.md) | Principles, trace correlation, retention, and what is intentionally *not* emitted. |
