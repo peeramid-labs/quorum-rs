@@ -1,4 +1,5 @@
 pub mod app;
+pub mod ask_modal;
 pub mod client;
 pub mod config_writer;
 pub mod event;
@@ -244,6 +245,12 @@ async fn setup_and_run(
         handle_action(&mut app, &mut tui_client, &data_tx, &action, config_path);
     }
 
+    // App-level `ask_user` overlay. It renders + captures input ABOVE the view stack, so a
+    // blocked agent's question surfaces on any screen (thread, job detail, menu) — not only
+    // the thread reader. Views are recreated when a sub-view is pushed, so this can't live in
+    // a view.
+    let mut ask_modal = ask_modal::AskModal::new();
+
     // Main loop
     loop {
         terminal.draw(|frame| {
@@ -264,6 +271,10 @@ async fn setup_and_run(
             // The active view's model (a thread's) wins over the app default.
             let model = current_view.active_model().or(app.active_model.as_deref());
             render_footer(frame, footer_area, &app, model, app.active_effort);
+            // The HITL question modal draws last, over everything.
+            if ask_modal.is_active() {
+                ask_modal.draw(frame, area);
+            }
         })?;
 
         // Wait for event
@@ -302,6 +313,9 @@ async fn setup_and_run(
                 )
             });
             app.push_view(view_id);
+            // Point the ask_user overlay at this deliberation so a question that fires while
+            // watching it (on any screen) is answerable + cancellable.
+            ask_modal.set_context(orchestrator.clone(), app.job_thread.get(job_id).cloned());
             current_view = create_view(app.current_view().unwrap(), &app);
             let actions = current_view.on_enter();
             for a in actions {
@@ -403,6 +417,18 @@ async fn setup_and_run(
                 }
             }
             continue;
+        }
+
+        // App-level ask_user overlay: it renders + captures input above the view stack, so a
+        // blocked agent's question surfaces on any screen. `drive` returns whether it swallowed
+        // the event (or produced an answer to run); only an `Idle` outcome flows to the view.
+        match ask_modal.drive(&app_event) {
+            ask_modal::ModalOutcome::Consumed => continue,
+            ask_modal::ModalOutcome::Action(action) => {
+                handle_action(&mut app, &mut tui_client, &data_tx, &action, config_path);
+                continue;
+            }
+            ask_modal::ModalOutcome::Idle => {}
         }
 
         // Update view
