@@ -7,6 +7,7 @@ mod nats_connection;
 mod registration;
 mod scratchpad_store;
 mod telemetry_emit;
+mod user_tool_wiring;
 mod worker_coverage;
 mod worker_lifecycle;
 mod worker_messaging;

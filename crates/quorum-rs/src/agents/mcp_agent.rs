@@ -300,6 +300,13 @@ impl NsedMcpServer {
             }
         }
         tools.extend(self.user_tools());
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        tracing::info!(
+            phase = ?self.phase,
+            has_user_tool_handler = self.context.user_tool_handler.is_some(),
+            advertised = ?names,
+            "MCP tools advertised to the claude subprocess (look for user_ask_user here)"
+        );
         tools
     }
 }
