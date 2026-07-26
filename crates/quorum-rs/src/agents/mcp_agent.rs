@@ -2295,30 +2295,19 @@ impl ClaudeAgent {
                 // same session (so context isn't lost) but with the
                 // feedback block appended to the system prompt.
                 //
-                // On a fresh restart, mint a NEW random uuid: the deterministic
-                // per-(agent, room) uuid is still held by the prior child that is
-                // dying, so reusing it re-collides ("Session ID … already in use").
-                // A v4 uuid can't collide, so the respawn always lands a clean session.
-                let fresh_uuid = if restart_fresh {
-                    Some(uuid::Uuid::new_v4().to_string())
-                } else {
-                    None
-                };
+                // On a fresh restart, create the session under the SAME deterministic
+                // per-(agent, room) uuid — its lock was just force-cleared above, so the
+                // dying child can no longer collide. Minting a random v4 here (the old
+                // "avoid re-collision" hack) created the session under an id the NEXT turn's
+                // `--resume` (deterministic) could never find → session-not-found → another
+                // fresh restart → the full task re-sent EVERY turn (the token-burn bug). The
+                // create uuid MUST equal the resume target or the session never resumes.
                 let (next_command, _next_sandbox) = if restart_fresh {
-                    self.build_command_inner_with_uuid(
-                        ctx,
-                        mcp_config_file2.path(),
-                        false,
-                        fresh_uuid.as_deref(),
-                    )
+                    self.build_command_inner_with_uuid(ctx, mcp_config_file2.path(), false, None)
                 } else {
                     self.build_command(ctx, mcp_config_file2.path())
                 };
-                // The attempt's uuid arg (lock/recovery telemetry) must match the
-                // command's session id — the fresh one on restart, else the original.
-                let attempt_uuid = fresh_uuid
-                    .as_deref()
-                    .unwrap_or(claude_session_uuid.as_str());
+                let attempt_uuid = claude_session_uuid.as_str();
 
                 // Issue #347 Option 2: feedback varies with the
                 // classified failure kind so claude gets a targeted
@@ -3711,6 +3700,34 @@ mod tests {
             "override wins over the deterministic uuid"
         );
         assert!(over.contains(&"--session-id".to_string()));
+    }
+
+    #[test]
+    fn fresh_restart_session_id_equals_the_resume_target_so_next_turn_resumes() {
+        // The token-burn regression: the fresh-restart retry minted a random v4 uuid, so the
+        // session was CREATED under an id the next turn's `--resume` (deterministic) could
+        // never find → session-not-found → another fresh restart → the full task re-sent
+        // EVERY turn. The invariant that prevents it: the fresh (`--session-id`) create uuid
+        // MUST equal the resume (`--resume`) target uuid. The restart path now passes `None`
+        // (deterministic) rather than a random override.
+        let agent = ClaudeAgent::new(
+            minimal_agent_config("Reviewer"),
+            crate::agents::config::ClaudeProviderConfig::default(),
+            stub_prompt_set(),
+        );
+        let ctx = minimal_context();
+        let (fresh, _) =
+            agent.build_command_inner_with_uuid(&ctx, &dummy_mcp_config(), false, None);
+        let (resumed, _) =
+            agent.build_command_inner_with_uuid(&ctx, &dummy_mcp_config(), true, None);
+        let arg_after = |cmd: &[String], flag: &str| -> String {
+            cmd[cmd.iter().position(|s| s == flag).unwrap() + 1].clone()
+        };
+        assert_eq!(
+            arg_after(&fresh, "--session-id"),
+            arg_after(&resumed, "--resume"),
+            "fresh-restart create uuid must equal the resume target, else resume never hits"
+        );
     }
 
     #[test]
