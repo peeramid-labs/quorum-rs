@@ -608,6 +608,14 @@ impl NatsNsedWorker {
         self
     }
 
+    /// The user-tool handler factory this worker was built with, if any. A worker WITHOUT
+    /// one silently drops every job-carried user tool (e.g. `ask_user`): the tool arrives in
+    /// the context but no handler is built, so it is never advertised over MCP. Exposed so a
+    /// test can assert the serve/build path actually wired it, and drive it end to end.
+    pub fn user_tool_factory(&self) -> Option<Arc<dyn UserToolHandlerFactory>> {
+        self.user_tool_factory.clone()
+    }
+
     /// Sets a [`ChatCapable`] agent for the status server chat endpoint.
     pub fn with_chat(mut self, chat: Arc<dyn ChatCapable>) -> Self {
         self.chat_agent = Some(chat);
@@ -1513,6 +1521,15 @@ impl NatsNsedWorker {
         context.telemetry = self.telemetry.clone();
 
         // Construct UserToolHandler if user tools are registered and factory is available
+        let user_tool_names: Vec<&str> =
+            context.user_tools.iter().map(|t| t.name.as_str()).collect();
+        tracing::info!(
+            agent = %self.agent.name(),
+            user_tool_count = context.user_tools.len(),
+            user_tools = ?user_tool_names,
+            has_factory = self.user_tool_factory.is_some(),
+            "user-tool wiring: names arriving in AgentContext (empty ⇒ ask_user won't be advertised)"
+        );
         if !context.user_tools.is_empty() {
             if let Some(ref factory) = self.user_tool_factory {
                 context.user_tool_handler = Some(factory.create(

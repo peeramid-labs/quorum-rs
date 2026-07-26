@@ -285,8 +285,14 @@ pub async fn build_worker(
         None => return Ok(None),
     };
 
-    let worker =
-        NatsNsedWorker::from_dyn_agent(agent, agent_config.clone(), worker_config, None).await?;
+    // Wire the user-tool handler factory so HITL tools (e.g. `ask_user`) an agent's job
+    // carries are actually advertised over MCP. Without it the tools arrive in the context
+    // but no handler is built, so `McpAgent::user_tools` stays empty and the agent never
+    // sees them. `nsed_worker.rs` wires this; the fleet `serve` path did not — the gap that
+    // kept `mcp__nsed__user_ask_user` off the claude agents.
+    let worker = NatsNsedWorker::from_dyn_agent(agent, agent_config.clone(), worker_config, None)
+        .await?
+        .with_user_tool_factory(Arc::new(crate::agents::NatsUserToolHandlerFactory));
     Ok(Some((worker, agent_config)))
 }
 
