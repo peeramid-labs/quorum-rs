@@ -125,7 +125,14 @@ impl AskModal {
                 self.queue.retain(|q| &q.call_id != call_id);
                 true
             }
-            AppEvent::Data(DataEvent::ToolCallsLoaded { calls, .. }) => {
+            AppEvent::Data(DataEvent::ToolCallsLoaded { thread_id, calls }) => {
+                // Only pop questions for the thread the operator is IN. A bulk fetch for a
+                // thread we're merely browsing in the list (or at TUI reopen, when there is no
+                // context yet) passes through untouched, so the thread list can badge it
+                // instead of the modal ambushing the operator.
+                if self.thread_id.as_deref() != Some(thread_id.as_str()) {
+                    return false;
+                }
                 for c in calls {
                     if let Some(q) =
                         AskQuestion::from_pending(c.job_id.clone(), c.call_id.clone(), &c.arguments)
@@ -403,6 +410,7 @@ mod tests {
     #[test]
     fn recovered_calls_are_deduped() {
         let mut m = AskModal::new();
+        m.set_context("orch".into(), Some("t1".into())); // recovered calls are scoped to context
         m.ingest(&pending_event("c1", "Q?", &[]));
         // The on-reopen recovery fetch delivers the same call — must not double-stack.
         let recovered: PendingToolCall = serde_json::from_value(serde_json::json!({
@@ -478,6 +486,25 @@ mod tests {
             ModalOutcome::Action(_)
         ));
         assert!(!m.is_active());
+    }
+
+    #[test]
+    fn drive_clears_pending_questions_on_job_complete() {
+        let mut m = AskModal::new();
+        m.set_context("orch".into(), Some("t1".into()));
+        m.drive(&pending_event("c1", "Q?", &[]));
+        assert!(m.is_active());
+        // The job the question blocked on finished → drop it, but let the view see JobComplete.
+        let done = AppEvent::Data(DataEvent::SseEvent(SseEvent::JobComplete {
+            status: "success".into(),
+            job_id: "job1".into(),
+            rounds_completed: 1,
+            best_proposal_content: String::new(),
+            best_proposal_score: 0.0,
+            best_proposal_author: String::new(),
+        }));
+        assert!(matches!(m.drive(&done), ModalOutcome::Idle));
+        assert!(!m.is_active(), "job completion clears the stale question");
     }
 
     #[test]

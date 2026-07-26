@@ -447,6 +447,16 @@ async fn setup_and_run(
                     }
                 }
                 ViewAction::Push(view_id) => {
+                    // Opening a thread points the ask_user overlay at it, so a question
+                    // recovered on open pops the modal here (the inbox badges the rest). The
+                    // orchestrator is the app's remote one — NOT thread.orchestrator, which is
+                    // never persisted, so an answer would carry an empty name and never send.
+                    if let ViewId::Thread { id: Some(tid) } = &view_id {
+                        ask_modal.set_context(
+                            remote_orchestrator_name(&app).unwrap_or_default(),
+                            Some(tid.clone()),
+                        );
+                    }
                     app.push_view(view_id);
                     current_view = create_view(app.current_view().unwrap(), &app);
                     let actions = current_view.on_enter();
@@ -502,12 +512,7 @@ async fn setup_and_run(
 fn create_view(view_id: &ViewId, app: &App) -> Box<dyn View> {
     // Determine default remote orchestrator for API-dependent views.
     // Only remote orchestrators have HTTP endpoints for agents/policies.
-    let remote_orch = app
-        .config
-        .orchestrators
-        .iter()
-        .find(|(_, o)| o.mode.as_ref() == Some(&OrchestratorMode::Remote))
-        .map(|(n, _)| n.clone());
+    let remote_orch = remote_orchestrator_name(app);
 
     match view_id {
         ViewId::MainMenu => Box::new(MainMenuView::new(
@@ -563,6 +568,18 @@ fn create_view(view_id: &ViewId, app: &App) -> Box<dyn View> {
             ))
         }
     }
+}
+
+/// The name of the first remote (HTTP) orchestrator in config, if any. This is the
+/// orchestrator a reopened thread and its `ask_user` answers route to — threads don't
+/// persist their own orchestrator, so an answer with an empty name silently fails to send
+/// (`build_remote` returns `unknown orchestrator ''`).
+fn remote_orchestrator_name(app: &App) -> Option<String> {
+    app.config
+        .orchestrators
+        .iter()
+        .find(|(_, o)| o.mode.as_ref() == Some(&OrchestratorMode::Remote))
+        .map(|(n, _)| n.clone())
 }
 
 /// Build a `RemoteOrchestrator` client from an orchestrator name in config.
@@ -1277,6 +1294,20 @@ mod tests {
             nats_url: None,
             config_file: None,
         }
+    }
+
+    #[test]
+    fn remote_orchestrator_name_resolves_the_answer_target_on_reopen() {
+        // A reopened thread carries no orchestrator of its own; the ask_user overlay must
+        // answer to the configured remote. Before this, the modal used thread.orchestrator
+        // (always None → empty name → build_remote fails → the answer silently never sent).
+        let mut orchs = HashMap::new();
+        orchs.insert("prod".into(), remote_orch("http://localhost:8080", "s"));
+        assert_eq!(
+            remote_orchestrator_name(&test_app(orchs)).as_deref(),
+            Some("prod"),
+        );
+        assert_eq!(remote_orchestrator_name(&test_app(HashMap::new())), None);
     }
 
     #[test]
