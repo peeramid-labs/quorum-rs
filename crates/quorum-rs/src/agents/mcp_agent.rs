@@ -600,6 +600,33 @@ impl NsedMcpServer {
             Err(e) => format!("Error updating scratchpad: {e}"),
         }
     }
+
+    /// Inspect the change history of a file (read-only provenance).
+    #[tool(
+        description = "Inspect the change history of a file in the working project: the \
+        sequence of revisions that touched it, each with author, date, and a one-line \
+        summary of what changed. Read-only — this reveals provenance, it does not modify \
+        anything. Use it to understand how a file reached its current state before you \
+        design changes to it."
+    )]
+    async fn nsed_file_history(&self, Parameters(input): Parameters<FileHistoryInput>) -> String {
+        let root = repo_root(&self.context);
+        file_history_report(&root, &input.path, input.limit.unwrap_or(20)).await
+    }
+
+    #[tool(
+        description = "Inspect the history of a range of lines in a file. By default: \
+        per-line provenance — for each line, which revision last changed it, by whom, and \
+        when. Pass `revisions: N` instead to see how that range EVOLVED across its last N \
+        changes (each revision with its diff) — the hunk-history view. Read-only. Use it to \
+        learn why a specific line is the way it is before proposing edits around it."
+    )]
+    async fn nsed_line_history(&self, Parameters(input): Parameters<LineHistoryInput>) -> String {
+        let root = repo_root(&self.context);
+        let start = input.start_line.max(1);
+        let end = input.end_line.unwrap_or(start).max(start);
+        line_history_report(&root, &input.path, start, end, input.revisions).await
+    }
 }
 
 impl ServerHandler for NsedMcpServer {
@@ -657,6 +684,153 @@ fn agent_id_match(stored_id: &str, requested_id: &str) -> bool {
     let requested_lower = requested.to_lowercase();
     stored_lower.starts_with(&format!("{requested_lower} ("))
         || stored_lower.starts_with(&format!("{requested_lower} "))
+}
+
+// ─── File-history inspection tools (read-only provenance) ────────────────────
+//
+// Agents deliberate inside a per-job worktree of the epic but MUST stay abstracted
+// from "managing a git repository" — they design an execution plan, they do not
+// mutate the repo. These helpers expose history/provenance FUNCTIONALLY (framed by
+// what they reveal, not as git commands) and are strictly read-only. Raw `git` is
+// blocked from Bash for the same reason (see `build_command_inner`).
+
+/// The working repository root for history inspection: the per-job worktree set by
+/// the `before_prompt` middleware (`agent_working_dir` → `working_dir_override`),
+/// falling back to the process cwd — the same resolution `phase_working_dir` uses.
+fn repo_root(ctx: &AgentContext) -> std::path::PathBuf {
+    ctx.working_dir_override
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()))
+}
+
+/// Validate a caller-supplied path stays within the working repo: reject absolute
+/// paths and any `..` traversal so a history tool can never read outside the epic
+/// worktree (git runs with `-C <root>`, so a clean relative path is confined).
+/// Returns the repo-relative path to hand to git as a pathspec.
+fn confine_within(rel: &str) -> Result<String, String> {
+    let p = std::path::Path::new(rel);
+    if p.is_absolute() {
+        return Err(format!(
+            "path must be relative to the project root, got an absolute path: {rel}"
+        ));
+    }
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "path must stay within the project (no `..` traversal): {rel}"
+        ));
+    }
+    Ok(rel.to_string())
+}
+
+/// Git discovery env that, if inherited (e.g. under a git hook that exports `GIT_DIR`
+/// and `GIT_WORK_TREE`), would override `-C <root>` and make git operate on the wrong
+/// repo — "core.bare and core.worktree do not make sense". Cleared so history commands
+/// always discover from `root`.
+const GIT_DISCOVERY_ENV: [&str; 7] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+    "GIT_PREFIX",
+    "GIT_CEILING_DIRECTORIES",
+];
+
+/// Run `git` read-only inside `root` and return stdout, or a human error string.
+/// `path`, when set, is appended as a `-- <path>` pathspec; it must be `None` for
+/// commands (like `git log -L`) that carry the path in an argument and reject `--`.
+async fn run_git_readonly(
+    root: &std::path::Path,
+    args: &[&str],
+    path: Option<&str>,
+) -> Result<String, String> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C").arg(root).args(args);
+    for var in GIT_DISCOVERY_ENV {
+        cmd.env_remove(var);
+    }
+    if let Some(p) = path {
+        cmd.arg("--").arg(p);
+    }
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("could not inspect history: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        let ctx = path.map(|p| format!(" for {p}")).unwrap_or_default();
+        Err(format!(
+            "could not inspect history{ctx}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// A file's revision history, most recent first, as `revision  date  author  summary`.
+async fn file_history_report(root: &std::path::Path, path: &str, limit: usize) -> String {
+    let rel = match confine_within(path) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let limit = limit.clamp(1, 200);
+    let n = format!("-n{limit}");
+    let args = [
+        "log",
+        "--follow",
+        n.as_str(),
+        "--date=short",
+        "--format=%h%x09%ad%x09%an%x09%s",
+    ];
+    match run_git_readonly(root, &args, Some(&rel)).await {
+        Ok(s) if s.trim().is_empty() => {
+            format!("No recorded history for {rel} (not tracked in this repository).")
+        }
+        Ok(s) => format!(
+            "Revision history of {rel} (most recent first):\nrevision\tdate\tauthor\tsummary\n{s}"
+        ),
+        Err(e) => e,
+    }
+}
+
+/// Per-line provenance for lines `start..=end` of a file. With `revisions = Some(n)`,
+/// returns instead how that range evolved across its last `n` revisions (each with
+/// its diff) — the "hunk history" view — rather than the last-change-only snapshot.
+async fn line_history_report(
+    root: &std::path::Path,
+    path: &str,
+    start: u32,
+    end: u32,
+    revisions: Option<usize>,
+) -> String {
+    let rel = match confine_within(path) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    if let Some(n) = revisions {
+        let n = n.clamp(1, 50);
+        let l = format!("-L{start},{end}:{rel}");
+        let nn = format!("-n{n}");
+        let args = ["log", l.as_str(), nn.as_str(), "--date=short"];
+        return match run_git_readonly(root, &args, None).await {
+            Ok(s) if s.trim().is_empty() => {
+                format!("No recorded changes to {rel} lines {start}-{end}.")
+            }
+            Ok(s) => format!(
+                "Change history of {rel} lines {start}-{end} (most recent first, up to {n} revisions):\n{s}"
+            ),
+            Err(e) => e,
+        };
+    }
+    let range = format!("{start},{end}");
+    let args = ["blame", "-L", range.as_str(), "--date=short", "-w"];
+    match run_git_readonly(root, &args, Some(&rel)).await {
+        Ok(s) if s.trim().is_empty() => format!("No provenance for {rel} lines {start}-{end}."),
+        Ok(s) => format!("Line provenance for {rel} (lines {start}-{end}):\n{s}"),
+        Err(e) => e,
+    }
 }
 
 // ─── McpAgent ───────────────────────────────────────────────────────────────
@@ -1047,13 +1221,16 @@ impl ClaudeAgent {
             ]);
         }
 
-        // Disallowed tools: user-specified, plus Write/Edit by default for safety.
-        // NSED agents interact via MCP tools (nsed_propose/nsed_evaluate),
-        // so filesystem writes are unnecessary unless explicitly enabled.
+        // Disallowed tools: user-specified, plus Write/Edit and raw `git` by default.
+        // NSED agents interact via MCP tools (nsed_propose/nsed_evaluate) and inspect
+        // history via nsed_file_history/nsed_line_history, so filesystem writes are
+        // unnecessary; `Bash(git:*)` is blocked so an agent designs an execution plan
+        // instead of thinking it manages — and mutating — the repo. Plain Bash (ls,
+        // cat, mkdir, …) stays available for read/scratch work.
         {
             let mut disallowed: Vec<String> = self.claude_config.disallowed_tools.clone();
             if !self.claude_config.writable {
-                for tool in &["Write", "Edit", "NotebookEdit"] {
+                for tool in &["Write", "Edit", "NotebookEdit", "Bash(git:*)"] {
                     let t = tool.to_string();
                     if !disallowed.contains(&t) {
                         disallowed.push(t);
@@ -5738,6 +5915,198 @@ printf '%s' '{{"type":"result","subtype":"success","result":"ok","cost_usd":0.0,
         assert!(
             err.to_string().contains("no text content"),
             "Expected assistant-no-text error, got: {err}"
+        );
+    }
+
+    // ─── File-history inspection tools ──────────────────────────────────────
+
+    /// Unwrap a setup `Result` in a fixture, panicking the test on failure.
+    fn must<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
+        match r {
+            Ok(v) => v,
+            Err(e) => panic!("test setup failed: {e:?}"),
+        }
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C")
+            .arg(dir)
+            .args(["-c", "user.email=t@e.test", "-c", "user.name=Tester"])
+            .args(args);
+        // Under the pre-commit hook, git exports GIT_DIR/GIT_WORK_TREE (wrong repo) and
+        // GIT_AUTHOR_*/GIT_COMMITTER_* (which override the -c user.* config above, so the
+        // commit author wouldn't be the fixture's "Tester"). Clear both so setup targets
+        // the temp repo with a deterministic identity.
+        for var in GIT_DISCOVERY_ENV {
+            cmd.env_remove(var);
+        }
+        for var in [
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_AUTHOR_DATE",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+            "GIT_COMMITTER_DATE",
+            "EMAIL",
+        ] {
+            cmd.env_remove(var);
+        }
+        let out = must(cmd.output());
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Temp repo: `src/a.txt` committed twice (beta → gamma on line 2).
+    fn repo_with_history() -> tempfile::TempDir {
+        let d = must(tempfile::TempDir::new());
+        let p = d.path();
+        git_in(p, &["init", "-q"]);
+        must(std::fs::create_dir_all(p.join("src")));
+        must(std::fs::write(p.join("src/a.txt"), "alpha\nbeta\n"));
+        git_in(p, &["add", "."]);
+        git_in(p, &["commit", "-q", "-m", "add alpha and beta"]);
+        must(std::fs::write(p.join("src/a.txt"), "alpha\ngamma\n"));
+        git_in(p, &["add", "."]);
+        git_in(p, &["commit", "-q", "-m", "change beta to gamma"]);
+        d
+    }
+
+    #[tokio::test]
+    async fn file_history_report_lists_all_revisions_of_a_file() {
+        let repo = repo_with_history();
+        let report = file_history_report(repo.path(), "src/a.txt", 20).await;
+        assert!(
+            report.contains("Revision history of src/a.txt"),
+            "missing header: {report}"
+        );
+        assert!(
+            report.contains("add alpha and beta") && report.contains("change beta to gamma"),
+            "both revision summaries must appear: {report}"
+        );
+        assert!(report.contains("Tester"), "author must appear: {report}");
+    }
+
+    #[tokio::test]
+    async fn file_history_report_flags_an_untracked_file() {
+        let repo = repo_with_history();
+        std::fs::write(repo.path().join("src/new.txt"), "x\n").unwrap();
+        let report = file_history_report(repo.path(), "src/new.txt", 20).await;
+        assert!(
+            report.contains("No recorded history"),
+            "untracked file must be flagged, not error: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn line_history_report_shows_per_line_provenance() {
+        let repo = repo_with_history();
+        // Line 2 last changed in the second commit (beta → gamma).
+        let report = line_history_report(repo.path(), "src/a.txt", 2, 2, None).await;
+        assert!(
+            report.contains("Line provenance for src/a.txt (lines 2-2)"),
+            "missing header: {report}"
+        );
+        assert!(
+            report.contains("gamma") && report.contains("Tester"),
+            "blame must carry the line content + author: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn line_history_report_tracks_hunk_evolution_across_revisions() {
+        let repo = repo_with_history();
+        // Line 2 was added ("beta") then changed ("gamma") — two revisions touch it.
+        let report = line_history_report(repo.path(), "src/a.txt", 2, 2, Some(5)).await;
+        assert!(
+            report.contains("Change history of src/a.txt lines 2-2"),
+            "evolution header expected: {report}"
+        );
+        assert!(
+            report.contains("add alpha and beta") && report.contains("change beta to gamma"),
+            "both revisions that touched the range must appear: {report}"
+        );
+        assert!(
+            report.contains("beta") && report.contains("gamma"),
+            "the range's diffs across revisions must appear: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_tools_reject_path_escapes_strictly() {
+        let repo = repo_with_history();
+        let up = file_history_report(repo.path(), "../secret.txt", 20).await;
+        assert!(up.contains("`..`"), "`..` traversal must be rejected: {up}");
+        let abs = file_history_report(repo.path(), "/etc/passwd", 20).await;
+        assert!(
+            abs.contains("absolute"),
+            "absolute path must be rejected: {abs}"
+        );
+        let up_line = line_history_report(repo.path(), "../secret.txt", 1, 1, None).await;
+        assert!(
+            up_line.contains("`..`"),
+            "line_history must reject `..` too: {up_line}"
+        );
+    }
+
+    #[test]
+    fn confine_within_accepts_nested_relative_paths() {
+        assert_eq!(confine_within("src/mod/a.rs").unwrap(), "src/mod/a.rs");
+    }
+
+    #[tokio::test]
+    async fn history_tools_are_advertised_to_the_agent() {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let server = NsedMcpServer::new(minimal_context(), ActivePhase::Proposing, None, tx);
+        let names: Vec<String> = server
+            .advertised_tools()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "nsed_file_history"),
+            "file-history tool must reach claude: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "nsed_line_history"),
+            "line-history tool must reach claude: {names:?}"
+        );
+    }
+
+    #[test]
+    fn deliberation_blocks_git_bash_but_keeps_plain_bash() {
+        // Read-only deliberation (writable=false): raw git blocked, plain Bash allowed.
+        let agent_cfg = minimal_agent_config("test");
+        let claude_cfg = crate::agents::config::ClaudeProviderConfig::default();
+        let agent = ClaudeAgent::new(agent_cfg, claude_cfg, stub_prompt_set());
+        let (cmd, _sandbox) = agent.build_command(&minimal_context(), &dummy_mcp_config());
+        let dt = cmd.iter().position(|s| s == "--disallowed-tools").unwrap();
+        let disallowed = &cmd[dt + 1];
+        assert!(
+            disallowed.split(',').any(|t| t == "Bash(git:*)"),
+            "raw git must be blocked in deliberation: {disallowed}"
+        );
+        assert!(
+            !disallowed.split(',').any(|t| t == "Bash"),
+            "plain Bash (ls/cat/mkdir) must stay available: {disallowed}"
+        );
+    }
+
+    #[test]
+    fn writable_agent_keeps_git_bash() {
+        let agent_cfg = minimal_agent_config("test");
+        let claude_cfg = crate::agents::config::ClaudeProviderConfig {
+            writable: true,
+            ..Default::default()
+        };
+        let agent = ClaudeAgent::new(agent_cfg, claude_cfg, stub_prompt_set());
+        let (cmd, _sandbox) = agent.build_command(&minimal_context(), &dummy_mcp_config());
+        assert!(
+            !cmd.contains(&"--disallowed-tools".to_string()),
+            "writable agent must not get the default git block: {cmd:?}"
         );
     }
 }
