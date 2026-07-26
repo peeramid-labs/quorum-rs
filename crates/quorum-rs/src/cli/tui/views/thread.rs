@@ -35,52 +35,6 @@ enum Mode {
     Compose,
 }
 
-/// An agent's live `ask_user` question awaiting the operator's answer. Time-boxed
-/// server-side to the round budget — if unanswered it expires and the agent
-/// proceeds, and the pending state clears on the `tool_call_expired` event.
-#[derive(Clone, Debug)]
-struct AskQuestion {
-    job_id: String,
-    call_id: String,
-    question: String,
-    options: Vec<String>,
-    /// Selected row: `0..options.len()` picks an option; `options.len()` is the
-    /// "type your own" row.
-    selected: usize,
-    /// Free-text entry (auto-on when there are no options).
-    typing: bool,
-    answer: String,
-}
-
-impl AskQuestion {
-    fn from_pending(
-        job_id: String,
-        call_id: String,
-        arguments: &serde_json::Value,
-    ) -> Option<Self> {
-        let question = arguments.get("question")?.as_str()?.to_string();
-        let options: Vec<String> = arguments
-            .get("options")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let typing = options.is_empty();
-        Some(Self {
-            job_id,
-            call_id,
-            question,
-            options,
-            selected: 0,
-            typing,
-            answer: String::new(),
-        })
-    }
-}
-
 /// Interactive view of a single thread — an email-style compose (Subject +
 /// Message, `Tab` between them) over the deliberation transcript.
 pub struct ThreadView {
@@ -137,11 +91,6 @@ pub struct ThreadView {
     /// shows a one-line preview (newest-on-top, email-style). Toggled with
     /// Enter/→ (expand) and ← (collapse) on the selected row.
     expanded: std::collections::HashSet<String>,
-    /// Live `ask_user` questions (Claude-style), shown as a modal one at a time.
-    /// Distinct concurrent questions stack here (front is shown); answering /
-    /// skipping / resolving pops that one and reveals the next. Server-side
-    /// moderator dedup collapses *same* questions before they reach here.
-    question_queue: std::collections::VecDeque<AskQuestion>,
     /// `Some(id)` while a single message is open full-screen (`o`); its own
     /// scroll offset is `full_scroll`. Esc returns to the reader.
     full_view: Option<String>,
@@ -191,7 +140,6 @@ impl ThreadView {
             pastes: Vec::new(),
             cursor: 0,
             expanded: std::collections::HashSet::new(),
-            question_queue: std::collections::VecDeque::new(),
             full_view: None,
             full_scroll: 0,
         }
@@ -808,84 +756,6 @@ impl ThreadView {
         None
     }
 
-    /// Keys while an agent's `ask_user` question is showing: pick an option
-    /// (↑↓ + Enter), type a free answer, or Esc to skip (the agent times out on
-    /// its round budget). Returns a `RespondToolCall` fetch when answered.
-    fn question_key(&mut self, ev: &crossterm::event::Event) -> Option<ViewAction> {
-        use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-        if event::is_escape(ev) {
-            self.question_queue.pop_front(); // skip this one — agent times out
-            return None;
-        }
-        // Ctrl-C aborts the whole deliberation even while a question is up — the
-        // agent is blocked in this job, so cancel it and drop all questions.
-        if is_ctrl(ev, 'c') {
-            let q = self.question_queue.front()?.clone();
-            self.question_queue.clear();
-            return Some(ViewAction::Fetch(FetchRequest::CancelJob {
-                orchestrator: self.orchestrator.clone(),
-                job_id: q.job_id,
-                thread_id: self.thread.id.clone(),
-            }));
-        }
-        let q = self.question_queue.front_mut()?;
-        let n_opts = q.options.len();
-        let answer: Option<String> = if q.typing {
-            match ev {
-                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                    // Guard against Ctrl-<letter> inserting the bare letter.
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        q.answer.push(c);
-                        None
-                    }
-                    KeyCode::Backspace => {
-                        q.answer.pop();
-                        None
-                    }
-                    KeyCode::Enter => {
-                        let a = q.answer.trim().to_string();
-                        (!a.is_empty()).then_some(a)
-                    }
-                    _ => None,
-                },
-                _ => None,
-            }
-        } else if event::is_up(ev) {
-            q.selected = q.selected.saturating_sub(1);
-            None
-        } else if event::is_down(ev) {
-            if q.selected < n_opts {
-                q.selected += 1;
-            }
-            None
-        } else if event::is_enter(ev) {
-            if q.selected < n_opts {
-                Some(q.options[q.selected].clone())
-            } else {
-                q.typing = true; // the "type your own" row
-                None
-            }
-        } else {
-            None
-        };
-        let answer = answer?;
-        let q = self.question_queue.pop_front()?; // reveal the next stacked one
-        Some(ViewAction::Fetch(FetchRequest::RespondToolCall {
-            orchestrator: self.orchestrator.clone(),
-            job_id: q.job_id,
-            call_id: q.call_id,
-            result: answer,
-        }))
-    }
-
-    /// Stack a question unless its `call_id` is already queued (the SSE and the
-    /// on-reopen recovery fetch can both deliver the same call).
-    fn enqueue_question(&mut self, q: AskQuestion) {
-        if !self.question_queue.iter().any(|e| e.call_id == q.call_id) {
-            self.question_queue.push_back(q);
-        }
-    }
-
     /// Cycle the effort override + report it (shared by both modes).
     fn cycle_effort(&mut self) -> ViewAction {
         self.effort = Self::next_effort(self.effort);
@@ -1190,85 +1060,6 @@ impl ThreadView {
         );
     }
 
-    /// The `ask_user` modal: the agent's question, its options (↑↓/Enter), a
-    /// "type your own" row, and a note that it's time-boxed to the round.
-    fn draw_question(&self, frame: &mut Frame, area: Rect) {
-        let Some(q) = self.question_queue.front() else {
-            return;
-        };
-        let mut lines: Vec<Line<'static>> = vec![
-            Line::from(Span::styled(
-                format!("[{}] asks:", display_role("assistant")),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-        ];
-        for wl in q.question.lines() {
-            lines.push(Line::from(wl.to_string()));
-        }
-        lines.push(Line::from(""));
-        for (i, opt) in q.options.iter().enumerate() {
-            let sel = !q.typing && q.selected == i;
-            let style = if sel {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            let prefix = if sel { "▸ " } else { "  " };
-            lines.push(Line::from(Span::styled(format!("{prefix}{opt}"), style)));
-        }
-        // The "type your own" row / the free-text input line.
-        if q.typing {
-            lines.push(Line::from(Span::styled(
-                format!("✎ {}", q.answer),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        } else {
-            let sel = q.selected == q.options.len();
-            let style = if sel {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let prefix = if sel { "▸ " } else { "  " };
-            lines.push(Line::from(Span::styled(
-                format!("{prefix}✎ type your own…"),
-                style,
-            )));
-        }
-        lines.push(Line::from(""));
-        let hint = if q.typing {
-            "type · Enter send · Esc skip"
-        } else {
-            "↑↓ pick · Enter · Esc skip — time-boxed to the round"
-        };
-        lines.push(Line::from(Span::styled(
-            hint,
-            Style::default().fg(Color::DarkGray),
-        )));
-        let title = match self.question_queue.len() {
-            0 | 1 => " ✋ Question from the deliberation ".to_string(),
-            n => format!(" ✋ Question from the deliberation  (+{} more) ", n - 1),
-        };
-        let para = Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow))
-                    .title(title),
-            )
-            .wrap(Wrap { trim: false });
-        frame.render_widget(para, area);
-    }
-
     /// Compose mode: a new thread shows Subject + Message; an existing thread
     /// shows the reply box under a "Reply to: <subject>" header.
     fn draw_compose(&mut self, frame: &mut Frame, area: Rect) {
@@ -1451,53 +1242,16 @@ impl View for ThreadView {
             // The in-flight turn resolved (a reply landed, or a dead job was
             // reconciled away) — stop showing "deliberating…".
             self.sent_awaiting = false;
-            // The job is over, so any questions it was blocked on are moot.
-            self.question_queue.clear();
             return None;
         }
-        // An agent asked the operator a question (ask_user) — stack it.
-        use crate::cli::tui::event::{DataEvent, SseEvent};
-        if let AppEvent::Data(DataEvent::SseEvent(SseEvent::ToolCallPending {
-            job_id,
-            call_id,
-            arguments,
-            ..
-        })) = app_event
-        {
-            if let Some(q) = AskQuestion::from_pending(job_id.clone(), call_id.clone(), arguments) {
-                self.enqueue_question(q);
-            }
-            return None;
-        }
-        // A question was answered (by us) or timed out — drop it from the stack.
-        if let AppEvent::Data(DataEvent::SseEvent(SseEvent::ToolCallResolved { call_id })) =
-            app_event
-        {
-            self.question_queue.retain(|q| &q.call_id != call_id);
-            return None;
-        }
-        // Recovered pending questions (on reopen) — stack every ask_user one.
-        if let AppEvent::Data(DataEvent::ToolCallsLoaded { thread_id, calls }) = app_event
-            && thread_id == &self.thread.id
-        {
-            for c in calls {
-                if let Some(q) =
-                    AskQuestion::from_pending(c.job_id.clone(), c.call_id.clone(), &c.arguments)
-                {
-                    self.enqueue_question(q);
-                }
-            }
-            return None;
-        }
+        // ask_user questions are handled by the app-level `AskModal` overlay (see
+        // `cli::tui::ask_modal`), which intercepts the pending/resolved/recovered events and
+        // captures input above the view stack — so a question surfaces on any screen.
         let AppEvent::Terminal(ev) = app_event else {
             return None;
         };
         if self.picking.is_some() {
             return self.picker_key(ev);
-        }
-        // A pending ask_user question captures all input until answered/skipped.
-        if !self.question_queue.is_empty() {
-            return self.question_key(ev);
         }
         // Full-screen message view captures all input (scroll + back).
         if self.full_view.is_some() {
@@ -1560,10 +1314,6 @@ impl View for ThreadView {
             return;
         }
 
-        if !self.question_queue.is_empty() {
-            self.draw_question(frame, area);
-            return;
-        }
         if self.full_view.is_some() {
             self.draw_full(frame, area);
             return;
@@ -2309,45 +2059,6 @@ mod tests {
         ))
     }
 
-    fn pending_ev(job: &str, call: &str, question: &str, options: &[&str]) -> AppEvent {
-        use crate::cli::tui::event::{DataEvent, SseEvent};
-        AppEvent::Data(DataEvent::SseEvent(SseEvent::ToolCallPending {
-            job_id: job.into(),
-            call_id: call.into(),
-            agent_id: "a".into(),
-            arguments: serde_json::json!({ "question": question, "options": options }),
-            round: 1,
-        }))
-    }
-
-    fn resolved_ev(call: &str) -> AppEvent {
-        use crate::cli::tui::event::{DataEvent, SseEvent};
-        AppEvent::Data(DataEvent::SseEvent(SseEvent::ToolCallResolved {
-            call_id: call.into(),
-        }))
-    }
-
-    fn pending_call(
-        job: &str,
-        call: &str,
-        question: &str,
-        options: &[&str],
-    ) -> crate::agents::PendingToolCall {
-        crate::agents::PendingToolCall {
-            call_id: call.into(),
-            job_id: job.into(),
-            agent_id: "a".into(),
-            tool_name: "user_ask_user".into(),
-            arguments: serde_json::json!({ "question": question, "options": options }),
-            round: 1,
-            phase: Default::default(),
-            status: crate::agents::ToolCallStatus::Pending,
-            created_at: 0,
-            responded_at: None,
-            result: None,
-        }
-    }
-
     #[test]
     fn on_enter_fetches_pending_questions_for_a_live_job() {
         let (_t, mut v) = view();
@@ -2359,168 +2070,6 @@ mod tests {
             a,
             ViewAction::Fetch(FetchRequest::PendingToolCalls { job_id, .. }) if job_id == "j1"
         )));
-    }
-
-    #[test]
-    fn recovered_tool_calls_surface_the_first_ask_user_question() {
-        use crate::cli::tui::event::DataEvent;
-        let (_t, mut v) = view();
-        let calls = vec![pending_call("j1", "c1", "Which?", &["a", "b"])];
-        v.update(&AppEvent::Data(DataEvent::ToolCallsLoaded {
-            thread_id: v.thread.id.clone(),
-            calls,
-        }));
-        assert_eq!(v.question_queue.front().unwrap().question, "Which?");
-        assert_eq!(v.question_queue.front().unwrap().call_id, "c1");
-    }
-
-    #[test]
-    fn distinct_questions_stack_and_answer_one_by_one() {
-        use crossterm::event::KeyCode;
-        let (_t, mut v) = view();
-        v.update(&pending_ev("j1", "c1", "Env?", &["dev", "prod"]));
-        v.update(&pending_ev("j1", "c2", "Region?", &["eu", "us"]));
-        assert_eq!(v.question_queue.len(), 2);
-        assert_eq!(v.question_queue.front().unwrap().question, "Env?");
-        // Same call again → not re-stacked (SSE + recovery dedup by call_id).
-        v.update(&pending_ev("j1", "c1", "Env?", &["dev", "prod"]));
-        assert_eq!(v.question_queue.len(), 2);
-        // Answer the front → reveals the next.
-        v.update(&plain(KeyCode::Enter)); // pick "dev"
-        assert_eq!(v.question_queue.len(), 1);
-        assert_eq!(v.question_queue.front().unwrap().question, "Region?");
-        // Esc skips the last → queue empty.
-        v.update(&plain(KeyCode::Esc));
-        assert!(v.question_queue.is_empty());
-    }
-
-    #[test]
-    fn resolved_removes_from_anywhere_in_the_stack() {
-        let (_t, mut v) = view();
-        v.update(&pending_ev("j", "c1", "A?", &["x"]));
-        v.update(&pending_ev("j", "c2", "B?", &["y"]));
-        // The second (not-shown) question expires/answers elsewhere → removed.
-        v.update(&resolved_ev("c2"));
-        assert_eq!(v.question_queue.len(), 1);
-        assert_eq!(v.question_queue.front().unwrap().call_id, "c1");
-    }
-
-    #[test]
-    fn ctrl_c_clears_the_whole_stack() {
-        let (_t, mut v) = view();
-        v.update(&pending_ev("j1", "c1", "A?", &["x"]));
-        v.update(&pending_ev("j1", "c2", "B?", &["y"]));
-        let action = v.update(&ctrl('c'));
-        assert!(matches!(
-            action,
-            Some(ViewAction::Fetch(FetchRequest::CancelJob { .. }))
-        ));
-        assert!(v.question_queue.is_empty());
-    }
-
-    #[test]
-    fn ask_user_ctrl_c_cancels_the_job_and_clears() {
-        let (_t, mut v) = view();
-        v.update(&pending_ev("j1", "c1", "Q?", &["a"]));
-        let action = v.update(&ctrl('c'));
-        match action {
-            Some(ViewAction::Fetch(FetchRequest::CancelJob { job_id, .. })) => {
-                assert_eq!(job_id, "j1")
-            }
-            other => panic!("expected CancelJob, got {other:?}"),
-        }
-        assert!(v.question_queue.is_empty());
-    }
-
-    #[test]
-    fn ask_user_ctrl_char_does_not_type_into_the_answer() {
-        let (_t, mut v) = view();
-        v.update(&pending_ev("j", "c", "Name?", &[])); // typing mode
-        v.update(&ctrl('w')); // Ctrl-W must not insert 'w'
-        assert_eq!(v.question_queue.front().unwrap().answer, "");
-    }
-
-    #[test]
-    fn job_complete_clears_a_stale_question() {
-        use crate::cli::tui::event::{DataEvent, SseEvent};
-        let (_t, mut v) = view();
-        v.update(&pending_ev("j", "c", "Q?", &["a"]));
-        v.update(&AppEvent::Data(DataEvent::SseEvent(
-            SseEvent::JobComplete {
-                status: "Success".into(),
-                job_id: "j".into(),
-                rounds_completed: 1,
-                best_proposal_content: "x".into(),
-                best_proposal_score: 0.5,
-                best_proposal_author: "a".into(),
-            },
-        )));
-        assert!(v.question_queue.is_empty());
-    }
-
-    #[test]
-    fn ask_user_pick_option_answers_and_clears() {
-        use crossterm::event::KeyCode;
-        let (_t, mut v) = view();
-        v.update(&pending_ev("j1", "c1", "Which env?", &["dev", "prod"]));
-        let q = v.question_queue.front().unwrap();
-        assert_eq!(q.question, "Which env?");
-        assert_eq!(q.options, vec!["dev", "prod"]);
-        // ↓ to "prod", Enter → RespondToolCall + cleared.
-        v.update(&plain(KeyCode::Down));
-        let action = v.update(&plain(KeyCode::Enter));
-        match action {
-            Some(ViewAction::Fetch(FetchRequest::RespondToolCall {
-                job_id,
-                call_id,
-                result,
-                ..
-            })) => {
-                assert_eq!(
-                    (job_id.as_str(), call_id.as_str(), result.as_str()),
-                    ("j1", "c1", "prod")
-                );
-            }
-            other => panic!("expected RespondToolCall, got {other:?}"),
-        }
-        assert!(v.question_queue.is_empty());
-    }
-
-    #[test]
-    fn ask_user_free_text_and_custom_row_and_skip() {
-        use crossterm::event::KeyCode;
-        let (_t, mut v) = view();
-        // No options → straight to typing.
-        v.update(&pending_ev("j", "c", "Name?", &[]));
-        assert!(v.question_queue.front().unwrap().typing);
-        for ch in "prod".chars() {
-            v.update(&plain(KeyCode::Char(ch)));
-        }
-        let action = v.update(&plain(KeyCode::Enter));
-        assert!(matches!(
-            action,
-            Some(ViewAction::Fetch(FetchRequest::RespondToolCall { result, .. })) if result == "prod"
-        ));
-        assert!(v.question_queue.is_empty());
-
-        // With options: ↓ past them lands on the "type your own" row → Enter → typing.
-        v.update(&pending_ev("j", "c2", "Q?", &["a"]));
-        v.update(&plain(KeyCode::Down)); // onto the custom row (index == options.len())
-        v.update(&plain(KeyCode::Enter));
-        assert!(v.question_queue.front().unwrap().typing);
-        // Esc skips (agent times out on its round budget).
-        v.update(&plain(KeyCode::Esc));
-        assert!(v.question_queue.is_empty());
-    }
-
-    #[test]
-    fn ask_user_resolved_event_clears_only_the_matching_call() {
-        let (_t, mut v) = view();
-        v.update(&pending_ev("j", "c1", "Q?", &["a"]));
-        v.update(&resolved_ev("other")); // different call — keep showing
-        assert!(!v.question_queue.is_empty());
-        v.update(&resolved_ev("c1")); // answered/expired — clear
-        assert!(v.question_queue.is_empty());
     }
 
     #[test]
