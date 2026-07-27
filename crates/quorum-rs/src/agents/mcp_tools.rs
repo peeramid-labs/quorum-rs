@@ -159,6 +159,30 @@ pub struct UpdateScratchpadInput {
     pub content: String,
 }
 
+/// Input for `nsed_file_history` — a file's revision history.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FileHistoryInput {
+    /// Path of the file to inspect, relative to the working repository root.
+    pub path: String,
+    /// Max number of revisions to return (default 20, capped at 200).
+    pub limit: Option<usize>,
+}
+
+/// Input for `nsed_line_history` — per-line provenance for a range of lines.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LineHistoryInput {
+    /// Path of the file to inspect, relative to the working repository root.
+    pub path: String,
+    /// First line of the range to inspect (1-based).
+    pub start_line: u32,
+    /// Last line of the range (1-based; defaults to `start_line`).
+    pub end_line: Option<u32>,
+    /// When set, return how this range EVOLVED across its last N revisions (each
+    /// change with its diff), instead of the default single-snapshot provenance
+    /// (who last touched each line). Capped at 50.
+    pub revisions: Option<usize>,
+}
+
 /// Result type captured by terminal tools.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum McpResult {
