@@ -913,11 +913,7 @@ impl RemoteOrchestrator {
 
         let url = format!("{}/job/{}/stream", self.base_url, job_id);
 
-        let handshake = self
-            .client
-            .get(&url)
-            .query(&[("token", &self.token)])
-            .send();
+        let handshake = self.client.get(&url).bearer_auth(&self.token).send();
         let resp = tokio::time::timeout(Duration::from_secs(30), handshake)
             .await
             .map_err(|_| RemoteError::HandshakeTimeout)??;
@@ -1113,11 +1109,7 @@ impl RemoteOrchestrator {
     pub async fn stream_events(&self, job_id: &str) -> Result<JobOutcome, RemoteError> {
         let url = format!("{}/job/{}/stream", self.base_url, job_id);
 
-        let handshake = self
-            .client
-            .get(&url)
-            .query(&[("token", &self.token)])
-            .send();
+        let handshake = self.client.get(&url).bearer_auth(&self.token).send();
         let resp = tokio::time::timeout(Duration::from_secs(30), handshake)
             .await
             .map_err(|_| RemoteError::HandshakeTimeout)??;
@@ -1403,7 +1395,7 @@ impl PhaseTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -1622,7 +1614,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/job/j1/stream"))
-            .and(query_param("token", "tok"))
+            .and(header("authorization", "Bearer tok"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
