@@ -24,6 +24,13 @@ sha2 = "0.10"
 sha3 = "0.10"
 thiserror = "2"
 
+# On wasm32-unknown-unknown, `getrandom` (pulled via rand/ed25519-dalek/k256)
+# needs its `js` backend or it refuses to compile. Target-scoped so native
+# builds are unaffected. Build the core for wasm with `--no-default-features`
+# (the `device`/nkeys feature has no wasm `KeyPair::new_user`).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
 [features]
 default = ["device"]
 # Device identity (NATS user nkey) for self-serve register. Pulls `nkeys`.
