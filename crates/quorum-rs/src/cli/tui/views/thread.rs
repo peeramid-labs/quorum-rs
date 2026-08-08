@@ -322,12 +322,14 @@ impl ThreadView {
         self.ensure_visible();
     }
 
-    /// ↓ — select the row below (older); stepping past the oldest clears it.
+    /// ↓ — select the row below (older). Clamps at the bottom: reaching the
+    /// oldest message keeps the cursor there instead of wrapping back to the top.
     fn select_down(&mut self) {
         let n = self.thread.messages.len();
         match self.selected {
             Some(r) if r + 1 < n => self.selected = Some(r + 1),
-            Some(_) => self.selected = None,
+            // Already on the bottom (oldest) row — stay put, never wrap to top.
+            Some(_) => {}
             // From nothing, ↓ selects the top row (symmetric with ↑) so the cursor
             // appears on the first keypress instead of being a no-op.
             None if n > 0 => self.selected = Some(0),
@@ -2175,6 +2177,20 @@ mod tests {
         v.selected = None;
         v.select_down();
         assert_eq!(v.selected, Some(0));
+    }
+
+    #[test]
+    fn select_down_clamps_at_bottom_no_wrap() {
+        // ↓ on the oldest row must stay there — never deselect and wrap to the top.
+        let (_t, mut v) = view();
+        v.thread.reply(None, "user", "root");
+        v.thread.reply(None, "assistant", "reply");
+        let last = v.thread.messages.len() - 1;
+        v.selected = Some(last);
+        v.select_down();
+        assert_eq!(v.selected, Some(last), "clamps at the bottom row");
+        v.select_down();
+        assert_eq!(v.selected, Some(last), "no circular wrap back to the top");
     }
 
     #[test]
