@@ -46,4 +46,15 @@ pub trait OutputLeakDetector: Send + Sync + Debug {
     /// Returns Pass/Warn/Block with a reason string suitable for surfacing
     /// to operators.
     async fn evaluate(&self, ctx: &MiddlewareContext) -> MiddlewareVerdict;
+
+    /// Strip leaked indicators from `text`, returning sanitized text that
+    /// no longer scans as a leak. Used as a graceful fallback: when a block
+    /// fires on already-recovered structured output, the caller redacts the
+    /// user-visible fields and continues the deliberation instead of failing.
+    ///
+    /// Default: identity (fail-open) so detectors that don't implement
+    /// redaction keep the pre-existing pass-through behaviour.
+    fn redact(&self, text: &str) -> String {
+        text.to_string()
+    }
 }

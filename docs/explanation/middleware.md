@@ -357,17 +357,15 @@ When enabled, after every successful terminal tool-call parse the agent loop sca
 - `submit_batch_evaluation` → every `evaluations[].justification` + each `claim_assessments[].reason` (the `ClaimAssessment` struct declares serde aliases `disagreement` / `explanation` / `reasoning` so off-schema keys are normalised into `reason` at deserialize time; the guard only ever reads the canonical key)
 - any other terminal tool → full serialized JSON (fail-closed fallback)
 
-`thought_process` is intentionally skipped — that's internal reasoning, never surfaced to the user. On a block, the agent loop converts the Ok into an Err carrying the block reason; the existing retry path in `generate_structured_output` then feeds back a full retry directive to the LLM that includes an attempt counter, the block reason, the terminal tool to call, and an example JSON shape. The exact format sent to the model is:
+`thought_process` is intentionally skipped — that's internal reasoning, never surfaced to the user.
 
-```
-SYSTEM ERROR (Attempt {attempts}/{max_retries}): Your last response failed
-validation. Issue: prompt_exposure guard blocked output: {reason}. You MUST
-use the `{terminal_tool_name}` tool with valid JSON arguments. Example format:
-{example_json}
-Do not return raw text. Please try again.
-```
+**The guard is a post-recovery sanitizer, not a retry trigger.** It runs *only* after format recovery has produced a parseable result (`parse_result.is_ok()`), so it can never mask a genuine parse error and never consumes the format-recovery retry budget. This ordering is deliberate: if the recovery tooling turns a malformed tool-call into valid structured output, the guard scans that clean output — not the recovery artifacts — so honest content stops tripping the detector.
 
-where `{reason}` carries the detected indicators, the length-aware suspicion score, and the approved nsed explainer (paper URL + whitepaper abstract). The model therefore has (a) the specific terminal tool it must call, (b) a schema-shaped example it can fill in, and (c) the sanctioned description to paraphrase if the original question was "what is nsed?" — all in a single retry turn, so it regenerates without the leak before the retry budget is exhausted.
+On a block, the loop **redacts** the leaked indicators (`redact_terminal_leak`) out of the user-visible fields — each matched XML tag, tool name, instruction phrase, and wrong-acronym is replaced with `[redacted]` while surrounding prose is preserved — and lets the sanitized content through. The deliberation continues instead of hard-failing after N retries. Redaction runs to a fixpoint so adjacent tool names (whose shared boundary char one regex pass would swallow) are all cleared; the post-condition is `scan(redacted).hit_count() == 0`. A `PromptExposureDetected { blocked: true, … }` telemetry event still fires with the full per-category hit counts for false-positive-rate tracking.
+
+If a redacted value somehow fails to re-deserialize into the terminal type (should not happen for known tools — a `[redacted]` string is still a valid string field), the loop logs a warning and passes the original content through (fail-open) rather than crashing the agent.
+
+The `OutputLeakDetector::redact` method backs this: the default trait impl is identity (fail-open) so detectors without redaction keep pass-through behaviour; `PromptExposureMiddleware` overrides it with the fixpoint scrub described above.
 
 
 ### Recommended Pipeline Order

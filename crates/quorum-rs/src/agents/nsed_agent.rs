@@ -1804,28 +1804,39 @@ where
             }
         }
 
-        // Prompt-exposure guardrail — runs on successfully parsed terminal
-        // content BEFORE we return it to the deliberation store. A block
-        // converts the Ok into an Err carrying the block reason so the
-        // existing retry path feeds it back to the LLM as a `SYSTEM
-        // ERROR` user message.
+        // Prompt-exposure guardrail — a POST-RECOVERY sanitizer, not a retry
+        // trigger. It runs only once format recovery has produced a parseable
+        // result (`parse_result.is_ok()`), so it can never mask a genuine
+        // parse error nor consume the format-recovery retry budget. On a block
+        // it REDACTS the leaked indicators from the user-visible fields and
+        // lets the (now-clean) content through, keeping the deliberation alive
+        // instead of hard-failing after N retries.
         //
         // Gated by `agent_config.prompt_exposure_guard` so existing
         // deployments are unaffected until they opt in.
-        if let Ok(ref parsed) = parse_result
-            && agent_config.prompt_exposure_guard
+        let guard_block = if agent_config.prompt_exposure_guard
+            && let Ok(ref parsed) = parse_result
             && let Some(detector) = output_guard
-            && let Some(block_result) =
-                run_prompt_exposure_guard(parsed, terminal_tool_name, &agent_config.name, detector)
-                    .await
         {
-            warn!(
-                agent_name = %agent_config.name,
-                attempt = attempts,
-                terminal_tool = terminal_tool_name,
-                "prompt_exposure guard blocked terminal content; triggering retry."
-            );
+            match run_prompt_exposure_guard(
+                parsed,
+                terminal_tool_name,
+                &agent_config.name,
+                detector,
+            )
+            .await
+            {
+                Some(block_result) => {
+                    let redacted = redact_terminal_leak(parsed, terminal_tool_name, detector);
+                    Some((block_result, redacted))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
 
+        if let Some((block_result, redacted)) = guard_block {
             emit_for!(
                 context,
                 PromptExposureDetected {
@@ -1842,20 +1853,27 @@ where
                 }
             );
 
-            // Override cleaned_json so the dump/retry rendering names the
-            // actual block reason rather than the (valid) terminal JSON
-            // that parsed fine.
-            cleaned_json = format!(
-                "prompt_exposure guard blocked output: {}",
-                block_result.reason
-            );
-            // Synthesize a serde_json::Error so we can slot back into the
-            // existing `Err` arm. Deserializing invalid JSON returns the
-            // error type we need without paying the parse.
-            let synth_err: serde_json::Error =
-                serde_json::from_str::<serde_json::Value>("not-json-prompt-exposure-block")
-                    .expect_err("invalid JSON always errors");
-            parse_result = Err(synth_err);
+            match redacted {
+                Some(clean) => {
+                    warn!(
+                        agent_name = %agent_config.name,
+                        attempt = attempts,
+                        terminal_tool = terminal_tool_name,
+                        reason = %block_result.reason,
+                        "prompt_exposure guard blocked; redacted user-visible fields and continued."
+                    );
+                    parse_result = Ok(clean);
+                }
+                None => {
+                    warn!(
+                        agent_name = %agent_config.name,
+                        attempt = attempts,
+                        terminal_tool = terminal_tool_name,
+                        reason = %block_result.reason,
+                        "prompt_exposure guard blocked but redaction failed to re-deserialize; passing original content through."
+                    );
+                }
+            }
         }
 
         // Submission validator — a reviewer (patch-deliberation provider_response,
@@ -2276,6 +2294,84 @@ where
     }
 
     None
+}
+
+/// Recursively apply `detector.redact` to every string leaf in `value`.
+/// Used for terminal tools without a hand-curated user-visible field map.
+fn redact_all_strings(
+    value: &mut serde_json::Value,
+    detector: &dyn crate::agents::OutputLeakDetector,
+) {
+    match value {
+        serde_json::Value::String(s) => {
+            *s = detector.redact(s);
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                redact_all_strings(v, detector);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_, v) in map.iter_mut() {
+                redact_all_strings(v, detector);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Graceful fallback for a prompt-exposure block: strip leaked indicators
+/// from the user-visible fields of already-recovered structured output and
+/// return the sanitized value, so the deliberation continues instead of
+/// hard-failing. Scans the SAME fields as [`run_prompt_exposure_guard`].
+///
+/// Returns `None` only if the redacted value no longer deserializes to `T`
+/// (should not happen for known tools — a `[redacted]` string is still a
+/// valid string field); callers pass the original content through in that case.
+fn redact_terminal_leak<T>(
+    parsed: &T,
+    terminal_tool_name: &str,
+    detector: &dyn crate::agents::OutputLeakDetector,
+) -> Option<T>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let mut value = serde_json::to_value(parsed).ok()?;
+    match terminal_tool_name {
+        "submit_proposal" => {
+            if let Some(s) = value.get("solution_content").and_then(|v| v.as_str()) {
+                let redacted = detector.redact(s);
+                value["solution_content"] = serde_json::Value::String(redacted);
+            }
+        }
+        "submit_batch_evaluation" => {
+            if let Some(evals) = value.get_mut("evaluations").and_then(|v| v.as_array_mut()) {
+                for ev in evals.iter_mut() {
+                    if let Some(j) = ev.get("justification").and_then(|v| v.as_str()) {
+                        let redacted = detector.redact(j);
+                        ev["justification"] = serde_json::Value::String(redacted);
+                    }
+                    if let Some(assessments) = ev
+                        .get_mut("claim_assessments")
+                        .and_then(|v| v.as_array_mut())
+                    {
+                        for a in assessments.iter_mut() {
+                            if let Some(c) = a.get("reason").and_then(|v| v.as_str()) {
+                                let redacted = detector.redact(c);
+                                a["reason"] = serde_json::Value::String(redacted);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            // Unknown terminal tool — fail closed by scrubbing every string
+            // leaf, mirroring the "scan the whole thing" branch of the guard.
+            redact_all_strings(&mut value, detector);
+        }
+    }
+    serde_json::from_value(value).ok()
 }
 
 /// content is re-merged with a fresh scratchpad injection.
@@ -3627,6 +3723,85 @@ mod tests {
         async fn validate(&self, content: &str) -> Option<String> {
             self.reject.then(|| content.to_string())
         }
+    }
+
+    // Minimal OutputLeakDetector: treats the literal "LEAK" as an indicator.
+    // `redact` strips it; `scan`/`evaluate` block when present. Enough to drive
+    // `redact_terminal_leak` without pulling in the real regex middleware
+    // (which lives in the downstream `nsed-agent` crate).
+    #[derive(Debug)]
+    struct LeakStub;
+    #[async_trait::async_trait]
+    impl crate::agents::OutputLeakDetector for LeakStub {
+        fn scan(&self, text: &str) -> crate::agents::OutputScanResult {
+            let hits = text.matches("LEAK").count() as u32;
+            crate::agents::OutputScanResult {
+                tool_name_hits: hits,
+                response_length_chars: text.chars().count() as u32,
+                ..Default::default()
+            }
+        }
+        async fn evaluate(
+            &self,
+            ctx: &crate::middleware::MiddlewareContext,
+        ) -> crate::middleware::MiddlewareVerdict {
+            let text = ctx.content.as_str().unwrap_or_default();
+            if text.contains("LEAK") {
+                crate::middleware::MiddlewareVerdict::block("test", "leak")
+            } else {
+                crate::middleware::MiddlewareVerdict::pass()
+            }
+        }
+        fn redact(&self, text: &str) -> String {
+            text.replace("LEAK", "[redacted]")
+        }
+    }
+
+    #[test]
+    fn redact_terminal_leak_scrubs_proposal_solution_content() {
+        use super::redact_terminal_leak;
+        let parsed = serde_json::json!({
+            "thought_process": "internal notes mentioning LEAK",
+            "solution_content": "answer with a LEAK in it",
+        });
+        let out: serde_json::Value =
+            redact_terminal_leak(&parsed, "submit_proposal", &LeakStub).expect("re-deserializes");
+        // User-visible field scrubbed.
+        assert_eq!(out["solution_content"], "answer with a [redacted] in it");
+        // thought_process is NOT a scanned field — left untouched.
+        assert_eq!(out["thought_process"], "internal notes mentioning LEAK");
+    }
+
+    #[test]
+    fn redact_terminal_leak_scrubs_batch_evaluation_fields() {
+        use super::redact_terminal_leak;
+        let parsed = serde_json::json!({
+            "evaluations": [{
+                "justification": "scored high but LEAK slipped in",
+                "claim_assessments": [{"reason": "supported, though LEAK"}],
+            }],
+        });
+        let out: serde_json::Value =
+            redact_terminal_leak(&parsed, "submit_batch_evaluation", &LeakStub)
+                .expect("re-deserializes");
+        assert_eq!(
+            out["evaluations"][0]["justification"],
+            "scored high but [redacted] slipped in"
+        );
+        assert_eq!(
+            out["evaluations"][0]["claim_assessments"][0]["reason"],
+            "supported, though [redacted]"
+        );
+    }
+
+    #[test]
+    fn redact_terminal_leak_unknown_tool_scrubs_all_strings() {
+        use super::redact_terminal_leak;
+        let parsed = serde_json::json!({"any": "field with LEAK", "nested": {"x": "LEAK"}});
+        let out: serde_json::Value =
+            redact_terminal_leak(&parsed, "some_new_tool", &LeakStub).expect("re-deserializes");
+        assert_eq!(out["any"], "field with [redacted]");
+        assert_eq!(out["nested"]["x"], "[redacted]");
     }
 
     #[tokio::test]
