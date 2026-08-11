@@ -366,7 +366,8 @@ pub struct ClaimAssessment {
     /// Format: 6-char hex hash derived from (target_id, claim_text, round).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_id: Option<String>,
-    /// The claim being assessed (e.g., "O(n log n) complexity proof").
+    /// The claim being assessed, quoted VERBATIM from the proposal — copy the exact
+    /// span word-for-word (a substring of the proposal text), e.g. "sorts in O(n log n) time".
     /// Models frequently hallucinate "content", "text", "description", or "summary"
     /// instead of "claim". Some models omit the claim text entirely when using
     /// claim_id references, so we default to empty string.
