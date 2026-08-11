@@ -946,7 +946,8 @@ impl ProposerEvaluatorAgent {
             );
             all_tools.push(Box::new(own_tool));
 
-            let search_tool = SearchDeliberationTool::new(store.clone(), context.round_number);
+            let search_tool = SearchDeliberationTool::new(store.clone(), context.round_number)
+                .with_candidates(context.candidates.clone());
             all_tools.push(Box::new(search_tool));
 
             debug!(agent=%self.config.name, "Injected NSED protocol tools (read_proposal, search_deliberation, etc.) via persistent store.");

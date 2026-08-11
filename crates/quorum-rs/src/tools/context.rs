@@ -343,6 +343,11 @@ impl ReadOwnProposalTool {
 pub struct SearchDeliberationTool {
     store: Arc<dyn PersistenceStore>,
     current_round: u32,
+    /// Current-round candidates as shown to the evaluator, keyed by anonymized id.
+    /// The store has no current-round records during evaluation ("hasn't finished
+    /// yet"), so a search scoped to the current round can only surface these from
+    /// here — same reason [`ReadProposalTool`] carries them.
+    candidates: Vec<CandidateProposal>,
 }
 
 impl SearchDeliberationTool {
@@ -350,7 +355,14 @@ impl SearchDeliberationTool {
         Self {
             store,
             current_round,
+            candidates: Vec::new(),
         }
+    }
+
+    /// Attach the current-round anonymized candidates (see the field doc).
+    pub fn with_candidates(mut self, candidates: Vec<CandidateProposal>) -> Self {
+        self.candidates = candidates;
+        self
     }
 }
 
@@ -613,6 +625,41 @@ impl Tool for SearchDeliberationTool {
             }
             if results.len() >= safe_limit {
                 break;
+            }
+        }
+
+        // Current-round anonymized candidates: not in the store during evaluation,
+        // so surface them from the plumbed set when the search covers the current
+        // round and wants proposals. Skip when the caller filters on evaluation-only
+        // dimensions (verdicts/stances/score) — a not-yet-evaluated candidate has no
+        // evaluations to match, so those filters correctly exclude it.
+        let candidate_filters_compatible = want_proposals
+            && filters.verdicts.is_empty()
+            && filters.stances.is_empty()
+            && filters.min_score.is_none()
+            && filters.max_score.is_none();
+        if candidate_filters_compatible && rounds_to_search.contains(&self.current_round) {
+            for c in &self.candidates {
+                if results.len() >= safe_limit {
+                    break;
+                }
+                if !filters.agent_ids.is_empty()
+                    && !filters.agent_ids.iter().any(|id| agent_id_match(&c.id, id))
+                {
+                    continue;
+                }
+                let text =
+                    format!("{} {}", c.proposal.content, c.proposal.thought_process).to_lowercase();
+                let keyword_match = keywords_lower.is_empty()
+                    || keywords_lower.iter().all(|kw| text.contains(kw.as_str()));
+                if keyword_match {
+                    results.push(format!(
+                        "<proposal round=\"{}\" agent=\"{}\">\n<content>{}</content>\n</proposal>",
+                        self.current_round,
+                        c.id,
+                        truncate_str(&c.proposal.content, 2000),
+                    ));
+                }
             }
         }
 
@@ -1231,6 +1278,58 @@ mod tests {
         assert!(result.contains("Radix sort"));
         // Should not contain proposals by other agents
         assert!(!result.contains("agent=\"Alice\""));
+    }
+
+    #[tokio::test]
+    async fn search_surfaces_current_round_anonymized_candidates() {
+        // Current round (3) is absent from the store during evaluation, so the
+        // agent's search_deliberation fallback for a Candidate_X id must resolve
+        // from the plumbed candidate set — the second tool Corepunk03 tried.
+        let store = build_test_corpus(); // rounds 1,2 only
+        let candidate = CandidateProposal {
+            id: "Candidate_B".to_string(),
+            proposal: Proposal {
+                content: "Merge sort keeps stability".to_string(),
+                thought_process: "reasoning".to_string(),
+                ..Default::default()
+            },
+        };
+        let tool = SearchDeliberationTool::new(store, 3).with_candidates(vec![candidate]);
+        let args = serde_json::json!({
+            "filters": { "agent_ids": ["Candidate_B"], "rounds": [3] },
+            "limit": 50
+        });
+        let result = tool.call(args).await.unwrap();
+        assert!(
+            result.contains("agent=\"Candidate_B\""),
+            "surfaces the anonymized candidate: {result}"
+        );
+        assert!(result.contains("Merge sort keeps stability"));
+    }
+
+    #[tokio::test]
+    async fn search_excludes_candidates_under_evaluation_only_filters() {
+        // A not-yet-evaluated candidate has no score/verdicts; an eval-only filter
+        // (min_score) must exclude it rather than emit an unscored result.
+        let store = build_test_corpus();
+        let candidate = CandidateProposal {
+            id: "Candidate_B".to_string(),
+            proposal: Proposal {
+                content: "unscored".to_string(),
+                thought_process: "y".to_string(),
+                ..Default::default()
+            },
+        };
+        let tool = SearchDeliberationTool::new(store, 3).with_candidates(vec![candidate]);
+        let args = serde_json::json!({
+            "filters": { "rounds": [3], "min_score": 0.5 },
+            "limit": 50
+        });
+        let result = tool.call(args).await.unwrap();
+        assert!(
+            !result.contains("Candidate_B"),
+            "score filter excludes the unscored candidate: {result}"
+        );
     }
 
     #[tokio::test]
