@@ -157,13 +157,15 @@ fn find_ws_tolerant(proposal: &str, cand: &str) -> Option<String> {
         return None;
     }
     let idx = p_norm.find(&c_norm)?;
-    // Map normalized [idx, idx+len) back to original byte offsets.
+    // Map normalized [idx, idx+len) back to original byte offsets. `map[j]` is the
+    // original offset of the char whose normalized byte is `j`, so `map[idx]` is the
+    // span start and `map[end_norm]` is the start of the char AFTER the match — the
+    // span end. Both are char boundaries; a match reaching the string end has no
+    // following char, so fall back to `proposal.len()`. (Mapping the last matched
+    // byte instead lands mid-char on a multibyte tail and panics on slice.)
     let start = *map.get(idx)?;
     let end_norm = idx + c_norm.len();
-    // end offset = byte after the last matched normalized byte.
-    let last = end_norm.checked_sub(1)?;
-    let last_orig = *map.get(last)?;
-    let end = last_orig + proposal[last_orig..].chars().next()?.len_utf8();
+    let end = map.get(end_norm).copied().unwrap_or(proposal.len());
     Some(proposal[start..end].to_string())
 }
 
@@ -251,6 +253,20 @@ mod tests {
             "unresolvable → unchanged"
         );
         assert_eq!(claims[2].claim, "", "empty left alone");
+    }
+
+    #[test]
+    fn ws_tolerant_match_ending_on_multibyte_char() {
+        // The double space forces the whitespace-tolerant path (exact find fails),
+        // and the match ends on `é` (2 bytes). The span end must land on a char
+        // boundary — previously it mapped to the last BYTE of `é` and sliced
+        // mid-char, panicking.
+        assert_eq!(resolve_cite("x café", "x  café").as_deref(), Some("x café"));
+        // Multibyte at the end of a longer proposal, ws-tolerant via a newline.
+        assert_eq!(
+            resolve_cite("value is 5€\ndone", "value is 5€ done").as_deref(),
+            Some("value is 5€\ndone")
+        );
     }
 
     #[test]
