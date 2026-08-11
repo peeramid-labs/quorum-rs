@@ -5,7 +5,7 @@
 //! process, such as retrieving past proposals and checking peer critiques.
 //! This capability functions as a lightweight, on-demand Retrieval-Augmented Generation (RAG) system.
 
-use crate::agents::{ClaimVerdict, PersistenceStore, Stance};
+use crate::agents::{CandidateProposal, ClaimVerdict, PersistenceStore, Proposal, Stance};
 use crate::tools::Tool;
 
 use async_openai::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
@@ -24,6 +24,13 @@ use std::sync::Arc;
 pub struct ReadProposalTool {
     store: Arc<dyn PersistenceStore>,
     current_round: u32,
+    /// Current-round candidates AS SHOWN to the evaluator — keyed by their
+    /// anonymized id (`Candidate_A`, …). These are inlined in the eval prompt but
+    /// live only here at eval time: the persistence store keys real author ids, so
+    /// a `read_proposal(current_round, "Candidate_X")` (the truncation hint) can't
+    /// resolve them from the store. Serving from this set fulfils that hint with the
+    /// full thought_process — the SAME anonymized content, no deanonymization.
+    candidates: Vec<CandidateProposal>,
 }
 
 impl ReadProposalTool {
@@ -31,8 +38,51 @@ impl ReadProposalTool {
         Self {
             store,
             current_round,
+            candidates: Vec::new(),
         }
     }
+
+    /// Attach the current-round anonymized candidates so `read_proposal` can serve
+    /// them by their `Candidate_X` id (see the field doc).
+    pub fn with_candidates(mut self, candidates: Vec<CandidateProposal>) -> Self {
+        self.candidates = candidates;
+        self
+    }
+}
+
+/// Render a proposal to the paginated `<proposal>` tool output. Shared by the
+/// current-round candidate branch and the store-history branch so both format
+/// identically.
+fn render_proposal(
+    round: u32,
+    agent_id: &str,
+    proposal: &Proposal,
+    offset: usize,
+    limit: usize,
+) -> String {
+    let thoughts = &proposal.thought_process;
+    let total_chars = thoughts.chars().count();
+    if offset >= total_chars {
+        return format!(
+            "Offset {offset} exceeds thought_process length {total_chars} chars. No more content."
+        );
+    }
+    let snippet: String = thoughts.chars().skip(offset).take(limit).collect();
+    let snippet_len = snippet.chars().count();
+    let remaining = total_chars.saturating_sub(offset + snippet_len);
+    let mut output = format!(
+        "<proposal round=\"{}\" agent=\"{}\">\n<final_solution>{}</final_solution>\n\n<thought_process offset=\"{}\" length=\"{}\" total=\"{}\">\n{}\n",
+        round, agent_id, proposal.content, offset, snippet_len, total_chars, snippet
+    );
+    if remaining > 0 {
+        output.push_str(&format!(
+            "\n... ({} characters remaining. Call read_proposal with offset={} to read more.)",
+            remaining,
+            offset + snippet_len
+        ));
+    }
+    output.push_str("</thought_process>\n</proposal>");
+    output
 }
 
 /// Helper function to match requested agent ID against stored ID.
@@ -105,6 +155,29 @@ impl Tool for ReadProposalTool {
         // Enforce hard cap of 15,000 characters to prevent context explosion
         let limit = args.limit.unwrap_or(5000).min(15_000);
 
+        // Current-round anonymized candidates first: the eval prompt inlines them
+        // (truncated at 4000 chars) and its truncation hint sends the agent here as
+        // `read_proposal(current_round, "Candidate_X")`. The store keys REAL author
+        // ids, so it can't resolve that anonymized label — serve it straight from
+        // the candidate set instead (the full thought_process, same anonymized
+        // content). Without this the hinted call returns "No proposal found", which
+        // reads to the agent as a systemic retrieval failure.
+        if target_round == self.current_round {
+            if let Some(c) = self
+                .candidates
+                .iter()
+                .find(|c| agent_id_match(&c.id, &args.agent_id))
+            {
+                return Ok(render_proposal(
+                    target_round,
+                    &args.agent_id,
+                    &c.proposal,
+                    offset,
+                    limit,
+                ));
+            }
+        }
+
         // Retrieve round history from store
         let history = self
             .store
@@ -117,42 +190,13 @@ impl Tool for ReadProposalTool {
                 .iter()
                 .find(|r| agent_id_match(&r.author_agent_id, &args.agent_id))
             {
-                // We paginate the thought process as it is the largest component.
-                let thoughts = &record.proposal.thought_process;
-                let total_chars = thoughts.chars().count();
-
-                if offset >= total_chars {
-                    return Ok(format!(
-                        "Offset {offset} exceeds thought_process length {total_chars} chars. No more content."
-                    ));
-                }
-
-                // Use character-based slicing to avoid UTF-8 boundary panics
-                let snippet: String = thoughts.chars().skip(offset).take(limit).collect();
-                let snippet_len = snippet.chars().count();
-                let remaining = total_chars.saturating_sub(offset + snippet_len);
-
-                let mut output = format!(
-                    "<proposal round=\"{}\" agent=\"{}\">\n<final_solution>{}</final_solution>\n\n<thought_process offset=\"{}\" length=\"{}\" total=\"{}\">\n{}\n",
+                Ok(render_proposal(
                     target_round,
-                    args.agent_id,
-                    record.proposal.content,
+                    &args.agent_id,
+                    &record.proposal,
                     offset,
-                    snippet_len,
-                    total_chars,
-                    snippet
-                );
-
-                if remaining > 0 {
-                    output.push_str(&format!(
-                        "\n... ({} characters remaining. Call read_proposal with offset={} to read more.)",
-                        remaining,
-                        offset + snippet_len
-                    ));
-                }
-                output.push_str("</thought_process>\n</proposal>");
-
-                Ok(output)
+                    limit,
+                ))
             } else {
                 Ok(format!(
                     "No proposal found for agent_id '{}' in round {}.",
@@ -768,6 +812,52 @@ mod tests {
 
         let result = tool.call(args).await.unwrap();
         assert!(result.contains("Offset 1000 exceeds"));
+    }
+
+    #[tokio::test]
+    async fn read_proposal_resolves_current_round_anonymized_candidate() {
+        // The exact call the truncation hint emits: read_proposal(current_round,
+        // "Candidate_B"). The store keys REAL author ids and holds no such record,
+        // so this must resolve from the plumbed candidate set — the bug Corepunk03
+        // hit was this returning "No proposal found" and looping on ask_user.
+        let store = Arc::new(MockStore::default()); // deliberately empty
+        let candidate = CandidateProposal {
+            id: "Candidate_B".to_string(),
+            proposal: Proposal {
+                content: "The answer is 42.".to_string(),
+                thought_process: "Full un-truncated reasoning for candidate B.".to_string(),
+                ..Default::default()
+            },
+        };
+        let tool = ReadProposalTool::new(store, 3).with_candidates(vec![candidate]);
+
+        let args = serde_json::json!({ "agent_id": "Candidate_B", "round": 3 });
+        let result = tool.call(args).await.unwrap();
+        assert!(
+            result.contains("The answer is 42."),
+            "serves the candidate's final solution: {result}"
+        );
+        assert!(
+            result.contains("Full un-truncated reasoning for candidate B."),
+            "serves the FULL thought_process the truncation hint promised: {result}"
+        );
+        assert!(!result.contains("No proposal found"));
+        assert!(!result.contains("No history found"));
+    }
+
+    #[tokio::test]
+    async fn read_proposal_anonymized_label_without_candidates_misses() {
+        // Regression anchor: with NO candidates plumbed (the old wiring), the store
+        // cannot resolve an anonymized label — proving the fix is the plumbing, not
+        // agent_id_match. This is the exact failure mode before the fix.
+        let store = Arc::new(MockStore::default());
+        let tool = ReadProposalTool::new(store, 3);
+        let args = serde_json::json!({ "agent_id": "Candidate_B", "round": 3 });
+        let result = tool.call(args).await.unwrap();
+        assert!(
+            result.contains("No history found") || result.contains("No proposal found"),
+            "unresolvable anonymized label without the candidate set: {result}"
+        );
     }
 
     #[test]
