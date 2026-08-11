@@ -455,16 +455,38 @@ impl NsedMcpServer {
     #[tool(description = "Read a proposal from a previous round by agent ID. \
         Useful for understanding what was proposed before and building on it.")]
     async fn nsed_read_proposal(&self, Parameters(input): Parameters<ReadProposalInput>) -> String {
-        let store = match &self.store {
-            Some(s) => s,
-            None => return "No persistence store available".to_string(),
-        };
         let round = input
             .round
             .unwrap_or(self.context.round_number.saturating_sub(1));
         let offset = input.offset.unwrap_or(0);
         let limit = input.limit.unwrap_or(5000);
 
+        // Current-round anonymized candidates (Candidate_A/B/…) aren't in the store
+        // during evaluation — it keys real author ids. Resolve them from the context
+        // candidate set the evaluator already sees inline, so a lookup by the
+        // anonymized id returns content instead of "No proposal found" (mirrors
+        // ReadProposalTool; see the anonymized-candidate-retrieval fix). Checked
+        // before the store so it works even with no store wired.
+        if round == self.context.round_number {
+            if let Some(c) = self
+                .context
+                .candidates
+                .iter()
+                .find(|c| agent_id_match(&c.id, &input.agent_id))
+            {
+                let content = &c.proposal.content;
+                let char_count = content.chars().count();
+                if offset >= char_count {
+                    return "Offset beyond content length".to_string();
+                }
+                return content.chars().skip(offset).take(limit).collect::<String>();
+            }
+        }
+
+        let store = match &self.store {
+            Some(s) => s,
+            None => return "No persistence store available".to_string(),
+        };
         match store.get_round_history(round).await {
             Ok(Some(records)) => {
                 for record in &records {
@@ -527,17 +549,16 @@ impl NsedMcpServer {
         Useful for finding specific topics or building on prior work."
     )]
     async fn nsed_search(&self, Parameters(input): Parameters<SearchInput>) -> String {
-        let store = match &self.store {
-            Some(s) => s,
-            None => return "No persistence store available".to_string(),
-        };
         let query_lower = input.query.to_lowercase();
         let mut results = Vec::new();
         let max_round = input
             .round
             .unwrap_or(self.context.round_number.saturating_sub(1));
 
+        // Store scan (past rounds). The current-round candidate scan below runs
+        // regardless of whether a store is wired.
         for r in 1..=max_round {
+            let Some(store) = &self.store else { break };
             match store.get_round_history(r).await {
                 Ok(Some(records)) => {
                     for record in &records {
@@ -572,6 +593,31 @@ impl NsedMcpServer {
                 }
                 Ok(None) => {}
                 Err(e) => results.push(format!("[Round {r}] Error: {e}")),
+            }
+        }
+
+        // Current-round anonymized candidates aren't in the store during eval —
+        // surface them from the context set when the search covers the current round.
+        if max_round >= self.context.round_number {
+            for c in &self.context.candidates {
+                if let Some(ref filter_agent) = input.agent_id {
+                    if !agent_id_match(&c.id, filter_agent) {
+                        continue;
+                    }
+                }
+                if c.proposal.content.to_lowercase().contains(&query_lower)
+                    || c.proposal
+                        .thought_process
+                        .to_lowercase()
+                        .contains(&query_lower)
+                {
+                    results.push(format!(
+                        "[Round {} / {}] {}",
+                        self.context.round_number,
+                        c.id,
+                        c.proposal.content.chars().take(200).collect::<String>()
+                    ));
+                }
             }
         }
 
@@ -3557,6 +3603,61 @@ mod tests {
         let ctx = minimal_context();
         let spawn = std::time::Instant::now();
         emit_claude_subprocess_exit(&ctx, "", spawn, 0, true);
+    }
+
+    fn ctx_with_candidate(round: u32, id: &str, content: &str, thoughts: &str) -> AgentContext {
+        AgentContext {
+            round_number: round,
+            candidates: vec![crate::agents::CandidateProposal {
+                id: id.to_string(),
+                proposal: crate::agents::Proposal {
+                    content: content.to_string(),
+                    thought_process: thoughts.to_string(),
+                    ..Default::default()
+                },
+            }],
+            ..minimal_context()
+        }
+    }
+
+    #[tokio::test]
+    async fn nsed_read_proposal_resolves_current_round_anonymized_candidate() {
+        // MCP path parity with ReadProposalTool: the store keys real author ids and
+        // has no current-round records during eval, so a lookup by the anonymized
+        // Candidate_X id must resolve from the context set (no store even wired).
+        let ctx = ctx_with_candidate(3, "Candidate_B", "answer from B", "reasoning");
+        let (tx, _rx) = oneshot::channel();
+        let server = NsedMcpServer::new(ctx, ActivePhase::Evaluating, None, tx);
+        let out = server
+            .nsed_read_proposal(Parameters(ReadProposalInput {
+                round: Some(3),
+                agent_id: "Candidate_B".to_string(),
+                offset: None,
+                limit: None,
+            }))
+            .await;
+        assert!(out.contains("answer from B"), "resolves candidate: {out}");
+        assert!(!out.contains("No proposal found"));
+        assert!(!out.contains("No persistence store"));
+    }
+
+    #[tokio::test]
+    async fn nsed_search_surfaces_current_round_anonymized_candidate() {
+        let ctx = ctx_with_candidate(2, "Candidate_C", "quicksort variant", "t");
+        let (tx, _rx) = oneshot::channel();
+        let server = NsedMcpServer::new(ctx, ActivePhase::Evaluating, None, tx);
+        let out = server
+            .nsed_search(Parameters(SearchInput {
+                query: "quicksort".to_string(),
+                round: Some(2),
+                agent_id: Some("Candidate_C".to_string()),
+            }))
+            .await;
+        assert!(
+            out.contains("Candidate_C"),
+            "search surfaces candidate: {out}"
+        );
+        assert!(out.contains("quicksort variant"));
     }
 
     #[test]
