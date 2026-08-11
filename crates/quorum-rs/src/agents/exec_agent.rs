@@ -637,6 +637,35 @@ Some debug info
         assert_eq!(evals[0].1.justification, "good");
     }
 
+    #[tokio::test]
+    async fn evaluate_grounds_claim_cite_to_proposal_span() {
+        use crate::agents::{CandidateProposal, Proposal};
+        // A quote-wrapped cite; evaluate() must substitute it with the exact span
+        // of the target proposal (the exec-path grounding).
+        let eval_json = r#"{"evaluations":[{"target_id":"AGENT_A","score":0.5,"justification":"j","claim_assessments":[{"cite":"\"sorts in O(n log n) time\"","verdict":"verified"}]}]}"#;
+        let config = default_config(vec![
+            "bash".into(),
+            "-c".into(),
+            format!("cat >/dev/null; echo '{eval_json}'"),
+        ]);
+        let agent = ExecAgent::new("test".into(), config);
+        let mut ctx = minimal_context();
+        ctx.candidates = vec![CandidateProposal {
+            id: "AGENT_A".into(),
+            proposal: Proposal {
+                content: "The system sorts in O(n log n) time overall.".into(),
+                ..Default::default()
+            },
+        }];
+
+        let evals = agent.evaluate(&ctx).await.unwrap();
+        let claim = &evals[0].1.claim_assessments[0].claim;
+        assert_eq!(
+            claim, "sorts in O(n log n) time",
+            "wrapped cite grounded to the exact proposal span"
+        );
+    }
+
     // ── Stdout pollution resistance ──────────────────────────────────────
 
     #[tokio::test]
