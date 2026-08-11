@@ -402,12 +402,48 @@ impl NsedMcpServer {
     )]
     async fn nsed_evaluate(
         &self,
-        Parameters(input): Parameters<EvaluateInput>,
+        Parameters(mut input): Parameters<EvaluateInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         if self.phase != ActivePhase::Evaluating {
             return Ok(CallToolResult::error(vec![Content::text(
                 "nsed_evaluate can only be called during the evaluate phase",
             )]));
+        }
+        // Ground each claim citation to an exact span of the proposal it targets,
+        // tolerating the quote decorations models add (see cite::resolve_cite).
+        // A resolved cite is substituted with the exact proposal substring so the
+        // client can string-match it; an unresolvable one (fabricated / rephrased
+        // beyond recognition) is rejected with feedback so the evaluator re-quotes
+        // — the error/react loop. Empty claims are claim_id back-references and
+        // are left untouched.
+        let content_by_id: std::collections::HashMap<&str, &str> = self
+            .context
+            .candidates
+            .iter()
+            .map(|c| (c.id.as_str(), c.proposal.content.as_str()))
+            .collect();
+        let mut unresolved: Vec<String> = Vec::new();
+        for e in &mut input.evaluations {
+            let Some(content) = content_by_id.get(e.target_id.as_str()) else {
+                continue;
+            };
+            for ca in &mut e.claim_assessments {
+                if ca.claim.trim().is_empty() {
+                    continue;
+                }
+                match super::cite::resolve_cite(content, &ca.claim) {
+                    Some(span) => ca.claim = span,
+                    None => unresolved.push(format!("  • [{}] {:?}", e.target_id, ca.claim)),
+                }
+            }
+        }
+        if !unresolved.is_empty() {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "These claim citations do not match any span of the proposal they target. \
+                 Quote each claim VERBATIM — copy-paste the exact text from the proposal \
+                 (no paraphrase) — then resubmit nsed_evaluate:\n{}",
+                unresolved.join("\n")
+            ))]));
         }
         let evals = input
             .evaluations
