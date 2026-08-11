@@ -366,8 +366,13 @@ pub struct ClaimAssessment {
     /// Format: 6-char hex hash derived from (target_id, claim_text, round).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_id: Option<String>,
-    /// The claim being assessed, quoted VERBATIM from the proposal — copy the exact
-    /// span word-for-word (a substring of the proposal text), e.g. "sorts in O(n log n) time".
+    /// The claim being assessed, quoted VERBATIM from the proposal — an EXACT,
+    /// character-for-character substring of the proposal text. Do NOT paraphrase,
+    /// summarize, shorten, or reword: the client locates claims by exact substring
+    /// match, so any rephrase breaks highlighting. Copy-paste the span; don't type
+    /// it from memory.
+    ///   WRONG (paraphrase): "the sort is efficient"
+    ///   RIGHT (verbatim):   "sorts in O(n log n) time"
     /// Models frequently hallucinate "content", "text", "description", or "summary"
     /// instead of "claim". Some models omit the claim text entirely when using
     /// claim_id references, so we default to empty string.
