@@ -387,23 +387,38 @@ impl NsedAgent for ExecAgent {
             )
         })?;
 
-        // Try direct parse first (standard exec protocol).
-        if let Ok(response) = serde_json::from_str::<ExecEvaluationResponse>(json) {
-            return Ok(response
+        // Ground each claim citation to the exact span of the proposal it
+        // targets (quote-wrapper + whitespace tolerant), leaving unresolvable
+        // ones unchanged — exec has no tool-error retry, so this is the
+        // non-destructive counterpart to the MCP path's reject-and-retry.
+        let content_by_id: std::collections::HashMap<&str, &str> = context
+            .candidates
+            .iter()
+            .map(|c| (c.id.as_str(), c.proposal.content.as_str()))
+            .collect();
+        let ground = |response: ExecEvaluationResponse| -> Vec<(String, Evaluation)> {
+            response
                 .evaluations
                 .into_iter()
-                .map(|item| (item.target_id, item.evaluation))
-                .collect());
+                .map(|item| {
+                    let mut eval = item.evaluation;
+                    if let Some(content) = content_by_id.get(item.target_id.as_str()) {
+                        super::cite::substitute_resolvable(content, &mut eval.claim_assessments);
+                    }
+                    (item.target_id, eval)
+                })
+                .collect()
+        };
+
+        // Try direct parse first (standard exec protocol).
+        if let Ok(response) = serde_json::from_str::<ExecEvaluationResponse>(json) {
+            return Ok(ground(response));
         }
 
         // Unwrap known provider envelopes (e.g. Claude CLI).
         if let Some(inner) = unwrap_provider_envelope(json) {
             if let Ok(response) = serde_json::from_str::<ExecEvaluationResponse>(&inner) {
-                return Ok(response
-                    .evaluations
-                    .into_iter()
-                    .map(|item| (item.target_id, item.evaluation))
-                    .collect());
+                return Ok(ground(response));
             }
             // Plain text — coerce to evaluations with candidate IDs from context.
             let candidate_ids: Vec<&str> =
@@ -416,11 +431,7 @@ impl NsedAgent for ExecAgent {
                         self.name,
                     )
                 })?;
-            return Ok(response
-                .evaluations
-                .into_iter()
-                .map(|item| (item.target_id, item.evaluation))
-                .collect());
+            return Ok(ground(response));
         }
 
         // No provider envelope — report original parse error.
@@ -431,11 +442,7 @@ impl NsedAgent for ExecAgent {
                 self.name, preview,
             )
         })?;
-        Ok(response
-            .evaluations
-            .into_iter()
-            .map(|item| (item.target_id, item.evaluation))
-            .collect())
+        Ok(ground(response))
     }
 
     fn name(&self) -> String {

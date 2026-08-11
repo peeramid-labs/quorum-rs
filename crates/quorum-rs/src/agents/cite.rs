@@ -35,6 +35,21 @@ pub fn cite_resolves(proposal: &str, cite: &str) -> bool {
     resolve_cite(proposal, cite).is_some()
 }
 
+/// Substitute each claim with the exact proposal span it resolves to, leaving
+/// unresolvable (and empty) claims unchanged. Non-destructive — for evaluation
+/// paths WITHOUT a retry loop (e.g. exec agents), where the MCP path's
+/// reject-and-retry isn't available. Grounds what it can; never drops a claim.
+pub fn substitute_resolvable(proposal: &str, claims: &mut [super::ClaimAssessment]) {
+    for c in claims.iter_mut() {
+        if c.claim.trim().is_empty() {
+            continue;
+        }
+        if let Some(span) = resolve_cite(proposal, &c.claim) {
+            c.claim = span;
+        }
+    }
+}
+
 /// De-decorated candidate forms of a raw cite, most-specific first. Always
 /// includes the trimmed original so an already-clean cite still matches.
 fn candidates(cite: &str) -> Vec<String> {
@@ -210,6 +225,32 @@ mod tests {
             resolve_cite(PROPOSAL, "is stable. It uses").as_deref(),
             Some("is stable.\nIt uses")
         );
+    }
+
+    #[test]
+    fn substitute_resolvable_grounds_and_preserves() {
+        use crate::agents::{ClaimAssessment, ClaimVerdict};
+        let mk = |claim: &str, v: ClaimVerdict| ClaimAssessment {
+            claim_id: None,
+            claim: claim.to_string(),
+            verdict: v,
+            reason: None,
+        };
+        let mut claims = vec![
+            mk("\"sorts in O(n log n) time\"", ClaimVerdict::Verified),
+            mk("not in the proposal at all", ClaimVerdict::Wrong),
+            mk("", ClaimVerdict::Unverified),
+        ];
+        substitute_resolvable(PROPOSAL, &mut claims);
+        assert_eq!(
+            claims[0].claim, "sorts in O(n log n) time",
+            "grounded (quotes stripped)"
+        );
+        assert_eq!(
+            claims[1].claim, "not in the proposal at all",
+            "unresolvable → unchanged"
+        );
+        assert_eq!(claims[2].claim, "", "empty left alone");
     }
 
     #[test]
