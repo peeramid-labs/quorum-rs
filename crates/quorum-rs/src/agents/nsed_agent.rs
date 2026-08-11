@@ -1828,7 +1828,22 @@ where
             {
                 Some(block_result) => {
                     let redacted = redact_terminal_leak(parsed, terminal_tool_name, detector);
-                    Some((block_result, redacted))
+                    // Only trust the redaction if a RE-SCAN confirms it cleared the
+                    // leak. The default `redact` is identity (no-op) and a partial
+                    // redact can miss the blocked category — either way passing the
+                    // content through would leak. `false` → block + retry instead.
+                    let cleared = match &redacted {
+                        Some(clean) => run_prompt_exposure_guard(
+                            clean,
+                            terminal_tool_name,
+                            &agent_config.name,
+                            detector,
+                        )
+                        .await
+                        .is_none(),
+                        None => false,
+                    };
+                    Some((block_result, redacted, cleared))
                 }
                 None => None,
             }
@@ -1836,7 +1851,7 @@ where
             None
         };
 
-        if let Some((block_result, redacted)) = guard_block {
+        if let Some((block_result, redacted, cleared)) = guard_block {
             emit_for!(
                 context,
                 PromptExposureDetected {
@@ -1853,26 +1868,36 @@ where
                 }
             );
 
-            match redacted {
-                Some(clean) => {
-                    warn!(
-                        agent_name = %agent_config.name,
-                        attempt = attempts,
-                        terminal_tool = terminal_tool_name,
-                        reason = %block_result.reason,
-                        "prompt_exposure guard blocked; redacted user-visible fields and continued."
-                    );
-                    parse_result = Ok(clean);
-                }
-                None => {
-                    warn!(
-                        agent_name = %agent_config.name,
-                        attempt = attempts,
-                        terminal_tool = terminal_tool_name,
-                        reason = %block_result.reason,
-                        "prompt_exposure guard blocked but redaction failed to re-deserialize; passing original content through."
-                    );
-                }
+            if cleared {
+                // Redaction verified clean by re-scan — safe to continue.
+                let clean = redacted.expect("cleared implies a redacted value");
+                warn!(
+                    agent_name = %agent_config.name,
+                    attempt = attempts,
+                    terminal_tool = terminal_tool_name,
+                    reason = %block_result.reason,
+                    "prompt_exposure guard blocked; redacted, re-scanned clean, continued."
+                );
+                parse_result = Ok(clean);
+            } else {
+                // Redaction was a no-op / partial / failed → do NOT pass the leak
+                // through. Convert to Err so the retry path re-prompts the model
+                // for a self-contained answer (fail-closed on exhaustion).
+                warn!(
+                    agent_name = %agent_config.name,
+                    attempt = attempts,
+                    terminal_tool = terminal_tool_name,
+                    reason = %block_result.reason,
+                    "prompt_exposure guard blocked and redaction did not clear it; blocking + retrying."
+                );
+                cleaned_json = format!(
+                    "prompt_exposure guard blocked output (redaction did not clear it): {}",
+                    block_result.reason
+                );
+                let synth_err: serde_json::Error =
+                    serde_json::from_str::<serde_json::Value>("not-json-prompt-exposure-block")
+                        .expect_err("invalid JSON always errors");
+                parse_result = Err(synth_err);
             }
         }
 
