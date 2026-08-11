@@ -2423,9 +2423,10 @@ mod tests {
             }
             other => panic!("expected Push(JobDetail), got {other:?}"),
         }
-        // ↓ past the oldest clears the selection.
+        // ↓ on the oldest row clamps (no wrap to top) — the deliberate behaviour
+        // from 30f5154; see select_down_clamps_at_bottom_no_wrap.
         v.update(&arrow(false));
-        assert_eq!(v.selected, None);
+        assert_eq!(v.selected, Some(1));
     }
 
     #[test]
