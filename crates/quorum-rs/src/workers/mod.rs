@@ -28,7 +28,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{error, info, warn};
@@ -437,6 +437,12 @@ pub struct NatsNsedWorker {
     /// whether completed responses are released, while this flag controls
     /// whether new tasks are pulled from NATS.
     paused: Arc<AtomicBool>,
+    /// Epoch-ms deadline until which this agent's remote model is considered
+    /// down (`0` = up). Armed when a task fails with a model-unavailable error
+    /// (e.g. 404); the heartbeat reports `model_down` while the deadline is in
+    /// the future so the scheduler stops assigning doomed tasks, and it clears
+    /// automatically on expiry so a transient outage doesn't bench forever.
+    model_down_until_ms: Arc<AtomicU64>,
     /// Optional telemetry emitter for recording LLM call metrics.
     telemetry: Option<TelemetryEmitterMux>,
     /// Agent middleware pipelines, built from `agent_config.middleware`.
@@ -554,6 +560,7 @@ impl NatsNsedWorker {
             chat_agent: None,
             response_buffer: None,
             paused: Arc::new(AtomicBool::new(false)),
+            model_down_until_ms: Arc::new(AtomicU64::new(0)),
             telemetry,
             before_prompt_mw,
             provider_response_mw,
@@ -1996,6 +2003,21 @@ impl NatsNsedWorker {
                     }
                 }
 
+                // Bench the agent when its remote model is unavailable (e.g. a
+                // 404 from a removed model / dead endpoint): the next heartbeat
+                // reports model_down so the scheduler stops assigning it doomed
+                // tasks until the cooldown expires and it self-heals.
+                if is_model_down_error(&err_str) {
+                    let until =
+                        chrono::Utc::now().timestamp_millis() as u64 + MODEL_DOWN_COOLDOWN_MS;
+                    self.model_down_until_ms.store(until, Ordering::Relaxed);
+                    warn!(
+                        agent_id = %self.agent_id,
+                        cooldown_secs = MODEL_DOWN_COOLDOWN_MS / 1000,
+                        "Remote model unavailable — reporting model_down until cooldown expires"
+                    );
+                }
+
                 if !suppress_error_event {
                     // `reason` is a short machine-readable classifier so
                     // the orchestrator (and telemetry consumers) can group
@@ -2164,9 +2186,10 @@ impl NatsNsedWorker {
             capability_tags: self.agent_config.capability_tags.clone(),
             description: self.agent_config.description.clone(),
             signing_schemes: self.agent_config.signing_schemes.clone(),
-            // Set by the model health probe / reactive 404 handling (follow-up
-            // increments); reported `false` (up) until then.
-            model_down: false,
+            model_down: model_down_active(
+                self.model_down_until_ms.load(Ordering::Relaxed),
+                chrono::Utc::now().timestamp_millis() as u64,
+            ),
         };
         let subject = format!(
             "{}.agent.heartbeat.{}",
@@ -2512,6 +2535,7 @@ impl Clone for NatsNsedWorker {
             chat_agent: self.chat_agent.clone(),
             response_buffer: self.response_buffer.clone(),
             paused: self.paused.clone(),
+            model_down_until_ms: self.model_down_until_ms.clone(),
             telemetry: self.telemetry.clone(),
             before_prompt_mw: self.before_prompt_mw.clone(),
             provider_response_mw: self.provider_response_mw.clone(),
@@ -2858,6 +2882,33 @@ fn is_transient_error(err: &anyhow::Error) -> bool {
 /// payload the worker publishes on bail so the orchestrator (and
 /// telemetry consumers) can distinguish parse failures from iteration
 /// caps without parsing the full error string.
+/// How long (ms) to bench an agent after its remote model reports unavailable.
+/// Long enough to skip a flapping/removed model across a job, short enough that
+/// a recovered model rejoins on its own without operator intervention.
+const MODEL_DOWN_COOLDOWN_MS: u64 = 300_000; // 5 minutes
+
+/// True when a task error indicates the remote MODEL/endpoint is unavailable
+/// (removed model / dead endpoint) rather than a transient, auth, rate, or
+/// billing error. Only these bench the agent — over-matching (e.g. on a bare
+/// "404" that could appear in a job id) is avoided by anchoring on the HTTP
+/// status phrase and known model-not-found messages.
+fn is_model_down_error(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("status 404")
+        || e.contains("404 not found")
+        || e.contains("model_not_found")
+        || e.contains("model not found")
+        || e.contains("does not exist")
+        || e.contains("no such model")
+}
+
+/// Whether the model-down cooldown is still active. `until_ms == 0` means the
+/// model was never marked down; otherwise it is down until `now_ms` reaches the
+/// deadline, after which the agent is eligible again.
+fn model_down_active(until_ms: u64, now_ms: u64) -> bool {
+    until_ms != 0 && now_ms < until_ms
+}
+
 fn classify_abstention_reason(err: &str) -> String {
     let lower = err.to_lowercase();
     if lower.contains("failed to parse structured output") || lower.contains("missing field") {
@@ -7351,6 +7402,35 @@ mod tests {
     #[test]
     fn classify_fallback() {
         assert_eq!(classify_abstention_reason("kaboom"), "error");
+    }
+
+    #[test]
+    fn is_model_down_error_flags_only_model_unavailable() {
+        // The observed incident: a 404 from a removed model / dead endpoint.
+        assert!(is_model_down_error(
+            "API request failed with status 404 Not Found"
+        ));
+        assert!(is_model_down_error("error: model_not_found"));
+        assert!(is_model_down_error("The model `x` does not exist"));
+        assert!(is_model_down_error("no such model: gpt-9"));
+        // Not model-down: transient / auth / rate / billing / other statuses.
+        assert!(!is_model_down_error("402 Payment Required"));
+        assert!(!is_model_down_error("429 Too Many Requests"));
+        assert!(!is_model_down_error("500 Internal Server Error"));
+        assert!(!is_model_down_error("upstream timed out after 60s"));
+        // A bare "404" inside unrelated text (e.g. a job id) must not trip it.
+        assert!(!is_model_down_error("job sphera_jobs-404 completed"));
+    }
+
+    #[test]
+    fn model_down_active_respects_the_cooldown_deadline() {
+        // 0 = never marked down.
+        assert!(!model_down_active(0, 1_000));
+        // Down while now is before the deadline.
+        assert!(model_down_active(5_000, 4_999));
+        // Recovered once now reaches/passes the deadline.
+        assert!(!model_down_active(5_000, 5_000));
+        assert!(!model_down_active(5_000, 6_000));
     }
 
     #[test]
