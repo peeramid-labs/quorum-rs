@@ -1308,6 +1308,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_candidate_branch_filters_by_keyword() {
+        // The candidate-path search (with_candidates) must honor the keyword
+        // filter too — not only agent_ids / min_score.
+        let store = build_test_corpus(); // rounds 1,2 only
+        let candidates = vec![
+            CandidateProposal {
+                id: "Candidate_B".to_string(),
+                proposal: Proposal {
+                    content: "Merge sort keeps stability".to_string(),
+                    thought_process: "reasoning".to_string(),
+                    ..Default::default()
+                },
+            },
+            CandidateProposal {
+                id: "Candidate_C".to_string(),
+                proposal: Proposal {
+                    content: "Quicksort trades stability for speed".to_string(),
+                    thought_process: "z".to_string(),
+                    ..Default::default()
+                },
+            },
+        ];
+        let tool = SearchDeliberationTool::new(store, 3).with_candidates(candidates);
+        let args = serde_json::json!({
+            "keywords": ["merge sort"],
+            "filters": { "rounds": [3] },
+            "limit": 50
+        });
+        let result = tool.call(args).await.unwrap();
+        assert!(
+            result.contains("Candidate_B"),
+            "the keyword-matching candidate is surfaced: {result}"
+        );
+        assert!(
+            !result.contains("Candidate_C"),
+            "the non-matching candidate is filtered out: {result}"
+        );
+    }
+
+    #[tokio::test]
     async fn search_excludes_candidates_under_evaluation_only_filters() {
         // A not-yet-evaluated candidate has no score/verdicts; an eval-only filter
         // (min_score) must exclude it rather than emit an unscored result.
