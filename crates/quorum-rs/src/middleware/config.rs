@@ -122,8 +122,9 @@ pub enum BuiltinMiddlewareType {
 }
 
 impl MiddlewareConfig {
-    /// Build a pipeline for the `before_release` hook point.
-    pub fn build_before_release_pipeline(&self) -> MiddlewarePipeline {
+    /// Build a pipeline for the `before_release` hook point. `Err` if any
+    /// configured middleware fails to build (fail-closed — see `build_pipeline`).
+    pub fn build_before_release_pipeline(&self) -> Result<MiddlewarePipeline, String> {
         self.build_pipeline(
             &self.before_release,
             &[MiddlewareStage::Edit, MiddlewareStage::Release],
@@ -131,7 +132,7 @@ impl MiddlewareConfig {
     }
 
     /// Build a pipeline for the `on_provider_response` hook point.
-    pub fn build_provider_response_pipeline(&self) -> MiddlewarePipeline {
+    pub fn build_provider_response_pipeline(&self) -> Result<MiddlewarePipeline, String> {
         self.build_pipeline(
             &self.on_provider_response,
             &[MiddlewareStage::ProviderResponse],
@@ -139,17 +140,17 @@ impl MiddlewareConfig {
     }
 
     /// Build a pipeline for the `before_prompt` hook point.
-    pub fn build_before_prompt_pipeline(&self) -> MiddlewarePipeline {
+    pub fn build_before_prompt_pipeline(&self) -> Result<MiddlewarePipeline, String> {
         self.build_pipeline(&self.before_prompt, &[MiddlewareStage::BeforePrompt])
     }
 
     /// Build a pipeline for the `on_completion` hook point.
-    pub fn build_completion_pipeline(&self) -> MiddlewarePipeline {
+    pub fn build_completion_pipeline(&self) -> Result<MiddlewarePipeline, String> {
         self.build_pipeline(&self.on_completion, &[MiddlewareStage::Completion])
     }
 
     /// Build a pipeline for the `on_job_complete` hook point.
-    pub fn build_job_complete_pipeline(&self) -> MiddlewarePipeline {
+    pub fn build_job_complete_pipeline(&self) -> Result<MiddlewarePipeline, String> {
         self.build_pipeline(&self.on_job_complete, &[MiddlewareStage::JobComplete])
     }
 
@@ -166,19 +167,23 @@ impl MiddlewareConfig {
         &self,
         entries: &[MiddlewareEntry],
         default_stages: &[MiddlewareStage],
-    ) -> MiddlewarePipeline {
-        let middleware: Vec<Box<dyn AgentMiddleware>> = entries
+    ) -> Result<MiddlewarePipeline, String> {
+        // Fail CLOSED: a middleware that can't be built (missing/corrupt dylib,
+        // builtin create error) is a broken security guard — propagate the error so
+        // the agent refuses to start, rather than silently dropping the guard and
+        // running the pipeline without it (fail-open).
+        let middleware = entries
             .iter()
-            .filter_map(|entry| self.build_entry(entry, default_stages))
-            .collect();
-        MiddlewarePipeline::new(middleware)
+            .map(|entry| self.build_entry(entry, default_stages))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(MiddlewarePipeline::new(middleware))
     }
 
     fn build_entry(
         &self,
         entry: &MiddlewareEntry,
         default_stages: &[MiddlewareStage],
-    ) -> Option<Box<dyn AgentMiddleware>> {
+    ) -> Result<Box<dyn AgentMiddleware>, String> {
         match entry {
             MiddlewareEntry::Builtin {
                 builtin,
@@ -201,16 +206,11 @@ impl MiddlewareConfig {
                             builtin_type = ?builtin,
                             "Loaded builtin middleware"
                         );
-                        Some(mw)
+                        Ok(mw)
                     }
-                    Err(e) => {
-                        tracing::error!(
-                            builtin_type = ?builtin,
-                            error = %e,
-                            "Failed to create builtin middleware"
-                        );
-                        None
-                    }
+                    Err(e) => Err(format!(
+                        "failed to create builtin middleware {builtin:?}: {e}"
+                    )),
                 }
             }
             MiddlewareEntry::Dylib {
@@ -232,20 +232,15 @@ impl MiddlewareConfig {
                             dylib = ?dylib,
                             "Loaded dynamic library middleware"
                         );
-                        Some(Box::new(mw))
+                        Ok(Box::new(mw))
                     }
-                    Err(e) => {
-                        tracing::error!(
-                            dylib = ?dylib,
-                            error = %e,
-                            "Failed to load dynamic library middleware — agent will refuse to start. \
-                             Fix the dylib path or remove from config."
-                        );
-                        // Fail startup: return None so pipeline is incomplete,
-                        // and the caller (build_pipeline) will log the gap.
-                        // TODO: convert build_pipeline to Result to propagate this properly.
-                        None
-                    }
+                    // Fail CLOSED: propagate so the agent refuses to start (matching
+                    // the operator-facing contract) instead of running without this
+                    // guard. Fix the dylib path or remove it from config.
+                    Err(e) => Err(format!(
+                        "failed to load dynamic library middleware {dylib:?}: {e} \
+                         — fix the dylib path or remove it from config"
+                    )),
                 }
             }
             MiddlewareEntry::Binary {
@@ -265,7 +260,7 @@ impl MiddlewareConfig {
                     .unwrap_or("binary")
                     .to_string();
 
-                Some(Box::new(BinaryMiddleware {
+                Ok(Box::new(BinaryMiddleware {
                     display_name: name,
                     path: binary.clone(),
                     args: args.clone(),
@@ -389,7 +384,7 @@ before_release:
     timeout_secs: 5
 "#;
         let config: MiddlewareConfig = serde_yaml::from_str(yaml).unwrap();
-        let pipeline = config.build_before_release_pipeline();
+        let pipeline = config.build_before_release_pipeline().unwrap();
         assert_eq!(pipeline.len(), 1);
         assert!(!pipeline.is_empty());
     }
@@ -402,9 +397,26 @@ before_release:
     config: {}
 "#;
         let config: MiddlewareConfig = serde_yaml::from_str(yaml).unwrap();
-        let pipeline = config.build_before_release_pipeline();
+        let pipeline = config.build_before_release_pipeline().unwrap();
         // rule_based is implemented — should create 1 middleware
         assert_eq!(pipeline.len(), 1);
+    }
+
+    #[test]
+    fn unloadable_dylib_fails_closed_not_dropped() {
+        // A dylib that can't load must make pipeline-build ERROR (→ agent refuses to
+        // start), not silently drop the guard and run the pipeline without it.
+        let yaml = r#"
+before_prompt:
+  - dylib: /nonexistent/path/to/guard.so
+"#;
+        let config: MiddlewareConfig = serde_yaml::from_str(yaml).unwrap();
+        let result = config.build_before_prompt_pipeline();
+        assert!(
+            result.is_err(),
+            "an unloadable dylib guard must fail closed (Err), got Ok"
+        );
+        assert!(result.unwrap_err().contains("dynamic library"));
     }
 
     #[test]

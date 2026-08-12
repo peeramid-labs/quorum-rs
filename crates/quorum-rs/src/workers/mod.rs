@@ -531,11 +531,33 @@ impl NatsNsedWorker {
                 Some(Arc::new(p))
             }
         };
-        let before_prompt_mw = opt_pipeline(agent_config.middleware.build_before_prompt_pipeline());
-        let provider_response_mw =
-            opt_pipeline(agent_config.middleware.build_provider_response_pipeline());
-        let completion_mw = opt_pipeline(agent_config.middleware.build_completion_pipeline());
-        let job_complete_mw = opt_pipeline(agent_config.middleware.build_job_complete_pipeline());
+        // `?` — a middleware that fails to build (broken/missing dylib, builtin
+        // error) fails the agent's startup (fail-closed) rather than silently
+        // running without the guard.
+        let before_prompt_mw = opt_pipeline(
+            agent_config
+                .middleware
+                .build_before_prompt_pipeline()
+                .map_err(|e| anyhow::anyhow!(e))?,
+        );
+        let provider_response_mw = opt_pipeline(
+            agent_config
+                .middleware
+                .build_provider_response_pipeline()
+                .map_err(|e| anyhow::anyhow!(e))?,
+        );
+        let completion_mw = opt_pipeline(
+            agent_config
+                .middleware
+                .build_completion_pipeline()
+                .map_err(|e| anyhow::anyhow!(e))?,
+        );
+        let job_complete_mw = opt_pipeline(
+            agent_config
+                .middleware
+                .build_job_complete_pipeline()
+                .map_err(|e| anyhow::anyhow!(e))?,
+        );
 
         Ok(Self {
             agent,
