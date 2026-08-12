@@ -236,4 +236,53 @@ mod tests {
         assert!(mgr.agent_names().is_empty());
         assert!(!mgr.has_agent("x"));
     }
+
+    #[tokio::test]
+    async fn persist_without_config_path_errors() {
+        let mgr = AgentManager::new();
+        let err = mgr.persist_agents_to_yaml(&[]).await.unwrap_err();
+        assert!(err.contains("No config path"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn persist_rejects_non_mapping_yaml_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.yml");
+        // Root is a sequence, not a mapping → the agents key can't be set.
+        tokio::fs::write(&path, "- a\n- b\n").await.unwrap();
+        let mgr = AgentManager::new().with_config_path(path);
+        let err = mgr.persist_agents_to_yaml(&[]).await.unwrap_err();
+        assert!(err.contains("not a mapping"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn persist_replaces_agents_key_and_preserves_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.yml");
+        tokio::fs::write(
+            &path,
+            "orchestrators:\n  - id: main\nagents:\n  - name: stale\n",
+        )
+        .await
+        .unwrap();
+        let mgr = AgentManager::new().with_config_path(path.clone());
+
+        // Persist an empty agent set — must replace `agents`, keep the rest.
+        mgr.persist_agents_to_yaml(&[]).await.expect("persist");
+
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&written).unwrap();
+        let root = parsed.as_mapping().expect("root mapping");
+        assert!(
+            root.get("orchestrators").is_some(),
+            "unrelated keys preserved: {written}"
+        );
+        let agents = root.get("agents").expect("agents key present");
+        assert!(
+            agents.as_sequence().is_some_and(|s| s.is_empty()),
+            "stale agent replaced by the new (empty) set: {written}"
+        );
+        // Atomic write cleaned up its temp file.
+        assert!(!path.with_extension("yml.tmp").exists());
+    }
 }
