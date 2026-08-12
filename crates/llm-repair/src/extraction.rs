@@ -2638,6 +2638,20 @@ solution_content: {"answer": 42, "steps": [1, 2, 3]}
         assert_eq!(val["flag"], true);
     }
 
+    #[test]
+    fn parse_python_literal_deep_nesting_hits_depth_cap_gracefully() {
+        // `True` is Python, not JSON, so this routes to the python-AST path.
+        // Nesting past MAX_PY_AST_DEPTH must stop the recursion and return None
+        // — never overflow the stack on adversarial `[[[[…]]]]` input.
+        let deep = format!("{}True{}", "[".repeat(60), "]".repeat(60));
+        assert!(
+            parse_json_or_python_literal(&deep).is_none(),
+            "nesting past the depth cap must fail gracefully to None"
+        );
+        // Sanity: the cap doesn't reject ordinary shallow python literals.
+        assert!(parse_json_or_python_literal("[True, False, None]").is_some());
+    }
+
     // ---------------------------------------------------------------
     // extract_python_tool_calls — backtick label with JSON content
     // ---------------------------------------------------------------
