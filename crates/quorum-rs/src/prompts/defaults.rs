@@ -5,6 +5,14 @@ use crate::agents::DeliberationPhase;
 use super::PromptSet;
 use crate::agents::{Proposal, UserInjection};
 
+/// Char budget for a candidate's `thought_process` inlined into the evaluation
+/// prompt. Beyond this the prompt truncates and points the evaluator at
+/// `read_proposal(offset=…)`. Citation grounding
+/// ([`crate::agents::mcp_agent::ground_evaluation_claims`]) matches against this
+/// SAME window so the two never diverge — grounding a wider corpus would let a
+/// cite resolve to reasoning the evaluator was never shown.
+pub const EVAL_THOUGHT_LIMIT: usize = 4000;
+
 fn render_user_updates(injections: &[UserInjection], context: &str) -> String {
     if injections.is_empty() {
         return String::new();
@@ -343,7 +351,7 @@ impl PromptSet for DefaultPromptSet {
         let mut candidates_text = String::new();
         // Inline full thought processes to avoid wasting iterations on individual read_proposal calls.
         // Only truncate if a single candidate's thoughts exceed a generous limit.
-        let thought_limit = 4000;
+        let thought_limit = EVAL_THOUGHT_LIMIT;
         for candidate in candidates {
             let thought_chars = candidate.proposal.thought_process.chars().count();
             let (thoughts_text, truncated) = if thought_chars > thought_limit {
@@ -576,7 +584,7 @@ impl PromptSet for DefaultPromptSet {
         let valid_ids_str = valid_ids.join(", ");
 
         let mut candidates_text = String::new();
-        let thought_limit = 4000;
+        let thought_limit = EVAL_THOUGHT_LIMIT;
         for candidate in candidates {
             let thought_chars = candidate.proposal.thought_process.chars().count();
             let (thoughts_text, truncated) = if thought_chars > thought_limit {

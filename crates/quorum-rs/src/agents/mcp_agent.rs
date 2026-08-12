@@ -416,27 +416,7 @@ impl NsedMcpServer {
         // beyond recognition) is rejected with feedback so the evaluator re-quotes
         // — the error/react loop. Empty claims are claim_id back-references and
         // are left untouched.
-        let content_by_id: std::collections::HashMap<&str, &str> = self
-            .context
-            .candidates
-            .iter()
-            .map(|c| (c.id.as_str(), c.proposal.content.as_str()))
-            .collect();
-        let mut unresolved: Vec<String> = Vec::new();
-        for e in &mut input.evaluations {
-            let Some(content) = content_by_id.get(e.target_id.as_str()) else {
-                continue;
-            };
-            for ca in &mut e.claim_assessments {
-                if ca.claim.trim().is_empty() {
-                    continue;
-                }
-                match super::cite::resolve_cite(content, &ca.claim) {
-                    Some(span) => ca.claim = span,
-                    None => unresolved.push(format!("  • [{}] {:?}", e.target_id, ca.claim)),
-                }
-            }
-        }
+        let unresolved = ground_evaluation_claims(&self.context.candidates, &mut input.evaluations);
         if !unresolved.is_empty() {
             return Ok(CallToolResult::error(vec![Content::text(format!(
                 "These claim citations do not match any span of the proposal they target. \
@@ -3508,6 +3488,60 @@ impl super::ChatCapable for ClaudeAgent {
     }
 }
 
+/// Ground each cited claim in `evaluations` to the exact span it quotes,
+/// substituting the claim with that span (so the client can string-match it),
+/// and return the citations that resolve to NO span — the caller rejects those
+/// and asks the evaluator to re-quote (the error/react loop).
+///
+/// Matches against exactly what the evaluator was SHOWN for each candidate: the
+/// full final solution (`content`, inlined whole) AND the first
+/// [`EVAL_THOUGHT_LIMIT`](crate::prompts::defaults::EVAL_THOUGHT_LIMIT) chars of
+/// the `thought_process` (the prompt truncates there). Grounding only against
+/// `content` would hard-reject a legitimate
+/// reasoning quote into an unbreakable retry loop; grounding against the FULL
+/// thought_process would instead scan an unbounded reasoning body and could
+/// false-accept a cite the evaluator never saw. Bounding the thoughts corpus to
+/// the shown window fixes both. Empty claims are claim_id back-references, left
+/// untouched; an evaluation targeting an unknown candidate id is skipped.
+fn ground_evaluation_claims(
+    candidates: &[crate::agents::CandidateProposal],
+    evaluations: &mut [crate::agents::mcp_tools::EvaluationItem],
+) -> Vec<String> {
+    // (content, thoughts_shown) per candidate id. `content` borrows in full;
+    // `thoughts_shown` is the truncated window the prompt actually inlined, so
+    // the match corpus never exceeds what the evaluator could quote.
+    let corpus_by_id: std::collections::HashMap<&str, (&str, String)> = candidates
+        .iter()
+        .map(|c| {
+            let thoughts_shown: String = c
+                .proposal
+                .thought_process
+                .chars()
+                .take(crate::prompts::defaults::EVAL_THOUGHT_LIMIT)
+                .collect();
+            (c.id.as_str(), (c.proposal.content.as_str(), thoughts_shown))
+        })
+        .collect();
+    let mut unresolved: Vec<String> = Vec::new();
+    for e in evaluations.iter_mut() {
+        let Some((content, thoughts)) = corpus_by_id.get(e.target_id.as_str()) else {
+            continue;
+        };
+        for ca in &mut e.claim_assessments {
+            if ca.claim.trim().is_empty() {
+                continue;
+            }
+            match super::cite::resolve_cite(content, &ca.claim)
+                .or_else(|| super::cite::resolve_cite(thoughts, &ca.claim))
+            {
+                Some(span) => ca.claim = span,
+                None => unresolved.push(format!("  • [{}] {:?}", e.target_id, ca.claim)),
+            }
+        }
+    }
+    unresolved
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3515,6 +3549,127 @@ mod tests {
     use super::*;
     use crate::agents::config::McpProviderConfig;
     use std::collections::HashMap;
+
+    // ── ground_evaluation_claims: nsed_evaluate citation grounding ───────────
+
+    fn candidate(id: &str, content: &str, thoughts: &str) -> crate::agents::CandidateProposal {
+        crate::agents::CandidateProposal {
+            id: id.into(),
+            proposal: crate::agents::Proposal {
+                content: content.into(),
+                thought_process: thoughts.into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn eval_with_cite(target: &str, cite: &str) -> crate::agents::mcp_tools::EvaluationItem {
+        serde_json::from_value(serde_json::json!({
+            "target_id": target,
+            "score": 0.5,
+            "justification": "j",
+            "claim_assessments": [{ "cite": cite, "verdict": "verified" }],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn ground_claims_substitutes_a_solution_cite_and_accepts() {
+        let cands = vec![candidate(
+            "Candidate_A",
+            "The system sorts in O(n log n) time overall.",
+            "irrelevant thoughts",
+        )];
+        // A quote-wrapped cite from the FINAL SOLUTION.
+        let mut evals = vec![eval_with_cite(
+            "Candidate_A",
+            "\"sorts in O(n log n) time\"",
+        )];
+        let unresolved = ground_evaluation_claims(&cands, &mut evals);
+        assert!(unresolved.is_empty(), "a real solution cite must resolve");
+        assert_eq!(
+            evals[0].claim_assessments[0].claim, "sorts in O(n log n) time",
+            "the wrapped cite is replaced with the exact proposal span"
+        );
+    }
+
+    #[test]
+    fn ground_claims_resolves_a_thought_process_cite() {
+        // Regression for the corpus mismatch: the evaluator is shown BOTH the
+        // final solution and the thought_process and told to quote verbatim, so
+        // a quote taken from the thought_process must ground — not hard-reject
+        // into an unbreakable retry loop (which content-only grounding caused).
+        let cands = vec![candidate(
+            "Candidate_A",
+            "Final answer: 42.",
+            "I chose quicksort because it sorts in O(n log n) on average.",
+        )];
+        let mut evals = vec![eval_with_cite(
+            "Candidate_A",
+            "sorts in O(n log n) on average",
+        )];
+        let unresolved = ground_evaluation_claims(&cands, &mut evals);
+        assert!(
+            unresolved.is_empty(),
+            "a verbatim thought_process quote must resolve, got {unresolved:?}"
+        );
+        assert_eq!(
+            evals[0].claim_assessments[0].claim,
+            "sorts in O(n log n) on average"
+        );
+    }
+
+    #[test]
+    fn ground_claims_rejects_a_fabricated_cite() {
+        let cands = vec![candidate(
+            "Candidate_A",
+            "Final answer: 42.",
+            "some reasoning",
+        )];
+        let mut evals = vec![eval_with_cite(
+            "Candidate_A",
+            "this text is nowhere in the proposal",
+        )];
+        let unresolved = ground_evaluation_claims(&cands, &mut evals);
+        assert_eq!(
+            unresolved.len(),
+            1,
+            "a fabricated cite must be reported unresolved for reject-and-retry"
+        );
+        assert!(unresolved[0].contains("Candidate_A"));
+    }
+
+    #[test]
+    fn ground_claims_skips_unknown_target_and_empty_cite() {
+        let cands = vec![candidate("Candidate_A", "content here", "thoughts")];
+        // Unknown target → skipped, NOT reported unresolved.
+        let mut unknown = vec![eval_with_cite("Candidate_Z", "content here")];
+        assert!(ground_evaluation_claims(&cands, &mut unknown).is_empty());
+        // Empty cite (a claim_id back-reference) → left untouched, not rejected.
+        let mut empty = vec![eval_with_cite("Candidate_A", "")];
+        assert!(ground_evaluation_claims(&cands, &mut empty).is_empty());
+        assert_eq!(empty[0].claim_assessments[0].claim, "");
+    }
+
+    #[test]
+    fn ground_claims_ignores_thought_process_beyond_the_shown_window() {
+        // The prompt inlines only the first EVAL_THOUGHT_LIMIT chars of the
+        // thought_process; grounding matches the SAME window. A cite that only
+        // appears BEYOND it must be rejected — never scanned into an unbounded
+        // reasoning body, never false-accepted against text the evaluator was
+        // not shown.
+        let limit = crate::prompts::defaults::EVAL_THOUGHT_LIMIT;
+        let mut thoughts = "x".repeat(limit); // fills the entire shown window
+        thoughts.push_str("UNIQUE_BEYOND_WINDOW_MARKER");
+        let cands = vec![candidate("Candidate_A", "final", &thoughts)];
+        let mut evals = vec![eval_with_cite("Candidate_A", "UNIQUE_BEYOND_WINDOW_MARKER")];
+        let unresolved = ground_evaluation_claims(&cands, &mut evals);
+        assert_eq!(
+            unresolved.len(),
+            1,
+            "a cite present only beyond the shown window must not ground"
+        );
+    }
 
     /// Minimal PromptSet for unit tests — returns stub prompts.
     #[derive(Debug, Clone)]
