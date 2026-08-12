@@ -485,6 +485,15 @@ pub fn retry_feedback_block(failure: &LastFailureKind, terminal_tool: &str) -> S
     format!("{header}\n{body}\n{footer}")
 }
 
+/// True when the process runs as root (euid 0), where the kernel bypasses
+/// directory permission bits — a 0o000 dir is still readable to root.
+/// Only consumed by the permission-sensitive sweep test.
+#[cfg(all(unix, test))]
+fn running_as_root() -> bool {
+    // SAFETY: geteuid is a pure syscall with no preconditions.
+    unsafe { libc::geteuid() == 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,9 +629,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn running_as_root_matches_geteuid() {
+        // SAFETY: geteuid is always safe to call.
+        let expected = unsafe { libc::geteuid() } == 0;
+        assert_eq!(running_as_root(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
     #[serial_test::serial(home_env)]
     fn sweep_orphan_session_env_lock_handles_unreadable_dir() {
         use std::os::unix::fs::PermissionsExt;
+        // Root (e.g. CI containers running as uid 0) bypasses directory
+        // permission bits, so a 0o000 dir stays readable and this test's
+        // "unreadable → EACCES" premise cannot be reproduced: the sweep would
+        // legitimately treat the dir as empty and remove it, then the perm
+        // restore below hits NotFound. Skip rather than assert a false premise.
+        if running_as_root() {
+            return;
+        }
         let prev = std::env::var_os("HOME");
         let tmp = tempfile::tempdir().expect("tempdir");
         // SAFETY: env mutation in tests is serialized via `home_env`.
