@@ -48,6 +48,36 @@ pub fn repair_tool_calls(response_message: &mut ChatCompletionResponseMessage, a
     }
 }
 
+/// If `s` ends with an INCOMPLETE `\uXXXX` escape (an UNESCAPED `\`, then `u`, then
+/// 0–3 hex digits), return the byte index to truncate to (dropping the partial
+/// escape). Returns `None` otherwise — crucially for `\\u0` (an escaped backslash
+/// followed by a literal `u0`): the backslash run before `u` is even, so the `u` is
+/// NOT part of an escape, and trimming would eat the escaped backslash. A complete
+/// 4-hex `A` also returns `None` (not incomplete). All indices land on the
+/// ASCII `\`/`u`/hex bytes, so truncation is always char-boundary-safe.
+fn incomplete_unicode_trunc(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut i = b.len();
+    let mut hex = 0;
+    while i > 0 && hex < 3 && b[i - 1].is_ascii_hexdigit() {
+        i -= 1;
+        hex += 1;
+    }
+    // Require `\` `u` immediately before the (0–3) trailing hex digits.
+    if i < 2 || b[i - 1] != b'u' || b[i - 2] != b'\\' {
+        return None;
+    }
+    // Parity of the backslash run ending at i-2: odd ⇒ the last `\` escapes the `u`
+    // (a real, incomplete `\u…`); even ⇒ the backslashes are literal pairs (`\\u…`).
+    let mut bs = 0usize;
+    let mut j = i - 1; // the `u` position; walk left over backslashes
+    while j > 0 && b[j - 1] == b'\\' {
+        j -= 1;
+        bs += 1;
+    }
+    if bs % 2 == 1 { Some(i - 2) } else { None }
+}
+
 /// Attempts to repair a truncated JSON string by closing open braces, brackets, and quotes.
 pub fn repair_truncated_json(input: &str) -> String {
     let mut repaired = input.to_string();
@@ -57,26 +87,8 @@ pub fn repair_truncated_json(input: &str) -> String {
     // or just a backslash "\", we need to trim it before closing.
     // However, blind removal is dangerous (e.g. removing '\' from "\\") so we rely on parser state.
 
-    if repaired.ends_with("\\u") {
-        repaired.truncate(repaired.len() - 2);
-    } else if repaired.len() >= 3
-        && repaired.is_char_boundary(repaired.len() - 3)
-        && repaired[repaired.len() - 3..].starts_with("\\u")
-    {
-        // e.g. ends with \u0
-        repaired.truncate(repaired.len() - 3);
-    } else if repaired.len() >= 4
-        && repaired.is_char_boundary(repaired.len() - 4)
-        && repaired[repaired.len() - 4..].starts_with("\\u")
-    {
-        // e.g. ends with \u00
-        repaired.truncate(repaired.len() - 4);
-    } else if repaired.len() >= 5
-        && repaired.is_char_boundary(repaired.len() - 5)
-        && repaired[repaired.len() - 5..].starts_with("\\u")
-    {
-        // e.g. ends with \u000
-        repaired.truncate(repaired.len() - 5);
+    if let Some(pos) = incomplete_unicode_trunc(&repaired) {
+        repaired.truncate(pos);
     }
 
     // 2. Scan string state
@@ -663,6 +675,23 @@ mod tests {
         let repaired = repair_truncated_json(input);
         let val: serde_json::Value = serde_json::from_str(&repaired).unwrap();
         assert_eq!(val["key"], "val");
+    }
+
+    #[test]
+    fn escaped_backslash_before_u_is_not_eaten_as_incomplete_unicode() {
+        // `\\u0` is an ESCAPED backslash followed by a literal `u0`, not an incomplete
+        // `\u` escape. The old fixed-offset branch trimmed `\u0` and then popped the
+        // orphaned `\`, losing the escaped backslash. The parity check preserves it.
+        // Even backslash run before `u` ⇒ no truncation.
+        assert_eq!(incomplete_unicode_trunc(r"foo\\u0"), None);
+        assert_eq!(incomplete_unicode_trunc(r"foo\\u"), None);
+        // Odd run ⇒ a real incomplete escape ⇒ trims from the escaping backslash.
+        assert_eq!(incomplete_unicode_trunc(r"foo\u0"), Some(3));
+        assert_eq!(incomplete_unicode_trunc(r"foo\\\u00"), Some(5));
+        // A complete 4-hex escape is not "incomplete".
+        assert_eq!(incomplete_unicode_trunc(r"xA"), None);
+        // Trailing hex with no `\u` doesn't false-trigger.
+        assert_eq!(incomplete_unicode_trunc("deadbeef"), None);
     }
 
     #[test]
