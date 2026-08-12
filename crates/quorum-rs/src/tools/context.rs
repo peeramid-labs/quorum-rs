@@ -1838,6 +1838,38 @@ mod tests {
         assert!(result.contains("No more content"));
     }
 
+    #[test]
+    fn render_proposal_offset_beyond_thoughts_reports_no_more_content() {
+        // The candidate-path helper's own offset-overflow branch (separate from
+        // the store-backed read_own_proposal one above).
+        let p = Proposal {
+            content: "final".into(),
+            thought_process: "short".into(),
+            ..Default::default()
+        };
+        let out = render_proposal(7, "Candidate_A", &p, 100, 50);
+        assert!(out.contains("Offset 100 exceeds"), "offset overflow: {out}");
+        assert!(out.contains("No more content"));
+    }
+
+    #[test]
+    fn render_proposal_windows_thoughts_and_flags_remaining() {
+        let p = Proposal {
+            content: "the answer".into(),
+            thought_process: "0123456789".into(),
+            ..Default::default()
+        };
+        // offset 3, limit 4 → the window "3456", 3 chars remaining.
+        let out = render_proposal(2, "Candidate_A", &p, 3, 4);
+        assert!(out.contains("3456"), "windowed thoughts: {out}");
+        assert!(out.contains("the answer"), "includes final_solution");
+        assert!(
+            out.contains("characters remaining"),
+            "flags more to read: {out}"
+        );
+        assert!(out.contains("offset=7"), "next offset = 3+4: {out}");
+    }
+
     // =========================================================================
     // ReadOwnProposalTool — agent not found in round data
     // =========================================================================
