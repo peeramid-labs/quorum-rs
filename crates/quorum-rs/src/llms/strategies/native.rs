@@ -797,7 +797,7 @@ mod tests {
                 web_search: Some(WebSearchConfig {
                     engine: Some("exa".to_string()),
                     max_results: Some(3),
-                    ..Default::default()
+                    search_prompt: Some("Prefer peer-reviewed sources.".to_string()),
                 }),
                 ..Default::default()
             }),
@@ -825,6 +825,7 @@ mod tests {
         assert_eq!(arr[0]["id"], "web");
         assert_eq!(arr[0]["engine"], "exa");
         assert_eq!(arr[0]["max_results"], 3);
+        assert_eq!(arr[0]["search_prompt"], "Prefer peer-reviewed sources.");
         // ZDR + fallback still emitted alongside the plugin.
         assert_eq!(body["provider"]["zdr"], true);
         assert_eq!(body["provider"]["allow_fallbacks"], true);
