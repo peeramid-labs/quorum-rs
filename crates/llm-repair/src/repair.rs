@@ -102,6 +102,26 @@ pub fn repair_truncated_json(input: &str) -> String {
         repaired.push('"');
     }
 
+    // 2b. A truncated trailing NUMBER in object-value position (`… : 9` cut from
+    // `95`) would otherwise be closed into a valid-but-WRONG value and flow silently
+    // into consensus scoring. A complete `5` and a truncated `5…` are indistinguishable,
+    // so — outside a string — strip a numeric run that directly follows a `:`, leaving
+    // `{"k": }` which fails to parse (→ rejected/retried) instead of a wrong score. A
+    // cut-off keyword (a partial `true`/`false`/`null`) already fails to parse safely;
+    // only numbers repair into a valid wrong value, so only numbers need this.
+    // `in_string` here is the pre-close state — when we were mid-string the trailing
+    // run is string content, not a value.
+    if !in_string {
+        let b = repaired.as_bytes();
+        let mut end = repaired.len();
+        while end > 0 && matches!(b[end - 1], b'0'..=b'9' | b'.' | b'-' | b'+' | b'e' | b'E') {
+            end -= 1;
+        }
+        if end < repaired.len() && repaired[..end].trim_end().ends_with(':') {
+            repaired.truncate(end);
+        }
+    }
+
     // 3. Close open objects/arrays
     let mut stack = Vec::new();
 
@@ -893,6 +913,38 @@ mod tests {
         let input = r#"{"key": "value", "num": 42}"#;
         let repaired = repair_truncated_json(input);
         assert_eq!(repaired, input);
+    }
+
+    #[test]
+    fn truncated_number_after_colon_is_not_silently_closed_to_wrong_value() {
+        // "95" cut to "9" must NOT become a valid {"endorsement_weight": 9} — that
+        // wrong score would flow silently into consensus. The dangling number is
+        // stripped so the result fails to parse (→ rejected/retried).
+        let out = repair_truncated_json(r#"{"endorsement_weight": 9"#);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&out).is_err(),
+            "a truncated number must not repair to valid JSON, got {out:?}"
+        );
+        // Multi-field: the truncated last value is dropped, not accepted as-is.
+        let out2 = repair_truncated_json(r#"{"a": 1, "score": 0.9"#);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&out2).is_err(),
+            "trailing truncated number after a colon must invalidate, got {out2:?}"
+        );
+    }
+
+    #[test]
+    fn truncated_string_and_array_values_still_repair() {
+        // The number-strip is colon-scoped: string values and array elements
+        // (comma/bracket-preceded) are untouched and still close correctly.
+        let s = repair_truncated_json(r#"{"a": "hello"#);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&s).unwrap()["a"],
+            "hello"
+        );
+        let a = repair_truncated_json(r#"{"a": [1, 2"#);
+        let v: serde_json::Value = serde_json::from_str(&a).unwrap();
+        assert_eq!(v["a"], serde_json::json!([1, 2]));
     }
 
     #[test]

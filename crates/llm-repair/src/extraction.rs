@@ -648,7 +648,22 @@ fn parse_json_or_python_literal(input: &str) -> Option<Value> {
     }
 }
 
+/// Max nesting the Python-literal → JSON traversal will descend. Matches the
+/// depth-50 cap on the sibling `heuristic_json_tool_calls_recursive`. Deeply
+/// nested adversarial input (`[[[[…]]]]`) would otherwise recurse one stack frame
+/// per level and overflow.
+const MAX_PY_AST_DEPTH: usize = 50;
+
 fn python_ast_to_json(expr: &ast::Expr) -> anyhow::Result<Value> {
+    python_ast_to_json_depth(expr, 0)
+}
+
+fn python_ast_to_json_depth(expr: &ast::Expr, depth: usize) -> anyhow::Result<Value> {
+    if depth > MAX_PY_AST_DEPTH {
+        return Err(anyhow::anyhow!(
+            "Python literal nesting exceeds max depth {MAX_PY_AST_DEPTH}"
+        ));
+    }
     match expr {
         ast::Expr::Constant(ast::ExprConstant { value, .. }) => match value {
             ast::Constant::Str(s) => Ok(Value::String(s.clone())),
@@ -665,7 +680,7 @@ fn python_ast_to_json(expr: &ast::Expr) -> anyhow::Result<Value> {
         ast::Expr::List(ast::ExprList { elts, .. }) => {
             let mut arr = Vec::new();
             for elt in elts {
-                arr.push(python_ast_to_json(elt)?);
+                arr.push(python_ast_to_json_depth(elt, depth + 1)?);
             }
             Ok(Value::Array(arr))
         }
@@ -674,9 +689,9 @@ fn python_ast_to_json(expr: &ast::Expr) -> anyhow::Result<Value> {
             for (key, value) in keys.iter().zip(values.iter()) {
                 if let Some(key_expr) = key {
                     // Keys must be strings in JSON
-                    let key_json = python_ast_to_json(key_expr)?;
+                    let key_json = python_ast_to_json_depth(key_expr, depth + 1)?;
                     if let Value::String(key_str) = key_json {
-                        obj.insert(key_str, python_ast_to_json(value)?);
+                        obj.insert(key_str, python_ast_to_json_depth(value, depth + 1)?);
                     } else {
                         return Err(anyhow::anyhow!("Dict keys must be strings"));
                     }
@@ -1625,6 +1640,16 @@ Trailing text.
         let input = "not json or python at all";
         let result = parse_json_or_python_literal(input);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn python_literal_deep_nesting_is_capped_not_overflowed() {
+        // Invalid JSON (bare `True`) forces the rustpython path; nesting past
+        // MAX_PY_AST_DEPTH (50) must error out (→ None), not recurse the traversal
+        // one frame per level into a stack overflow.
+        let deep = format!("{}True{}", "[".repeat(60), "]".repeat(60));
+        let result = parse_json_or_python_literal(&deep);
+        assert!(result.is_none(), "deep nesting must be rejected, not crash");
     }
 
     // ---------------------------------------------------------------
