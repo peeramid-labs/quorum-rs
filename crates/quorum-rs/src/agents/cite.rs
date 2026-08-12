@@ -221,6 +221,40 @@ mod tests {
     }
 
     #[test]
+    fn strips_dash_labels_list_bullets_and_smart_single_quotes() {
+        let target = Some("sorts in O(n log n) time");
+        // Dash label separators (em / hyphen / en dash) — the code handles all
+        // three but only the colon form was covered.
+        for c in [
+            "Claim — sorts in O(n log n) time",
+            "Claim - sorts in O(n log n) time",
+            "Claim – sorts in O(n log n) time",
+        ] {
+            assert_eq!(
+                resolve_cite(PROPOSAL, c).as_deref(),
+                target,
+                "dash label {c:?}"
+            );
+        }
+        // List bullets (dash / asterisk / bullet / numbered).
+        for c in [
+            "- sorts in O(n log n) time",
+            "* sorts in O(n log n) time",
+            "• sorts in O(n log n) time",
+            "1. sorts in O(n log n) time",
+            "2) sorts in O(n log n) time",
+        ] {
+            assert_eq!(resolve_cite(PROPOSAL, c).as_deref(), target, "bullet {c:?}");
+        }
+        // Smart single quotes (‘…’) — in the strip pairs but untested.
+        assert_eq!(
+            resolve_cite(PROPOSAL, "‘sorts in O(n log n) time’").as_deref(),
+            target,
+            "smart single quotes"
+        );
+    }
+
+    #[test]
     fn whitespace_tolerant_across_newlines() {
         // Cite collapses a newline the proposal has as a real span.
         assert_eq!(
