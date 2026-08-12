@@ -2164,6 +2164,9 @@ impl NatsNsedWorker {
             capability_tags: self.agent_config.capability_tags.clone(),
             description: self.agent_config.description.clone(),
             signing_schemes: self.agent_config.signing_schemes.clone(),
+            // Set by the model health probe / reactive 404 handling (follow-up
+            // increments); reported `false` (up) until then.
+            model_down: false,
         };
         let subject = format!(
             "{}.agent.heartbeat.{}",
