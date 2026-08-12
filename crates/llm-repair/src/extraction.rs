@@ -138,9 +138,15 @@ pub fn extract_evaluations_from_markdown(content: &str) -> Option<String> {
             }
         };
 
-        let justification = parts[3];
+        // Anchor the fixed columns from BOTH ends so a literal `|` inside the
+        // justification (a free-text middle column) doesn't shift `is_final` right and
+        // silently drop a finalize vote. Layout:
+        //   parts = ["", agent_id, weight, <justification …>, is_final, ""]
+        // Justification is everything between weight and is_final; rejoin it with
+        // " | " so an embedded pipe is preserved rather than truncating the cell.
+        let justification = parts[3..parts.len() - 2].join(" | ");
 
-        let is_final_str = parts[4].to_lowercase();
+        let is_final_str = parts[parts.len() - 2].to_lowercase();
         let is_final_solution =
             is_final_str == "true" || is_final_str == "yes" || is_final_str == "1";
 
@@ -796,8 +802,16 @@ fn heuristic_json_tool_calls_recursive(
                     },
                 });
             }
-            // Heuristic 1: read_proposal (has agent_id + round?)
-            else if obj.contains_key("agent_id") && obj.contains_key("round") {
+            // Heuristic 1: read_proposal (agent_id + round, and NOT carrying a
+            // proposal payload). Some models echo their own agent_id/round alongside
+            // the proposal; without this guard such a proposal is misclassified as a
+            // research read and its payload silently discarded. submit_proposal
+            // (Heuristic 4) is the more-specific match, so defer to it.
+            else if obj.contains_key("agent_id")
+                && obj.contains_key("round")
+                && !obj.contains_key("thought_process")
+                && !obj.contains_key("solution_content")
+            {
                 calls.push(ChatCompletionMessageToolCall {
                     id: format!("call_heuristic_{}", uuid::Uuid::new_v4().simple()),
                     r#type: async_openai::types::ChatCompletionToolType::Function,
@@ -1292,6 +1306,30 @@ def solve(n):
     }
 
     #[test]
+    fn markdown_pipe_in_justification_preserves_is_final() {
+        // A literal `|` inside the justification cell must NOT shift is_final_solution
+        // right (which silently dropped the finalize vote). Columns are anchored from
+        // both ends; the middle rejoins with the pipe preserved.
+        let markdown = "\
+| agent_id | endorsement_weight | justification | is_final_solution |
+|---|---|---|---|
+| Xue | 95 | Good, but risky | maybe | true |
+";
+        let result = extract_evaluations_from_markdown(markdown).expect("parse");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let e = &parsed["evaluations"][0];
+        assert_eq!(
+            e["is_final_solution"], true,
+            "the real finalize signal (last column) is read, not the mid-cell"
+        );
+        assert_eq!(
+            e["justification"], "Good, but risky | maybe",
+            "the embedded pipe is preserved in the justification"
+        );
+        assert_eq!(e["endorsement_weight"], 95.0);
+    }
+
+    #[test]
     fn test_extract_evaluations_from_markdown_missing_columns() {
         // Table with too few columns (only 3 cells instead of required 4+)
         let markdown = r#"
@@ -1688,6 +1726,25 @@ Trailing text.
         let calls = heuristic_json_tool_calls(input);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "submit_proposal");
+    }
+
+    #[test]
+    fn heuristic_proposal_echoing_agent_id_is_not_misclassified_as_read() {
+        // Some models echo their own agent_id/round inside the proposal object. It
+        // carries the proposal payload, so it must classify as submit_proposal — not
+        // read_proposal (which would discard the payload).
+        let input = r#"{"agent_id": "Xue", "round": 2, "thought_process": "reasoning", "solution_content": "answer"}"#;
+        let calls = heuristic_json_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].function.name, "submit_proposal",
+            "proposal payload wins over the read_proposal agent_id+round signature"
+        );
+        // A genuine read (no payload) still classifies as read_proposal.
+        let read = r#"{"agent_id": "Xue", "round": 2}"#;
+        let read_calls = heuristic_json_tool_calls(read);
+        assert_eq!(read_calls.len(), 1);
+        assert_eq!(read_calls[0].function.name, "read_proposal");
     }
 
     // ---------------------------------------------------------------
