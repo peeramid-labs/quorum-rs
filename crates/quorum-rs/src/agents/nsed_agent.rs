@@ -1381,8 +1381,17 @@ impl NsedAgent for ProposerEvaluatorAgent {
             })
             .collect();
 
-        // Normalize only over valid evaluations.
-        let total_weight: f32 = valid_evals.iter().map(|e| e.endorsement_weight.abs()).sum();
+        // Normalize only over valid evaluations. A non-finite weight (overflowed
+        // LLM value → ±inf) is treated as 0 here so one garbage weight doesn't make
+        // the whole sum inf and collapse the evaluator's other opinions; normalize_score
+        // also independently guards the per-proposal raw weight.
+        let total_weight: f32 = valid_evals
+            .iter()
+            .map(|e| {
+                let w = e.endorsement_weight.abs();
+                if w.is_finite() { w } else { 0.0 }
+            })
+            .sum();
         debug!(
             agent_name = %self.config.name,
             valid_count = valid_evals.len(),

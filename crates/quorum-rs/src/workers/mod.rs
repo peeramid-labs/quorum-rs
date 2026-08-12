@@ -2664,16 +2664,28 @@ fn job_complete_payload(
 }
 
 /// The winning agent of a round summary = the highest aggregated score.
-/// `None` for an empty score list. Ties resolve to the first max encountered.
+/// `None` for an empty score list. Among equal maxima, `max_by` returns the LAST,
+/// so ties resolve to the last-listed proposal (deterministic — `proposal_scores`
+/// is an ordered `Vec`). A NaN score (should be unreachable — `normalize_score`
+/// guards against it — but defended here too) sorts LOWEST so it can never win over
+/// a real score.
 fn pick_winner(scores: &[crate::events::ProposalScoreEntry]) -> Option<String> {
     scores
         .iter()
-        .max_by(|a, b| {
-            a.aggregated_score
-                .partial_cmp(&b.aggregated_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        .max_by(|a, b| aggregated_score_cmp(a.aggregated_score, b.aggregated_score))
         .map(|e| e.agent_id.clone())
+}
+
+/// Compare two aggregated scores with NaN sorting LOWEST (so a poisoned score never
+/// wins). Finite scores compare naturally.
+pub(crate) fn aggregated_score_cmp(a: f32, b: f32) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+    }
 }
 
 /// Extract a human-readable content preview from a serialized response payload.
@@ -3183,6 +3195,36 @@ mod tests {
         ];
         assert_eq!(pick_winner(&scores).as_deref(), Some("beta"));
         assert_eq!(pick_winner(&[]), None);
+    }
+
+    #[test]
+    fn pick_winner_never_selects_a_nan_score() {
+        use crate::events::ProposalScoreEntry;
+        // A NaN-scored proposal at the END must not win over a strictly-larger real
+        // score (max_by returns the last of Equal, and NaN compared naively is Equal
+        // to all). NaN sorts lowest.
+        let scores = vec![
+            ProposalScoreEntry {
+                agent_id: "real".into(),
+                aggregated_score: 4.0,
+                ..Default::default()
+            },
+            ProposalScoreEntry {
+                agent_id: "poisoned".into(),
+                aggregated_score: f32::NAN,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(pick_winner(&scores).as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn aggregated_score_cmp_sorts_nan_lowest() {
+        use std::cmp::Ordering;
+        assert_eq!(aggregated_score_cmp(f32::NAN, 1.0), Ordering::Less);
+        assert_eq!(aggregated_score_cmp(1.0, f32::NAN), Ordering::Greater);
+        assert_eq!(aggregated_score_cmp(f32::NAN, f32::NAN), Ordering::Equal);
+        assert_eq!(aggregated_score_cmp(2.0, 1.0), Ordering::Greater);
     }
 
     #[test]

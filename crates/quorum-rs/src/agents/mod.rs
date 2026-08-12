@@ -994,6 +994,14 @@ pub struct OrchestratorPing {
 /// When `total_abs_weight` is effectively zero (≤ `f32::EPSILON`), returns
 /// `0.0` — the evaluator expressed no opinion.
 pub fn normalize_score(raw_weight: f32, total_abs_weight: f32) -> f32 {
+    // `endorsement_weight` is unvalidated LLM JSON; an overflowed value deserializes
+    // to ±inf. inf/inf = NaN, and f32::clamp PROPAGATES NaN, so it would escape as the
+    // evaluation score and poison the proposal's aggregated_score. Also inf/finite
+    // clamps to ±1.0 — a garbage weight masquerading as a full endorsement. Treat any
+    // non-finite input as no opinion.
+    if !raw_weight.is_finite() || !total_abs_weight.is_finite() {
+        return 0.0;
+    }
     if total_abs_weight > f32::EPSILON {
         (raw_weight / total_abs_weight).clamp(-1.0, 1.0)
     } else {
@@ -1008,6 +1016,11 @@ pub fn normalize_score(raw_weight: f32, total_abs_weight: f32) -> f32 {
 /// Preserves sign (endorsement vs opposition), applies QV diminishing returns
 /// to the magnitude. Used for both ranking and convergence — single pipeline.
 pub fn calculate_qv_from_fraction(fraction: f32) -> f32 {
+    // Defense-in-depth: a non-finite fraction (e.g. a NaN leaking from an upstream
+    // aggregate) would propagate through clamp/sqrt/signum as NaN. Collapse to 0.
+    if !fraction.is_finite() {
+        return 0.0;
+    }
     let f = fraction.clamp(-1.0, 1.0);
     if f.abs() <= f32::EPSILON {
         return 0.0;
@@ -3087,6 +3100,25 @@ mod tests {
         // normalize(+60, 100) = 0.6, normalize(-40, 100) = -0.4
         assert!((normalize_score(60.0, 100.0) - 0.6).abs() < f32::EPSILON);
         assert!((normalize_score(-40.0, 100.0) - (-0.4)).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn normalize_score_non_finite_input_is_zero_not_nan() {
+        // An overflowed LLM weight deserializes to ±inf. inf/inf would be NaN (which
+        // clamp propagates) and inf/finite would clamp to a fake ±1.0 endorsement.
+        // Both must collapse to 0 (no opinion), never NaN.
+        assert_eq!(normalize_score(f32::INFINITY, f32::INFINITY), 0.0);
+        assert_eq!(normalize_score(f32::INFINITY, 100.0), 0.0);
+        assert_eq!(normalize_score(f32::NAN, 100.0), 0.0);
+        assert_eq!(normalize_score(50.0, f32::INFINITY), 0.0);
+        assert!(normalize_score(f32::INFINITY, f32::INFINITY).is_finite());
+    }
+
+    #[test]
+    fn qv_from_fraction_non_finite_is_zero() {
+        assert_eq!(calculate_qv_from_fraction(f32::NAN), 0.0);
+        assert_eq!(calculate_qv_from_fraction(f32::INFINITY), 0.0);
+        assert_eq!(calculate_qv_from_fraction(f32::NEG_INFINITY), 0.0);
     }
 
     // =========================================================================
