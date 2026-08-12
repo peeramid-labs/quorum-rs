@@ -688,6 +688,9 @@ mod tests {
         // Odd run ⇒ a real incomplete escape ⇒ trims from the escaping backslash.
         assert_eq!(incomplete_unicode_trunc(r"foo\u0"), Some(3));
         assert_eq!(incomplete_unicode_trunc(r"foo\\\u00"), Some(5));
+        // Zero-hex bare `\u` (real, incomplete) and the 3-hex max both trim.
+        assert_eq!(incomplete_unicode_trunc(r"foo\u"), Some(3));
+        assert_eq!(incomplete_unicode_trunc(r"foo\u000"), Some(3));
         // A complete 4-hex escape is not "incomplete".
         assert_eq!(incomplete_unicode_trunc(r"xA"), None);
         // Trailing hex with no `\u` doesn't false-trigger.
