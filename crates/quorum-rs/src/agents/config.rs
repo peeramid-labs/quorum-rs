@@ -863,6 +863,34 @@ pub struct OpenRouterConfig {
     /// legacy `reasoning_effort` top-level field is no longer emitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude_reasoning: Option<bool>,
+
+    /// When set, enables OpenRouter's web-search plugin for this agent —
+    /// injected into the request `plugins` array. Omitted → `plugins: []`
+    /// (the explicit no-outbound-network default). See [`WebSearchConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search: Option<WebSearchConfig>,
+}
+
+/// OpenRouter web-search plugin (`plugins: [{ "id": "web", ... }]`). All fields
+/// optional; an empty config still enables the plugin at OpenRouter's defaults
+/// (native/exa engine, 5 results). Docs:
+/// <https://openrouter.ai/docs/guides/features/plugins/web-search>
+#[derive(Debug, Deserialize, Clone, Serialize, Default, PartialEq, ToSchema)]
+pub struct WebSearchConfig {
+    /// Search backend: `"native"` (provider-built-in, e.g. OpenAI/xAI),
+    /// `"exa"`, `"firecrawl"`, `"parallel"`, `"perplexity"`. Unset → OpenRouter
+    /// default. `native` avoids the per-request exa surcharge on models that
+    /// browse natively.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+
+    /// Max results to fetch (OpenRouter default 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_results: Option<u32>,
+
+    /// Override the prompt prepended to the injected search results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_prompt: Option<String>,
 }
 
 /// Precision parameters for a specific task category.
@@ -1750,6 +1778,7 @@ provider_config:
                 ignore: vec!["nextbit".into()],
                 only: vec!["akashml/fp8".into()],
                 exclude_reasoning: Some(true),
+                web_search: None,
             }),
             ..Default::default()
         };

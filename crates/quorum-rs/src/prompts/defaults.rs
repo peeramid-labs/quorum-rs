@@ -437,7 +437,7 @@ impl PromptSet for DefaultPromptSet {
 
             5. For EACH candidate, provide **structured analysis**:
                * **stance**: your overall position (strong_agree/agree/neutral/disagree/strong_disagree)
-               * **claim_assessments**: The 2-3 MOST PIVOTAL claims only, each with verdict (verified/contested/unverified/wrong). Do NOT exhaustively list minor details.
+               * **claim_assessments**: The 2-3 MOST PIVOTAL claims only. `claim` MUST be an EXACT verbatim substring copy-pasted from the proposal (never paraphrase/summarize — the client highlights by substring match, so a reworded claim can't be located), plus a verdict (verified/contested/unverified/wrong). Do NOT exhaustively list minor details.
                * **disagreements**: For contested/wrong claims only — what the proposal claims vs. what you believe, with your confidence (high/medium/low).
                * **category_scores**: Break your endorsement into the five axes below (each -100 to +100, same scale as endorsement_weight — negative undermines the proposal, positive supports it).
                   - **correctness**: technical claims true; cited file:line and anchors match reality.

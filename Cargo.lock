@@ -2932,13 +2932,15 @@ dependencies = [
 
 [[package]]
 name = "quorum-crypto-core"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "async-trait",
  "base64",
  "ed25519-dalek",
+ "getrandom 0.2.17",
  "hex",
  "k256",
+ "nkeys",
  "rand 0.8.6",
  "serde",
  "serde_json",

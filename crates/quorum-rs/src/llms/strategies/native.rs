@@ -269,14 +269,27 @@ impl ChatStrategy for NativeStrategy {
                     v["provider"] = serde_json::Value::Object(provider_obj);
                 }
 
-                // Belt-and-suspenders: OpenRouter's web-search (and any
-                // future) plugins are opt-in only, but models like
-                // gpt-oss-120b advertise "native browsing" as a capability.
-                // Pin `plugins: []` so the request is explicit about the
-                // no-plugin stance — no amount of future provider defaults
-                // or model-inherent tool access will silently enable
-                // outbound network calls on this agent.
-                v["plugins"] = serde_json::json!([]);
+                // Web-search plugin is opt-in per agent. When configured, emit
+                // `plugins: [{ "id": "web", ... }]`; otherwise pin `plugins: []`
+                // so the request is explicit about the no-plugin stance — no
+                // provider default or model-inherent tool access can silently
+                // enable outbound network calls on an agent that didn't ask.
+                if let Some(ws) = &or.web_search {
+                    let mut web = serde_json::Map::new();
+                    web.insert("id".to_string(), serde_json::json!("web"));
+                    if let Some(engine) = &ws.engine {
+                        web.insert("engine".to_string(), serde_json::json!(engine));
+                    }
+                    if let Some(n) = ws.max_results {
+                        web.insert("max_results".to_string(), serde_json::json!(n));
+                    }
+                    if let Some(p) = &ws.search_prompt {
+                        web.insert("search_prompt".to_string(), serde_json::json!(p));
+                    }
+                    v["plugins"] = serde_json::json!([serde_json::Value::Object(web)]);
+                } else {
+                    v["plugins"] = serde_json::json!([]);
+                }
             }
         }
 
@@ -764,6 +777,57 @@ mod tests {
             0,
             "plugins array must be empty"
         );
+    }
+
+    #[tokio::test]
+    async fn test_prepare_request_injects_web_search_plugin() {
+        use crate::agents::config::{OpenRouterConfig, WebSearchConfig};
+
+        let strategy = NativeStrategy::new("openrouter");
+        let agent = AgentConfig {
+            name: "searcher".to_string(),
+            provider_id: "openrouter".to_string(),
+            model_name: "openai/gpt-5.6-luna".to_string(),
+            temperature: 0.7,
+            max_tokens: 4096,
+            use_streaming: false,
+            openrouter: Some(OpenRouterConfig {
+                zdr: Some(true),
+                allow_fallbacks: Some(true),
+                web_search: Some(WebSearchConfig {
+                    engine: Some("exa".to_string()),
+                    max_results: Some(3),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let request_config = RequestConfig {
+            messages: vec![ChatCompletionRequestMessage::User(
+                ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Text("Hi".to_string()),
+                    name: None,
+                },
+            )],
+            tools: None,
+            tool_choice: None,
+            presence_penalty: None,
+        };
+        let body = strategy
+            .prepare_request(&agent, &request_config, &RequestOverrides::default())
+            .await
+            .unwrap();
+
+        let plugins = body.get("plugins").expect("plugins array must exist");
+        let arr = plugins.as_array().expect("plugins is array");
+        assert_eq!(arr.len(), 1, "web-search plugin must be present");
+        assert_eq!(arr[0]["id"], "web");
+        assert_eq!(arr[0]["engine"], "exa");
+        assert_eq!(arr[0]["max_results"], 3);
+        // ZDR + fallback still emitted alongside the plugin.
+        assert_eq!(body["provider"]["zdr"], true);
+        assert_eq!(body["provider"]["allow_fallbacks"], true);
     }
 
     #[tokio::test]

@@ -322,12 +322,14 @@ impl ThreadView {
         self.ensure_visible();
     }
 
-    /// ↓ — select the row below (older); stepping past the oldest clears it.
+    /// ↓ — select the row below (older). Clamps at the bottom: reaching the
+    /// oldest message keeps the cursor there instead of wrapping back to the top.
     fn select_down(&mut self) {
         let n = self.thread.messages.len();
         match self.selected {
             Some(r) if r + 1 < n => self.selected = Some(r + 1),
-            Some(_) => self.selected = None,
+            // Already on the bottom (oldest) row — stay put, never wrap to top.
+            Some(_) => {}
             // From nothing, ↓ selects the top row (symmetric with ↑) so the cursor
             // appears on the first keypress instead of being a no-op.
             None if n > 0 => self.selected = Some(0),
@@ -2178,6 +2180,20 @@ mod tests {
     }
 
     #[test]
+    fn select_down_clamps_at_bottom_no_wrap() {
+        // ↓ on the oldest row must stay there — never deselect and wrap to the top.
+        let (_t, mut v) = view();
+        v.thread.reply(None, "user", "root");
+        v.thread.reply(None, "assistant", "reply");
+        let last = v.thread.messages.len() - 1;
+        v.selected = Some(last);
+        v.select_down();
+        assert_eq!(v.selected, Some(last), "clamps at the bottom row");
+        v.select_down();
+        assert_eq!(v.selected, Some(last), "no circular wrap back to the top");
+    }
+
+    #[test]
     fn on_enter_skips_reconcile_without_a_pending_job() {
         // Awaiting a reply but no recorded job id → nothing to reconcile against
         // (but the job refresh still fires).
@@ -2407,9 +2423,10 @@ mod tests {
             }
             other => panic!("expected Push(JobDetail), got {other:?}"),
         }
-        // ↓ past the oldest clears the selection.
+        // ↓ on the oldest row clamps (no wrap to top) — the deliberate behaviour
+        // from 30f5154; see select_down_clamps_at_bottom_no_wrap.
         v.update(&arrow(false));
-        assert_eq!(v.selected, None);
+        assert_eq!(v.selected, Some(1));
     }
 
     #[test]
