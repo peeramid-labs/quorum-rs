@@ -16,6 +16,7 @@ use utoipa::OpenApi;
 
         // Agent listing
         super::list_agents,
+        super::agent_diagnostics,
 
         // Per-agent status & config
         status_handlers::agent_status,
@@ -55,6 +56,7 @@ use utoipa::OpenApi;
         schemas(
             // Agent listing
             super::AgentSummary,
+            super::AgentDiagnostics,
 
             // Agent status snapshot (SDK types)
             crate::status::AgentStatusSnapshot,

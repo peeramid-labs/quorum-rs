@@ -2691,3 +2691,55 @@ fn resolve_dashboard_bind_falls_back_on_garbage() {
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
     );
 }
+
+#[test]
+fn diagnostics_from_snapshot_surfaces_errors_and_metrics() {
+    use crate::status::{AgentStatusSnapshot, EventLogEntry, TaskLogEntry};
+    let mut snap = AgentStatusSnapshot::new("Corepunk18".into(), "gpt".into(), "openrouter".into());
+    snap.tasks_completed = 3;
+    snap.tasks_failed = 5;
+    snap.error_rate = 0.625;
+    snap.event_log.push_back(EventLogEntry {
+        timestamp: "t1".into(),
+        event_type: "agent_error".into(),
+        job_id: Some("j".into()),
+        detail: "API request failed with status 404".into(),
+    });
+    snap.event_log.push_back(EventLogEntry {
+        timestamp: "t2".into(),
+        event_type: "task_complete".into(),
+        job_id: None,
+        detail: "ok".into(),
+    });
+    snap.recent_tasks.push_back(TaskLogEntry {
+        timestamp: "t".into(),
+        action: "evaluate".into(),
+        job_id: "j".into(),
+        round: 4,
+        status: "error".into(),
+        duration_ms: 10,
+        content_preview: None,
+    });
+    snap.recent_tasks.push_back(TaskLogEntry {
+        timestamp: "t".into(),
+        action: "propose".into(),
+        job_id: "j".into(),
+        round: 4,
+        status: "ok".into(),
+        duration_ms: 10,
+        content_preview: None,
+    });
+
+    let d = super::diagnostics_from_snapshot("Corepunk18", &snap);
+    assert_eq!(d.tasks_failed, 5);
+    assert_eq!(d.tasks_completed, 3);
+    // Only agent_error events surface, carrying their detail.
+    assert_eq!(d.recent_errors.len(), 1);
+    assert_eq!(
+        d.recent_errors[0].detail,
+        "API request failed with status 404"
+    );
+    // Only status=="error" tasks surface.
+    assert_eq!(d.recent_failed_tasks.len(), 1);
+    assert_eq!(d.recent_failed_tasks[0].action, "evaluate");
+}
