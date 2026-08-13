@@ -51,6 +51,7 @@ use utoipa::OpenApi;
         registry_handlers::add_orchestrator,
         registry_handlers::get_global_config,
         registry_handlers::update_global_config,
+        registry_handlers::get_orchestrator_budgets,
     ),
     components(
         schemas(
@@ -92,6 +93,7 @@ use utoipa::OpenApi;
             // Orchestrator registry
             crate::orchestrator_registry::ActiveOrchestrator,
             crate::orchestrator_registry::AddOrchestratorRequest,
+            registry_handlers::OrchestratorBudget,
 
             // Agent management (CRUD)
             registration_handlers::RegisterAgentRequest,

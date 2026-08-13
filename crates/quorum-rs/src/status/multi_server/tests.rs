@@ -2033,6 +2033,11 @@ fn openapi_spec_generates_without_panic() {
     assert!(json.contains("/api/agents"));
     assert!(json.contains("/api/agents/{name}/status"));
     assert!(json.contains("/api/agents/{name}/buffer"));
+    // Annotated endpoints that must stay registered in ApiDoc paths():
+    // the operator diagnostics pull and the per-orchestrator budget proxy.
+    assert!(json.contains("/api/agents/{name}/diagnostics"));
+    assert!(json.contains("/api/orchestrators/budgets"));
+    assert!(json.contains("OrchestratorBudget"));
 }
 
 // ── Swagger UI endpoint test ──
