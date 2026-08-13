@@ -2040,6 +2040,71 @@ fn openapi_spec_generates_without_panic() {
     assert!(json.contains("OrchestratorBudget"));
 }
 
+/// Extract every `path = "..."` inside a `#[utoipa::path(...)]` attribute in
+/// `src`. Paren-depth scan from the opening `(` so nested groups like
+/// `responses((status = 200, ...))` don't confuse the boundary.
+fn utoipa_annotated_paths(src: &str) -> Vec<String> {
+    const MARKER: &str = "#[utoipa::path(";
+    let bytes = src.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = src[i..].find(MARKER) {
+        let start = i + rel + MARKER.len();
+        let mut depth = 1usize;
+        let mut j = start;
+        while j < bytes.len() && depth > 0 {
+            match bytes[j] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            j += 1;
+        }
+        let attr = &src[start..j];
+        if let Some(p) = attr.find("path = \"") {
+            let rest = &attr[p + "path = \"".len()..];
+            if let Some(end) = rest.find('"') {
+                out.push(rest[..end].to_string());
+            }
+        }
+        i = j;
+    }
+    out
+}
+
+/// Drift guard: any `multi_server` handler carrying a `#[utoipa::path]` MUST be
+/// listed in `ApiDoc` `paths()`, else it silently vanishes from the agent
+/// dashboard's OpenAPI/Swagger spec — exactly how `get_orchestrator_budgets`
+/// regressed. `paths()` is hand-maintained apart from the annotations, so this
+/// catches the whole drift class for current + future annotated handlers.
+#[test]
+fn every_annotated_utoipa_path_is_registered() {
+    use utoipa::OpenApi;
+    let spec = super::api_docs::ApiDoc::openapi();
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/status/multi_server");
+    let mut missing = Vec::new();
+    for entry in std::fs::read_dir(&dir)
+        .expect("read multi_server dir")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().is_none_or(|x| x != "rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).unwrap();
+        for p in utoipa_annotated_paths(&src) {
+            if !spec.paths.paths.contains_key(&p) {
+                missing.push(format!("{p}  ({})", path.display()));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "utoipa-annotated endpoints missing from ApiDoc paths() — register them:\n{}",
+        missing.join("\n")
+    );
+}
+
 // ── Swagger UI endpoint test ──
 
 #[tokio::test]
