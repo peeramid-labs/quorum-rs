@@ -42,6 +42,14 @@ pub enum LlmError {
     /// surfaces (e.g. `quorum smoke-test`) opt into showing.
     #[error("bad request (status {status})")]
     BadRequest { status: u16, body: String },
+    /// A non-2xx HTTP status that isn't one of the specific categories above
+    /// (401 auth, 403, 404 model-unavailable, 422, …). Preserves `status`
+    /// structurally so telemetry charts it and operators can tell a dead model
+    /// id (404) from an auth failure (401) — the previous `Other` catch-all
+    /// flattened all of these to an opaque "other" with no status. `body` is
+    /// withheld from `Display` like `BadRequest`; recover it via [`LlmError::detail`].
+    #[error("api error (status {status})")]
+    Api { status: u16, body: String },
     #[error("transport")]
     Transport(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("parse")]
@@ -88,7 +96,7 @@ impl LlmError {
     /// so the body never leaks server-side.
     pub fn detail(&self) -> Option<&str> {
         match self {
-            LlmError::BadRequest { body, .. } => Some(body),
+            LlmError::BadRequest { body, .. } | LlmError::Api { body, .. } => Some(body),
             _ => None,
         }
     }
@@ -97,6 +105,7 @@ impl LlmError {
     pub fn classify(&self) -> (LlmErrorClass, Option<u16>) {
         match self {
             LlmError::BadRequest { status, .. } => (LlmErrorClass::Other, Some(*status)),
+            LlmError::Api { status, .. } => (LlmErrorClass::Other, Some(*status)),
             LlmError::RateLimit {
                 retry_after_ms: _,
                 status,
@@ -174,6 +183,14 @@ mod tests {
                 },
                 LlmErrorClass::Other,
                 Some(400),
+            ),
+            (
+                LlmError::Api {
+                    status: 404,
+                    body: "{\"error\":\"No endpoints found for model\"}".to_string(),
+                },
+                LlmErrorClass::Other,
+                Some(404),
             ),
         ];
         for (err, want_class, want_status) in cases {

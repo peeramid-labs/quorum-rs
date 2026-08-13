@@ -330,9 +330,11 @@ impl AiModel for OpenAICompatibleModel {
                     // reaches logs/dumps.
                     LlmError::BadRequest { status: code, body }
                 } else {
-                    LlmError::Other(Box::new(std::io::Error::other(format!(
-                        "API request failed with status {status}"
-                    ))))
+                    // Any other non-2xx (401/403/404/422/…). Preserve the status
+                    // structurally (→ telemetry http_status) so a dead model id
+                    // (404) is distinguishable from auth (401); body withheld
+                    // from Display, recoverable via detail().
+                    LlmError::Api { status: code, body }
                 };
                 return Err(err);
             }
@@ -765,15 +767,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_completion_404_maps_to_other_carrying_status() {
-        // ai21/jamba-large-1.7 (Corepunk18): a non-400/402/429/5xx status —
-        // e.g. 404 model-unavailable — falls to the Other catch-all. Display is
-        // just "other"; the status survives only in the wrapped source chain.
-        let server = mock_status_body(
-            404,
-            r#"{"error":{"message":"No endpoints found for model"}}"#,
-        )
-        .await;
+    async fn chat_completion_404_maps_to_api_carrying_status() {
+        // ai21/jamba-large-1.7 (Corepunk18): a 404 model-unavailable — must keep
+        // the status, not collapse to opaque "other".
+        let body = r#"{"error":{"message":"No endpoints found for model"}}"#;
+        let server = mock_status_body(404, body).await;
         let model = OpenAICompatibleModel::new(server.uri(), "test-key".to_string(), None);
 
         let err = expect_err(
@@ -786,24 +784,20 @@ mod tests {
         );
 
         assert!(
-            matches!(&err, LlmError::Other(_)),
-            "404 must map to Other, got {err:?}"
+            matches!(&err, LlmError::Api { status: 404, .. }),
+            "404 must map to Api carrying the status, got {err:?}"
         );
-        assert_eq!(err.to_string(), "other");
-        assert!(
-            err.display_chain().contains("404"),
-            "status must survive in the source chain for triage: {}",
-            err.display_chain()
-        );
+        assert_eq!(err.to_string(), "api error (status 404)");
+        assert_eq!(err.detail(), Some(body), "reason recoverable via detail()");
         assert_eq!(
             err.classify(),
-            (crate::telemetry::LlmErrorClass::Other, None)
+            (crate::telemetry::LlmErrorClass::Other, Some(404))
         );
     }
 
     #[tokio::test]
-    async fn chat_completion_401_maps_to_other() {
-        // Auth/permission (401) is also a non-400 4xx → Other.
+    async fn chat_completion_401_maps_to_api() {
+        // Auth/permission (401) is also a non-400 4xx → Api, status preserved.
         let server = mock_status_body(401, "unauthorized").await;
         let model = OpenAICompatibleModel::new(server.uri(), "test-key".to_string(), None);
 
@@ -814,10 +808,13 @@ mod tests {
         );
 
         assert!(
-            matches!(&err, LlmError::Other(_)),
-            "401 must map to Other, got {err:?}"
+            matches!(&err, LlmError::Api { status: 401, .. }),
+            "401 must map to Api, got {err:?}"
         );
-        assert!(err.display_chain().contains("401"));
+        assert_eq!(
+            err.classify(),
+            (crate::telemetry::LlmErrorClass::Other, Some(401))
+        );
     }
 
     // ---------------------------------------------------------------
