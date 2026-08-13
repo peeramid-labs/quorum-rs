@@ -2749,3 +2749,22 @@ fn diagnostics_from_snapshot_surfaces_errors_and_metrics() {
     assert_eq!(d.recent_failed_tasks.len(), 1);
     assert_eq!(d.recent_failed_tasks[0].action, "evaluate");
 }
+
+#[tokio::test]
+async fn agent_diagnostics_endpoint_serves_metrics_and_404s_unknown() {
+    // Known agent → 200 with the diagnostics shape.
+    let app = build_router(test_state());
+    let (status, body) = get_request(app, "/api/agents/ALPHA/diagnostics").await;
+    assert_eq!(status, StatusCode::OK);
+    let d: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(d["name"], "ALPHA");
+    assert_eq!(d["model_name"], "MiniMax-M2.5");
+    assert!(d["recent_errors"].is_array());
+    assert!(d["recent_failed_tasks"].is_array());
+    assert!(d["tasks_failed"].is_u64());
+
+    // Unknown agent → 404.
+    let app2 = build_router(test_state());
+    let (status, _) = get_request(app2, "/api/agents/NOPE/diagnostics").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
