@@ -361,6 +361,14 @@ pub(super) struct AgentDiagnostics {
     tasks_completed: u64,
     tasks_failed: u64,
     error_rate: f32,
+    /// Whether the agent is paused (e.g. auto-paused on a 402/billing error) —
+    /// it pulls no new tasks while paused.
+    is_paused: bool,
+    /// Whether the agent is flagged for operator attention (e.g. score
+    /// divergence from peers).
+    is_flagged: bool,
+    /// Why it's flagged, if flagged.
+    flag_reason: Option<String>,
     /// Most recent `agent_error` events (newest first), with their detail.
     #[schema(value_type = Vec<crate::status::EventLogEntry>)]
     recent_errors: Vec<crate::status::EventLogEntry>,
@@ -401,6 +409,9 @@ fn diagnostics_from_snapshot(
         tasks_completed: snap.tasks_completed,
         tasks_failed: snap.tasks_failed,
         error_rate: snap.error_rate,
+        is_paused: snap.is_paused,
+        is_flagged: snap.is_flagged,
+        flag_reason: snap.flag_reason.clone(),
         recent_errors,
         recent_failed_tasks,
     }

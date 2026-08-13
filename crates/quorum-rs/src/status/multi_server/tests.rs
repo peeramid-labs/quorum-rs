@@ -2699,6 +2699,9 @@ fn diagnostics_from_snapshot_surfaces_errors_and_metrics() {
     snap.tasks_completed = 3;
     snap.tasks_failed = 5;
     snap.error_rate = 0.625;
+    snap.is_paused = true;
+    snap.is_flagged = true;
+    snap.flag_reason = Some("score divergence".into());
     snap.event_log.push_back(EventLogEntry {
         timestamp: "t1".into(),
         event_type: "agent_error".into(),
@@ -2733,6 +2736,9 @@ fn diagnostics_from_snapshot_surfaces_errors_and_metrics() {
     let d = super::diagnostics_from_snapshot("Corepunk18", &snap);
     assert_eq!(d.tasks_failed, 5);
     assert_eq!(d.tasks_completed, 3);
+    assert!(d.is_paused, "paused state surfaced");
+    assert!(d.is_flagged);
+    assert_eq!(d.flag_reason.as_deref(), Some("score divergence"));
     // Only agent_error events surface, carrying their detail.
     assert_eq!(d.recent_errors.len(), 1);
     assert_eq!(
