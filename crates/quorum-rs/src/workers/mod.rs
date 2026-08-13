@@ -443,6 +443,11 @@ pub struct NatsNsedWorker {
     /// the future so the scheduler stops assigning doomed tasks, and it clears
     /// automatically on expiry so a transient outage doesn't bench forever.
     model_down_until_ms: Arc<AtomicU64>,
+    /// Count of consecutive model-down task failures. Drives escalating bench
+    /// backoff via [`escalated_cooldown_ms`] so a chronically-dead model is
+    /// quiesced (progressively longer benches, capped) instead of re-entering
+    /// scheduling every fixed cooldown. Reset to `0` on any successful task.
+    model_down_strikes: Arc<AtomicU64>,
     /// Optional telemetry emitter for recording LLM call metrics.
     telemetry: Option<TelemetryEmitterMux>,
     /// Agent middleware pipelines, built from `agent_config.middleware`.
@@ -561,6 +566,7 @@ impl NatsNsedWorker {
             response_buffer: None,
             paused: Arc::new(AtomicBool::new(false)),
             model_down_until_ms: Arc::new(AtomicU64::new(0)),
+            model_down_strikes: Arc::new(AtomicU64::new(0)),
             telemetry,
             before_prompt_mw,
             provider_response_mw,
@@ -1954,6 +1960,11 @@ impl NatsNsedWorker {
                     }
                 }
 
+                // Task succeeded → the remote model is reachable. Clear the
+                // model-down strike count so a recovered model waits only the
+                // base cooldown on any future failure, not an escalated bench.
+                self.model_down_strikes.store(0, Ordering::Relaxed);
+
                 // queue_wait_ms / llm_attempts / tool_call_count /
                 // pending_publish_depth: see docs/agent-sdk/reference/telemetry.md
                 let phase_budget_remaining_ms =
@@ -2008,13 +2019,15 @@ impl NatsNsedWorker {
                 // reports model_down so the scheduler stops assigning it doomed
                 // tasks until the cooldown expires and it self-heals.
                 if is_model_down_error(&err_str) {
-                    let until =
-                        chrono::Utc::now().timestamp_millis() as u64 + MODEL_DOWN_COOLDOWN_MS;
+                    let strikes = self.model_down_strikes.fetch_add(1, Ordering::Relaxed) + 1;
+                    let cooldown = escalated_cooldown_ms(strikes);
+                    let until = chrono::Utc::now().timestamp_millis() as u64 + cooldown;
                     self.model_down_until_ms.store(until, Ordering::Relaxed);
                     warn!(
                         agent_id = %self.agent_id,
-                        cooldown_secs = MODEL_DOWN_COOLDOWN_MS / 1000,
-                        "Remote model unavailable — reporting model_down until cooldown expires"
+                        strikes,
+                        cooldown_secs = cooldown / 1000,
+                        "Remote model unavailable — reporting model_down until cooldown expires (escalating backoff)"
                     );
                 }
 
@@ -2536,6 +2549,7 @@ impl Clone for NatsNsedWorker {
             response_buffer: self.response_buffer.clone(),
             paused: self.paused.clone(),
             model_down_until_ms: self.model_down_until_ms.clone(),
+            model_down_strikes: self.model_down_strikes.clone(),
             telemetry: self.telemetry.clone(),
             before_prompt_mw: self.before_prompt_mw.clone(),
             provider_response_mw: self.provider_response_mw.clone(),
@@ -2886,6 +2900,20 @@ fn is_transient_error(err: &anyhow::Error) -> bool {
 /// Long enough to skip a flapping/removed model across a job, short enough that
 /// a recovered model rejoins on its own without operator intervention.
 const MODEL_DOWN_COOLDOWN_MS: u64 = 300_000; // 5 minutes
+
+/// Bench duration (ms) for the Nth consecutive model-down strike: the base
+/// cooldown doubled per strike, capped at 30 minutes. A single transient 404
+/// waits [`MODEL_DOWN_COOLDOWN_MS`]; a chronically-dead model (e.g. a removed
+/// endpoint that 404s every job) backs off toward the cap so it stops
+/// re-entering scheduling every fixed cooldown. The strike count resets on any
+/// successful task, so a recovered model waits only the base again.
+fn escalated_cooldown_ms(strikes: u64) -> u64 {
+    const CAP_MS: u64 = 1_800_000; // 30 minutes
+    let shift = strikes.saturating_sub(1).min(20); // keep `1 << shift` in range
+    MODEL_DOWN_COOLDOWN_MS
+        .saturating_mul(1u64 << shift)
+        .min(CAP_MS)
+}
 
 /// True when a task error indicates the remote MODEL/endpoint is unavailable
 /// (removed model / dead endpoint) rather than a transient, auth, rate, or
@@ -7431,6 +7459,24 @@ mod tests {
         // Recovered once now reaches/passes the deadline.
         assert!(!model_down_active(5_000, 5_000));
         assert!(!model_down_active(5_000, 6_000));
+    }
+
+    #[test]
+    fn escalated_cooldown_doubles_per_strike_then_caps() {
+        // First strike (and the defensive 0 case) = base cooldown.
+        assert_eq!(escalated_cooldown_ms(0), MODEL_DOWN_COOLDOWN_MS);
+        assert_eq!(escalated_cooldown_ms(1), MODEL_DOWN_COOLDOWN_MS);
+        // Each further consecutive strike doubles the bench.
+        assert_eq!(escalated_cooldown_ms(2), MODEL_DOWN_COOLDOWN_MS * 2);
+        assert_eq!(escalated_cooldown_ms(3), MODEL_DOWN_COOLDOWN_MS * 4);
+        // *8 would be 2.4M ms, so it saturates at the 30-minute cap.
+        assert_eq!(escalated_cooldown_ms(4), 1_800_000);
+        assert_eq!(escalated_cooldown_ms(100), 1_800_000);
+        // Monotonic non-decreasing up to the cap, never above it.
+        for s in 1..50 {
+            assert!(escalated_cooldown_ms(s) <= escalated_cooldown_ms(s + 1));
+            assert!(escalated_cooldown_ms(s) <= 1_800_000);
+        }
     }
 
     #[test]
