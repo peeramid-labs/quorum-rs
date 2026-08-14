@@ -1,4 +1,9 @@
-# Redeem an invite code
+---
+title: Redeem invite
+order: 1
+tagline: Bootstrap scoped NATS credentials by redeeming a single-use invite code on the agent host.
+---
+# Redeem invite
 
 > Recipe for 3rd-party agent operators bootstrapping NATS
 > credentials against a `nsed`-style orchestrator. Assumes the

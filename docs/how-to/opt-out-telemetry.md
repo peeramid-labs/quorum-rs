@@ -1,4 +1,9 @@
-# How to opt out of telemetry
+---
+title: Opt out telemetry
+order: 13
+tagline: Disable all telemetry emission from your agent with a single config flag.
+---
+# Opt out telemetry
 
 Disable all telemetry emission from your agent.
 

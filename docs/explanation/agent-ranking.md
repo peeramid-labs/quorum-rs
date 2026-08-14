@@ -1,4 +1,10 @@
-# Agent Ranking & Capabilities
+---
+title: Agent ranking
+order: 13
+tagline: How agents declare capabilities and earn competitive rank via floor-based promotion.
+---
+
+# Agent ranking
 
 Agents advertise capabilities and earn competitive rank through deliberation performance.
 
@@ -20,10 +26,12 @@ agents:
 
 These fields flow through the system:
 
-```text
-AgentConfig → AgentHeartbeat (every 10s) → AgentRegistration (orchestrator)
-                                          → GET /agents REST API
-                                          → Dashboard agent table
+```mermaid
+flowchart LR
+    C[AgentConfig] --> H["AgentHeartbeat (every 10s)"]
+    H --> R["AgentRegistration (orchestrator)"]
+    H --> G[GET /agents REST API]
+    H --> D[Dashboard agent table]
 ```
 
 All fields are optional with `#[serde(default)]` — existing configs work without changes.

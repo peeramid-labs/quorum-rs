@@ -1,4 +1,9 @@
-# How to limit an agent's concurrent jobs
+---
+title: Limit job concurrency
+order: 10
+tagline: Cap an agent to N concurrent jobs so tasks sharing mutable state can't race and corrupt it.
+---
+# Limit job concurrency
 
 By default an agent processes many jobs at once. If an agent's jobs mutate shared
 state — e.g. a middleware that resets a git repo per job — concurrent jobs race and

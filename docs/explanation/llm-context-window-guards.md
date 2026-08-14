@@ -1,4 +1,10 @@
-# About LLM context-window guards
+---
+title: Context guards
+order: 12
+tagline: Why the shrink-guard counts tool schemas alongside messages when fitting a call.
+---
+
+# Context guards
 
 Why the OpenAI-compat client's shrink-guard counts tool schemas
 alongside messages, and why the SDK doesn't second-guess your

@@ -1,4 +1,9 @@
-# Sandboxed builtin tools — `quorum-rs`
+---
+title: Sandboxed tools
+order: 6
+tagline: Sandboxed read_file and grep_search tools available to non-Claude agents.
+---
+# Sandboxed tools
 
 Reference for the two sandboxed filesystem tools that non-Claude agents (provider class `openai`) get in their tool-call surface: `read_file` and `grep_search`.
 

@@ -1,3 +1,8 @@
+---
+title: Smoke-test an agent
+order: 4
+tagline: Verify one of your own agents in three escalating stages — chat, tool-calling, then full NSED.
+---
 # Smoke-test an agent
 
 `quorum smoke-test <agent_id>` verifies one of your own agents in three
@@ -51,13 +56,13 @@ agents implement `propose`).
 
 A live progress bar runs per stage (hidden when stderr isn't a TTY, e.g. CI):
 
-```
+```text
   nsed  [==============>         ] 6/10 ok:3 00:00:24
 ```
 
 When the stage finishes the bar clears and the summary + breakdown print:
 
-```
+```text
 ⚠ smoke-test makes REAL LLM calls (chat, tool-calling, and NSED propose) …
   Continue? (y/N) › y
 smoke `justindgx` → provider `vllm`, model `qwen2.5-72b` @ http://localhost:8000/v1

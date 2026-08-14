@@ -1,4 +1,10 @@
-# Email-style branching thread TUI — roadmap
+---
+title: Thread TUI roadmap
+order: 16
+tagline: Roadmap for an email-style, branching, newest-on-top conversation thread view.
+---
+
+# Thread TUI roadmap
 
 Turns the thread reader into an email-style, branching conversation view.
 

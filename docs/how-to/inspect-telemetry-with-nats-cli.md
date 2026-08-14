@@ -1,4 +1,9 @@
-# Inspect agent telemetry with the NATS CLI
+---
+title: "Inspect telemetry (NATS CLI)"
+order: 15
+tagline: Live-tail and filter agent telemetry events straight from the NATS CLI, no forwarder needed.
+---
+# Inspect telemetry (NATS CLI)
 
 Live-tail and filter agent telemetry events without standing up a
 forwarder or sink. Useful while #309's full pipeline (sub-issues

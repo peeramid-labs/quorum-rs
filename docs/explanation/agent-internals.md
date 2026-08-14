@@ -1,4 +1,10 @@
-# Agent Internals — Library API & Architecture
+---
+title: Agent internals
+order: 2
+tagline: The quorum-rs crate's library API and agent architecture for Rust developers.
+---
+
+# Agent internals
 
 This document covers the internal architecture of the `quorum-rs` crate for developers who want to use it as a Rust library or understand how the reference agent works under the hood.
 
@@ -55,13 +61,11 @@ async fn main() -> anyhow::Result<()> {
 
 The orchestrator and agent are decoupled over NATS JetStream:
 
-```text
-┌─────────────────────────┐           ┌──────────────────────────┐
-│   Orchestrator (Admin)  │           │   Agent Process           │
-├─────────────────────────┤   NATS    ├──────────────────────────┤
-│ Creates stream           │◄────────►│ Subscribes via            │
-│   "sphera_jobs"          │           │   NatsNsedWorker          │
-└─────────────────────────┘           └──────────────────────────┘
+```mermaid
+flowchart LR
+    O["Orchestrator (Admin)<br/>creates stream 'sphera_jobs'"]
+    A["Agent Process<br/>subscribes via NatsNsedWorker"]
+    O <-->|NATS| A
 ```
 
 | Direction | Subject | Purpose |
@@ -131,18 +135,10 @@ The `status` module provides real-time agent monitoring, gated behind the `statu
 
 ### Architecture
 
-```text
-┌──────────────────┐         ┌───────────────────────────┐
-│  NatsNsedWorker  │────────>│  SharedAgentStatus        │
-│  (push events)   │         │  Arc<RwLock<Snapshot>>    │
-└──────────────────┘         └──────────┬────────────────┘
-                                        │ poll every 2s
-                             ┌──────────▼────────────────┐
-                             │  StatusServer (axum)       │
-                             │  GET /api/status           │
-                             │  GET /api/config           │
-                             │  POST /api/chat            │
-                             └───────────────────────────┘
+```mermaid
+flowchart TD
+    W["NatsNsedWorker<br/>(push events)"] -->|push events| S["SharedAgentStatus<br/>Arc&lt;RwLock&lt;Snapshot&gt;&gt;"]
+    S -->|poll every 2s| SS["StatusServer (axum)<br/>GET /api/status<br/>GET /api/config<br/>POST /api/chat"]
 ```
 
 - **`AgentStatusSnapshot`** — Shared state with identity, counters, current job, recent tasks (max 20), and event log (max 200 entries). Defined in `quorum-rs`.

@@ -1,3 +1,8 @@
+---
+title: Chat Completions API
+order: 2
+tagline: OpenAI-compatible /v1/chat/completions endpoint mapping model tags to NSED policies.
+---
 # Chat Completions API
 
 NSED exposes a standard OpenAI-compatible `/v1/chat/completions` endpoint that
@@ -7,7 +12,7 @@ See also: [Request Deduplication](dedup.md) | [Scheduling & Policies](scheduling
 
 ## Endpoint
 
-```
+```http
 POST /v1/chat/completions
 Authorization: Bearer <token>
 Content-Type: application/json
@@ -134,7 +139,7 @@ can use it to skip their own title-agent invocation when
 
 SSE stream of `chat.completion.chunk` events:
 
-```
+```text
 data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
 
 data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"Round 1 complete — convergence: 45%"},"finish_reason":null}]}
@@ -178,7 +183,7 @@ response includes `tool_calls` in the delta with `finish_reason: "tool_calls"`:
 NSED jobs can be long-running. During idle periods (workers evaluating but not
 emitting text), the server sends SSE keep-alive comments every 15 seconds:
 
-```
+```text
 : keep-alive
 ```
 

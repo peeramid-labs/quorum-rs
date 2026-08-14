@@ -1,4 +1,9 @@
-# Register a custom provider
+---
+title: Register a provider
+order: 8
+tagline: Teach quorum serve a new provider.type via a ProviderFactory — no fork required.
+---
+# Register a provider
 
 You want `quorum serve` to recognise a `provider.type` the SDK doesn't ship — without forking it. Implement a `ProviderFactory`, register it, and hand the registry to `serve_fleet`.
 

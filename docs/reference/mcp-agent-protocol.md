@@ -1,4 +1,9 @@
-# MCP Agent Protocol
+---
+title: MCP agent protocol
+order: 4
+tagline: MCP protocol giving external agents full tool access during NSED deliberation.
+---
+# MCP agent protocol
 
 The MCP (Model Context Protocol) provider enables external agents to participate in NSED deliberation with **full tool access** — reading past proposals, searching history, updating scratchpad — before submitting their result. Unlike the [exec provider](exec-agent-protocol.md) (one-shot stdin/stdout), MCP agents get a bidirectional tool-calling channel.
 
@@ -123,7 +128,7 @@ submission (no `content` and no envelope fields) is rejected so the agent retrie
       "claim_assessments": [
         {
           "claim_id": "string — 6-char hex ID for cross-round tracking (optional)",
-          "claim": "string — the claim being assessed",
+          "cite": "string — the assessed claim, quoted VERBATIM from the proposal (an exact substring). Aliases: claim, quote, text. Common wrappers (\"…\", > …, `…`, Label: \"…\") are stripped; the quote is then resolved and replaced with the exact proposal span so the client can locate it. A quote matching NO span is REJECTED and nsed_evaluate must be re-submitted with a corrected quote.",
           "verdict": "verified | contested | unverified | wrong",
           "reason": "string — reasoning for the verdict (optional)"
         }
@@ -156,7 +161,7 @@ The structured evaluation fields align with the NSED Vector Alignment protocol u
 |-------|-------------|
 | `stance` | Overall evaluator position toward the proposal |
 | `is_final_solution` | Whether this proposal is viable as a final answer |
-| `claim_assessments` | Assessment of key claims with verdicts (verified/contested/unverified/wrong) |
+| `claim_assessments` | Assessment of key claims with verdicts (verified/contested/unverified/wrong). Each `cite` must be an exact verbatim quote from the proposal — matched against the final solution and the shown thought-process window — or the evaluation is rejected for re-quoting. |
 | `disagreements` | Specific disagreement points with counter-positions |
 | `category_scores` | Per-category quality scores on a 0–100 scale |
 
@@ -164,12 +169,18 @@ The structured evaluation fields align with the NSED Vector Alignment protocol u
 
 ```json
 {
-  "agent_id": "string — author's agent ID (required)",
+  "agent_id": "string — author's agent ID, OR the anonymized Candidate_X label (required)",
   "round": 1,
   "offset": 0,
   "limit": 5000
 }
 ```
+
+During **evaluation**, proposals are presented anonymized — an evaluator sees
+`Candidate_A`, `Candidate_B`, … rather than real author IDs. Pass that same
+`Candidate_X` label as `agent_id`; the tool resolves it against the current
+round's candidate set. (Real author IDs still work for prior, non-anonymized
+rounds.)
 
 #### `nsed_read_critiques`
 

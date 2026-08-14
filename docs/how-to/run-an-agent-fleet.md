@@ -1,4 +1,9 @@
-# Run an agent fleet via `quorum serve`
+---
+title: Run an agent fleet
+order: 3
+tagline: Boot a whole agent fleet from a single quorum.yml with one quorum serve command.
+---
+# Run an agent fleet
 
 Task-oriented recipe. Assumes you've already got an invite code
 from an admin and an LLM endpoint to point each agent at. If
