@@ -448,6 +448,10 @@ pub struct NatsNsedWorker {
     /// quiesced (progressively longer benches, capped) instead of re-entering
     /// scheduling every fixed cooldown. Reset to `0` on any successful task.
     model_down_strikes: Arc<AtomicU64>,
+    /// Strategy that decides whether a task-failure error means the remote model
+    /// is gone (→ bench). Defaults to [`HeuristicModelDownDetector`]; override
+    /// via [`NatsNsedWorker::with_model_down_detector`].
+    model_down_detector: Arc<dyn ModelDownDetector>,
     /// Optional telemetry emitter for recording LLM call metrics.
     telemetry: Option<TelemetryEmitterMux>,
     /// Agent middleware pipelines, built from `agent_config.middleware`.
@@ -567,6 +571,7 @@ impl NatsNsedWorker {
             paused: Arc::new(AtomicBool::new(false)),
             model_down_until_ms: Arc::new(AtomicU64::new(0)),
             model_down_strikes: Arc::new(AtomicU64::new(0)),
+            model_down_detector: Arc::new(HeuristicModelDownDetector),
             telemetry,
             before_prompt_mw,
             provider_response_mw,
@@ -583,6 +588,15 @@ impl NatsNsedWorker {
     /// Sets a [`WorkerHook`] for intercepting NATS publishes.
     pub fn with_hook(mut self, hook: Arc<dyn WorkerHook>) -> Self {
         self.hook = Some(hook);
+        self
+    }
+
+    /// Override the model-down detection strategy (default:
+    /// [`HeuristicModelDownDetector`]). A deployment can supply a stricter or
+    /// provider-tuned [`ModelDownDetector`] that decides when a task-failure
+    /// error means the remote model is gone and the agent should bench itself.
+    pub fn with_model_down_detector(mut self, detector: Arc<dyn ModelDownDetector>) -> Self {
+        self.model_down_detector = detector;
         self
     }
 
@@ -2018,7 +2032,7 @@ impl NatsNsedWorker {
                 // 404 from a removed model / dead endpoint): the next heartbeat
                 // reports model_down so the scheduler stops assigning it doomed
                 // tasks until the cooldown expires and it self-heals.
-                if is_model_down_error(&err_str) {
+                if self.model_down_detector.is_model_down(&err_str) {
                     let strikes = self.model_down_strikes.fetch_add(1, Ordering::Relaxed) + 1;
                     let cooldown = escalated_cooldown_ms(strikes);
                     let until = chrono::Utc::now().timestamp_millis() as u64 + cooldown;
@@ -2550,6 +2564,7 @@ impl Clone for NatsNsedWorker {
             paused: self.paused.clone(),
             model_down_until_ms: self.model_down_until_ms.clone(),
             model_down_strikes: self.model_down_strikes.clone(),
+            model_down_detector: self.model_down_detector.clone(),
             telemetry: self.telemetry.clone(),
             before_prompt_mw: self.before_prompt_mw.clone(),
             provider_response_mw: self.provider_response_mw.clone(),
@@ -2920,14 +2935,33 @@ fn escalated_cooldown_ms(strikes: u64) -> u64 {
 /// billing error. Only these bench the agent — over-matching (e.g. on a bare
 /// "404" that could appear in a job id) is avoided by anchoring on the HTTP
 /// status phrase and known model-not-found messages.
-fn is_model_down_error(err: &str) -> bool {
-    let e = err.to_ascii_lowercase();
-    e.contains("status 404")
-        || e.contains("404 not found")
-        || e.contains("model_not_found")
-        || e.contains("model not found")
-        || e.contains("does not exist")
-        || e.contains("no such model")
+/// Decides, from a failed task's error text, whether the agent's remote model is
+/// unavailable and the agent should bench itself. Pluggable so a deployment can
+/// tighten or provider-tune the rule; [`HeuristicModelDownDetector`] is the
+/// default. Must be conservative: a false positive benches a healthy agent, so
+/// only genuine "this model does not exist" signals should return `true` — never
+/// transient/auth/rate/billing errors.
+pub trait ModelDownDetector: Send + Sync + std::fmt::Debug {
+    /// `true` iff `error` indicates the remote model is unavailable.
+    fn is_model_down(&self, error: &str) -> bool;
+}
+
+/// Default detector: substring-matches the common provider phrasings for a
+/// missing/removed model. Deliberately narrow — a bare "404" inside unrelated
+/// text (a job id) must not trip it.
+#[derive(Debug, Default, Clone)]
+pub struct HeuristicModelDownDetector;
+
+impl ModelDownDetector for HeuristicModelDownDetector {
+    fn is_model_down(&self, error: &str) -> bool {
+        let e = error.to_ascii_lowercase();
+        e.contains("status 404")
+            || e.contains("404 not found")
+            || e.contains("model_not_found")
+            || e.contains("model not found")
+            || e.contains("does not exist")
+            || e.contains("no such model")
+    }
 }
 
 /// Whether the model-down cooldown is still active. `until_ms == 0` means the
@@ -7433,21 +7467,34 @@ mod tests {
     }
 
     #[test]
-    fn is_model_down_error_flags_only_model_unavailable() {
+    fn heuristic_detector_flags_only_model_unavailable() {
+        let d = HeuristicModelDownDetector;
         // The observed incident: a 404 from a removed model / dead endpoint.
-        assert!(is_model_down_error(
-            "API request failed with status 404 Not Found"
-        ));
-        assert!(is_model_down_error("error: model_not_found"));
-        assert!(is_model_down_error("The model `x` does not exist"));
-        assert!(is_model_down_error("no such model: gpt-9"));
+        assert!(d.is_model_down("API request failed with status 404 Not Found"));
+        assert!(d.is_model_down("error: model_not_found"));
+        assert!(d.is_model_down("The model `x` does not exist"));
+        assert!(d.is_model_down("no such model: gpt-9"));
         // Not model-down: transient / auth / rate / billing / other statuses.
-        assert!(!is_model_down_error("402 Payment Required"));
-        assert!(!is_model_down_error("429 Too Many Requests"));
-        assert!(!is_model_down_error("500 Internal Server Error"));
-        assert!(!is_model_down_error("upstream timed out after 60s"));
+        assert!(!d.is_model_down("402 Payment Required"));
+        assert!(!d.is_model_down("429 Too Many Requests"));
+        assert!(!d.is_model_down("500 Internal Server Error"));
+        assert!(!d.is_model_down("upstream timed out after 60s"));
         // A bare "404" inside unrelated text (e.g. a job id) must not trip it.
-        assert!(!is_model_down_error("job sphera_jobs-404 completed"));
+        assert!(!d.is_model_down("job sphera_jobs-404 completed"));
+    }
+
+    #[test]
+    fn model_down_detector_is_pluggable() {
+        // A deployment can swap in a stricter/looser rule via the trait.
+        #[derive(Debug)]
+        struct AlwaysDown;
+        impl ModelDownDetector for AlwaysDown {
+            fn is_model_down(&self, _error: &str) -> bool {
+                true
+            }
+        }
+        let d: Arc<dyn ModelDownDetector> = Arc::new(AlwaysDown);
+        assert!(d.is_model_down("anything"));
     }
 
     #[test]
