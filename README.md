@@ -49,7 +49,9 @@ See [use the Claude Code plugin](docs/how-to/use-the-claude-code-plugin.md).
 
 ## Documentation
 
-Start in [`docs/`](docs/), organised by what you need:
+Browse the docs online at **<https://noolog.io/docs>** (human-readable), or query them from an agent over MCP at **<https://noolog.io/mcp>**.
+
+The same content lives in [`docs/`](docs/), organised by what you need:
 
 - **[Tutorials](docs/tutorials/)** — learn by doing: [your first agent from an invite](docs/tutorials/first-agent-from-invite.md).
 - **[How-to](docs/how-to/)** — task recipes: [smoke-test an agent](docs/how-to/smoke-test-an-agent.md), [run a fleet](docs/how-to/run-an-agent-fleet.md), [register a provider](docs/how-to/register-a-custom-provider.md).
