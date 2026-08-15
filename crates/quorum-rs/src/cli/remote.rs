@@ -1219,9 +1219,10 @@ impl RemoteOrchestrator {
                     "round_summary" => {
                         if let Ok(ev) = serde_json::from_str::<RoundSummaryData>(&data) {
                             let best = ev.proposal_scores.iter().max_by(|a, b| {
-                                a.aggregated_score
-                                    .partial_cmp(&b.aggregated_score)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                crate::workers::aggregated_score_cmp(
+                                    a.aggregated_score,
+                                    b.aggregated_score,
+                                )
                             });
                             if let Some(top) = best {
                                 eprintln!(

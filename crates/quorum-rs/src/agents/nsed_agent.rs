@@ -1383,8 +1383,17 @@ impl NsedAgent for ProposerEvaluatorAgent {
             })
             .collect();
 
-        // Normalize only over valid evaluations.
-        let total_weight: f32 = valid_evals.iter().map(|e| e.endorsement_weight.abs()).sum();
+        // Normalize only over valid evaluations. A non-finite weight (overflowed
+        // LLM value → ±inf) is treated as 0 here so one garbage weight doesn't make
+        // the whole sum inf and collapse the evaluator's other opinions; normalize_score
+        // also independently guards the per-proposal raw weight.
+        let total_weight: f32 = valid_evals
+            .iter()
+            .map(|e| {
+                let w = e.endorsement_weight.abs();
+                if w.is_finite() { w } else { 0.0 }
+            })
+            .sum();
         debug!(
             agent_name = %self.config.name,
             valid_count = valid_evals.len(),
@@ -3829,6 +3838,57 @@ mod tests {
             redact_terminal_leak(&parsed, "some_new_tool", &LeakStub).expect("re-deserializes");
         assert_eq!(out["any"], "field with [redacted]");
         assert_eq!(out["nested"]["x"], "[redacted]");
+    }
+
+    /// Detects "LEAK" but does NOT override `redact` — exercises the default
+    /// identity (no-op) redaction path.
+    #[derive(Debug)]
+    struct NoRedactStub;
+    #[async_trait::async_trait]
+    impl crate::agents::OutputLeakDetector for NoRedactStub {
+        fn scan(&self, text: &str) -> crate::agents::OutputScanResult {
+            crate::agents::OutputScanResult {
+                tool_name_hits: text.matches("LEAK").count() as u32,
+                response_length_chars: text.chars().count() as u32,
+                ..Default::default()
+            }
+        }
+        async fn evaluate(
+            &self,
+            ctx: &crate::middleware::MiddlewareContext,
+        ) -> crate::middleware::MiddlewareVerdict {
+            if ctx.content.as_str().unwrap_or_default().contains("LEAK") {
+                crate::middleware::MiddlewareVerdict::block("test", "leak")
+            } else {
+                crate::middleware::MiddlewareVerdict::pass()
+            }
+        }
+        // redact intentionally NOT overridden → default identity (no-op).
+    }
+
+    #[tokio::test]
+    async fn default_redact_noop_stays_blocked_on_rescan() {
+        use super::{redact_terminal_leak, run_prompt_exposure_guard};
+        // A detector with the default (identity) redact can't scrub the leak, so
+        // the re-scan the caller runs must still block — the fail-closed guard
+        // that stops a no-op/partial redaction from passing a leak through.
+        let parsed = serde_json::json!({
+            "thought_process": "t",
+            "solution_content": "answer with a LEAK in it",
+        });
+        let redacted: serde_json::Value =
+            redact_terminal_leak(&parsed, "submit_proposal", &NoRedactStub)
+                .expect("re-deserializes");
+        assert_eq!(
+            redacted["solution_content"], "answer with a LEAK in it",
+            "identity redact is a no-op — the leak survives"
+        );
+        let rescan =
+            run_prompt_exposure_guard(&redacted, "submit_proposal", "agent", &NoRedactStub).await;
+        assert!(
+            rescan.is_some(),
+            "a no-op redact must NOT clear the leak on re-scan (fail-closed)"
+        );
     }
 
     #[tokio::test]

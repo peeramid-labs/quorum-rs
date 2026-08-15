@@ -13,6 +13,41 @@ use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 use tracing::{debug, warn};
 
+/// Cap on the compiled-regex cache. `tool_name` is derived from the model's own
+/// closing tag, so an adversarial stream of fresh tag names would grow the cache
+/// without bound over the process lifetime. The real tool set is tiny (~10), so a
+/// generous cap that clears on overflow (a regex recompile is cheap) bounds memory
+/// without evicting live tools in normal operation.
+const MAX_TOOL_RE_CACHE: usize = 256;
+
+/// Get or compile the `<tool>(.*?)</tool>` capture regex for `tool_name`, caching by
+/// name with a hard size cap (see [`MAX_TOOL_RE_CACHE`]). `None` if the name fails to
+/// compile (regex-escaped, so effectively never for well-formed names).
+fn bounded_tool_regex(cache: &RwLock<HashMap<String, Regex>>, tool_name: &str) -> Option<Regex> {
+    if let Ok(guard) = cache.read()
+        && let Some(re) = guard.get(tool_name)
+    {
+        return Some(re.clone());
+    }
+    let pattern = format!(r"(?s)<{0}>(.*?)</{0}>", regex::escape(tool_name));
+    match Regex::new(&pattern) {
+        Ok(new_re) => {
+            if let Ok(mut guard) = cache.write() {
+                // Bound memory: clear past the cap rather than growing unboundedly.
+                if guard.len() >= MAX_TOOL_RE_CACHE {
+                    guard.clear();
+                }
+                guard.insert(tool_name.to_string(), new_re.clone());
+            }
+            Some(new_re)
+        }
+        Err(e) => {
+            warn!("Failed to compile regex for tool '{}': {}", tool_name, e);
+            None
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct XmlRegexStrategy {
     pub engine: Option<String>,
@@ -51,31 +86,7 @@ impl XmlRegexStrategy {
         // 2. Extract tool body
         static TOOL_RE_CACHE: OnceLock<RwLock<HashMap<String, Regex>>> = OnceLock::new();
         let cache = TOOL_RE_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
-
-        let re = if let Ok(guard) = cache.read() {
-            guard.get(tool_name).cloned()
-        } else {
-            None
-        };
-
-        let re = if let Some(re) = re {
-            Some(re)
-        } else {
-            let escaped_name = regex::escape(tool_name);
-            let pattern = format!(r"(?s)<{0}>(.*?)</{0}>", escaped_name);
-            match Regex::new(&pattern) {
-                Ok(new_re) => {
-                    if let Ok(mut guard) = cache.write() {
-                        guard.insert(tool_name.to_string(), new_re.clone());
-                    }
-                    Some(new_re)
-                }
-                Err(e) => {
-                    warn!("Failed to compile regex for tool '{}': {}", tool_name, e);
-                    None
-                }
-            }
-        };
+        let re = bounded_tool_regex(cache, tool_name);
 
         let tool_content = re
             .as_ref()
@@ -497,6 +508,29 @@ impl ChatStrategy for XmlRegexStrategy {
 mod tests {
     use super::*;
     use async_openai::types::{ChatCompletionTool, FunctionObject};
+
+    #[test]
+    fn bounded_tool_regex_caps_cache_and_still_matches() {
+        let cache = RwLock::new(HashMap::new());
+        // A flood of distinct model-controlled tag names must not grow the cache
+        // without bound — it stays at/under the cap.
+        for i in 0..(MAX_TOOL_RE_CACHE + 50) {
+            let re = bounded_tool_regex(&cache, &format!("tag_{i}")).expect("compiles");
+            // The compiled regex actually matches its tag.
+            assert!(re.is_match(&format!("<tag_{i}>body</tag_{i}>")));
+        }
+        assert!(
+            cache.read().unwrap().len() <= MAX_TOOL_RE_CACHE,
+            "cache must stay within the cap, got {}",
+            cache.read().unwrap().len()
+        );
+        // A cache hit returns a working regex for a name inserted after the last clear.
+        let re = bounded_tool_regex(&cache, "submit_proposal").unwrap();
+        assert!(
+            re.captures("<submit_proposal>X</submit_proposal>")
+                .is_some()
+        );
+    }
 
     #[test]
     fn test_to_xml_regex() {
