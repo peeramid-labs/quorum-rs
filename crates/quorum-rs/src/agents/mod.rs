@@ -905,6 +905,61 @@ pub enum AgentLiveStatus {
     Busy,
 }
 
+/// Coarse operational health an agent self-reports so the orchestrator can act
+/// (exclude / deprioritize) and surface WHY.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentHealthState {
+    /// Serving normally.
+    #[default]
+    Healthy,
+    /// Serving but impaired — still assignable, but the orchestrator may
+    /// deprioritize (e.g. paused, payment pending, rate-limited).
+    Degraded,
+    /// Not serving — do NOT assign work (e.g. the remote model is unavailable).
+    Down,
+}
+
+/// An agent's self-reported health plus a short reason when it isn't `Healthy`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema, Default)]
+pub struct AgentHealth {
+    #[serde(default)]
+    pub state: AgentHealthState,
+    /// Short human-readable reason when `state != Healthy` (e.g. "remote model
+    /// unavailable", "paused"). `None` when `Healthy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl AgentHealth {
+    /// `true` when the agent should not be assigned new work.
+    pub fn is_down(&self) -> bool {
+        self.state == AgentHealthState::Down
+    }
+}
+
+/// Derive an agent's health from its current operational flags. `Down` (model
+/// unavailable) takes precedence over `Degraded` (paused) — a down agent can't
+/// serve at all. Keep this the single source of truth so `model_down` and
+/// `health` stay consistent.
+pub fn compute_agent_health(model_down: bool, paused: bool) -> AgentHealth {
+    if model_down {
+        AgentHealth {
+            state: AgentHealthState::Down,
+            reason: Some("remote model unavailable".to_string()),
+        }
+    } else if paused {
+        AgentHealth {
+            state: AgentHealthState::Degraded,
+            reason: Some("paused".to_string()),
+        }
+    } else {
+        AgentHealth::default()
+    }
+}
+
 /// Heartbeat message published by agents to announce their presence on the bus.
 ///
 /// Published to `{prefix}.agent.heartbeat.{agent_id}` every 10 seconds via
@@ -923,6 +978,15 @@ pub struct AgentHeartbeat {
     /// schedulable, i.e. back-compatible.
     #[serde(default)]
     pub model_down: bool,
+    /// Richer self-reported operational health: `Healthy`, `Degraded` (serving
+    /// but impaired — paused, payment-pending, …), or `Down` (do not assign —
+    /// e.g. remote model unavailable), each with a short reason. Lets the
+    /// orchestrator surface WHY an agent is benched, not just that it is. A
+    /// missing field (older agent) defaults to `Healthy`. `model_down` above is
+    /// kept as the coarse boolean back-compat signal and equals
+    /// `health.state == Down`.
+    #[serde(default)]
+    pub health: AgentHealth,
     /// Job ID if currently processing, else None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_job: Option<String>,
@@ -1058,6 +1122,46 @@ pub fn calculate_qv_score(raw_weight: f32, total_weight: f32) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compute_agent_health_precedence_and_reasons() {
+        // Down beats Degraded — a down agent can't serve at all.
+        let both = compute_agent_health(true, true);
+        assert_eq!(both.state, AgentHealthState::Down);
+        assert!(both.is_down());
+        assert_eq!(both.reason.as_deref(), Some("remote model unavailable"));
+
+        let down = compute_agent_health(true, false);
+        assert_eq!(down.state, AgentHealthState::Down);
+
+        let degraded = compute_agent_health(false, true);
+        assert_eq!(degraded.state, AgentHealthState::Degraded);
+        assert!(!degraded.is_down());
+        assert_eq!(degraded.reason.as_deref(), Some("paused"));
+
+        let healthy = compute_agent_health(false, false);
+        assert_eq!(healthy.state, AgentHealthState::Healthy);
+        assert!(healthy.reason.is_none());
+        assert_eq!(healthy, AgentHealth::default());
+    }
+
+    #[test]
+    fn heartbeat_without_health_defaults_to_healthy() {
+        // An older agent omits `health`; it must deserialize as Healthy so the
+        // orchestrator keeps scheduling it (back-compat).
+        let json = r#"{"agent_id":"a","status":"idle","model_name":"m","provider_id":"p","uptime_secs":1,"timestamp":"t"}"#;
+        let hb: AgentHeartbeat = serde_json::from_str(json).unwrap();
+        assert_eq!(hb.health.state, AgentHealthState::Healthy);
+        assert!(!hb.model_down);
+    }
+
+    #[test]
+    fn agent_health_serde_roundtrip() {
+        let h = compute_agent_health(true, false);
+        let s = serde_json::to_string(&h).unwrap();
+        assert!(s.contains("\"down\""), "state serializes snake_case: {s}");
+        assert_eq!(serde_json::from_str::<AgentHealth>(&s).unwrap(), h);
+    }
 
     // =========================================================================
     // Serde Roundtrip Tests — ensure backward compatibility for all new types
@@ -2619,10 +2723,16 @@ mod tests {
             description: Some("Legal specialist".to_string()),
             signing_schemes: vec!["eip712".to_string()],
             model_down: true,
+            health: compute_agent_health(true, false),
         };
         let json = serde_json::to_string(&hb).unwrap();
         let deserialized: AgentHeartbeat = serde_json::from_str(&json).unwrap();
         assert!(deserialized.model_down, "model_down round-trips");
+        assert_eq!(
+            deserialized.health.state,
+            AgentHealthState::Down,
+            "health round-trips"
+        );
         assert_eq!(deserialized.agent_id, "agent-1");
         assert_eq!(deserialized.status, AgentLiveStatus::Busy);
         assert_eq!(deserialized.model_name, "gpt-4");
