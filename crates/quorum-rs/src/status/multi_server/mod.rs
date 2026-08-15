@@ -19,8 +19,8 @@ use crate::orchestrator_registry::OrchestratorRegistry;
 use crate::workers::buffer::ResponseBuffer;
 use axum::{
     Router,
-    extract::State,
-    http::header,
+    extract::{Path, State},
+    http::{StatusCode, header},
     response::{Html, IntoResponse, Json},
     routing::{get, post, put},
 };
@@ -350,6 +350,93 @@ pub(super) async fn list_agents(State(state): State<MultiAppState>) -> Json<Vec<
     Json(agents)
 }
 
+/// Per-agent operator diagnostics — metrics + latest errors, pullable via API so
+/// operators can catch agent-side problems from the dashboard without going
+/// through the orchestrator.
+#[derive(Serialize, ToSchema)]
+pub(super) struct AgentDiagnostics {
+    name: String,
+    model_name: String,
+    uptime_secs: u64,
+    tasks_completed: u64,
+    tasks_failed: u64,
+    error_rate: f32,
+    /// Whether the agent is paused (e.g. auto-paused on a 402/billing error) —
+    /// it pulls no new tasks while paused.
+    is_paused: bool,
+    /// Whether the agent is flagged for operator attention (e.g. score
+    /// divergence from peers).
+    is_flagged: bool,
+    /// Why it's flagged, if flagged.
+    flag_reason: Option<String>,
+    /// Most recent `agent_error` events (newest first), with their detail.
+    #[schema(value_type = Vec<crate::status::EventLogEntry>)]
+    recent_errors: Vec<crate::status::EventLogEntry>,
+    /// Most recent tasks that ended in `"error"` (newest first).
+    #[schema(value_type = Vec<crate::status::TaskLogEntry>)]
+    recent_failed_tasks: Vec<crate::status::TaskLogEntry>,
+}
+
+/// Build diagnostics from an agent's status snapshot. Pure — testable without
+/// the dashboard app state. Surfaces the reliability metrics plus the latest
+/// error events and failed tasks an operator needs to catch an agent-side
+/// problem (e.g. a model 404-ing every round).
+fn diagnostics_from_snapshot(
+    name: &str,
+    snap: &crate::status::AgentStatusSnapshot,
+) -> AgentDiagnostics {
+    const MAX: usize = 20;
+    let recent_errors: Vec<_> = snap
+        .event_log
+        .iter()
+        .rev()
+        .filter(|e| e.event_type == "agent_error")
+        .take(MAX)
+        .cloned()
+        .collect();
+    let recent_failed_tasks: Vec<_> = snap
+        .recent_tasks
+        .iter()
+        .rev()
+        .filter(|t| t.status == "error")
+        .take(MAX)
+        .cloned()
+        .collect();
+    AgentDiagnostics {
+        name: name.to_string(),
+        model_name: snap.model_name.clone(),
+        uptime_secs: snap.uptime_secs,
+        tasks_completed: snap.tasks_completed,
+        tasks_failed: snap.tasks_failed,
+        error_rate: snap.error_rate,
+        is_paused: snap.is_paused,
+        is_flagged: snap.is_flagged,
+        flag_reason: snap.flag_reason.clone(),
+        recent_errors,
+        recent_failed_tasks,
+    }
+}
+
+/// `GET /api/agents/{name}/diagnostics` — metrics + latest errors for one agent.
+#[utoipa::path(
+    get,
+    path = "/api/agents/{name}/diagnostics",
+    params(("name" = String, Path, description = "Agent name")),
+    responses(
+        (status = 200, description = "Agent metrics + latest errors", body = AgentDiagnostics),
+        (status = 404, description = "Unknown agent")
+    ),
+    tag = "Agents"
+)]
+pub(super) async fn agent_diagnostics(
+    State(state): State<MultiAppState>,
+    Path(name): Path<String>,
+) -> Result<Json<AgentDiagnostics>, StatusCode> {
+    let status = state.statuses.get(&name).ok_or(StatusCode::NOT_FOUND)?;
+    let snap = status.read().await;
+    Ok(Json(diagnostics_from_snapshot(&name, &snap)))
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -368,6 +455,7 @@ fn build_router(state: MultiAppState) -> Router {
             get(registry_handlers::get_global_config).put(registry_handlers::update_global_config),
         )
         .route("/api/agents", get(list_agents))
+        .route("/api/agents/{name}/diagnostics", get(agent_diagnostics))
         .route(
             "/api/agents/register",
             post(registration_handlers::register_agent),

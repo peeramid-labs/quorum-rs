@@ -2033,6 +2033,76 @@ fn openapi_spec_generates_without_panic() {
     assert!(json.contains("/api/agents"));
     assert!(json.contains("/api/agents/{name}/status"));
     assert!(json.contains("/api/agents/{name}/buffer"));
+    // Annotated endpoints that must stay registered in ApiDoc paths():
+    // the operator diagnostics pull and the per-orchestrator budget proxy.
+    assert!(json.contains("/api/agents/{name}/diagnostics"));
+    assert!(json.contains("/api/orchestrators/budgets"));
+    assert!(json.contains("OrchestratorBudget"));
+}
+
+/// Extract every `path = "..."` inside a `#[utoipa::path(...)]` attribute in
+/// `src`. Paren-depth scan from the opening `(` so nested groups like
+/// `responses((status = 200, ...))` don't confuse the boundary.
+fn utoipa_annotated_paths(src: &str) -> Vec<String> {
+    const MARKER: &str = "#[utoipa::path(";
+    let bytes = src.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = src[i..].find(MARKER) {
+        let start = i + rel + MARKER.len();
+        let mut depth = 1usize;
+        let mut j = start;
+        while j < bytes.len() && depth > 0 {
+            match bytes[j] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            j += 1;
+        }
+        let attr = &src[start..j];
+        if let Some(p) = attr.find("path = \"") {
+            let rest = &attr[p + "path = \"".len()..];
+            if let Some(end) = rest.find('"') {
+                out.push(rest[..end].to_string());
+            }
+        }
+        i = j;
+    }
+    out
+}
+
+/// Drift guard: any `multi_server` handler carrying a `#[utoipa::path]` MUST be
+/// listed in `ApiDoc` `paths()`, else it silently vanishes from the agent
+/// dashboard's OpenAPI/Swagger spec — exactly how `get_orchestrator_budgets`
+/// regressed. `paths()` is hand-maintained apart from the annotations, so this
+/// catches the whole drift class for current + future annotated handlers.
+#[test]
+fn every_annotated_utoipa_path_is_registered() {
+    use utoipa::OpenApi;
+    let spec = super::api_docs::ApiDoc::openapi();
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/status/multi_server");
+    let mut missing = Vec::new();
+    for entry in std::fs::read_dir(&dir)
+        .expect("read multi_server dir")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().is_none_or(|x| x != "rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).unwrap();
+        for p in utoipa_annotated_paths(&src) {
+            if !spec.paths.paths.contains_key(&p) {
+                missing.push(format!("{p}  ({})", path.display()));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "utoipa-annotated endpoints missing from ApiDoc paths() — register them:\n{}",
+        missing.join("\n")
+    );
 }
 
 // ── Swagger UI endpoint test ──
@@ -2690,4 +2760,81 @@ fn resolve_dashboard_bind_falls_back_on_garbage() {
         super::resolve_dashboard_bind(Some("not-an-ip")),
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
     );
+}
+
+#[test]
+fn diagnostics_from_snapshot_surfaces_errors_and_metrics() {
+    use crate::status::{AgentStatusSnapshot, EventLogEntry, TaskLogEntry};
+    let mut snap = AgentStatusSnapshot::new("Corepunk18".into(), "gpt".into(), "openrouter".into());
+    snap.tasks_completed = 3;
+    snap.tasks_failed = 5;
+    snap.error_rate = 0.625;
+    snap.is_paused = true;
+    snap.is_flagged = true;
+    snap.flag_reason = Some("score divergence".into());
+    snap.event_log.push_back(EventLogEntry {
+        timestamp: "t1".into(),
+        event_type: "agent_error".into(),
+        job_id: Some("j".into()),
+        detail: "API request failed with status 404".into(),
+    });
+    snap.event_log.push_back(EventLogEntry {
+        timestamp: "t2".into(),
+        event_type: "task_complete".into(),
+        job_id: None,
+        detail: "ok".into(),
+    });
+    snap.recent_tasks.push_back(TaskLogEntry {
+        timestamp: "t".into(),
+        action: "evaluate".into(),
+        job_id: "j".into(),
+        round: 4,
+        status: "error".into(),
+        duration_ms: 10,
+        content_preview: None,
+    });
+    snap.recent_tasks.push_back(TaskLogEntry {
+        timestamp: "t".into(),
+        action: "propose".into(),
+        job_id: "j".into(),
+        round: 4,
+        status: "ok".into(),
+        duration_ms: 10,
+        content_preview: None,
+    });
+
+    let d = super::diagnostics_from_snapshot("Corepunk18", &snap);
+    assert_eq!(d.tasks_failed, 5);
+    assert_eq!(d.tasks_completed, 3);
+    assert!(d.is_paused, "paused state surfaced");
+    assert!(d.is_flagged);
+    assert_eq!(d.flag_reason.as_deref(), Some("score divergence"));
+    // Only agent_error events surface, carrying their detail.
+    assert_eq!(d.recent_errors.len(), 1);
+    assert_eq!(
+        d.recent_errors[0].detail,
+        "API request failed with status 404"
+    );
+    // Only status=="error" tasks surface.
+    assert_eq!(d.recent_failed_tasks.len(), 1);
+    assert_eq!(d.recent_failed_tasks[0].action, "evaluate");
+}
+
+#[tokio::test]
+async fn agent_diagnostics_endpoint_serves_metrics_and_404s_unknown() {
+    // Known agent → 200 with the diagnostics shape.
+    let app = build_router(test_state());
+    let (status, body) = get_request(app, "/api/agents/ALPHA/diagnostics").await;
+    assert_eq!(status, StatusCode::OK);
+    let d: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(d["name"], "ALPHA");
+    assert_eq!(d["model_name"], "MiniMax-M2.5");
+    assert!(d["recent_errors"].is_array());
+    assert!(d["recent_failed_tasks"].is_array());
+    assert!(d["tasks_failed"].is_u64());
+
+    // Unknown agent → 404.
+    let app2 = build_router(test_state());
+    let (status, _) = get_request(app2, "/api/agents/NOPE/diagnostics").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
