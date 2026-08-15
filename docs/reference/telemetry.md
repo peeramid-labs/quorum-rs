@@ -35,7 +35,7 @@ telemetry:
       subject_prefix: tenant.x.telemetry  # explicit override
 ```
 
-An empty `endpoints` list (or block omitted) with `enabled: true` is allowed and results in **no telemetry emitted** — the mux falls through silently. Validation that requires non-empty endpoints when enabled lands with the worker/loader migration in [#357 Phase 2](https://github.com/peeramid-labs/nsed/issues/357); operators relying on telemetry should declare at least one endpoint today.
+An empty `endpoints` list (or block omitted) with `enabled: true` is allowed and results in **no telemetry emitted** — the mux falls through silently. Operators relying on telemetry should declare at least one endpoint.
 
 Overlay merges replace the list wholesale — env-specific overlays must restate every endpoint, not just the additions.
 
@@ -118,13 +118,13 @@ Not sent: error body text, stack trace, raw provider response.
 
 ### `llm_request_stalled`
 
-Fired every 30s while an in-flight `llm_request_start` has no terminal event. Implemented by `LlmRequestSpan` (#364): `start()` spawns a heartbeat task; `complete()` / `fail()` notify cancellation before emitting the terminal event so no `llm_request_stalled` is published after the matching terminal. First emission is at `+30s` (not `+0s`) — a request that completes inside the first interval emits zero stalled events.
+Fired every 30s while an in-flight `llm_request_start` has no terminal event. Implemented by `LlmRequestSpan`: `start()` spawns a heartbeat task; `complete()` / `fail()` notify cancellation before emitting the terminal event so no `llm_request_stalled` is published after the matching terminal. First emission is at `+30s` (not `+0s`) — a request that completes inside the first interval emits zero stalled events.
 
 | Field | Type | Description |
 |---|---|---|
 | `request_id` | string | Matches the original start |
 | `elapsed_ms` | int | Time since dispatch |
-| `ttft_received` | bool | `false` = provider never sent a first token. Today always `false` — providers that surface streaming partials need to wire this; tracked in #309 follow-up. |
+| `ttft_received` | bool | `false` = provider never sent a first token. Currently always `false` — providers that surface streaming partials need to wire this. |
 | `last_token_ms` | int \| null | When the last token arrived. Today always `null` for the same reason. |
 
 ### `api_error`
@@ -151,7 +151,7 @@ Fired when the agent runs an internal tool.
 | `output_bytes` | int | Length of the tool result payload. Pairs with `llm_request_start.recent_tool_output_bytes` for context-bloat attribution |
 | `output_tokens_estimated` | int | `ceil(output_bytes / 4)`, always populated by the built-in agent. The schema permits `null` for custom callers that genuinely have no tokenizer hint; consumers that only ingest the built-in agent's events can treat this column as guaranteed. |
 | `truncated` | bool | `true` when the tool's own `max_bytes` cap clipped the result. Per-tool wrapper-dependent — currently always `false` until each tool surfaces a structured `truncated` marker |
-| `paginated` | bool | `true` when the tool emitted a `next_offset` cursor (post-#93e776c). Per-tool wrapper-dependent in the same way |
+| `paginated` | bool | `true` when the tool emitted a `next_offset` cursor. Per-tool wrapper-dependent in the same way |
 
 Not sent: tool arguments, tool output, search queries.
 
@@ -192,7 +192,7 @@ Task-level bookends.
 | Field | Type | Description |
 |---|---|---|
 | `dispatch_delay_ms` | int | Orchestrator-publish to agent pickup |
-| `task_publish_ts` | int \| null | `task_accepted` only: Unix milliseconds the orchestrator stamped on the task envelope at publish time. `null` on payloads from a pre-#355 orchestrator |
+| `task_publish_ts` | int \| null | `task_accepted` only: Unix milliseconds the orchestrator stamped on the task envelope at publish time. `null` on payloads from an older orchestrator that does not stamp a publish timestamp |
 | `job_age_at_accept_ms` | int \| null | `task_accepted` only: `agent_receive_ts − task_publish_ts`. Distinguishes a fresh dispatch (sub-second) from a resurrection (minutes / hours after a container restart). `null` when `task_publish_ts` is unset |
 | `queue_wait_ms` | int \| null | task_accepted to first llm_request_start (omitted until wired — see below) |
 | `duration_ms` | int | End-to-end wall-clock (completed/failed only) |
@@ -209,8 +209,7 @@ Not sent: what the agent proposed.
 The four fields below are typed `Option<u64>`/`Option<u32>` and the
 worker emits `null` (omitted from the JSON via
 `#[serde(skip_serializing_if = "Option::is_none")]`) until the
-wiring to populate them lands as a follow-up to issue
-[#309](https://github.com/peeramid-labs/nsed/issues/309). Operators
+wiring to populate them is in place. Operators
 should treat absent fields as "not yet measured", **not** as
 "measured zero" — those are different signals.
 
@@ -249,9 +248,7 @@ parsing `trace_id` see a uniform shape across the whole catalog.
 `pending_publish_depth` and `buffer_bytes` are `Option<u32>` /
 `Option<u64>` and the worker emits `null` (omitted from the JSON)
 until `async_nats::Client::statistics()` (or equivalent
-introspection) is wired. Tracked alongside the task-event
-population follow-up in
-[#309](https://github.com/peeramid-labs/nsed/issues/309). Treat
+introspection) is wired. Treat
 absent fields as "not yet measured", not "buffer is empty".
 
 ### `context_emergency_shrink`

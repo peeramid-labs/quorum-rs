@@ -56,7 +56,7 @@ files) are resolved — so everything the subprocess does lands in the same plac
 - **Everyone else:** nothing to do. The field is `None` unless a middleware sets it,
   and behaviour is unchanged.
 
-## Why not just static config?
+## Why not static config?
 
 A configured `working_dir` is one fixed directory per agent. A long-lived worker
 handles many tasks, and a middleware may want a *different* directory per task —

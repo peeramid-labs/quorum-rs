@@ -5,11 +5,8 @@ tagline: Live-tail and filter agent telemetry events straight from the NATS CLI,
 ---
 # Inspect telemetry (NATS CLI)
 
-Live-tail and filter agent telemetry events without standing up a
-forwarder or sink. Useful while #309's full pipeline (sub-issues
-[#365 forwarder](https://github.com/peeramid-labs/nsed/issues/365)
-/ [#366 sinks](https://github.com/peeramid-labs/nsed/issues/366))
-is still landing.
+Live-tail and filter agent telemetry events straight from the
+NATS CLI — no forwarder or sink required.
 
 ## Prerequisites
 
@@ -36,7 +33,7 @@ the catalog (see [event reference](../reference/telemetry.md)).
 
 Subject becomes `telemetry.agent.*.>` — one stream of every
 agent in your scope. Pre-deployment debugging only; in production a
-forwarder (#365) handles fan-in.
+forwarder handles fan-in.
 
 ## Filter by event type
 

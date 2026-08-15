@@ -19,7 +19,7 @@ agents:
     model_name: "gpt-4o"
     description: "Financial audit specialist — compliance, risk, regulatory analysis"
     capability_tags: ["audit", "compliance", "legal", "financial"]
-    signing_schemes: ["eip712"]    # placeholder for #115
+    signing_schemes: ["eip712"]    # placeholder for future crypto signing
     input_price_per_mtok: 2.5
     output_price_per_mtok: 10.0
 ```

@@ -101,7 +101,7 @@ Concretely:
 - CI jobs that invoke `quorum serve` from a parent dir use
   absolute paths or a wrapper shell script that `cd`s first.
 
-If a future feature really needs yaml-relative paths (e.g.
+If a future feature needs yaml-relative paths (e.g.
 `include:` for sub-yaml composition), it'll be worth wiring
 option (a) globally. For one field with one shape, CWD is
 enough.
@@ -116,8 +116,8 @@ enough.
 - **Layer reordering / overrides via control plane.** The control
   plane patches `AgentConfig.persona` as a single string today
   — same shape, same wire format. Layered editing would need a
-  whole new patch grammar, which is more product than this PR
-  is trying to be.
+  whole new patch grammar, a much larger surface than this
+  feature covers.
 - **Roundtrip preservation of the layered shape.** Serialising
   an `AgentConfig` back to yaml writes the resolved string. If
   operators want to dump-and-re-edit a layered persona, they

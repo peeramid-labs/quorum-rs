@@ -1,7 +1,5 @@
 # quorum-rs documentation
 
-Organized by the [Diátaxis](https://diataxis.fr) framework — four sections serving distinct user needs.
-
 ## Tutorials
 
 Learning-by-doing material — single-path lessons with verification checkpoints at every step.

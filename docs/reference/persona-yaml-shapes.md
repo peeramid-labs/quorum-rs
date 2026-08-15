@@ -26,7 +26,7 @@ persona: "you are a careful reviewer"
 ```
 
 Equivalent to `Some("you are a careful reviewer")` after
-deserialization. Same as the pre-PR-#457 behaviour.
+deserialization.
 
 ### Shape B — layered array
 

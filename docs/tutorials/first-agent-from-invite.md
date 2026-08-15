@@ -221,14 +221,14 @@ quorum run --room demo "What is the most efficient way to boil water?"
 Watch the Step 4 terminal — within a few seconds you should see:
 
 ```
-INFO cortex-a proposing on round 0 ...
-INFO cortex-a evaluating round 0 ...
+INFO 🤖 Agent is starting the proposal generation process.
+INFO 🕵️ Agent is starting the batch proposal evaluation process.
 ```
 
 And the client terminal will print a deliberation outcome.
 
-✅ **Checkpoint:** Your agent logged `proposing` AND
-`evaluating` (the two phases per round) for at least one round,
+✅ **Checkpoint:** Your agent logged the 🤖 proposal-generation AND
+🕵️ evaluation lines (the two phases per round) for at least one round,
 and the client got a result.
 
 > **Live view (optional):** `quorum tui` shows your agent, the

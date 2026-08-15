@@ -90,7 +90,7 @@ to run one deliberation, and it can be pointed at by any number of rooms.
 
 Here is the trap. "Room" names *two different things at two different layers*,
 and they are related but not identical. Almost every "wait, what is a room?"
-confusion is really "which of these two rooms do you mean?".
+confusion is "which of these two rooms do you mean?".
 
 ### 1. The workspace room (client side, `quorum.yml`)
 
@@ -132,7 +132,7 @@ registry. Its config is small:
 - `policy` — an *optional* policy name. This is **metadata only**: it records the
   workspace room → policy binding for discovery, and the access predicate
   **never reads it**. A `RoomConfig` does not run anything; do not confuse this
-  field with the policy that actually drives the deliberation.
+  field with the policy that drives the deliberation.
 
 The registry is seeded from the config (`tenancy.rooms`) at boot and merged with
 runtime rooms held in a durable NATS-KV store; runtime-created rooms win on id
@@ -259,7 +259,7 @@ Public widens the audience, not the authority.
 
 ### Where private rooms are the wrong tool
 
-- **When you actually want a shared audience.** Private defeats the demo/watch
+- **When you want a shared audience.** Private defeats the demo/watch
   use case: the presenter's audience would each see nothing but their own
   (empty) view.
 
@@ -285,13 +285,13 @@ things rooms do not do:
    — cross-submission continuity is not an automatic property of the room.
 2. **A hard security boundary, today.** The tenancy check
    (`can_see_job`) is an *app-layer* fence — real, enforced, but living in the
-   orchestrator process. It is **not** yet a broker-level fence: pre-#234, a
-   determined party with NATS access is not stopped by `RoomConfig` alone. The
-   milestone that turns the `op:` tag convention into NATS *account* isolation
-   (#234) is what makes the room a broker-enforced boundary. Until then, treat
-   room visibility as *access control for the API*, and defence-in-depth rather
-   than the sole wall. (The orchestrator's own tenancy docs cover how the
-   app-layer and broker-layer fences compose.)
+   orchestrator process. It is **not** yet a broker-level fence: a determined
+   party with NATS access is not stopped by `RoomConfig` alone. Turning the
+   `op:` tag convention into NATS *account* isolation is what will make the room
+   a broker-enforced boundary. Until then, treat room visibility as *access
+   control for the API*, and defence-in-depth rather than the sole wall. (The
+   orchestrator's own tenancy docs cover how the app-layer and broker-layer
+   fences compose.)
 
 ---
 

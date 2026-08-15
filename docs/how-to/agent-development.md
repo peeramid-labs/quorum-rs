@@ -192,13 +192,13 @@ The worker reads these from the environment if they're set; otherwise it connect
 
 ## Bootstrap with an invite code
 
-For 3rd-party agent operators where shipping a long-lived bearer token over a messenger is the wrong shape, the orchestrator can mint single-use, short-TTL JWT **invite codes** that an agent redeems on its own host for a freshly scoped NATS User JWT. The agent's NKey seed never crosses the network.
+The orchestrator can mint single-use, short-TTL JWT **invite codes** that an agent redeems on its own host for a freshly scoped NATS User JWT — no long-lived bearer token to ship, and the agent's NKey seed never crosses the network.
 
 Two ways to consume from the SDK:
 
 ### Option A: one-shot CLI — `quorum redeem`
 
-The shipping `quorum` binary takes the operator UX off the SDK consumer's plate entirely:
+The shipping `quorum` binary handles the operator UX for you:
 
 ```bash
 # Default: hits https://api.peeramid.xyz.

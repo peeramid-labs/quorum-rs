@@ -31,7 +31,7 @@ of tools, requesting `max_tokens = 131072` ships ~131820 tokens of
 intent — the provider always says no, the SDK retry loop tries again
 with the same math, the propose phase eventually times out. From
 the outside it looks like a hung LLM call; the fleet log shows a
-tight 400-loop. This was the failure mode in #351.
+tight 400-loop. Counting the tool budget is what closes that loop.
 
 ## How the shrink-guard works
 

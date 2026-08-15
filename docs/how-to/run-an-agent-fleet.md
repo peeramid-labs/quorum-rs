@@ -10,7 +10,7 @@ from an admin and an LLM endpoint to point each agent at. If
 you've never run an agent before, start with the
 [tutorial](../tutorials/first-agent-from-invite.md) — it walks
 through the same flow with hand-holding. This page is for when
-you know the shape and just need to look up the exact commands.
+you know the shape and need the exact commands.
 
 ## What `serve` does
 
@@ -180,7 +180,7 @@ engine is a provider-level field, so the wizard advises setting
 
 ### Layering customisations on top of the scaffold
 
-Everything below shows just the `providers:` / `agents:` portion
+Everything below shows only the `providers:` / `agents:` portion
 of `quorum.yml`. The patterns differ only in which provider block
 you uncomment and what `model_name`s you list under `agents:`.
 
