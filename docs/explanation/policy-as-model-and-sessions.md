@@ -32,9 +32,9 @@ names. The confusion is purely lexical:
 The Chat Completions layer already made the call: a client sends a `model`
 (= policy) and a message array; the server auto-mints the `room_id` as a
 session/thread and returns it as `x-nsed-session-id` so the client can resume.
-The code literally names it `session_id` / `thread_prefix` /
+The code names it `session_id` / `thread_prefix` /
 `find_active_job_for_session`. So **room and session are the same thing** —
-"session" is just the client-facing name for it.
+"session" is the client-facing name for it.
 
 ## Why the client owns the transcript (Completions, not Responses)
 
@@ -54,7 +54,7 @@ client must own the transcript:
 
 - **Restore** = reload the local session file and replay — independent of the
   server's history retention (NATS `nsed_hist_*` has a TTL).
-- **Swap policy mid-chat** = the next turn simply carries a different policy. On
+- **Swap policy mid-chat** = the next turn carries a different policy. On
   the Completions path a changed `policy_id` deliberately forces a *fresh*
   deliberation, which the client stitches into the same session. The Responses
   path forbids this — its thread is parameter-locked.

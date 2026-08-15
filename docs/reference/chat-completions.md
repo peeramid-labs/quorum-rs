@@ -105,12 +105,12 @@ can use it to skip their own title-agent invocation when
 
 ### Known Limitations
 
-| Limitation | Impact | Workaround | Tracked |
-|---|---|---|---|
-| Moderator and passthrough reuse the same NATS `passthrough` subject | No explicit opt-in from agents for moderation tasks | Pin moderator role to a specific agent in the policy config | Backlog issue filed |
-| Agent worker event loop serializes all message types | A moderator request blocks behind in-flight deliberation tasks on the same agent | Pin the moderator role to a dedicated agent not shared with deliberation policies | #276 |
-| NATS subject prefix hardcoded as `"nsed"` for passthrough subjects | Must stay in sync with agent SDK default manually | Documented with TODO in `submit_single_agent` | — |
-| `nsed_metadata` only on `ChatCompletionResponse`, not on SSE chunks | Streaming clients cannot inspect the mode mid-stream | Mode is evident from the model tag (`nsed:moderated`) | — |
+| Limitation | Impact | Workaround |
+|---|---|---|
+| Moderator and passthrough reuse the same NATS `passthrough` subject | No explicit opt-in from agents for moderation tasks | Pin moderator role to a specific agent in the policy config |
+| Agent worker event loop serializes all message types | A moderator request blocks behind in-flight deliberation tasks on the same agent | Pin the moderator role to a dedicated agent not shared with deliberation policies |
+| NATS subject prefix hardcoded as `"nsed"` for passthrough subjects | Must stay in sync with agent SDK default manually | Documented with TODO in `submit_single_agent` |
+| `nsed_metadata` only on `ChatCompletionResponse`, not on SSE chunks | Streaming clients cannot inspect the mode mid-stream | Mode is evident from the model tag (`nsed:moderated`) |
 
 ## Response Format
 
@@ -294,7 +294,7 @@ Each entry of `candidates[]`:
 ```
 
 - `content_preview` carries the **full** proposal text (no server-side char
-  cap since #321). UIs should apply a CSS `line-clamp` for card views and
+  cap). UIs should apply a CSS `line-clamp` for card views and
   show the full body in detail modals.
 - `thought_preview` is the **full** `thought_process` — untruncated for the
   same reason.
@@ -316,8 +316,7 @@ Request body: empty. Returns an SSE stream shaped identically to
 `/v1/chat/completions` responses.
 
 The chat UI auto-invokes `/resume` on transient disconnects using the
-`nsed_session_id` captured from the first chunk of the original stream
-(see #318).
+`nsed_session_id` captured from the first chunk of the original stream.
 
 ## Architecture
 

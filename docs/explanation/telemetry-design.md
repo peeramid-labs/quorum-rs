@@ -16,7 +16,7 @@ Telemetry exists for operator visibility, not for debugging agent behavior. An a
 - Create a temptation to "fix" agent behavior via telemetry dashboards rather than via the scoring/convergence protocol.
 - Inflate JetStream buffer usage by orders of magnitude (content dwarfs metadata).
 
-Redaction is enforced at the type layer — the struct fields for sensitive content simply do not exist on any `TelemetryEvent` variant. This is a structural guarantee, not a runtime policy.
+Redaction is enforced at the type layer — the struct fields for sensitive content do not exist on any `TelemetryEvent` variant. This is a structural guarantee, not a runtime policy.
 
 ## Why fire-and-forget?
 

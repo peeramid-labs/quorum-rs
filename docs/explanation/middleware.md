@@ -231,7 +231,7 @@ Builtin types are compiled into the binary:
 | `rule_based` | Regex blocklist, content length limits, PII detection (email, phone, SSN, credit card), binary data rejection | edit + release |
 | `llm_moderation` | LLM-based content classification against configurable categories (harassment, hate speech, NSFW, prompt injection) | release |
 | `prompt_exposure` | Blocks LLM output that leaks the agent's own system prompt (internal XML tags, protocol phrases) or the canonical tool registry. See [below](#prompt_exposure-config). | provider_response |
-| `signature_verification` | Cryptographic signature validation — requires #115 (crypto crate). Currently pass-through. | release |
+| `signature_verification` | Cryptographic signature validation — requires the crypto crate. Currently pass-through. | release |
 
 ### `rule_based` Config
 

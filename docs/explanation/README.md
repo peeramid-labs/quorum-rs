@@ -2,7 +2,7 @@
 
 Discussion-mode material — why, design rationale, tradeoffs.
 
-Read these away from the keyboard when you want to understand a design decision rather than just use the resulting code.
+Read these away from the keyboard when you want to understand a design decision rather than use the resulting code.
 
 | Article | Topic |
 |---|---|

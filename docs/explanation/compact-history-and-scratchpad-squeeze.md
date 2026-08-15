@@ -25,18 +25,18 @@ Three options were considered:
 - **Sliding window.** Drop the oldest N tool calls. Cheap, but loses
   the file paths and citations the agent has been reasoning over.
 - **Token-bucket eviction.** Drop tool results whose serialized form
-  exceeds a per-call cap. Implemented in PR #397 as the per-call
-  output cap; necessary but not sufficient — the cap stops a single
-  call from blowing the budget but doesn't reclaim space already
-  spent by older calls.
+  exceeds a per-call cap. This ships as the per-call output cap;
+  necessary but not sufficient — the cap stops a single call from
+  blowing the budget but doesn't reclaim space already spent by
+  older calls.
 - **LLM-summarised fold.** Call the agent's own model to compress
   older tool results into a structured summary that REPLACES them in
   the conversation. Costs one extra LLM round-trip; preserves the
-  evidence the agent has cited; the only option that actually
-  reduces input on the next iteration.
+  evidence the agent has cited; the only option that reduces input
+  on the next iteration.
 
-PR #398 lands the third option as the `compact_history` MCP tool,
-plus a paired scratchpad squeeze that runs alongside it.
+The third option is the `compact_history` MCP tool, plus a paired
+scratchpad squeeze that runs alongside it.
 
 ## What the tool does
 
@@ -82,8 +82,9 @@ When the agent issues this tool call, NSED:
 ## The scratchpad squeeze
 
 Scratchpads cap at `max_scratchpad_size`. When `compact_history` (or
-the M3 auto-invoke) appends a summary the candidate buffer can cross
-the cap. The squeeze fires when length / `max_scratchpad_size` ≥
+the context-pressure auto-invoke) appends a summary the candidate
+buffer can cross the cap. The squeeze fires when length /
+`max_scratchpad_size` ≥
 `scratchpad_squeeze_fraction` (default 0.95):
 
 1. Splits the scratchpad at a UTF-8 boundary 75% in.
@@ -158,7 +159,7 @@ Two safety nets layer over the basic check:
 ## What this does not solve
 
 - It does not reduce the size of any single tool call. That's the
-  per-call output cap (M1+M4).
+  per-call output cap.
 - It does not preserve token-perfect fidelity. A summariser hallucination
   is possible; the synthetic `compact_history` tool call leaves the
   fact of the fold visible so an evaluator can see when the agent
