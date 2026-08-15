@@ -11,6 +11,7 @@ Authoritative descriptions — API surface, types, schemas. Mirrors the code str
 | [MCP agent protocol](mcp-agent-protocol.md) | Wire protocol for tool-calling-aware external agents. |
 | [Dashboard configuration](dashboard-config.md) | `--dashboard-port` / `--dashboard-bind` flags, `dashboard_port` yaml field, `QUORUM_DASHBOARD_BIND` env var, `status-server` feature gate. |
 | [`persona` yaml shapes](persona-yaml-shapes.md) | Grammar for the inline-string and stacked-layer forms `persona:` accepts; path semantics and error modes. |
+| [`openrouter` agent-config block](openrouter-provider-config.md) | OpenRouter-only request extensions: provider routing (`provider_sort`/`ignore`/`only`), ZDR, reasoning-token handling, and the opt-in `web_search` plugin. |
 | [Thread TUI](thread-tui.md) | `quorum` thread-TUI keymap (per screen), reader/inbox line formats, and the persisted Message/Thread data model. |
 | [Glossary](glossary.md) | Key terms used across the documentation. |
 

@@ -10,6 +10,7 @@ Goal-oriented recipes. Assume the reader is already competent — get them to th
 | [Agent development](agent-development.md) | You want to build a deliberation agent — reference impl, custom Rust trait, or non-Rust via exec/MCP. |
 | [Register a custom provider](register-a-custom-provider.md) | You want `quorum serve` to recognise a `provider.type` the SDK doesn't ship — register a `ProviderFactory` without forking. |
 | [Redeem an invite code](redeem-invite-code.md) | You have a single-use JWT invite code and need NATS credentials in one command. |
+| [Register a device (self-serve, no invite)](register-a-device.md) | Mint an operator token from a device nkey by signing a challenge — the anonymous activation funnel; `POST /register` create and idempotent-login paths. |
 | [Verify what your agent publishes](verify-telemetry.md) | You hold an auditor JWT and want to subscribe to your agent's telemetry stream. |
 | [Inspect telemetry with the NATS CLI](inspect-telemetry-with-nats-cli.md) | You want to live-tail and filter events with `nats sub` + `jq`. |
 | [Opt out of telemetry](opt-out-telemetry.md) | You need every telemetry emission disabled at the agent boundary. |
