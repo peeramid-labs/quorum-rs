@@ -17,6 +17,7 @@ use crate::agents::{
     PersistenceStore, ProposalRecord, UserToolHandlerTrait,
 };
 use crate::nats_utils::{NatsAuth, connect_nats, ensure_kv_bucket, sanitize_subject_component};
+use crate::providers::{Availability, ModelAvailability};
 use crate::status::{SharedAgentStatus, TaskLogEntry, new_shared_status};
 use crate::telemetry::{TaskFailureClass, TelemetryEmitterMux};
 
@@ -452,6 +453,15 @@ pub struct NatsNsedWorker {
     /// is gone (→ bench). Defaults to [`HeuristicModelDownDetector`]; override
     /// via [`NatsNsedWorker::with_model_down_detector`].
     model_down_detector: Arc<dyn ModelDownDetector>,
+    /// Optional proactive availability probe over the provider's model catalog.
+    /// When set, the agent periodically checks whether its own model is still
+    /// listed and benches itself (arms `model_down`) BEFORE a task fails — the
+    /// proactive complement to the reactive [`model_down_detector`]. `None` =
+    /// reactive-only (default). Wire via [`NatsNsedWorker::with_model_availability`].
+    model_availability: Option<Arc<ModelAvailability>>,
+    /// Epoch-ms of the last proactive availability probe, throttling it to the
+    /// probe interval regardless of the (faster) heartbeat cadence.
+    last_availability_probe_ms: Arc<AtomicU64>,
     /// Optional telemetry emitter for recording LLM call metrics.
     telemetry: Option<TelemetryEmitterMux>,
     /// Agent middleware pipelines, built from `agent_config.middleware`.
@@ -594,6 +604,8 @@ impl NatsNsedWorker {
             model_down_until_ms: Arc::new(AtomicU64::new(0)),
             model_down_strikes: Arc::new(AtomicU64::new(0)),
             model_down_detector: Arc::new(HeuristicModelDownDetector),
+            model_availability: None,
+            last_availability_probe_ms: Arc::new(AtomicU64::new(0)),
             telemetry,
             before_prompt_mw,
             provider_response_mw,
@@ -620,6 +632,63 @@ impl NatsNsedWorker {
     pub fn with_model_down_detector(mut self, detector: Arc<dyn ModelDownDetector>) -> Self {
         self.model_down_detector = detector;
         self
+    }
+
+    /// Enable proactive model-availability self-benching: the agent periodically
+    /// checks its own model against the provider catalog via `probe` and arms
+    /// `model_down` if the model is no longer listed — before a task fails.
+    /// Without this, model-down is detected only reactively on a failed task.
+    pub fn with_model_availability(mut self, probe: Arc<ModelAvailability>) -> Self {
+        self.model_availability = Some(probe);
+        self
+    }
+
+    /// Interval between proactive availability probes (throttles the check that
+    /// rides the faster heartbeat tick).
+    const AVAILABILITY_PROBE_INTERVAL_MS: u64 = 300_000; // 5 min
+
+    /// Proactively check whether this agent's own model is still in the provider
+    /// catalog and self-bench (arm `model_down`) if not. Throttled to
+    /// [`Self::AVAILABILITY_PROBE_INTERVAL_MS`]; a no-op when no probe is wired.
+    /// Fail-open: an `Unknown` verdict (fetch failed / provider not covered)
+    /// never benches. Returns `true` if it armed model_down this call.
+    async fn maybe_probe_model_availability(&self) -> bool {
+        let Some(probe) = self.model_availability.as_ref() else {
+            return false;
+        };
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        if !availability_probe_due(
+            self.last_availability_probe_ms.load(Ordering::Relaxed),
+            now,
+            Self::AVAILABILITY_PROBE_INTERVAL_MS,
+        ) {
+            return false;
+        }
+        self.last_availability_probe_ms
+            .store(now, Ordering::Relaxed);
+        if let Err(e) = probe.refresh().await {
+            // Fail-open: keep serving on a catalog fetch error.
+            warn!(agent_id = %self.agent_id, error = %e, "model-availability probe refresh failed — keeping agent up");
+            return false;
+        }
+        if probe.is_available(
+            &self.agent_config.provider_id,
+            &self.agent_config.model_name,
+        ) == Availability::Unavailable
+        {
+            let strikes = self.model_down_strikes.fetch_add(1, Ordering::Relaxed) + 1;
+            let cooldown = escalated_cooldown_ms(strikes);
+            let until = now + cooldown;
+            self.model_down_until_ms.store(until, Ordering::Relaxed);
+            warn!(
+                agent_id = %self.agent_id,
+                model = %self.agent_config.model_name,
+                cooldown_secs = cooldown / 1000,
+                "Model absent from provider catalog — self-benching (proactive) until cooldown expires"
+            );
+            return true;
+        }
+        false
     }
 
     /// Install a [`SigningHook`] with an explicit [`AgentKeyPair`](crate::crypto::AgentKeyPair).
@@ -1008,6 +1077,7 @@ impl NatsNsedWorker {
                     }
                 }
                 _ = heartbeat_interval.tick() => {
+                    self.maybe_probe_model_availability().await;
                     self.publish_heartbeat().await;
                 }
                 _ = drain_interval.tick() => {
@@ -2587,6 +2657,8 @@ impl Clone for NatsNsedWorker {
             model_down_until_ms: self.model_down_until_ms.clone(),
             model_down_strikes: self.model_down_strikes.clone(),
             model_down_detector: self.model_down_detector.clone(),
+            model_availability: self.model_availability.clone(),
+            last_availability_probe_ms: self.last_availability_probe_ms.clone(),
             telemetry: self.telemetry.clone(),
             before_prompt_mw: self.before_prompt_mw.clone(),
             provider_response_mw: self.provider_response_mw.clone(),
@@ -3003,6 +3075,13 @@ impl ModelDownDetector for HeuristicModelDownDetector {
 /// deadline, after which the agent is eligible again.
 fn model_down_active(until_ms: u64, now_ms: u64) -> bool {
     until_ms != 0 && now_ms < until_ms
+}
+
+/// Whether a proactive availability probe is due: either never run
+/// (`last_ms == 0`) or `interval_ms` has elapsed since the last one. Throttles
+/// the check so it runs on its own cadence, not on every (faster) heartbeat.
+fn availability_probe_due(last_ms: u64, now_ms: u64, interval_ms: u64) -> bool {
+    last_ms == 0 || now_ms.saturating_sub(last_ms) >= interval_ms
 }
 
 fn classify_abstention_reason(err: &str) -> String {
@@ -7559,6 +7638,18 @@ mod tests {
         }
         let d: Arc<dyn ModelDownDetector> = Arc::new(AlwaysDown);
         assert!(d.is_model_down("anything"));
+    }
+
+    #[test]
+    fn availability_probe_due_throttles_to_the_interval() {
+        // Never probed → due immediately.
+        assert!(availability_probe_due(0, 1_000, 300_000));
+        // Within the interval → not due.
+        assert!(!availability_probe_due(1_000, 1_500, 300_000));
+        // Interval elapsed → due again.
+        assert!(availability_probe_due(1_000, 301_000, 300_000));
+        // Exactly at the boundary → due.
+        assert!(availability_probe_due(1_000, 301_000, 300_000));
     }
 
     #[test]

@@ -35,6 +35,8 @@ pub mod builtins;
 /// provider) can reuse the exact spawn/timeout plumbing the built-in
 /// `exec` / `mcp` providers use, instead of reimplementing it.
 pub mod cli_base;
+pub mod model_availability;
+pub use model_availability::{Availability, ModelAvailability};
 
 use std::collections::HashMap;
 use std::sync::Arc;
