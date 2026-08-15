@@ -214,6 +214,53 @@ pub fn extract_xml_tool_calls(
     calls
 }
 
+/// Parse the `[round], <id>` argument shape shared by `read_proposal`
+/// (`id_key = "agent_id"`) and `read_critiques` (`id_key = "target_agent_id"`).
+/// JSON object args win verbatim; otherwise `key=value` kwargs are inserted as
+/// typed values and bare positionals map to `round` (when numeric first) + the
+/// id key. The only difference between the two tools is `id_key`.
+fn parse_round_and_id_args(
+    args_str: &str,
+    id_key: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut arguments = serde_json::Map::new();
+    if args_str.trim().starts_with('{')
+        && let Ok(serde_json::Value::Object(map)) = serde_json::from_str(args_str)
+    {
+        arguments = map;
+    }
+    if arguments.is_empty() {
+        let parts = split_args_respecting_brackets(args_str);
+        let mut positional_args = Vec::new();
+        for part in &parts {
+            if let Some((key, raw_value)) = part.split_once('=') {
+                let key = key.trim();
+                let kw_value = raw_value.trim().trim_matches(|c| c == '"' || c == '\'');
+                if let Ok(num) = kw_value.parse::<u32>() {
+                    arguments.insert(key.to_string(), serde_json::json!(num));
+                } else {
+                    arguments.insert(key.to_string(), serde_json::json!(kw_value));
+                }
+            } else {
+                positional_args.push(part.trim());
+            }
+        }
+        if !positional_args.is_empty() {
+            if positional_args.len() >= 2 {
+                if let Ok(round_num) = positional_args[0].parse::<u32>() {
+                    arguments.insert("round".to_string(), serde_json::json!(round_num));
+                }
+                let id_val = positional_args[1].trim_matches(|c| c == '"' || c == '\'');
+                arguments.insert(id_key.to_string(), serde_json::json!(id_val));
+            } else if positional_args.len() == 1 {
+                let single_id = positional_args[0].trim_matches(|c| c == '"' || c == '\'');
+                arguments.insert(id_key.to_string(), serde_json::json!(single_id));
+            }
+        }
+    }
+    arguments
+}
+
 /// Extracts Python-style function calls (e.g., `func(arg="val")`) from a text block.
 ///
 /// This handles:
@@ -313,93 +360,9 @@ pub fn extract_python_tool_calls(
             let mut arguments = serde_json::Map::new();
             // This handles: read_proposal({"round": 1, "agent_id": "Xue"})
             if name == "read_proposal" {
-                if args_str.trim().starts_with('{')
-                    && let Ok(serde_json::Value::Object(map)) = serde_json::from_str(args_str)
-                {
-                    arguments = map;
-                }
-                if arguments.is_empty() {
-                    // Expected: [round], agent_id OR agent_id=..., round=...
-                    let parts = split_args_respecting_brackets(args_str);
-
-                    // Handle keyword arguments (key=value) first
-                    let mut positional_args = Vec::new();
-                    for part in &parts {
-                        if let Some((key, val)) = part.split_once('=') {
-                            let key = key.trim();
-                            let val = val.trim().trim_matches(|c| c == '"' || c == '\'');
-                            if let Ok(num) = val.parse::<u32>() {
-                                arguments.insert(key.to_string(), serde_json::json!(num));
-                            } else {
-                                arguments.insert(key.to_string(), serde_json::json!(val));
-                            }
-                        } else {
-                            positional_args.push(part.trim());
-                        }
-                    }
-
-                    // If positional args exist, map them
-                    if !positional_args.is_empty() {
-                        // Case 1: round, agent_id (2 args)
-                        if positional_args.len() >= 2 {
-                            if let Ok(r) = positional_args[0].parse::<u32>() {
-                                arguments.insert("round".to_string(), serde_json::json!(r));
-                            }
-                            let agent_id =
-                                positional_args[1].trim_matches(|c| c == '"' || c == '\'');
-                            arguments.insert("agent_id".to_string(), serde_json::json!(agent_id));
-                        }
-                        // Case 2: agent_id only (1 arg) - assumes default round
-                        else if positional_args.len() == 1 {
-                            let val = positional_args[0].trim_matches(|c| c == '"' || c == '\'');
-                            // Heuristic: if it's a number, it's a round? No, round alone makes no sense. Must be agent_id.
-                            // Unless it's `read_proposal(1)`? But schema requires agent_id.
-                            // Let's assume single arg is agent_id.
-                            arguments.insert("agent_id".to_string(), serde_json::json!(val));
-                        }
-                    }
-                }
+                arguments = parse_round_and_id_args(args_str, "agent_id");
             } else if name == "read_critiques" {
-                // Same logic as read_proposal: try JSON first, fall back to positional only if empty
-                if args_str.trim().starts_with('{')
-                    && let Ok(serde_json::Value::Object(map)) = serde_json::from_str(args_str)
-                {
-                    arguments = map;
-                }
-                if arguments.is_empty() {
-                    let parts = split_args_respecting_brackets(args_str);
-                    let mut positional_args = Vec::new();
-                    for part in &parts {
-                        if let Some((key, val)) = part.split_once('=') {
-                            let key = key.trim();
-                            let val = val.trim().trim_matches(|c| c == '"' || c == '\'');
-                            if let Ok(num) = val.parse::<u32>() {
-                                arguments.insert(key.to_string(), serde_json::json!(num));
-                            } else {
-                                arguments.insert(key.to_string(), serde_json::json!(val));
-                            }
-                        } else {
-                            positional_args.push(part.trim());
-                        }
-                    }
-
-                    if !positional_args.is_empty() {
-                        if positional_args.len() >= 2 {
-                            if let Ok(r) = positional_args[0].parse::<u32>() {
-                                arguments.insert("round".to_string(), serde_json::json!(r));
-                            }
-                            let target_id =
-                                positional_args[1].trim_matches(|c| c == '"' || c == '\'');
-                            arguments.insert(
-                                "target_agent_id".to_string(),
-                                serde_json::json!(target_id),
-                            );
-                        } else if positional_args.len() == 1 {
-                            let val = positional_args[0].trim_matches(|c| c == '"' || c == '\'');
-                            arguments.insert("target_agent_id".to_string(), serde_json::json!(val));
-                        }
-                    }
-                } // end if arguments.is_empty()
+                arguments = parse_round_and_id_args(args_str, "target_agent_id");
             } else if name == "read_own_proposal" {
                 // No mandatory args
             } else if name == "submit_proposal"

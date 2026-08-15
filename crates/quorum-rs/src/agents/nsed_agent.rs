@@ -932,7 +932,8 @@ impl ProposerEvaluatorAgent {
 
         // Automatically inject Context Tools if store is available
         if let Some(store) = &context.store {
-            let read_tool = ReadProposalTool::new(store.clone(), context.round_number);
+            let read_tool = ReadProposalTool::new(store.clone(), context.round_number)
+                .with_candidates(context.candidates.clone());
             all_tools.push(Box::new(read_tool));
 
             let critiques_tool = ReadCritiquesTool::new(store.clone(), context.round_number);
@@ -945,7 +946,8 @@ impl ProposerEvaluatorAgent {
             );
             all_tools.push(Box::new(own_tool));
 
-            let search_tool = SearchDeliberationTool::new(store.clone(), context.round_number);
+            let search_tool = SearchDeliberationTool::new(store.clone(), context.round_number)
+                .with_candidates(context.candidates.clone());
             all_tools.push(Box::new(search_tool));
 
             debug!(agent=%self.config.name, "Injected NSED protocol tools (read_proposal, search_deliberation, etc.) via persistent store.");
