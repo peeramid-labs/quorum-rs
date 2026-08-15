@@ -1,4 +1,9 @@
-# Agent development guide
+---
+title: Develop own agent
+order: 9
+tagline: Build a deliberation agent in Rust and connect it to a quorum-rs orchestrator.
+---
+# Develop own agent
 
 How to build a deliberation agent in Rust and connect it to a quorum-rs orchestrator.
 

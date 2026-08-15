@@ -1,4 +1,9 @@
-# Compose a persona from shared files
+---
+title: Compose persona
+order: 7
+tagline: Build an agent persona from reusable stacked layers of shared markdown prompt files.
+---
+# Compose persona
 
 > Recipe for fleet operators who want a single persona text built
 > from reusable building blocks: a domain preamble, a
@@ -24,7 +29,7 @@ prompt.
 
 ### 1. Lay out shared prompt files next to `quorum.yml`
 
-```
+```text
 agents/
   quorum.yml
   prompts/
@@ -54,7 +59,7 @@ agents:
 
 Layers run top-to-bottom. The final persona string is:
 
-```
+```text
 <contents of review-style.md>
 
 Focus on memory-safety issues specifically.
@@ -66,7 +71,7 @@ Focus on memory-safety issues specifically.
 
 ### 3. Boot the fleet
 
-```
+```bash
 quorum serve --config ./quorum.yml
 ```
 

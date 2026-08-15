@@ -1,4 +1,9 @@
-# Thread TUI reference
+---
+title: Thread TUI ref
+order: 10
+tagline: Keys, line formats, and persisted data model of the quorum thread TUI.
+---
+# Thread TUI ref
 
 Authoritative surface of the `quorum` thread TUI: keys per screen, line
 formats, and the persisted data model. Task-oriented usage is in
@@ -95,7 +100,7 @@ Reader order: each thread **root is pinned at the top** (oldest first), then its
 descendants **newest-first** below, with every fork's subtree grouped and
 indented. Reader row (one line collapsed):
 
-```
+```text
 {mark} {fold} [MM-DD HH:MM] {role}  {indent}{preview}{  ⑂N}{  ↳ re: parent}{  (^D)}
 ```
 

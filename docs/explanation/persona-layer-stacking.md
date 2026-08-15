@@ -1,4 +1,10 @@
-# Why persona layer stacking, and why CWD-relative paths
+---
+title: Persona layer stacking
+order: 7
+tagline: Why personas stack in layers and why md paths resolve against process CWD.
+---
+
+# Persona layer stacking
 
 > Design rationale for the layered-persona feature on `quorum.yml`.
 > Covers why the layered shape exists, why files are read at

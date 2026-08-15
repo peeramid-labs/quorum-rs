@@ -1,4 +1,10 @@
-# About the provider registry
+---
+title: Provider registry
+order: 5
+tagline: Why providers are a registry of factories a third-party crate can extend without forking.
+---
+
+# Provider registry
 
 Why agent providers are a registry of factories rather than a hard-coded `match`, and what that buys a third-party crate.
 

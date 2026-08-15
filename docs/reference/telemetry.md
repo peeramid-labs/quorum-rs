@@ -1,10 +1,15 @@
-# Telemetry event catalog — `quorum-rs`
+---
+title: Telemetry catalog
+order: 5
+tagline: Every event type published by quorum-rs telemetry, with fields and redaction rules.
+---
+# Telemetry catalog
 
 Every event type published by `quorum-rs::telemetry`.
 
 ## Subject layout
 
-```
+```text
 telemetry.agent.{agent_id}.{event_type}
 ```
 

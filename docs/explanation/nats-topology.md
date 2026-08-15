@@ -1,4 +1,10 @@
-# **NSED System Architecture & NATS Topology**
+---
+title: "Architecture & NATS"
+order: 1
+tagline: How NSED uses NATS JetStream for orchestration, task distribution, and state.
+---
+
+# Architecture & NATS
 
 This document outlines the event-driven architecture used in the NSED system, focusing on how NATS JetStream is used for orchestration, task distribution, and state management.
 
@@ -29,17 +35,17 @@ The system is built around a "Hub-and-Spoke" model where **NATS JetStream** acts
 The subject structure follows a base pattern with variations by message type:
 
 **Task messages** (5 segments):
-```
+```text
 {prefix}.{session}.task.{agent}.{action}
 ```
 
 **Result messages** (6 segments — includes round number):
-```
+```text
 {prefix}.{session}.result.{round}.{agent}.{action}
 ```
 
 **Event messages** (5 segments):
-```
+```text
 {prefix}.{session}.result.event.{type}
 ```
 
@@ -185,7 +191,7 @@ The system uses a **two-layer** strategy for Job ID / Room ID safety:
 
 The SSE (Server-Sent Events) handler in `crates/the orchestrator/src/handlers/stream.rs` subscribes to **Core NATS** (not JetStream) on the subject pattern:
 
-```
+```text
 nsed.{job_id}.result.event.>
 ```
 

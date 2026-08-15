@@ -1,4 +1,10 @@
-# About `compact_history` and scratchpad squeeze
+---
+title: Compact history
+order: 11
+tagline: Why agents fold older tool results into a summary to survive context-window pressure.
+---
+
+# Compact history
 
 Why agents get a self-driven mechanism to fold older tool results
 into a shorter form, and what trade-offs the design accepts.
@@ -34,7 +40,7 @@ plus a paired scratchpad squeeze that runs alongside it.
 
 ## What the tool does
 
-```
+```text
 compact_history(keep_last_n_calls: int = compact_history_default_keep)
 ```
 

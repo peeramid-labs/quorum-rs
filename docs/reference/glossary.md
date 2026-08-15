@@ -1,3 +1,8 @@
+---
+title: Glossary
+order: 1
+tagline: Key terms used across the NSED documentation and CLI output.
+---
 # Glossary
 
 Key terms used across the NSED documentation and CLI output.

@@ -1,4 +1,10 @@
-# About agent telemetry design
+---
+title: Telemetry design
+order: 15
+tagline: Why agent telemetry is metrics-only, fire-and-forget, with deterministic trace ids.
+---
+
+# Telemetry design
 
 Why the agent telemetry system works the way it does.
 
@@ -55,7 +61,7 @@ gantt
     kv write            :175, 180
 ```
 
-```
+```text
 duration_ms = dispatch_delay + queue_wait
             + Σ llm_request.latency_ms   (includes HITL regeneration cycles)
             + Σ tool_call.latency_ms

@@ -1,4 +1,10 @@
-# Agent Middleware System
+---
+title: Middleware
+order: 6
+tagline: The pluggable pipeline for validation, transformation, and moderation at agent lifecycle points.
+---
+
+# Middleware
 
 NSED agents support a pluggable middleware system for validation, transformation, and moderation at key lifecycle points. Middleware runs as a sequential pipeline — each middleware sees the (potentially transformed) output of the previous one.
 
@@ -146,6 +152,14 @@ int32_t nsed_middleware_execute(
 );
 // Return: 0 = success, 1 = block, -1 = error
 ```
+
+**Fail-closed loading.** If a configured middleware cannot be built — a dylib
+that won't load or resolve `nsed_middleware_execute`, or a builtin that fails to
+construct — agent startup **aborts** rather than silently running without the
+guard. A moderation or validation stage you configured can never be quietly
+dropped because of a load error: either it is in the pipeline, or the agent
+doesn't start. (Fail-open loading would silently disable exactly the guard you
+asked for, at the moment it's most likely to matter.)
 
 ### Example: Rust cdylib
 

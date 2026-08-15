@@ -1,4 +1,9 @@
-# How to verify what your agent publishes
+---
+title: Verify telemetry
+order: 14
+tagline: Subscribe to your agent's telemetry subtree to inspect the events it actually publishes.
+---
+# Verify telemetry
 
 Inspect the telemetry events your agent emits by subscribing to its telemetry subtree.
 

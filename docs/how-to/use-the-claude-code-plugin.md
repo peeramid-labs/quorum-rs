@@ -1,4 +1,9 @@
-# Use the Claude Code plugin
+---
+title: Use Claude Code plugin
+order: 6
+tagline: Expose every quorum lifecycle command as a slash command inside Claude Code.
+---
+# Use Claude Code plugin
 
 > Recipe for operators who want every quorum lifecycle step
 > (init / redeem / run / serve / status / trace / validate / tui)
@@ -41,7 +46,7 @@ slash command fails before talking to the orchestrator.
 
 In Claude Code:
 
-```
+```text
 /plugin marketplace add peeramid-labs/plugin-marketplace
 /plugin install quorum
 ```
@@ -53,7 +58,7 @@ quorum plugin sits under `quorum/` in that repo. After install,
 
 ### 3. Run through a first deployment
 
-```
+```text
 /quorum:init
 ```
 
@@ -72,19 +77,19 @@ What Claude does behind the prompt:
 
 Then if the operator has an invite code:
 
-```
+```text
 /quorum:redeem <eyJhbGc...>
 ```
 
 Then to dispatch:
 
-```
+```text
 /quorum:run "Pick the best strategy for X under constraint Y"
 ```
 
 Or to bring up an agent fleet:
 
-```
+```text
 /quorum:serve
 ```
 

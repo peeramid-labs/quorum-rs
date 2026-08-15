@@ -1,3 +1,8 @@
+---
+title: Use the thread TUI
+order: 5
+tagline: Hold a branching, email-style conversation whose replies are quorum deliberations.
+---
 # Use the thread TUI
 
 > Recipe for holding a branching, email-style conversation with a
@@ -43,7 +48,7 @@ see the latest exchange without opening it.
 
 Messages are newest-on-top, one collapsed line each:
 
-```
+```text
 ▸▾ [07-07 13:42] [noosphera] here's the summary…  ⑂2  ↳ re: what changed?
 ```
 

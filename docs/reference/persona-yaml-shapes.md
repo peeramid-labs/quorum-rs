@@ -1,4 +1,9 @@
-# `persona` yaml shapes
+---
+title: persona yaml shapes
+order: 9
+tagline: The two shapes the persona field on an agent entry accepts.
+---
+# persona yaml shapes
 
 > Reference for the two shapes the `persona:` field on an agent
 > entry accepts. The runtime always sees a single resolved

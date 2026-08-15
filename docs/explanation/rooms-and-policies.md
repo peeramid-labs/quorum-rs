@@ -1,4 +1,10 @@
-# Understanding rooms and policies
+---
+title: "Rooms & policies"
+order: 3
+tagline: Why a policy (who deliberates and how) is orthogonal to a room (who can watch).
+---
+
+# Rooms & policies
 
 This is an *explanation* document. It exists to help you build a correct mental
 model of two concepts that are constantly confused in NSED: the **room** and the

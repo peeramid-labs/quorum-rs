@@ -1,4 +1,10 @@
-# Policy-as-model and the chat session
+---
+title: "Policy & sessions"
+order: 4
+tagline: Why the interactive client treats policy as the model and the session as the thread.
+---
+
+# Policy & sessions
 
 This is an *explanation* document — the reasoning behind how the interactive
 client models a conversation. Its companion,

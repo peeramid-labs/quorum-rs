@@ -1,4 +1,10 @@
-# About the sandboxed `read_file` tool
+---
+title: read_file sandbox
+order: 9
+tagline: Why HTTP-only agents get a sandboxed, read-only file tool scoped to operator roots.
+---
+
+# read_file sandbox
 
 Why agents that lack a native filesystem affordance get a
 configurable, sandboxed read path, and what the sandbox does and
@@ -127,7 +133,7 @@ layer is faster than discovering it post-mortem.
 Every call emits a single `tracing::info!` line at the agent
 binary's log level:
 
-```
+```text
 agent=ResearchBot tool=read_file path=docs/topic.md bytes=4216 truncated=false result=ok
 agent=ResearchBot tool=read_file path=docs/big.md bytes=65536 truncated=true result=ok
 agent=ResearchBot tool=read_file path=docs/somedir bytes=0 result=denied

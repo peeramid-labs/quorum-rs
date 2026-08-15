@@ -1,4 +1,9 @@
-# How to dump outgoing prompts for token-efficiency analysis
+---
+title: Dump prompts
+order: 12
+tagline: Capture each agent's exact model payload to hunt prompt bloat, with no config change or rebuild.
+---
+# Dump prompts
 
 Capture the exact payload each agent sends to its model — to find prompt bloat,
 redundant context, or oversized system prompts — without changing any provider

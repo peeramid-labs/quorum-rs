@@ -1,4 +1,10 @@
-# About the agent working-directory override
+---
+title: Working dir override
+order: 8
+tagline: How a before_prompt middleware picks the directory an agent's subprocess runs in.
+---
+
+# Working dir override
 
 How a middleware can choose the directory an agent's subprocess runs in, and what a
 custom agent should do with it. This is a generic SDK feature — it knows nothing

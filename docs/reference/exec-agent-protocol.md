@@ -1,4 +1,9 @@
-# Exec Agent Protocol
+---
+title: Exec agent protocol
+order: 3
+tagline: Bridge protocol for external stdin/stdout subprocesses to act as NSED deliberation agents.
+---
+# Exec agent protocol
 
 The exec provider enables external processes (Python, TypeScript, shell scripts, etc.) to participate as NSED deliberation agents without speaking NATS or implementing Rust traits. The Rust `ExecAgent` acts as a bridge: it receives tasks from NATS, spawns the subprocess, feeds it JSON via stdin, reads the response from stdout, and publishes results back to NATS.
 
