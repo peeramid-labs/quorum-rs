@@ -1,4 +1,10 @@
-# How to register a device (self-serve, no invite)
+---
+title: Register a device
+order: 2
+tagline: Mint an operator token from a device key pair — self-serve, no invite code or admin needed.
+---
+
+# Register a device
 
 Mint an operator token from a device key pair — no invite code, no admin. The
 caller proves possession of a NATS **user** nkey by signing a domain-separated

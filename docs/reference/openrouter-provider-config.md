@@ -1,4 +1,10 @@
-# `openrouter` agent-config block
+---
+title: openrouter config
+order: 8
+tagline: Fields of the openrouter agent-config block for provider routing, ZDR, and web search.
+---
+
+# openrouter config
 
 Reference for the `openrouter:` block in an agent's configuration. It carries
 OpenRouter-specific request extensions — provider routing, Zero-Data-Retention,
