@@ -14,6 +14,7 @@ Read these away from the keyboard when you want to understand a design decision 
 | [About model-down benching](model-down-benching.md) | How an agent whose remote model 404s benches itself from scheduling, why the bench escalates with consecutive strikes, and why a successful task resets it. |
 | [NATS topology](nats-topology.md) | Subjects, JetStream streams, JWT scopes, dispatch model. |
 | [Middleware system](middleware.md) | Pluggable validation/moderation pipeline and the design rationale behind it. |
+| [Claim-citation grounding](claim-citation-grounding.md) | Why evaluator claims quote verbatim, how resolution tolerates model wrappers, what the cite matches against (the shown thought window), and why the MCP path rejects-and-retries while exec is non-destructive. |
 | [Agent working-directory override](agent-working-directory.md) | Why `AgentContext.working_dir_override` exists, how a `before_prompt` middleware sets it via `agent_working_dir`, and what a custom agent must do with it. |
 | [About telemetry design](telemetry-design.md) | Principles, trace correlation, retention, and what is intentionally *not* emitted. |
 | [About scoped `read_file`](scoped-read-file.md) | Sandbox semantics for non-Claude agents reading from configured roots. |

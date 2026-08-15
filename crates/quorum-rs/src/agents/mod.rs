@@ -1,3 +1,4 @@
+pub mod cite;
 pub mod claude_recovery;
 pub mod config;
 pub mod exec_agent;
@@ -376,8 +377,14 @@ pub struct ClaimAssessment {
     /// Models frequently hallucinate "content", "text", "description", or "summary"
     /// instead of "claim". Some models omit the claim text entirely when using
     /// claim_id references, so we default to empty string.
+    // `cite` / `quote` are the explicit agent-facing tool field names for the same
+    // internal `claim` — the evaluator quotes the proposal span; it is resolved and
+    // substituted with the exact proposal substring (see [`cite::resolve_cite`]),
+    // so the internal API is unchanged.
     #[serde(
         default,
+        alias = "cite",
+        alias = "quote",
         alias = "content",
         alias = "text",
         alias = "claim_text",

@@ -68,8 +68,23 @@ pub struct McpClaimAssessment {
     /// Stable claim ID for cross-round tracking (6-char hex).
     #[serde(default)]
     pub claim_id: Option<String>,
-    /// The claim being assessed.
-    #[serde(default, alias = "content", alias = "text", alias = "claim_text")]
+    /// The claim, quoted VERBATIM from the proposal — an exact, character-for-
+    /// character substring. Copy-paste the span; do NOT paraphrase. Common quote
+    /// wrappers (`"…"`, `> …`, `` `…` ``, `Label: "…"`) are tolerated and stripped,
+    /// and the quote is resolved + replaced with the exact proposal substring so
+    /// the client can locate it. A quote that matches NO span of the proposal is
+    /// rejected — you must re-quote before the evaluation is accepted.
+    // Agent-facing name is `cite`; the internal field stays `claim` (rename only
+    // affects the tool schema/wire name). `claim`/`quote`/… still accepted.
+    #[serde(
+        rename = "cite",
+        default,
+        alias = "claim",
+        alias = "quote",
+        alias = "content",
+        alias = "text",
+        alias = "claim_text"
+    )]
     pub claim: String,
     /// Verdict: "verified", "contested", "unverified", or "wrong".
     pub verdict: String,
@@ -248,3 +263,32 @@ impl Serialize for McpCategoryScores {
 
 // ExecEvaluationResponse/ExecEvaluationItem live in exec_agent.rs with full
 // Evaluation fields via #[serde(flatten)]. Do not duplicate here.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claim_assessment_accepts_cite_quote_and_legacy_names() {
+        // Agent-facing field is `cite`; legacy `claim`/`quote`/`content` still
+        // deserialize into the same internal `claim` field.
+        for key in ["cite", "quote", "claim", "content", "text"] {
+            let json = format!(r#"{{"{key}":"sorts in O(n log n)","verdict":"verified"}}"#);
+            let a: McpClaimAssessment =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("{key}: {e}"));
+            assert_eq!(a.claim, "sorts in O(n log n)", "via {key}");
+        }
+    }
+
+    #[test]
+    fn tool_schema_exposes_cite_not_claim() {
+        // The generated JSON schema (what the agent sees) must advertise `cite`.
+        let schema = schemars::schema_for!(McpClaimAssessment);
+        let s = serde_json::to_string(&schema).unwrap();
+        assert!(s.contains("\"cite\""), "schema must expose `cite`: {s}");
+        assert!(
+            !s.contains("\"claim\":{"),
+            "schema property should be `cite`, not `claim`"
+        );
+    }
+}
