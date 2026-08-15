@@ -290,9 +290,23 @@ pub async fn build_worker(
     // but no handler is built, so `McpAgent::user_tools` stays empty and the agent never
     // sees them. `nsed_worker.rs` wires this; the fleet `serve` path did not — the gap that
     // kept `mcp__nsed__user_ask_user` off the claude agents.
-    let worker = NatsNsedWorker::from_dyn_agent(agent, agent_config.clone(), worker_config, None)
-        .await?
-        .with_user_tool_factory(Arc::new(crate::agents::NatsUserToolHandlerFactory));
+    let mut worker =
+        NatsNsedWorker::from_dyn_agent(agent, agent_config.clone(), worker_config, None)
+            .await?
+            .with_user_tool_factory(Arc::new(crate::agents::NatsUserToolHandlerFactory));
+    // Proactive model-availability self-bench: when the provider exposes an
+    // OpenAI-compatible model catalog (it has a base_url), poll it so the agent
+    // benches itself if its pinned model leaves the catalog — before a task
+    // fails. Providers without a base_url (subprocess exec/mcp agents) get no
+    // probe and rely on the reactive detector only.
+    let base = provider.base_url.trim_end_matches('/');
+    if !base.is_empty() {
+        let probe = crate::providers::ModelAvailability::new(
+            format!("{base}/models"),
+            agent_config.provider_id.clone(),
+        );
+        worker = worker.with_model_availability(Arc::new(probe));
+    }
     Ok(Some((worker, agent_config)))
 }
 
