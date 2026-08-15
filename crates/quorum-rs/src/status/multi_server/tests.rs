@@ -69,6 +69,7 @@ fn test_state() -> MultiAppState {
         response_sla_secs: Arc::new(AtomicU64::new(10)),
         buffer_floor_pct: Arc::new(AtomicU64::new(0)),
         before_release_middleware: None,
+        auth_token: None,
     }
 }
 
@@ -263,6 +264,7 @@ async fn list_agents_empty_state() {
         response_sla_secs: Arc::new(AtomicU64::new(10)),
         buffer_floor_pct: Arc::new(AtomicU64::new(0)),
         before_release_middleware: None,
+        auth_token: None,
     };
     let app = build_router(state);
     let (status, body) = get_request(app, "/api/agents").await;
@@ -741,6 +743,7 @@ async fn default_sla_is_zero_when_no_buffers() {
         response_sla_secs: Arc::new(AtomicU64::new(0)),
         buffer_floor_pct: Arc::new(AtomicU64::new(0)),
         before_release_middleware: None,
+        auth_token: None,
     };
     let app = build_router(state);
     let (status, body) = get_request(app, "/api/config").await;
@@ -1875,6 +1878,7 @@ async fn auto_all_empty_state_returns_zero_count() {
         response_sla_secs: Arc::new(AtomicU64::new(10)),
         buffer_floor_pct: Arc::new(AtomicU64::new(0)),
         before_release_middleware: None,
+        auth_token: None,
     };
     let app = build_router(state);
     let (status, body) = put_json(app, "/api/agents/auto-all", r#"{"enabled": true}"#).await;
@@ -2837,4 +2841,130 @@ async fn agent_diagnostics_endpoint_serves_metrics_and_404s_unknown() {
     let app2 = build_router(test_state());
     let (status, _) = get_request(app2, "/api/agents/NOPE/diagnostics").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// -----------------------------------------------------------------------
+// Control-plane bearer auth
+// -----------------------------------------------------------------------
+
+/// Build a test state whose `/api/*` control plane is guarded by `token`.
+fn test_state_with_token(token: &str) -> MultiAppState {
+    let mut state = test_state();
+    state.auth_token = Some(Arc::from(token));
+    state
+}
+
+/// Helper: drive a request through the router and decode the response body.
+async fn send_request(app: Router, req: axum::http::Request<Body>) -> (StatusCode, String) {
+    let resp = match app.oneshot(req).await {
+        Ok(resp) => resp,
+        Err(err) => panic!("router is infallible: {err}"),
+    };
+    let status = resp.status();
+    let bytes = match resp.into_body().collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(err) => panic!("body collects: {err}"),
+    };
+    let body = match String::from_utf8(bytes.to_vec()) {
+        Ok(text) => text,
+        Err(err) => panic!("body is valid utf8: {err}"),
+    };
+    (status, body)
+}
+
+/// Helper: GET with an `Authorization: Bearer <token>` header. Reuses the
+/// shared `send_request` sender so response handling stays in one place.
+async fn get_with_bearer(app: Router, uri: &str, token: &str) -> (StatusCode, String) {
+    let req = match axum::http::Request::builder()
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+    {
+        Ok(req) => req,
+        Err(err) => panic!("request builds: {err}"),
+    };
+    send_request(app, req).await
+}
+
+#[tokio::test]
+async fn api_rejects_missing_token_when_auth_enabled() {
+    let app = build_router(test_state_with_token("s3cr3t"));
+    let (status, _) = get_request(app, "/api/agents").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn api_rejects_wrong_token_when_auth_enabled() {
+    let app = build_router(test_state_with_token("s3cr3t"));
+    let (status, _) = get_with_bearer(app, "/api/agents", "wrong").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn api_accepts_correct_token_when_auth_enabled() {
+    let app = build_router(test_state_with_token("s3cr3t"));
+    let (status, body) = get_with_bearer(app, "/api/agents", "s3cr3t").await;
+    assert_eq!(status, StatusCode::OK);
+    let agents: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(agents.len(), 2);
+}
+
+#[tokio::test]
+async fn api_passes_through_when_auth_disabled() {
+    let app = build_router(test_state());
+    let (status, _) = get_request(app, "/api/agents").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn dashboard_page_is_public_when_auth_enabled() {
+    let app = build_router(test_state_with_token("s3cr3t"));
+    let (status, _) = get_request(app, "/").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auth_status_reports_required_and_unauthenticated_without_token() {
+    let app = build_router(test_state_with_token("s3cr3t"));
+    let (status, body) = get_request(app, "/auth/status").await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["auth_required"], true);
+    assert_eq!(v["authenticated"], false);
+}
+
+#[tokio::test]
+async fn auth_status_reports_authenticated_with_valid_token() {
+    let app = build_router(test_state_with_token("s3cr3t"));
+    let (status, body) = get_with_bearer(app, "/auth/status", "s3cr3t").await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["auth_required"], true);
+    assert_eq!(v["authenticated"], true);
+}
+
+#[tokio::test]
+async fn auth_status_reports_not_required_when_auth_disabled() {
+    let app = build_router(test_state());
+    let (_, body) = get_request(app, "/auth/status").await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["auth_required"], false);
+    assert_eq!(v["authenticated"], true);
+}
+
+#[test]
+fn ct_eq_matches_only_identical_bytes() {
+    assert!(super::ct_eq(b"tok-1", b"tok-1"));
+    assert!(!super::ct_eq(b"tok-1", b"tok-2"));
+    assert!(!super::ct_eq(b"tok-1", b"tok"));
+}
+
+#[test]
+fn resolve_dashboard_token_treats_empty_as_absent() {
+    assert!(super::resolve_dashboard_token(None).is_none());
+    assert!(super::resolve_dashboard_token(Some(String::new())).is_none());
+    assert_eq!(
+        super::resolve_dashboard_token(Some("tok".into())).as_deref(),
+        Some("tok")
+    );
 }
