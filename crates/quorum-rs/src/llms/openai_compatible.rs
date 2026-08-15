@@ -330,9 +330,11 @@ impl AiModel for OpenAICompatibleModel {
                     // reaches logs/dumps.
                     LlmError::BadRequest { status: code, body }
                 } else {
-                    LlmError::Other(Box::new(std::io::Error::other(format!(
-                        "API request failed with status {status}"
-                    ))))
+                    // Any other non-2xx (401/403/404/422/…). Preserve the status
+                    // structurally (→ telemetry http_status) so a dead model id
+                    // (404) is distinguishable from auth (401); body withheld
+                    // from Display, recoverable via detail().
+                    LlmError::Api { status: code, body }
                 };
                 return Err(err);
             }
@@ -664,6 +666,155 @@ mod tests {
 
         let invalid_msg = "Some other error";
         assert_eq!(parse_vllm_context_error(invalid_msg), None);
+    }
+
+    // ---------------------------------------------------------------
+    // End-to-end error classification: drive `chat_completion` against a
+    // mocked OpenRouter that returns 4xx, asserting the exact terminal
+    // status→LlmError mapping. These are the surfaces behind the
+    // operator-visible "bad request (status 400)" (Corepunk19,
+    // upstage/solar-pro-2) and "other" (Corepunk18, ai21/jamba-large-1.7)
+    // deliberation failures — a model-specific request rejection whose
+    // real reason (the provider body) Display withholds.
+    // ---------------------------------------------------------------
+
+    fn hello_agent(name: &str, model: &str) -> AgentConfig {
+        AgentConfig {
+            name: name.to_string(),
+            model_name: model.to_string(),
+            use_streaming: false,
+            max_tokens: 64,
+            context_window: 8000,
+            response_sla_secs: 30,
+            ..Default::default()
+        }
+    }
+
+    fn hello_request() -> RequestConfig {
+        use async_openai::types::{
+            ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+        };
+        RequestConfig {
+            messages: vec![
+                ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Text("Hello".to_string()),
+                    ..Default::default()
+                }
+                .into(),
+            ],
+            tools: None,
+            tool_choice: None,
+            presence_penalty: None,
+        }
+    }
+
+    fn expect_err(r: Result<ChatCompletionResult, LlmError>) -> LlmError {
+        match r {
+            Ok(_) => panic!("expected an LlmError, got Ok"),
+            Err(e) => e,
+        }
+    }
+
+    async fn mock_status_body(status: u16, body: &str) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body.to_string()))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn chat_completion_plain_400_maps_to_bad_request_with_hidden_body() {
+        // upstage/solar-pro-2 (Corepunk19): a real 400 that is NOT a vLLM
+        // context overflow → BadRequest. The provider's reason is captured in
+        // `body` (exposed via detail()) but withheld from Display so it never
+        // reaches logs/dumps.
+        let body = r#"{"error":{"message":"model does not support the 'reasoning' parameter","code":400}}"#;
+        let server = mock_status_body(400, body).await;
+        let model = OpenAICompatibleModel::new(server.uri(), "test-key".to_string(), None);
+
+        let err = expect_err(
+            model
+                .chat_completion(
+                    &hello_agent("Corepunk19", "upstage/solar-pro-2"),
+                    hello_request(),
+                )
+                .await,
+        );
+
+        assert!(
+            matches!(&err, LlmError::BadRequest { status: 400, .. }),
+            "plain 400 must map to BadRequest, got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "bad request (status 400)",
+            "Display stays terse"
+        );
+        assert_eq!(
+            err.detail(),
+            Some(body),
+            "real reason recoverable via detail()"
+        );
+        assert_eq!(
+            err.classify(),
+            (crate::telemetry::LlmErrorClass::Other, Some(400))
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_404_maps_to_api_carrying_status() {
+        // ai21/jamba-large-1.7 (Corepunk18): a 404 model-unavailable — must keep
+        // the status, not collapse to opaque "other".
+        let body = r#"{"error":{"message":"No endpoints found for model"}}"#;
+        let server = mock_status_body(404, body).await;
+        let model = OpenAICompatibleModel::new(server.uri(), "test-key".to_string(), None);
+
+        let err = expect_err(
+            model
+                .chat_completion(
+                    &hello_agent("Corepunk18", "ai21/jamba-large-1.7"),
+                    hello_request(),
+                )
+                .await,
+        );
+
+        assert!(
+            matches!(&err, LlmError::Api { status: 404, .. }),
+            "404 must map to Api carrying the status, got {err:?}"
+        );
+        assert_eq!(err.to_string(), "api error (status 404)");
+        assert_eq!(err.detail(), Some(body), "reason recoverable via detail()");
+        assert_eq!(
+            err.classify(),
+            (crate::telemetry::LlmErrorClass::Other, Some(404))
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_401_maps_to_api() {
+        // Auth/permission (401) is also a non-400 4xx → Api, status preserved.
+        let server = mock_status_body(401, "unauthorized").await;
+        let model = OpenAICompatibleModel::new(server.uri(), "test-key".to_string(), None);
+
+        let err = expect_err(
+            model
+                .chat_completion(&hello_agent("agent", "some/model"), hello_request())
+                .await,
+        );
+
+        assert!(
+            matches!(&err, LlmError::Api { status: 401, .. }),
+            "401 must map to Api, got {err:?}"
+        );
+        assert_eq!(
+            err.classify(),
+            (crate::telemetry::LlmErrorClass::Other, Some(401))
+        );
     }
 
     // ---------------------------------------------------------------
