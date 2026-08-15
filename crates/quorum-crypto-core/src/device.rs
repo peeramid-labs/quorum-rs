@@ -130,4 +130,13 @@ mod tests {
         let account_seed = KeyPair::new_account().seed().unwrap();
         assert!(DeviceIdentity::from_seed(&account_seed).is_err());
     }
+
+    #[test]
+    fn from_seed_rejects_a_malformed_seed() {
+        // Garbage that isn't a parseable nkey seed → the KeyPair::from_seed error
+        // path (distinct from the valid-but-wrong-type rejection above).
+        assert!(DeviceIdentity::from_seed("not-a-seed").is_err());
+        assert!(DeviceIdentity::from_seed("").is_err());
+        assert!(DeviceIdentity::from_seed("SU").is_err());
+    }
 }
