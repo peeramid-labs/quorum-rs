@@ -915,6 +915,14 @@ pub struct AgentHeartbeat {
     pub status: AgentLiveStatus,
     pub model_name: String,
     pub provider_id: String,
+    /// `true` when the agent has determined its remote model is unreachable
+    /// (e.g. a health probe or a task failed with 404 / model-unavailable).
+    /// The scheduler excludes a down-model agent from job assignment even while
+    /// its process keeps heartbeating. Defaults `false` (up) so an agent that
+    /// never reports health — or an older agent that omits the field — stays
+    /// schedulable, i.e. back-compatible.
+    #[serde(default)]
+    pub model_down: bool,
     /// Job ID if currently processing, else None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_job: Option<String>,
@@ -2610,9 +2618,11 @@ mod tests {
             capability_tags: vec!["legal".to_string(), "audit".to_string()],
             description: Some("Legal specialist".to_string()),
             signing_schemes: vec!["eip712".to_string()],
+            model_down: true,
         };
         let json = serde_json::to_string(&hb).unwrap();
         let deserialized: AgentHeartbeat = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.model_down, "model_down round-trips");
         assert_eq!(deserialized.agent_id, "agent-1");
         assert_eq!(deserialized.status, AgentLiveStatus::Busy);
         assert_eq!(deserialized.model_name, "gpt-4");
@@ -2638,6 +2648,26 @@ mod tests {
             Some("Legal specialist")
         );
         assert_eq!(deserialized.signing_schemes, vec!["eip712"]);
+    }
+
+    #[test]
+    fn agent_heartbeat_missing_model_down_defaults_to_up() {
+        // Back-compat: a heartbeat from an older agent omits `model_down`.
+        // It must deserialize as `false` (up) so the agent stays schedulable —
+        // never silently benched by the new health filter.
+        let json = r#"{
+            "agent_id": "legacy",
+            "status": "idle",
+            "model_name": "gpt-4",
+            "provider_id": "openai",
+            "uptime_secs": 10,
+            "timestamp": "2025-01-01T00:00:00Z"
+        }"#;
+        let hb: AgentHeartbeat = serde_json::from_str(json).unwrap();
+        assert!(
+            !hb.model_down,
+            "an omitted model_down must default to false (up)"
+        );
     }
 
     #[test]

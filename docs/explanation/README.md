@@ -11,6 +11,7 @@ Read these away from the keyboard when you want to understand a design decision 
 | [Agent internals](agent-internals.md) | Library API surface + ReAct loop architecture inside `quorum-rs`. |
 | [About the provider registry](provider-registry.md) | Why `provider.type` dispatch is a registry of factories, and how a third-party crate adds a provider without forking the SDK. |
 | [Agent ranking](agent-ranking.md) | Capability declaration + how agents earn rank through deliberation outcomes. |
+| [About model-down benching](model-down-benching.md) | How an agent whose remote model 404s benches itself from scheduling, why the bench escalates with consecutive strikes, and why a successful task resets it. |
 | [NATS topology](nats-topology.md) | Subjects, JetStream streams, JWT scopes, dispatch model. |
 | [Middleware system](middleware.md) | Pluggable validation/moderation pipeline and the design rationale behind it. |
 | [Agent working-directory override](agent-working-directory.md) | Why `AgentContext.working_dir_override` exists, how a `before_prompt` middleware sets it via `agent_working_dir`, and what a custom agent must do with it. |

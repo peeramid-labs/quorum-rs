@@ -28,7 +28,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{error, info, warn};
@@ -437,6 +437,21 @@ pub struct NatsNsedWorker {
     /// whether completed responses are released, while this flag controls
     /// whether new tasks are pulled from NATS.
     paused: Arc<AtomicBool>,
+    /// Epoch-ms deadline until which this agent's remote model is considered
+    /// down (`0` = up). Armed when a task fails with a model-unavailable error
+    /// (e.g. 404); the heartbeat reports `model_down` while the deadline is in
+    /// the future so the scheduler stops assigning doomed tasks, and it clears
+    /// automatically on expiry so a transient outage doesn't bench forever.
+    model_down_until_ms: Arc<AtomicU64>,
+    /// Count of consecutive model-down task failures. Drives escalating bench
+    /// backoff via [`escalated_cooldown_ms`] so a chronically-dead model is
+    /// quiesced (progressively longer benches, capped) instead of re-entering
+    /// scheduling every fixed cooldown. Reset to `0` on any successful task.
+    model_down_strikes: Arc<AtomicU64>,
+    /// Strategy that decides whether a task-failure error means the remote model
+    /// is gone (→ bench). Defaults to [`HeuristicModelDownDetector`]; override
+    /// via [`NatsNsedWorker::with_model_down_detector`].
+    model_down_detector: Arc<dyn ModelDownDetector>,
     /// Optional telemetry emitter for recording LLM call metrics.
     telemetry: Option<TelemetryEmitterMux>,
     /// Agent middleware pipelines, built from `agent_config.middleware`.
@@ -554,6 +569,9 @@ impl NatsNsedWorker {
             chat_agent: None,
             response_buffer: None,
             paused: Arc::new(AtomicBool::new(false)),
+            model_down_until_ms: Arc::new(AtomicU64::new(0)),
+            model_down_strikes: Arc::new(AtomicU64::new(0)),
+            model_down_detector: Arc::new(HeuristicModelDownDetector),
             telemetry,
             before_prompt_mw,
             provider_response_mw,
@@ -570,6 +588,15 @@ impl NatsNsedWorker {
     /// Sets a [`WorkerHook`] for intercepting NATS publishes.
     pub fn with_hook(mut self, hook: Arc<dyn WorkerHook>) -> Self {
         self.hook = Some(hook);
+        self
+    }
+
+    /// Override the model-down detection strategy (default:
+    /// [`HeuristicModelDownDetector`]). A deployment can supply a stricter or
+    /// provider-tuned [`ModelDownDetector`] that decides when a task-failure
+    /// error means the remote model is gone and the agent should bench itself.
+    pub fn with_model_down_detector(mut self, detector: Arc<dyn ModelDownDetector>) -> Self {
+        self.model_down_detector = detector;
         self
     }
 
@@ -1947,6 +1974,11 @@ impl NatsNsedWorker {
                     }
                 }
 
+                // Task succeeded → the remote model is reachable. Clear the
+                // model-down strike count so a recovered model waits only the
+                // base cooldown on any future failure, not an escalated bench.
+                self.model_down_strikes.store(0, Ordering::Relaxed);
+
                 // queue_wait_ms / llm_attempts / tool_call_count /
                 // pending_publish_depth: see docs/agent-sdk/reference/telemetry.md
                 let phase_budget_remaining_ms =
@@ -1994,6 +2026,23 @@ impl NatsNsedWorker {
                     if let Some(ref buf) = self.response_buffer {
                         buf.pause();
                     }
+                }
+
+                // Bench the agent when its remote model is unavailable (e.g. a
+                // 404 from a removed model / dead endpoint): the next heartbeat
+                // reports model_down so the scheduler stops assigning it doomed
+                // tasks until the cooldown expires and it self-heals.
+                if self.model_down_detector.is_model_down(&err_str) {
+                    let strikes = self.model_down_strikes.fetch_add(1, Ordering::Relaxed) + 1;
+                    let cooldown = escalated_cooldown_ms(strikes);
+                    let until = chrono::Utc::now().timestamp_millis() as u64 + cooldown;
+                    self.model_down_until_ms.store(until, Ordering::Relaxed);
+                    warn!(
+                        agent_id = %self.agent_id,
+                        strikes,
+                        cooldown_secs = cooldown / 1000,
+                        "Remote model unavailable — reporting model_down until cooldown expires (escalating backoff)"
+                    );
                 }
 
                 if !suppress_error_event {
@@ -2164,6 +2213,10 @@ impl NatsNsedWorker {
             capability_tags: self.agent_config.capability_tags.clone(),
             description: self.agent_config.description.clone(),
             signing_schemes: self.agent_config.signing_schemes.clone(),
+            model_down: model_down_active(
+                self.model_down_until_ms.load(Ordering::Relaxed),
+                chrono::Utc::now().timestamp_millis() as u64,
+            ),
         };
         let subject = format!(
             "{}.agent.heartbeat.{}",
@@ -2509,6 +2562,9 @@ impl Clone for NatsNsedWorker {
             chat_agent: self.chat_agent.clone(),
             response_buffer: self.response_buffer.clone(),
             paused: self.paused.clone(),
+            model_down_until_ms: self.model_down_until_ms.clone(),
+            model_down_strikes: self.model_down_strikes.clone(),
+            model_down_detector: self.model_down_detector.clone(),
             telemetry: self.telemetry.clone(),
             before_prompt_mw: self.before_prompt_mw.clone(),
             provider_response_mw: self.provider_response_mw.clone(),
@@ -2855,6 +2911,66 @@ fn is_transient_error(err: &anyhow::Error) -> bool {
 /// payload the worker publishes on bail so the orchestrator (and
 /// telemetry consumers) can distinguish parse failures from iteration
 /// caps without parsing the full error string.
+/// How long (ms) to bench an agent after its remote model reports unavailable.
+/// Long enough to skip a flapping/removed model across a job, short enough that
+/// a recovered model rejoins on its own without operator intervention.
+const MODEL_DOWN_COOLDOWN_MS: u64 = 300_000; // 5 minutes
+
+/// Bench duration (ms) for the Nth consecutive model-down strike: the base
+/// cooldown doubled per strike, capped at 30 minutes. A single transient 404
+/// waits [`MODEL_DOWN_COOLDOWN_MS`]; a chronically-dead model (e.g. a removed
+/// endpoint that 404s every job) backs off toward the cap so it stops
+/// re-entering scheduling every fixed cooldown. The strike count resets on any
+/// successful task, so a recovered model waits only the base again.
+fn escalated_cooldown_ms(strikes: u64) -> u64 {
+    const CAP_MS: u64 = 1_800_000; // 30 minutes
+    let shift = strikes.saturating_sub(1).min(20); // keep `1 << shift` in range
+    MODEL_DOWN_COOLDOWN_MS
+        .saturating_mul(1u64 << shift)
+        .min(CAP_MS)
+}
+
+/// True when a task error indicates the remote MODEL/endpoint is unavailable
+/// (removed model / dead endpoint) rather than a transient, auth, rate, or
+/// billing error. Only these bench the agent — over-matching (e.g. on a bare
+/// "404" that could appear in a job id) is avoided by anchoring on the HTTP
+/// status phrase and known model-not-found messages.
+/// Decides, from a failed task's error text, whether the agent's remote model is
+/// unavailable and the agent should bench itself. Pluggable so a deployment can
+/// tighten or provider-tune the rule; [`HeuristicModelDownDetector`] is the
+/// default. Must be conservative: a false positive benches a healthy agent, so
+/// only genuine "this model does not exist" signals should return `true` — never
+/// transient/auth/rate/billing errors.
+pub trait ModelDownDetector: Send + Sync + std::fmt::Debug {
+    /// `true` iff `error` indicates the remote model is unavailable.
+    fn is_model_down(&self, error: &str) -> bool;
+}
+
+/// Default detector: substring-matches the common provider phrasings for a
+/// missing/removed model. Deliberately narrow — a bare "404" inside unrelated
+/// text (a job id) must not trip it.
+#[derive(Debug, Default, Clone)]
+pub struct HeuristicModelDownDetector;
+
+impl ModelDownDetector for HeuristicModelDownDetector {
+    fn is_model_down(&self, error: &str) -> bool {
+        let e = error.to_ascii_lowercase();
+        e.contains("status 404")
+            || e.contains("404 not found")
+            || e.contains("model_not_found")
+            || e.contains("model not found")
+            || e.contains("does not exist")
+            || e.contains("no such model")
+    }
+}
+
+/// Whether the model-down cooldown is still active. `until_ms == 0` means the
+/// model was never marked down; otherwise it is down until `now_ms` reaches the
+/// deadline, after which the agent is eligible again.
+fn model_down_active(until_ms: u64, now_ms: u64) -> bool {
+    until_ms != 0 && now_ms < until_ms
+}
+
 fn classify_abstention_reason(err: &str) -> String {
     let lower = err.to_lowercase();
     if lower.contains("failed to parse structured output") || lower.contains("missing field") {
@@ -7348,6 +7464,66 @@ mod tests {
     #[test]
     fn classify_fallback() {
         assert_eq!(classify_abstention_reason("kaboom"), "error");
+    }
+
+    #[test]
+    fn heuristic_detector_flags_only_model_unavailable() {
+        let d = HeuristicModelDownDetector;
+        // The observed incident: a 404 from a removed model / dead endpoint.
+        assert!(d.is_model_down("API request failed with status 404 Not Found"));
+        assert!(d.is_model_down("error: model_not_found"));
+        assert!(d.is_model_down("The model `x` does not exist"));
+        assert!(d.is_model_down("no such model: gpt-9"));
+        // Not model-down: transient / auth / rate / billing / other statuses.
+        assert!(!d.is_model_down("402 Payment Required"));
+        assert!(!d.is_model_down("429 Too Many Requests"));
+        assert!(!d.is_model_down("500 Internal Server Error"));
+        assert!(!d.is_model_down("upstream timed out after 60s"));
+        // A bare "404" inside unrelated text (e.g. a job id) must not trip it.
+        assert!(!d.is_model_down("job sphera_jobs-404 completed"));
+    }
+
+    #[test]
+    fn model_down_detector_is_pluggable() {
+        // A deployment can swap in a stricter/looser rule via the trait.
+        #[derive(Debug)]
+        struct AlwaysDown;
+        impl ModelDownDetector for AlwaysDown {
+            fn is_model_down(&self, _error: &str) -> bool {
+                true
+            }
+        }
+        let d: Arc<dyn ModelDownDetector> = Arc::new(AlwaysDown);
+        assert!(d.is_model_down("anything"));
+    }
+
+    #[test]
+    fn model_down_active_respects_the_cooldown_deadline() {
+        // 0 = never marked down.
+        assert!(!model_down_active(0, 1_000));
+        // Down while now is before the deadline.
+        assert!(model_down_active(5_000, 4_999));
+        // Recovered once now reaches/passes the deadline.
+        assert!(!model_down_active(5_000, 5_000));
+        assert!(!model_down_active(5_000, 6_000));
+    }
+
+    #[test]
+    fn escalated_cooldown_doubles_per_strike_then_caps() {
+        // First strike (and the defensive 0 case) = base cooldown.
+        assert_eq!(escalated_cooldown_ms(0), MODEL_DOWN_COOLDOWN_MS);
+        assert_eq!(escalated_cooldown_ms(1), MODEL_DOWN_COOLDOWN_MS);
+        // Each further consecutive strike doubles the bench.
+        assert_eq!(escalated_cooldown_ms(2), MODEL_DOWN_COOLDOWN_MS * 2);
+        assert_eq!(escalated_cooldown_ms(3), MODEL_DOWN_COOLDOWN_MS * 4);
+        // *8 would be 2.4M ms, so it saturates at the 30-minute cap.
+        assert_eq!(escalated_cooldown_ms(4), 1_800_000);
+        assert_eq!(escalated_cooldown_ms(100), 1_800_000);
+        // Monotonic non-decreasing up to the cap, never above it.
+        for s in 1..50 {
+            assert!(escalated_cooldown_ms(s) <= escalated_cooldown_ms(s + 1));
+            assert!(escalated_cooldown_ms(s) <= 1_800_000);
+        }
     }
 
     #[test]
