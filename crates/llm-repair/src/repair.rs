@@ -48,6 +48,36 @@ pub fn repair_tool_calls(response_message: &mut ChatCompletionResponseMessage, a
     }
 }
 
+/// If `s` ends with an INCOMPLETE `\uXXXX` escape (an UNESCAPED `\`, then `u`, then
+/// 0–3 hex digits), return the byte index to truncate to (dropping the partial
+/// escape). Returns `None` otherwise — crucially for `\\u0` (an escaped backslash
+/// followed by a literal `u0`): the backslash run before `u` is even, so the `u` is
+/// NOT part of an escape, and trimming would eat the escaped backslash. A complete
+/// 4-hex `A` also returns `None` (not incomplete). All indices land on the
+/// ASCII `\`/`u`/hex bytes, so truncation is always char-boundary-safe.
+fn incomplete_unicode_trunc(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut i = b.len();
+    let mut hex = 0;
+    while i > 0 && hex < 3 && b[i - 1].is_ascii_hexdigit() {
+        i -= 1;
+        hex += 1;
+    }
+    // Require `\` `u` immediately before the (0–3) trailing hex digits.
+    if i < 2 || b[i - 1] != b'u' || b[i - 2] != b'\\' {
+        return None;
+    }
+    // Parity of the backslash run ending at i-2: odd ⇒ the last `\` escapes the `u`
+    // (a real, incomplete `\u…`); even ⇒ the backslashes are literal pairs (`\\u…`).
+    let mut bs = 0usize;
+    let mut j = i - 1; // the `u` position; walk left over backslashes
+    while j > 0 && b[j - 1] == b'\\' {
+        j -= 1;
+        bs += 1;
+    }
+    if bs % 2 == 1 { Some(i - 2) } else { None }
+}
+
 /// Attempts to repair a truncated JSON string by closing open braces, brackets, and quotes.
 pub fn repair_truncated_json(input: &str) -> String {
     let mut repaired = input.to_string();
@@ -57,26 +87,8 @@ pub fn repair_truncated_json(input: &str) -> String {
     // or just a backslash "\", we need to trim it before closing.
     // However, blind removal is dangerous (e.g. removing '\' from "\\") so we rely on parser state.
 
-    if repaired.ends_with("\\u") {
-        repaired.truncate(repaired.len() - 2);
-    } else if repaired.len() >= 3
-        && repaired.is_char_boundary(repaired.len() - 3)
-        && repaired[repaired.len() - 3..].starts_with("\\u")
-    {
-        // e.g. ends with \u0
-        repaired.truncate(repaired.len() - 3);
-    } else if repaired.len() >= 4
-        && repaired.is_char_boundary(repaired.len() - 4)
-        && repaired[repaired.len() - 4..].starts_with("\\u")
-    {
-        // e.g. ends with \u00
-        repaired.truncate(repaired.len() - 4);
-    } else if repaired.len() >= 5
-        && repaired.is_char_boundary(repaired.len() - 5)
-        && repaired[repaired.len() - 5..].starts_with("\\u")
-    {
-        // e.g. ends with \u000
-        repaired.truncate(repaired.len() - 5);
+    if let Some(pos) = incomplete_unicode_trunc(&repaired) {
+        repaired.truncate(pos);
     }
 
     // 2. Scan string state
@@ -100,6 +112,26 @@ pub fn repair_truncated_json(input: &str) -> String {
     // Now safe to close the string
     if in_string {
         repaired.push('"');
+    }
+
+    // 2b. A truncated trailing NUMBER in object-value position (`… : 9` cut from
+    // `95`) would otherwise be closed into a valid-but-WRONG value and flow silently
+    // into consensus scoring. A complete `5` and a truncated `5…` are indistinguishable,
+    // so — outside a string — strip a numeric run that directly follows a `:`, leaving
+    // `{"k": }` which fails to parse (→ rejected/retried) instead of a wrong score. A
+    // cut-off keyword (a partial `true`/`false`/`null`) already fails to parse safely;
+    // only numbers repair into a valid wrong value, so only numbers need this.
+    // `in_string` here is the pre-close state — when we were mid-string the trailing
+    // run is string content, not a value.
+    if !in_string {
+        let b = repaired.as_bytes();
+        let mut end = repaired.len();
+        while end > 0 && matches!(b[end - 1], b'0'..=b'9' | b'.' | b'-' | b'+' | b'e' | b'E') {
+            end -= 1;
+        }
+        if end < repaired.len() && repaired[..end].trim_end().ends_with(':') {
+            repaired.truncate(end);
+        }
     }
 
     // 3. Close open objects/arrays
@@ -646,6 +678,26 @@ mod tests {
     }
 
     #[test]
+    fn escaped_backslash_before_u_is_not_eaten_as_incomplete_unicode() {
+        // `\\u0` is an ESCAPED backslash followed by a literal `u0`, not an incomplete
+        // `\u` escape. The old fixed-offset branch trimmed `\u0` and then popped the
+        // orphaned `\`, losing the escaped backslash. The parity check preserves it.
+        // Even backslash run before `u` ⇒ no truncation.
+        assert_eq!(incomplete_unicode_trunc(r"foo\\u0"), None);
+        assert_eq!(incomplete_unicode_trunc(r"foo\\u"), None);
+        // Odd run ⇒ a real incomplete escape ⇒ trims from the escaping backslash.
+        assert_eq!(incomplete_unicode_trunc(r"foo\u0"), Some(3));
+        assert_eq!(incomplete_unicode_trunc(r"foo\\\u00"), Some(5));
+        // Zero-hex bare `\u` (real, incomplete) and the 3-hex max both trim.
+        assert_eq!(incomplete_unicode_trunc(r"foo\u"), Some(3));
+        assert_eq!(incomplete_unicode_trunc(r"foo\u000"), Some(3));
+        // A complete 4-hex escape is not "incomplete".
+        assert_eq!(incomplete_unicode_trunc(r"xA"), None);
+        // Trailing hex with no `\u` doesn't false-trigger.
+        assert_eq!(incomplete_unicode_trunc("deadbeef"), None);
+    }
+
+    #[test]
     fn test_repair_truncated_json_incomplete_unicode_2hex() {
         let input = r#"{"key": "val\u00"#;
         let repaired = repair_truncated_json(input);
@@ -893,6 +945,38 @@ mod tests {
         let input = r#"{"key": "value", "num": 42}"#;
         let repaired = repair_truncated_json(input);
         assert_eq!(repaired, input);
+    }
+
+    #[test]
+    fn truncated_number_after_colon_is_not_silently_closed_to_wrong_value() {
+        // "95" cut to "9" must NOT become a valid {"endorsement_weight": 9} — that
+        // wrong score would flow silently into consensus. The dangling number is
+        // stripped so the result fails to parse (→ rejected/retried).
+        let out = repair_truncated_json(r#"{"endorsement_weight": 9"#);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&out).is_err(),
+            "a truncated number must not repair to valid JSON, got {out:?}"
+        );
+        // Multi-field: the truncated last value is dropped, not accepted as-is.
+        let out2 = repair_truncated_json(r#"{"a": 1, "score": 0.9"#);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&out2).is_err(),
+            "trailing truncated number after a colon must invalidate, got {out2:?}"
+        );
+    }
+
+    #[test]
+    fn truncated_string_and_array_values_still_repair() {
+        // The number-strip is colon-scoped: string values and array elements
+        // (comma/bracket-preceded) are untouched and still close correctly.
+        let s = repair_truncated_json(r#"{"a": "hello"#);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&s).unwrap()["a"],
+            "hello"
+        );
+        let a = repair_truncated_json(r#"{"a": [1, 2"#);
+        let v: serde_json::Value = serde_json::from_str(&a).unwrap();
+        assert_eq!(v["a"], serde_json::json!([1, 2]));
     }
 
     #[test]

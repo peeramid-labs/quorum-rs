@@ -138,9 +138,15 @@ pub fn extract_evaluations_from_markdown(content: &str) -> Option<String> {
             }
         };
 
-        let justification = parts[3];
+        // Anchor the fixed columns from BOTH ends so a literal `|` inside the
+        // justification (a free-text middle column) doesn't shift `is_final` right and
+        // silently drop a finalize vote. Layout:
+        //   parts = ["", agent_id, weight, <justification …>, is_final, ""]
+        // Justification is everything between weight and is_final; rejoin it with
+        // " | " so an embedded pipe is preserved rather than truncating the cell.
+        let justification = parts[3..parts.len() - 2].join(" | ");
 
-        let is_final_str = parts[4].to_lowercase();
+        let is_final_str = parts[parts.len() - 2].to_lowercase();
         let is_final_solution =
             is_final_str == "true" || is_final_str == "yes" || is_final_str == "1";
 
@@ -611,7 +617,22 @@ fn parse_json_or_python_literal(input: &str) -> Option<Value> {
     }
 }
 
+/// Max nesting the Python-literal → JSON traversal will descend. Matches the
+/// depth-50 cap on the sibling `heuristic_json_tool_calls_recursive`. Deeply
+/// nested adversarial input (`[[[[…]]]]`) would otherwise recurse one stack frame
+/// per level and overflow.
+const MAX_PY_AST_DEPTH: usize = 50;
+
 fn python_ast_to_json(expr: &ast::Expr) -> anyhow::Result<Value> {
+    python_ast_to_json_depth(expr, 0)
+}
+
+fn python_ast_to_json_depth(expr: &ast::Expr, depth: usize) -> anyhow::Result<Value> {
+    if depth > MAX_PY_AST_DEPTH {
+        return Err(anyhow::anyhow!(
+            "Python literal nesting exceeds max depth {MAX_PY_AST_DEPTH}"
+        ));
+    }
     match expr {
         ast::Expr::Constant(ast::ExprConstant { value, .. }) => match value {
             ast::Constant::Str(s) => Ok(Value::String(s.clone())),
@@ -628,7 +649,7 @@ fn python_ast_to_json(expr: &ast::Expr) -> anyhow::Result<Value> {
         ast::Expr::List(ast::ExprList { elts, .. }) => {
             let mut arr = Vec::new();
             for elt in elts {
-                arr.push(python_ast_to_json(elt)?);
+                arr.push(python_ast_to_json_depth(elt, depth + 1)?);
             }
             Ok(Value::Array(arr))
         }
@@ -637,9 +658,9 @@ fn python_ast_to_json(expr: &ast::Expr) -> anyhow::Result<Value> {
             for (key, value) in keys.iter().zip(values.iter()) {
                 if let Some(key_expr) = key {
                     // Keys must be strings in JSON
-                    let key_json = python_ast_to_json(key_expr)?;
+                    let key_json = python_ast_to_json_depth(key_expr, depth + 1)?;
                     if let Value::String(key_str) = key_json {
-                        obj.insert(key_str, python_ast_to_json(value)?);
+                        obj.insert(key_str, python_ast_to_json_depth(value, depth + 1)?);
                     } else {
                         return Err(anyhow::anyhow!("Dict keys must be strings"));
                     }
@@ -744,8 +765,16 @@ fn heuristic_json_tool_calls_recursive(
                     },
                 });
             }
-            // Heuristic 1: read_proposal (has agent_id + round?)
-            else if obj.contains_key("agent_id") && obj.contains_key("round") {
+            // Heuristic 1: read_proposal (agent_id + round, and NOT carrying a
+            // proposal payload). Some models echo their own agent_id/round alongside
+            // the proposal; without this guard such a proposal is misclassified as a
+            // research read and its payload silently discarded. submit_proposal
+            // (Heuristic 4) is the more-specific match, so defer to it.
+            else if obj.contains_key("agent_id")
+                && obj.contains_key("round")
+                && !obj.contains_key("thought_process")
+                && !obj.contains_key("solution_content")
+            {
                 calls.push(ChatCompletionMessageToolCall {
                     id: format!("call_heuristic_{}", uuid::Uuid::new_v4().simple()),
                     r#type: async_openai::types::ChatCompletionToolType::Function,
@@ -1240,6 +1269,30 @@ def solve(n):
     }
 
     #[test]
+    fn markdown_pipe_in_justification_preserves_is_final() {
+        // A literal `|` inside the justification cell must NOT shift is_final_solution
+        // right (which silently dropped the finalize vote). Columns are anchored from
+        // both ends; the middle rejoins with the pipe preserved.
+        let markdown = "\
+| agent_id | endorsement_weight | justification | is_final_solution |
+|---|---|---|---|
+| Xue | 95 | Good, but risky | maybe | true |
+";
+        let result = extract_evaluations_from_markdown(markdown).expect("parse");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let e = &parsed["evaluations"][0];
+        assert_eq!(
+            e["is_final_solution"], true,
+            "the real finalize signal (last column) is read, not the mid-cell"
+        );
+        assert_eq!(
+            e["justification"], "Good, but risky | maybe",
+            "the embedded pipe is preserved in the justification"
+        );
+        assert_eq!(e["endorsement_weight"], 95.0);
+    }
+
+    #[test]
     fn test_extract_evaluations_from_markdown_missing_columns() {
         // Table with too few columns (only 3 cells instead of required 4+)
         let markdown = r#"
@@ -1590,6 +1643,16 @@ Trailing text.
         assert!(result.is_none());
     }
 
+    #[test]
+    fn python_literal_deep_nesting_is_capped_not_overflowed() {
+        // Invalid JSON (bare `True`) forces the rustpython path; nesting past
+        // MAX_PY_AST_DEPTH (50) must error out (→ None), not recurse the traversal
+        // one frame per level into a stack overflow.
+        let deep = format!("{}True{}", "[".repeat(60), "]".repeat(60));
+        let result = parse_json_or_python_literal(&deep);
+        assert!(result.is_none(), "deep nesting must be rejected, not crash");
+    }
+
     // ---------------------------------------------------------------
     // submit_proposal with JSON-valued kwargs
     // ---------------------------------------------------------------
@@ -1626,6 +1689,25 @@ Trailing text.
         let calls = heuristic_json_tool_calls(input);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "submit_proposal");
+    }
+
+    #[test]
+    fn heuristic_proposal_echoing_agent_id_is_not_misclassified_as_read() {
+        // Some models echo their own agent_id/round inside the proposal object. It
+        // carries the proposal payload, so it must classify as submit_proposal — not
+        // read_proposal (which would discard the payload).
+        let input = r#"{"agent_id": "Xue", "round": 2, "thought_process": "reasoning", "solution_content": "answer"}"#;
+        let calls = heuristic_json_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].function.name, "submit_proposal",
+            "proposal payload wins over the read_proposal agent_id+round signature"
+        );
+        // A genuine read (no payload) still classifies as read_proposal.
+        let read = r#"{"agent_id": "Xue", "round": 2}"#;
+        let read_calls = heuristic_json_tool_calls(read);
+        assert_eq!(read_calls.len(), 1);
+        assert_eq!(read_calls[0].function.name, "read_proposal");
     }
 
     // ---------------------------------------------------------------
@@ -2517,6 +2599,20 @@ solution_content: {"answer": 42, "steps": [1, 2, 3]}
         assert!((val["score"].as_f64().unwrap() - 3.14).abs() < 0.001);
         assert!((val["weight"].as_f64().unwrap() - 0.5).abs() < 0.001);
         assert_eq!(val["flag"], true);
+    }
+
+    #[test]
+    fn parse_python_literal_deep_nesting_hits_depth_cap_gracefully() {
+        // `True` is Python, not JSON, so this routes to the python-AST path.
+        // Nesting past MAX_PY_AST_DEPTH must stop the recursion and return None
+        // — never overflow the stack on adversarial `[[[[…]]]]` input.
+        let deep = format!("{}True{}", "[".repeat(60), "]".repeat(60));
+        assert!(
+            parse_json_or_python_literal(&deep).is_none(),
+            "nesting past the depth cap must fail gracefully to None"
+        );
+        // Sanity: the cap doesn't reject ordinary shallow python literals.
+        assert!(parse_json_or_python_literal("[True, False, None]").is_some());
     }
 
     // ---------------------------------------------------------------
