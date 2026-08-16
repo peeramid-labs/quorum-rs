@@ -2149,13 +2149,18 @@
             var APP_STARTED = false;
 
             function guardedPath(url) {
-                var p;
+                var u;
                 try {
-                    p = new URL(url, window.location.origin).pathname;
+                    u = new URL(url, window.location.origin);
                 } catch (e) {
-                    p = String(url);
+                    return false;
                 }
-                return p.indexOf("/api/") === 0 || p === "/auth/status";
+                // Never attach the bearer to a cross-origin URL — a same-origin
+                // check stops the token leaking to an off-origin `/api/...`.
+                if (u.origin !== window.location.origin) {
+                    return false;
+                }
+                return u.pathname.indexOf("/api/") === 0 || u.pathname === "/auth/status";
             }
 
             // Wrap fetch so guarded calls carry the bearer token and a 401
@@ -2665,7 +2670,7 @@
 
             // ---- Job detail view with SSE + fallback polling ----
             var jobPollTimer = null;
-            var jobEventSource = null;
+            var jobSseController = null;
             var jobSseEvents = [];
             var currentViewedJobId = null;
 
@@ -2691,47 +2696,75 @@
 
             function cleanupJobView() {
                 currentViewedJobId = null;
-                if (jobEventSource) { jobEventSource.close(); jobEventSource = null; }
+                if (jobSseController) { jobSseController.abort(); jobSseController = null; }
                 if (jobPollTimer) { clearInterval(jobPollTimer); jobPollTimer = null; }
                 jobSseEvents = [];
             }
 
+            // Parse one SSE frame ("event: <type>\n data: <json>") and dispatch it.
+            function dispatchSseFrame(frame) {
+                var evType = null;
+                var dataStr = "";
+                frame.split("\n").forEach(function (line) {
+                    if (line.indexOf("event:") === 0) {
+                        evType = line.slice(6).trim();
+                    } else if (line.indexOf("data:") === 0) {
+                        dataStr += line.slice(5).trim();
+                    }
+                });
+                if (!dataStr) return;
+                try {
+                    var payload = JSON.parse(dataStr);
+                    if (evType) payload._sseType = evType;
+                    handleSseEvent(payload);
+                } catch (e) {
+                    handleSseEvent({ type: evType || "message", data: dataStr });
+                }
+            }
+
+            // Stream the job feed over fetch()+ReadableStream (NOT EventSource):
+            // EventSource cannot set an Authorization header, so under a bearer
+            // token it would 401. fetch() goes through the wrapper, which attaches
+            // the token to this same-origin /api/ URL — no token in the query string.
             function startJobSSE(jobId) {
                 if (!currentOrch) return;
                 var sseUrl = '/api/orchestrators/' + encodeURIComponent(currentOrch.id) +
                     '/stream/' + encodeURIComponent(jobId);
+                var badge = document.getElementById("job-status-badge");
+                var controller = new AbortController();
+                jobSseController = controller;
 
-                jobEventSource = new EventSource(sseUrl);
-                jobEventSource.onopen = function() {
-                    var badge = document.getElementById("job-status-badge");
-                    if (badge) badge.innerHTML = '<span style="color:#58a6ff;">● SSE connected</span>';
-                };
-                jobEventSource.onmessage = function(ev) {
-                    try {
-                        var data = JSON.parse(ev.data);
-                        handleSseEvent(data);
-                    } catch(e) {
-                        // raw text event
-                        handleSseEvent({ type: 'message', data: ev.data });
-                    }
-                };
-                // Listen for typed events from the orchestrator
-                ['round_start', 'phase_start', 'proposal', 'evaluation', 'round_end',
-                 'convergence', 'budget_update', 'job_complete', 'job_failed', 'replay_complete'].forEach(function(evType) {
-                    jobEventSource.addEventListener(evType, function(ev) {
-                        try {
-                            var data = JSON.parse(ev.data);
-                            data._sseType = evType;
-                            handleSseEvent(data);
-                        } catch(e) {}
-                    });
-                });
-                jobEventSource.onerror = function() {
-                    var badge = document.getElementById("job-status-badge");
+                function degraded() {
                     if (badge && badge.innerHTML.indexOf('COMPLETED') === -1 && badge.innerHTML.indexOf('FAILED') === -1) {
                         badge.innerHTML = '<span style="color:#f39c12;">● SSE reconnecting...</span>';
                     }
-                };
+                }
+
+                fetch(sseUrl, { headers: { Accept: "text/event-stream" }, signal: controller.signal })
+                    .then(function (resp) {
+                        if (!resp.ok || !resp.body) {
+                            throw new Error("sse http " + resp.status);
+                        }
+                        if (badge) badge.innerHTML = '<span style="color:#58a6ff;">● SSE connected</span>';
+                        var reader = resp.body.getReader();
+                        var decoder = new TextDecoder();
+                        var buf = "";
+                        function pump() {
+                            return reader.read().then(function (r) {
+                                if (r.done) return;
+                                buf += decoder.decode(r.value, { stream: true });
+                                var frames = buf.split("\n\n");
+                                buf = frames.pop(); // keep the incomplete tail
+                                frames.forEach(dispatchSseFrame);
+                                return pump();
+                            });
+                        }
+                        return pump();
+                    })
+                    .catch(function () {
+                        if (controller.signal.aborted) return; // normal close
+                        degraded();
+                    });
             }
 
             function handleSseEvent(data) {
