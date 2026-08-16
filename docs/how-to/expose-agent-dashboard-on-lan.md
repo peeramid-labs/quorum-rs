@@ -48,20 +48,44 @@ CLI flag wins over env var. Other usable values: a specific NIC
 IP (e.g. `192.168.1.42`), `::` for dual-stack, or any address
 `IpAddr::from_str` accepts.
 
-### 3. Verify
+### 3. Require a token
+
+Before exposing beyond loopback, guard the `/api/*` control plane
+with a bearer token:
 
 ```bash
-curl -sf http://<host>:8081/api/orchestrators
+QUORUM_DASHBOARD_TOKEN=$(openssl rand -hex 32) \
+QUORUM_DASHBOARD_BIND=0.0.0.0 \
+  quorum serve --dashboard-port 8081
 ```
 
-…should return JSON. If `curl` hangs from another machine,
-your host firewall is blocking the port — see step 4.
+With the token set, every `/api/*` request must carry
+`Authorization: Bearer <token>` or it is rejected with `401`. The
+dashboard page, Swagger UI, and `GET /auth/status` stay public so
+the page loads and prompts for the token. Open the dashboard in a
+browser, paste the token into the field in the top bar, and click
+**Connect** — it is stored in `localStorage` and attached to every
+guarded request.
 
-### 4. Security: what you just turned on
+Leave the token unset only for loopback dev; an unset token means
+`/api/*` is open.
 
-**The dashboard ships with NO authentication.** Loopback binds
-are an implicit access control. Anything wider gives every host
-on the network segment full access to:
+### 4. Verify
+
+```bash
+curl -sf http://<host>:8081/api/orchestrators \
+  -H "Authorization: Bearer $QUORUM_DASHBOARD_TOKEN"
+```
+
+…should return JSON. Without the header (when a token is set) you
+get `401`. If `curl` hangs from another machine, your host
+firewall is blocking the port — see step 5. Check the guard state
+any time with the public `curl -sf http://<host>:8081/auth/status`.
+
+### 5. Defense in depth
+
+The token is the primary control. It gives every host on the
+segment access to the control plane **only** with the credential:
 
 - per-agent status, including current job IDs and provider
   configuration
@@ -69,25 +93,23 @@ on the network segment full access to:
 - response-buffer inspection (mid-flight LLM output)
 - live config tuning (e.g. SLA changes that affect job routing)
 
-Boot a non-loopback bind and the server emits a single warn line
-to make the choice visible:
+Boot a non-loopback bind **without** a token and the server emits
+a warn line to make the exposure visible:
 
 ```text
-WARN dashboard bound to non-loopback address — control plane is
-     reachable from the network with no built-in authentication.
-     Restrict access via the host firewall, an external reverse
-     proxy with auth, or revert to the loopback default.
+WARN dashboard bound to non-loopback address with no
+     QUORUM_DASHBOARD_TOKEN set — the control plane is reachable
+     from the network with no authentication.
 ```
 
-**Minimum hardening:**
+**Additional hardening (layer on top of the token):**
 
 - Restrict the port to known IPs at the host firewall (`ufw allow
   from <admin-ip> to any port 8081`, or equivalent).
-- Front with a reverse proxy that adds auth (nginx + basic auth,
-  Caddy + JWT, traefik + forward auth) and bind the dashboard to
-  loopback so only the proxy can reach it.
-- Treat the dashboard like an `ssh -L` tunnel destination, not a
-  public service.
+- Front with a reverse proxy for TLS (nginx / Caddy / traefik) and
+  bind the dashboard to loopback so only the proxy can reach it.
+- Treat the dashboard like an `ssh -L` tunnel destination for the
+  most sensitive deployments.
 
 If you don't need LAN reach today, don't enable it today. The
 loopback default exists for a reason.

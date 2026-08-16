@@ -19,9 +19,10 @@ use crate::orchestrator_registry::OrchestratorRegistry;
 use crate::workers::buffer::ResponseBuffer;
 use axum::{
     Router,
-    extract::{Path, State},
-    http::{StatusCode, header},
-    response::{Html, IntoResponse, Json},
+    extract::{FromRef, Path, Request, State},
+    http::{HeaderMap, StatusCode, header},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Json, Response},
     routing::{get, post, put},
 };
 use serde::{Deserialize, Serialize};
@@ -55,6 +56,10 @@ pub(crate) struct MultiAppState {
     /// Middleware pipeline for `before_release` hook point (edit + release stages).
     /// None = no middleware configured.
     before_release_middleware: Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
+    /// Bearer token guarding the `/api/*` control plane. `None` = auth disabled
+    /// (the loopback-default / dev behaviour); `Some` = every `/api/*` request
+    /// must carry `Authorization: Bearer <token>`.
+    auth_token: Option<Arc<str>>,
 }
 
 /// Global configuration visible via the dashboard.
@@ -87,6 +92,91 @@ pub struct MultiAgentStatusServer;
 fn resolve_dashboard_bind(raw: Option<&str>) -> std::net::IpAddr {
     raw.and_then(|s| s.parse().ok())
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+}
+
+/// Resolve the dashboard bearer token from an env-var-shaped string.
+///
+/// A present-but-empty value is treated as absent so an exported-but-blank
+/// `QUORUM_DASHBOARD_TOKEN=` does not silently enable an unmatchable guard.
+fn resolve_dashboard_token(raw: Option<String>) -> Option<Arc<str>> {
+    raw.filter(|s| !s.is_empty()).map(Arc::from)
+}
+
+/// Constant-time byte comparison so token validation does not leak length or
+/// prefix information through response timing.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Cheap, cloneable view of the control-plane guard extracted from
+/// [`MultiAppState`] — carries only the token so per-request middleware
+/// extraction never clones the state's agent maps.
+#[derive(Clone)]
+struct DashAuth {
+    token: Option<Arc<str>>,
+}
+
+impl FromRef<MultiAppState> for DashAuth {
+    fn from_ref(state: &MultiAppState) -> Self {
+        DashAuth {
+            token: state.auth_token.clone(),
+        }
+    }
+}
+
+impl DashAuth {
+    /// `true` when the request may proceed: auth disabled (no token configured)
+    /// or the `Authorization: Bearer <token>` header matches the configured one.
+    fn is_authorized(&self, headers: &HeaderMap) -> bool {
+        let Some(expected) = &self.token else {
+            return true;
+        };
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(|token| ct_eq(token.as_bytes(), expected.as_bytes()))
+            .unwrap_or(false)
+    }
+}
+
+/// Middleware guarding the `/api/*` control plane. Rejects with `401` +
+/// `WWW-Authenticate: Bearer` when a token is configured and the request's
+/// bearer credential is missing or wrong; passes through when auth is disabled.
+async fn require_bearer(State(auth): State<DashAuth>, req: Request, next: Next) -> Response {
+    if auth.is_authorized(req.headers()) {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            "unauthorized",
+        )
+            .into_response()
+    }
+}
+
+/// Reports whether the dashboard requires a token and whether the caller's
+/// current credential satisfies it. Public (no auth) so the frontend can decide
+/// whether to show the token entry field before the user has connected.
+#[derive(Serialize)]
+struct AuthStatus {
+    auth_required: bool,
+    authenticated: bool,
+}
+
+async fn auth_status(State(auth): State<DashAuth>, headers: HeaderMap) -> Json<AuthStatus> {
+    Json(AuthStatus {
+        auth_required: auth.token.is_some(),
+        authenticated: auth.is_authorized(&headers),
+    })
 }
 
 impl MultiAgentStatusServer {
@@ -170,6 +260,7 @@ impl MultiAgentStatusServer {
             response_sla_secs: Arc::new(AtomicU64::new(sla_secs)),
             buffer_floor_pct: Arc::new(AtomicU64::new(0)), // deprecated — SLA-based release replaces buffer floor
             before_release_middleware: middleware,
+            auth_token: resolve_dashboard_token(std::env::var("QUORUM_DASHBOARD_TOKEN").ok()),
         };
 
         // Propagate initial response SLA to all buffers for deadline-based release.
@@ -179,6 +270,7 @@ impl MultiAgentStatusServer {
             buf.set_response_sla(base_hold);
         }
 
+        let auth_enabled = state.auth_token.is_some();
         let app = build_router(state);
 
         // Bind address resolution: `QUORUM_DASHBOARD_BIND` env var
@@ -197,13 +289,13 @@ impl MultiAgentStatusServer {
         // Operators opt into this via `--dashboard-bind` or
         // `QUORUM_DASHBOARD_BIND`; the warn line makes the
         // decision visible in the boot log so it can't be missed.
-        if !ip.is_loopback() {
+        if !ip.is_loopback() && !auth_enabled {
             warn!(
                 bind = %ip,
-                "dashboard bound to non-loopback address — control plane is reachable \
-                 from the network with no built-in authentication. Restrict access via \
-                 the host firewall, an external reverse proxy with auth, or revert to \
-                 the loopback default."
+                "dashboard bound to non-loopback address with no QUORUM_DASHBOARD_TOKEN set \
+                 — the control plane is reachable from the network with no authentication. \
+                 Set QUORUM_DASHBOARD_TOKEN to require a bearer token, restrict access via \
+                 the host firewall or a reverse proxy, or revert to the loopback default."
             );
         }
         info!(
@@ -442,14 +534,16 @@ pub(super) async fn agent_diagnostics(
 // ---------------------------------------------------------------------------
 
 /// Build the multi-agent router (exposed for testing).
+///
+/// The `/api/*` control plane is guarded by [`require_bearer`]; the guard is a
+/// no-op unless `state.auth_token` is set. The dashboard page, Swagger UI and
+/// `/auth/status` stay public so the frontend can load and probe auth first.
 fn build_router(state: MultiAppState) -> Router {
     use utoipa::OpenApi;
     let swagger_ui = utoipa_swagger_ui::SwaggerUi::new("/swagger-ui")
         .url("/api-docs/openapi.json", api_docs::ApiDoc::openapi());
 
-    Router::new()
-        .merge(swagger_ui)
-        .route("/", get(dashboard_page))
+    let protected = Router::new()
         .route(
             "/api/config",
             get(registry_handlers::get_global_config).put(registry_handlers::update_global_config),
@@ -531,6 +625,16 @@ fn build_router(state: MultiAppState) -> Router {
             "/api/orchestrators/{orch_id}/stream/{job_id}",
             get(registry_handlers::proxy_orchestrator_sse),
         )
+        .route_layer(middleware::from_fn_with_state(
+            DashAuth::from_ref(&state),
+            require_bearer,
+        ));
+
+    Router::new()
+        .merge(swagger_ui)
+        .route("/", get(dashboard_page))
+        .route("/auth/status", get(auth_status))
+        .merge(protected)
         .with_state(state)
 }
 

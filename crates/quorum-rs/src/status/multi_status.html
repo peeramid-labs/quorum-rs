@@ -1964,6 +1964,50 @@
     <body>
         <div class="topbar">
             <h1>NSED CONTROL PLANE</h1>
+            <div
+                id="auth-bar"
+                style="
+                    display: none;
+                    align-items: center;
+                    gap: 6px;
+                    margin-left: 12px;
+                "
+            >
+                <input
+                    type="password"
+                    id="token-input"
+                    placeholder="Bearer token…"
+                    autocomplete="off"
+                    onkeydown="if (event.key === 'Enter') connectAuth()"
+                    style="
+                        padding: 5px 9px;
+                        background: #0d1117;
+                        border: 1px solid #30363d;
+                        border-radius: 6px;
+                        color: #e6edf3;
+                        font-size: 13px;
+                        width: 220px;
+                    "
+                />
+                <button
+                    onclick="connectAuth()"
+                    style="
+                        padding: 5px 12px;
+                        background: #238636;
+                        border: none;
+                        border-radius: 6px;
+                        color: #fff;
+                        font-size: 13px;
+                        cursor: pointer;
+                    "
+                >
+                    Connect
+                </button>
+                <span
+                    id="auth-state"
+                    style="font-size: 12px; color: #8b949e"
+                ></span>
+            </div>
             <button
                 id="master-toggle"
                 class="pause-btn master-btn"
@@ -2091,6 +2135,134 @@
         <div id="task-overlay" class="task-overlay"></div>
         <script>
             /* Rain cards modules removed — board + queue views replace live rainfall */
+
+            // ── Dashboard auth (bearer token) ──────────────────────────────
+            // The /api/* control plane is guarded when the server runs with
+            // QUORUM_DASHBOARD_TOKEN set. The page and /auth/status stay public;
+            // the user pastes the token here, it is stored locally, and attached
+            // as `Authorization: Bearer <token>` to every guarded request.
+            var TOKEN = "";
+            try {
+                TOKEN = localStorage.getItem("quorum_dashboard_token") || "";
+            } catch (e) { /* storage blocked (e.g. private mode) — token stays in memory */ }
+            var AUTH_REQUIRED = false;
+            var APP_STARTED = false;
+
+            function guardedPath(url) {
+                var p;
+                try {
+                    p = new URL(url, window.location.origin).pathname;
+                } catch (e) {
+                    p = String(url);
+                }
+                return p.indexOf("/api/") === 0 || p === "/auth/status";
+            }
+
+            // Wrap fetch so guarded calls carry the bearer token and a 401
+            // re-prompts, without editing every individual call site.
+            (function () {
+                var nativeFetch = window.fetch.bind(window);
+                window.fetch = function (input, init) {
+                    init = init || {};
+                    var url =
+                        typeof input === "string"
+                            ? input
+                            : (input && input.url) || "";
+                    if (TOKEN && guardedPath(url)) {
+                        var headers = new Headers(init.headers || {});
+                        if (!headers.has("Authorization")) {
+                            headers.set("Authorization", "Bearer " + TOKEN);
+                        }
+                        init.headers = headers;
+                    }
+                    return nativeFetch(input, init).then(function (resp) {
+                        if (resp.status === 401 && AUTH_REQUIRED) {
+                            onAuthFailed();
+                        }
+                        return resp;
+                    });
+                };
+            })();
+
+            function onAuthFailed() {
+                TOKEN = "";
+                try {
+                    localStorage.removeItem("quorum_dashboard_token");
+                } catch (e) { /* storage blocked (e.g. private mode) — token stays in memory */ }
+                showAuthBar(true);
+                setAuthState("session expired — reconnect", false);
+            }
+
+            function showAuthBar(show) {
+                var bar = document.getElementById("auth-bar");
+                if (bar) bar.style.display = show ? "flex" : "none";
+            }
+
+            function setAuthState(msg, ok) {
+                var el = document.getElementById("auth-state");
+                if (el) {
+                    el.textContent = msg;
+                    el.style.color = ok ? "#3fb950" : "#f85149";
+                }
+            }
+
+            async function initAuth() {
+                try {
+                    var resp = await fetch("/auth/status");
+                    var s = await resp.json();
+                    AUTH_REQUIRED = !!s.auth_required;
+                    if (!AUTH_REQUIRED || s.authenticated) {
+                        showAuthBar(AUTH_REQUIRED);
+                        if (AUTH_REQUIRED) setAuthState("connected", true);
+                        startApp();
+                        return;
+                    }
+                } catch (e) {
+                    AUTH_REQUIRED = true;
+                }
+                showAuthBar(true);
+                setAuthState("enter token", false);
+            }
+
+            async function connectAuth() {
+                var tokenField = document.getElementById("token-input");
+                TOKEN = (tokenField && tokenField.value
+                    ? tokenField.value
+                    : "").trim();
+                if (!TOKEN) {
+                    setAuthState("token required", false);
+                    return;
+                }
+                try {
+                    localStorage.setItem("quorum_dashboard_token", TOKEN);
+                } catch (e) { /* storage blocked (e.g. private mode) — token stays in memory */ }
+                var resp = await fetch("/auth/status");
+                var s = await resp.json();
+                if (s.authenticated) {
+                    setAuthState("connected", true);
+                    startApp();
+                } else {
+                    TOKEN = "";
+                    try {
+                        localStorage.removeItem("quorum_dashboard_token");
+                    } catch (e) { /* storage blocked (e.g. private mode) — token stays in memory */ }
+                    setAuthState("invalid token", false);
+                }
+            }
+
+            function startApp() {
+                if (APP_STARTED) return;
+                APP_STARTED = true;
+                refreshAll().then(function () {
+                    var anyAuto = agents.some(function (a) {
+                        return a.auto_approve;
+                    });
+                    if (!anyAuto && agents.length > 0) {
+                        toggleAllAutoApprove();
+                    }
+                });
+                setInterval(refreshAll, 2000);
+            }
 
             function esc(s) {
                 if (s == null) return "";
@@ -7538,15 +7710,9 @@
                 }
             }
 
-            // Initial load + polling
-            refreshAll().then(function() {
-                // Auto-enable auto-approve at 100% threshold on startup (HITL bypass)
-                var anyAuto = agents.some(function(a) { return a.auto_approve; });
-                if (!anyAuto && agents.length > 0) {
-                    toggleAllAutoApprove();
-                }
-            });
-            setInterval(refreshAll, 2000);
+            // Initial load + polling — gated on auth so a guarded dashboard
+            // prompts for the token before it starts hitting /api/*.
+            initAuth();
         </script>
     </body>
 </html>

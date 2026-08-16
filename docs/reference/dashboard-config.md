@@ -1,12 +1,12 @@
 ---
 title: Dashboard config
 order: 7
-tagline: The four knobs controlling whether the agent dashboard starts and where it binds.
+tagline: The knobs controlling whether the agent dashboard starts, where it binds, and how it authenticates.
 ---
 # Dashboard config
 
-> Reference for the four knobs that control whether the unified
-> agent dashboard starts and where it binds.
+> Reference for the knobs that control whether the unified agent
+> dashboard starts, where it binds, and how it authenticates.
 
 ## Knobs
 
@@ -16,12 +16,14 @@ tagline: The four knobs controlling whether the agent dashboard starts and where
 | `dashboard_port` | `Option<u16>` | top-level field in `quorum.yml` | falls back to None |
 | `--dashboard-bind <ADDR>` | `IpAddr` string | `quorum serve` CLI flag | wins over env var |
 | `QUORUM_DASHBOARD_BIND` | `IpAddr` string | env var | falls back to `127.0.0.1` |
+| `QUORUM_DASHBOARD_TOKEN` | `String` | env var | falls back to no auth |
 
 ## Resolution
 
 ```text
-port = --dashboard-port > quorum.yml::dashboard_port > None
-bind = --dashboard-bind > $QUORUM_DASHBOARD_BIND > "127.0.0.1"
+port  = --dashboard-port > quorum.yml::dashboard_port > None
+bind  = --dashboard-bind > $QUORUM_DASHBOARD_BIND > "127.0.0.1"
+token = $QUORUM_DASHBOARD_TOKEN > (unset → auth disabled)
 ```
 
 When `port` resolves to `None`, **no dashboard starts** regardless
@@ -66,19 +68,38 @@ WARN dashboard_port set but `status-server` feature not compiled in
      — no dashboard will start.
 ```
 
-## Security note (no built-in auth)
+## Bearer-token auth
 
-The dashboard has **no authentication**. Loopback binds are an
-implicit access control. Non-loopback binds expose every endpoint
-to the network segment. On non-loopback bind the server emits:
+Set `QUORUM_DASHBOARD_TOKEN` to guard the `/api/*` control plane
+with a bearer token. When set, every `/api/*` request must carry
+`Authorization: Bearer <token>` or it is rejected with `401`. The
+dashboard HTML page, the Swagger UI, `/api-docs/openapi.json`, and
+`GET /auth/status` stay public so the page can load and the
+frontend can prompt for the token before connecting. The dashboard
+UI exposes a token field; the value is stored in `localStorage`
+(`quorum_dashboard_token`) and attached to every guarded request.
 
-```text
-WARN dashboard bound to non-loopback address — control plane is
-     reachable from the network with no built-in authentication.
+Token comparison is constant-time. When `QUORUM_DASHBOARD_TOKEN`
+is unset (or empty) auth is disabled and `/api/*` is open — the
+historical loopback-default behaviour, intended for local dev.
+
+`GET /auth/status` reports the guard state:
+
+```json
+{ "auth_required": true, "authenticated": false }
 ```
 
-See [how-to/expose-agent-dashboard-on-lan.md] for hardening
-patterns (firewall rules, reverse proxy with auth).
+On a non-loopback bind **without** a token set, the server emits:
+
+```text
+WARN dashboard bound to non-loopback address with no
+     QUORUM_DASHBOARD_TOKEN set — the control plane is reachable
+     from the network with no authentication.
+```
+
+Set the token before exposing the dashboard beyond loopback. See
+[how-to/expose-agent-dashboard-on-lan.md] for the full recipe
+(token, bind, plus firewall / reverse-proxy hardening).
 
 ## See also
 
