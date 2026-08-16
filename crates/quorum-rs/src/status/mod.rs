@@ -22,7 +22,13 @@ use utoipa::ToSchema;
 const MAX_RECENT_TASKS: usize = 20;
 
 /// Maximum number of event log entries retained in the snapshot.
-const MAX_EVENT_LOG: usize = 200;
+///
+/// The event log is a fixed-size ring buffer, not a time window: it holds the
+/// most recent `MAX_EVENT_LOG` lifecycle events per agent regardless of age.
+/// Time-scoped views (e.g. the 24h error feed) filter this buffer by timestamp,
+/// so on an agent that emits more than this many events within the window, the
+/// oldest in-window entries are evicted before the cutoff.
+pub(crate) const MAX_EVENT_LOG: usize = 200;
 
 /// Maximum number of recent peer evaluation scores retained.
 const MAX_RECENT_SCORES: usize = 50;

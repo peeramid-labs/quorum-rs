@@ -2888,6 +2888,126 @@ async fn agent_diagnostics_endpoint_serves_metrics_and_404s_unknown() {
 }
 
 // -----------------------------------------------------------------------
+// Fleet-wide 24h error feed
+// -----------------------------------------------------------------------
+
+#[test]
+fn collect_recent_errors_filters_window_type_and_sorts_newest_first() {
+    use crate::status::{AgentStatusSnapshot, EventLogEntry};
+
+    let now = chrono::Utc::now();
+    let recent = (now - chrono::Duration::hours(1)).to_rfc3339();
+    let older = (now - chrono::Duration::hours(3)).to_rfc3339();
+    let stale = (now - chrono::Duration::hours(30)).to_rfc3339();
+    let cutoff = now - chrono::Duration::hours(24);
+
+    let mut alpha = AgentStatusSnapshot::new("ALPHA".into(), "gpt".into(), "openrouter".into());
+    alpha.event_log.push_back(EventLogEntry {
+        timestamp: older.clone(),
+        event_type: "agent_error".into(),
+        job_id: Some("job-older".into()),
+        detail: "evaluate failed: API request failed with status 404".into(),
+    });
+    alpha.event_log.push_back(EventLogEntry {
+        timestamp: stale,
+        event_type: "agent_error".into(),
+        job_id: Some("job-stale".into()),
+        detail: "too old, outside 24h window".into(),
+    });
+    alpha.event_log.push_back(EventLogEntry {
+        timestamp: recent.clone(),
+        event_type: "task_complete".into(),
+        job_id: None,
+        detail: "not an error".into(),
+    });
+
+    let mut beta = AgentStatusSnapshot::new("BETA".into(), "llama".into(), "ollama".into());
+    beta.event_log.push_back(EventLogEntry {
+        timestamp: recent.clone(),
+        event_type: "agent_error".into(),
+        job_id: Some("job-recent".into()),
+        detail: "propose failed: API request failed with status 429".into(),
+    });
+
+    let snapshots = [("ALPHA", &alpha), ("BETA", &beta)];
+    let errors = super::collect_recent_errors(&snapshots, cutoff);
+
+    // Stale (>24h) and non-error events are dropped; two in-window errors remain.
+    assert_eq!(errors.len(), 2);
+    // Newest first: BETA's 1h-old error precedes ALPHA's 3h-old one.
+    assert_eq!(errors[0].agent, "BETA");
+    assert_eq!(errors[0].model_name, "llama");
+    assert_eq!(errors[0].job_id.as_deref(), Some("job-recent"));
+    assert_eq!(errors[1].agent, "ALPHA");
+    assert_eq!(errors[1].job_id.as_deref(), Some("job-older"));
+    assert!(errors[1].detail.contains("status 404"));
+}
+
+#[test]
+fn collect_recent_errors_drops_unparseable_timestamps() {
+    use crate::status::{AgentStatusSnapshot, EventLogEntry};
+
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+    let mut snap = AgentStatusSnapshot::new("ALPHA".into(), "gpt".into(), "openrouter".into());
+    snap.event_log.push_back(EventLogEntry {
+        timestamp: "not-a-timestamp".into(),
+        event_type: "agent_error".into(),
+        job_id: None,
+        detail: "unparseable".into(),
+    });
+
+    let errors = super::collect_recent_errors(&[("ALPHA", &snap)], cutoff);
+    assert!(errors.is_empty());
+}
+
+#[tokio::test]
+async fn agents_errors_endpoint_aggregates_across_agents() {
+    let state = test_state();
+    {
+        let mut alpha = state.statuses.get("ALPHA").unwrap().write().await;
+        alpha.push_event(
+            "agent_error",
+            Some("job-1"),
+            "evaluate failed: API request failed with status 404",
+        );
+    }
+    {
+        let mut beta = state.statuses.get("BETA").unwrap().write().await;
+        beta.push_event("agent_working", Some("job-2"), "round 1");
+    }
+
+    let app = build_router(state);
+    let (status, body) = get_request(app, "/api/agents/errors").await;
+    assert_eq!(status, StatusCode::OK);
+    let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(report["window_hours"], 24);
+    assert_eq!(report["event_log_cap"], crate::status::MAX_EVENT_LOG);
+    assert_eq!(report["total"], 1);
+    let errors = report["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0]["agent"], "ALPHA");
+    assert_eq!(errors[0]["event_type"], "agent_error");
+    assert!(errors[0]["detail"].as_str().unwrap().contains("status 404"));
+}
+
+#[tokio::test]
+async fn dashboard_html_contains_errors_view() {
+    let (_, body) = get_request(build_router(test_state()), "/").await;
+    assert!(
+        body.contains("data-view=\"errors\""),
+        "dashboard must expose the Errors view tab"
+    );
+    assert!(
+        body.contains("loadAgentErrors"),
+        "dashboard must wire the errors loader"
+    );
+    assert!(
+        body.contains("/api/agents/errors"),
+        "dashboard must call the fleet errors endpoint"
+    );
+}
+
+// -----------------------------------------------------------------------
 // Control-plane bearer auth
 // -----------------------------------------------------------------------
 

@@ -103,10 +103,49 @@ Loopback binds stay open (local dev); anything wider requires a token. See
 [how-to/expose-agent-dashboard-on-lan.md] for the full recipe
 (token, bind, plus firewall / reverse-proxy hardening).
 
+## Fleet API-error feed
+
+`GET /api/agents/errors` aggregates the `agent_error` events every agent
+records into one fleet-wide feed, powering the dashboard's **Errors** view
+("API errors per agent · last 24h"). Response shape:
+
+```json
+{
+  "window_hours": 24,
+  "event_log_cap": 200,
+  "total": 2,
+  "errors": [
+    {
+      "agent": "ALPHA",
+      "model_name": "MiniMax-M2.5",
+      "timestamp": "2026-08-16T10:15:03.512+00:00",
+      "event_type": "agent_error",
+      "job_id": "job-1",
+      "detail": "evaluate failed: API request failed with status 404"
+    }
+  ]
+}
+```
+
+Errors are returned newest-first across all agents; the UI groups them per
+agent and offers a free-text filter (agent, model, job, detail).
+
+**Retention window.** The feed reads each agent's in-memory event log, a
+fixed-size ring buffer of the last `event_log_cap` (200) lifecycle events —
+**not** a true 24h store. Entries are filtered to the last 24h by timestamp,
+but on an agent that emits more than 200 events inside that window the oldest
+in-window errors are evicted before the cutoff. `event_log_cap` is returned so
+the view can state the bound. `agent_error` events are rare relative to the
+total, so in normal operation the 24h window is fully covered; the cap only
+bites under a sustained event storm. Nothing is persisted — a restart clears
+the log.
+
 ## See also
 
 - [how-to/expose-agent-dashboard-on-lan.md] — operator recipe
 - `crates/quorum-rs/src/status/multi_server/mod.rs::run_control_plane`
   — bind resolution + boot
+- `crates/quorum-rs/src/status/multi_server/mod.rs::agents_errors`
+  — fleet API-error feed handler
 - `crates/quorum-rs/src/config.rs::AgentFleetConfig` — `dashboard_port` field
 - `crates/quorum-rs/src/main.rs::Serve` — CLI flags

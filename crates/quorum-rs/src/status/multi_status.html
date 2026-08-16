@@ -411,6 +411,108 @@
                 display: block;
             }
 
+            .errors-view {
+                display: none;
+                flex: 1;
+                overflow-y: auto;
+                padding: 16px;
+            }
+            .errors-view.active {
+                display: block;
+            }
+            .errors-header {
+                display: flex;
+                align-items: flex-start;
+                justify-content: space-between;
+                gap: 16px;
+                margin-bottom: 12px;
+                flex-wrap: wrap;
+            }
+            .errors-title {
+                font-size: 15px;
+                font-weight: 600;
+                color: var(--text);
+            }
+            .errors-sub {
+                font-size: 11px;
+                color: var(--text-dim);
+                margin-top: 4px;
+            }
+            .errors-filter {
+                background: var(--surface);
+                border: 1px solid var(--border);
+                border-radius: var(--radius);
+                color: var(--text);
+                padding: 6px 10px;
+                font-size: 12px;
+                min-width: 240px;
+            }
+            .errors-agent-group {
+                margin-bottom: 18px;
+            }
+            .errors-agent-head {
+                display: flex;
+                align-items: baseline;
+                gap: 8px;
+                margin-bottom: 6px;
+            }
+            .errors-agent-name {
+                font-weight: 600;
+                color: var(--text);
+                font-size: 13px;
+            }
+            .errors-agent-model {
+                color: var(--text-dim);
+                font-size: 11px;
+            }
+            .errors-agent-count {
+                margin-left: auto;
+                color: #f85149;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            .errors-table {
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 12px;
+            }
+            .errors-table th {
+                text-align: left;
+                color: var(--text-dim);
+                font-weight: 500;
+                padding: 4px 8px;
+                border-bottom: 1px solid var(--border);
+            }
+            .errors-table td {
+                padding: 6px 8px;
+                border-bottom: 1px solid var(--border);
+                vertical-align: top;
+            }
+            .errors-table td.err-time {
+                white-space: nowrap;
+                color: var(--text-dim);
+            }
+            .errors-table td.err-job {
+                white-space: nowrap;
+                color: var(--text-dim);
+                font-family: monospace;
+            }
+            .errors-table td.err-detail {
+                color: #ffa198;
+                word-break: break-word;
+            }
+            .errors-empty {
+                text-align: center;
+                color: var(--text-dim);
+                padding: 48px 16px;
+                font-size: 14px;
+            }
+            .errors-empty .empty-icon {
+                font-size: 32px;
+                margin-bottom: 8px;
+                opacity: 0.4;
+            }
+
             .queue-empty {
                 text-align: center;
                 color: var(--text-dim);
@@ -2086,6 +2188,13 @@
                 >
                     Orchestrators
                 </button>
+                <button
+                    class="view-tab"
+                    data-view="errors"
+                    onclick="switchView('errors')"
+                >
+                    Errors
+                </button>
                 <a
                     href="/swagger-ui/"
                     target="_blank"
@@ -2114,6 +2223,22 @@
                 <div id="orchestrators-detail" style="flex:1;overflow-y:auto;padding:20px;">
                     <div style="color:#888;text-align:center;margin-top:80px;font-size:14px;">Select an orchestrator to view details</div>
                 </div>
+            </div>
+            <div class="errors-view" id="errors-view">
+                <div class="errors-header">
+                    <div>
+                        <div class="errors-title">API errors per agent · last 24h</div>
+                        <div class="errors-sub" id="errors-sub"></div>
+                    </div>
+                    <input
+                        type="search"
+                        id="errors-filter"
+                        class="errors-filter"
+                        placeholder="Filter by agent, model, job or detail…"
+                        oninput="renderAgentErrors()"
+                    />
+                </div>
+                <div id="errors-body"></div>
             </div>
             <div class="detail-panel" id="detail-panel">
                 <div class="detail-inner" id="detail-inner"></div>
@@ -2355,12 +2480,149 @@
                 var board = document.getElementById("board");
                 var queue = document.getElementById("queue");
                 var orchView = document.getElementById("orchestrators-view");
+                var errorsView = document.getElementById("errors-view");
                 board.classList.toggle("active", view === "board");
                 queue.classList.toggle("active", view === "queue");
                 orchView.style.display = view === "orchestrators" ? "flex" : "none";
+                errorsView.classList.toggle("active", view === "errors");
                 if (view === "board") buildBoard(agents);
                 if (view === "queue") refreshQueueNow();
                 if (view === "orchestrators") loadOrchestratorBudgets();
+                if (view === "errors") loadAgentErrors();
+            }
+
+            // ---- Errors view (fleet-wide API errors, last 24h) ----
+            var agentErrorsReport = { window_hours: 24, event_log_cap: 0, total: 0, errors: [] };
+
+            async function loadAgentErrors() {
+                var sub = document.getElementById("errors-sub");
+                if (sub) sub.textContent = "Loading…";
+                try {
+                    var resp = await fetchWithTimeout("/api/agents/errors");
+                    if (!resp.ok) {
+                        if (sub) sub.textContent = "Failed to load errors (HTTP " + resp.status + ")";
+                        return;
+                    }
+                    agentErrorsReport = await resp.json();
+                } catch (err) {
+                    if (sub) sub.textContent = "Failed to load errors: " + esc(err.message || String(err));
+                    return;
+                }
+                renderAgentErrors();
+            }
+
+            function renderAgentErrors() {
+                var report = agentErrorsReport || { errors: [] };
+                var errors = report.errors || [];
+                var filterEl = document.getElementById("errors-filter");
+                var needle = filterEl ? filterEl.value.trim().toLowerCase() : "";
+                if (needle) {
+                    errors = errors.filter(function (e) {
+                        return (
+                            (e.agent || "").toLowerCase().indexOf(needle) !== -1 ||
+                            (e.model_name || "").toLowerCase().indexOf(needle) !== -1 ||
+                            (e.job_id || "").toLowerCase().indexOf(needle) !== -1 ||
+                            (e.detail || "").toLowerCase().indexOf(needle) !== -1
+                        );
+                    });
+                }
+
+                var sub = document.getElementById("errors-sub");
+                if (sub) {
+                    sub.textContent =
+                        report.total +
+                        " error" + (report.total === 1 ? "" : "s") +
+                        " across all agents. Window bounded by the last " +
+                        report.event_log_cap +
+                        " events per agent — older in-window errors may be evicted.";
+                }
+
+                var body = document.getElementById("errors-body");
+                if (!body) return;
+                body.replaceChildren();
+
+                if (errors.length === 0) {
+                    var empty = errorsEl("div", "errors-empty");
+                    empty.appendChild(errorsEl("div", "empty-icon", "✅"));
+                    empty.appendChild(
+                        document.createTextNode(
+                            needle
+                                ? "No errors match the filter."
+                                : "No API errors in the last 24h.",
+                        ),
+                    );
+                    body.appendChild(empty);
+                    return;
+                }
+
+                var groups = {};
+                var order = [];
+                errors.forEach(function (e) {
+                    var key = e.agent || "(unknown)";
+                    if (!groups[key]) {
+                        groups[key] = { model_name: e.model_name, rows: [] };
+                        order.push(key);
+                    }
+                    groups[key].rows.push(e);
+                });
+
+                order.forEach(function (agent) {
+                    var group = groups[agent];
+                    var wrap = errorsEl("div", "errors-agent-group");
+                    var head = errorsEl("div", "errors-agent-head");
+                    head.appendChild(errorsEl("span", "errors-agent-name", agent));
+                    head.appendChild(
+                        errorsEl("span", "errors-agent-model", group.model_name || ""),
+                    );
+                    var count = group.rows.length + " error" + (group.rows.length === 1 ? "" : "s");
+                    head.appendChild(errorsEl("span", "errors-agent-count", count));
+                    wrap.appendChild(head);
+
+                    var table = errorsEl("table", "errors-table");
+                    var thead = document.createElement("thead");
+                    var headRow = document.createElement("tr");
+                    ["Time", "Type", "Job", "Detail"].forEach(function (label) {
+                        var th = document.createElement("th");
+                        th.textContent = label;
+                        headRow.appendChild(th);
+                    });
+                    thead.appendChild(headRow);
+                    table.appendChild(thead);
+
+                    var tbody = document.createElement("tbody");
+                    group.rows.forEach(function (e) {
+                        var row = document.createElement("tr");
+                        row.appendChild(errorsCell("err-time", fmtErrorTime(e.timestamp)));
+                        row.appendChild(errorsCell("", e.event_type || ""));
+                        row.appendChild(errorsCell("err-job", e.job_id || "—"));
+                        row.appendChild(errorsCell("err-detail", e.detail || ""));
+                        tbody.appendChild(row);
+                    });
+                    table.appendChild(tbody);
+                    wrap.appendChild(table);
+                    body.appendChild(wrap);
+                });
+            }
+
+            function errorsEl(tag, className, text) {
+                var node = document.createElement(tag);
+                if (className) node.className = className;
+                if (text != null) node.textContent = text;
+                return node;
+            }
+
+            function errorsCell(className, text) {
+                var cell = document.createElement("td");
+                if (className) cell.className = className;
+                cell.textContent = text;
+                return cell;
+            }
+
+            function fmtErrorTime(ts) {
+                if (!ts) return "";
+                var when = new Date(ts);
+                if (isNaN(when.getTime())) return ts;
+                return when.toLocaleString();
             }
 
             // ---- Orchestrators view ----

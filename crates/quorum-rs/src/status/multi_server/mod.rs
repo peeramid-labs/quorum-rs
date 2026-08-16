@@ -535,6 +535,108 @@ pub(super) async fn agent_diagnostics(
     Ok(Json(diagnostics_from_snapshot(&name, &snap)))
 }
 
+const ERROR_WINDOW_HOURS: i64 = 24;
+
+/// One `agent_error` event, tagged with the agent it came from.
+#[derive(Serialize, ToSchema)]
+pub(super) struct AgentErrorEntry {
+    agent: String,
+    /// Model the agent runs — lets an operator spot a failing provider/model.
+    model_name: String,
+    /// RFC3339 timestamp of the error.
+    timestamp: String,
+    /// Event type — always `"agent_error"` for this feed.
+    event_type: String,
+    /// Job / session ID the error occurred under, if any.
+    job_id: Option<String>,
+    /// Human-readable detail, e.g. `"evaluate failed: API request failed with status 404"`.
+    detail: String,
+}
+
+/// Fleet-wide API error feed over a rolling time window.
+#[derive(Serialize, ToSchema)]
+pub(super) struct AgentErrorsReport {
+    window_hours: i64,
+    /// Per-agent event-log ring-buffer size. The window is bounded by this cap:
+    /// an agent emitting more than this many events inside `window_hours` loses
+    /// its oldest in-window errors to eviction.
+    event_log_cap: usize,
+    /// Number of errors in `errors`.
+    total: usize,
+    /// Errors across all agents, newest first.
+    errors: Vec<AgentErrorEntry>,
+}
+
+/// Collect `agent_error` events from every agent snapshot that fall at or after
+/// `cutoff`, newest first. Pure — testable without the dashboard app state.
+/// Unparseable timestamps are dropped rather than shown as recent.
+fn collect_recent_errors(
+    snapshots: &[(&str, &crate::status::AgentStatusSnapshot)],
+    cutoff: chrono::DateTime<chrono::Utc>,
+) -> Vec<AgentErrorEntry> {
+    let mut dated: Vec<(chrono::DateTime<chrono::Utc>, AgentErrorEntry)> = snapshots
+        .iter()
+        .flat_map(|(name, snap)| {
+            snap.event_log
+                .iter()
+                .filter(|event| event.event_type == "agent_error")
+                .filter_map(move |event| {
+                    let parsed = chrono::DateTime::parse_from_rfc3339(&event.timestamp).ok()?;
+                    let at = parsed.with_timezone(&chrono::Utc);
+                    if at < cutoff {
+                        return None;
+                    }
+                    Some((
+                        at,
+                        AgentErrorEntry {
+                            agent: (*name).to_string(),
+                            model_name: snap.model_name.clone(),
+                            timestamp: event.timestamp.clone(),
+                            event_type: event.event_type.clone(),
+                            job_id: event.job_id.clone(),
+                            detail: event.detail.clone(),
+                        },
+                    ))
+                })
+        })
+        .collect();
+    dated.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    dated.into_iter().map(|(_, entry)| entry).collect()
+}
+
+/// `GET /api/agents/errors` — fleet-wide API errors over the last 24h.
+///
+/// Aggregates the `agent_error` events every agent already records into one
+/// operator view so infra can be watched at a glance without pulling each
+/// agent's diagnostics individually.
+#[utoipa::path(
+    get,
+    path = "/api/agents/errors",
+    responses(
+        (status = 200, description = "Fleet-wide API errors over the last 24h", body = AgentErrorsReport)
+    ),
+    tag = "Agents"
+)]
+pub(super) async fn agents_errors(State(state): State<MultiAppState>) -> Json<AgentErrorsReport> {
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(ERROR_WINDOW_HOURS);
+    let mut snapshots = Vec::with_capacity(state.statuses.len());
+    for (name, status) in &state.statuses {
+        let snap = status.read().await;
+        snapshots.push((name.clone(), snap.clone()));
+    }
+    let borrowed: Vec<(&str, &crate::status::AgentStatusSnapshot)> = snapshots
+        .iter()
+        .map(|(name, snap)| (name.as_str(), snap))
+        .collect();
+    let errors = collect_recent_errors(&borrowed, cutoff);
+    Json(AgentErrorsReport {
+        window_hours: ERROR_WINDOW_HOURS,
+        event_log_cap: crate::status::MAX_EVENT_LOG,
+        total: errors.len(),
+        errors,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -555,6 +657,7 @@ fn build_router(state: MultiAppState) -> Router {
             get(registry_handlers::get_global_config).put(registry_handlers::update_global_config),
         )
         .route("/api/agents", get(list_agents))
+        .route("/api/agents/errors", get(agents_errors))
         .route("/api/agents/{name}/diagnostics", get(agent_diagnostics))
         .route(
             "/api/agents/register",
