@@ -2278,6 +2278,12 @@ impl NatsNsedWorker {
             (0, 0, None)
         };
 
+        let model_down = model_down_active(
+            self.model_down_until_ms.load(Ordering::Relaxed),
+            chrono::Utc::now().timestamp_millis() as u64,
+        );
+        let health =
+            crate::agents::compute_agent_health(model_down, self.paused.load(Ordering::Relaxed));
         let heartbeat = AgentHeartbeat {
             agent_id: self.agent_id.clone(),
             status: hb_status,
@@ -2305,10 +2311,8 @@ impl NatsNsedWorker {
             capability_tags: self.agent_config.capability_tags.clone(),
             description: self.agent_config.description.clone(),
             signing_schemes: self.agent_config.signing_schemes.clone(),
-            model_down: model_down_active(
-                self.model_down_until_ms.load(Ordering::Relaxed),
-                chrono::Utc::now().timestamp_millis() as u64,
-            ),
+            model_down,
+            health,
         };
         let subject = format!(
             "{}.agent.heartbeat.{}",
