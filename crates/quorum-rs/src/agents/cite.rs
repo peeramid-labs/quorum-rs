@@ -92,7 +92,7 @@
 ///
 /// Byte offsets are *not* what every client counts in. A browser measures a
 /// DOM text node in UTF-16 code units, and Python in Unicode scalar values, so
-/// slicing with these numbers there will silently mis-highlight as soon as the
+/// slicing with these numbers there will silently misplace highlights as soon as the
 /// source contains non-ASCII — which cited prose routinely does (typographic
 /// dashes, curly quotes, accented names). Convert explicitly with
 /// [`utf16_range`](Self::utf16_range) or [`char_range`](Self::char_range)
@@ -773,8 +773,8 @@ mod tests {
 
     #[test]
     fn span_ending_on_a_multibyte_char_is_a_char_boundary() {
-        let span = resolve_cite("x caf\u{e9}", "x  caf\u{e9}").unwrap();
-        assert_eq!(span.text, "x caf\u{e9}");
+        let span = resolve_cite("x café", "x  café").unwrap();
+        assert_eq!(span.text, "x café");
         let span = resolve_cite("value is 5\u{20ac}\ndone", "value is 5\u{20ac} done").unwrap();
         assert_eq!(span.text, "value is 5\u{20ac}\ndone");
     }
@@ -782,7 +782,7 @@ mod tests {
     #[test]
     fn offsets_convert_to_utf16_and_char_units() {
         // U+2011 is 3 bytes / 1 UTF-16 unit / 1 char — byte offsets alone would
-        // mis-highlight in a browser.
+        // misplace a highlight in a browser.
         let src = "a war\u{2011}criminal state was alleged";
         let span = resolve_cite(src, "state was alleged").unwrap();
         assert_eq!(&src[span.start..span.end], "state was alleged");

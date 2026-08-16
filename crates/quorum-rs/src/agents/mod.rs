@@ -437,7 +437,7 @@ pub enum ClaimAnchor {
     /// UTF-16 because the consumer indexes in it (a browser `Range` over a DOM
     /// text node, a JS string). Byte offsets would need the client to re-scan
     /// the string to convert, which is the re-matching this exists to remove,
-    /// and would silently mis-place every highlight after the first non-ASCII
+    /// and would silently misplace every highlight after the first non-ASCII
     /// character — real cited prose is full of typographic dashes and quotes.
     ///
     /// Invariant: slicing `content` by `[start_utf16, end_utf16)` in UTF-16
