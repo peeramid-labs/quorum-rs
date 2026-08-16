@@ -6,6 +6,8 @@
 //! Enable the `status-server` feature to serve a lightweight dashboard
 //! via an embedded axum server (see [`server`] / [`multi_server`]).
 
+pub mod agent_events;
+
 #[cfg(feature = "status-server")]
 pub mod server;
 

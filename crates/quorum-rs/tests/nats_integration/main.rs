@@ -1,4 +1,5 @@
 mod agent_emission_full;
+mod agent_events_store;
 mod common;
 mod g15_g17_g19_extensions;
 mod llm_stalled_heartbeat;

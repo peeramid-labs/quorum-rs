@@ -18,6 +18,7 @@ use crate::agents::{
 };
 use crate::nats_utils::{NatsAuth, connect_nats, ensure_kv_bucket, sanitize_subject_component};
 use crate::providers::{Availability, ModelAvailability};
+use crate::status::agent_events::{AgentEvent, AgentEventKind, AgentEventStore};
 use crate::status::{SharedAgentStatus, TaskLogEntry, new_shared_status};
 use crate::telemetry::{TaskFailureClass, TelemetryEmitterMux};
 
@@ -826,6 +827,25 @@ impl NatsNsedWorker {
         self.paused.load(Ordering::Relaxed)
     }
 
+    /// A handle to this agent's own event log (24h JetStream history). Public so
+    /// the multi-agent runner can hand the dashboard a per-agent read handle.
+    pub fn event_store(&self) -> AgentEventStore {
+        AgentEventStore::new(self.js.clone(), self.agent_id.clone())
+    }
+
+    /// Persist one event to the agent's log, best-effort. A publish failure is
+    /// logged and swallowed — the event log is operator telemetry, never on the
+    /// task's critical path.
+    async fn record_event(&self, event: AgentEvent) {
+        if let Err(e) = self.event_store().publish(&event).await {
+            warn!("failed to record agent event: {}", e);
+        }
+    }
+
+    fn new_event(&self, kind: AgentEventKind) -> AgentEvent {
+        AgentEvent::now(self.agent_id.clone(), kind)
+    }
+
     /// Runs the worker loop, consuming messages from the task and manifest
     /// consumers until the streams close or an unrecoverable error occurs.
     pub async fn run(&self) -> Result<()> {
@@ -861,6 +881,15 @@ impl NatsNsedWorker {
                 }
             }
         };
+
+        // Ensure the agent-scoped event log exists (24h retention). Best-effort:
+        // a failure here must not stop the worker from serving tasks.
+        if let Err(e) = AgentEventStore::ensure_stream(&self.js).await {
+            warn!(
+                "agent event log unavailable (dashboard history disabled): {}",
+                e
+            );
+        }
 
         // Task consumer
         // Short ack_wait (30s) enables fast task recovery after agent crash.
@@ -1638,6 +1667,7 @@ impl NatsNsedWorker {
         )) as Arc<dyn PersistenceStore>);
 
         context.telemetry = self.telemetry.clone();
+        context.event_store = Some(self.event_store());
 
         // Construct UserToolHandler if user tools are registered and factory is available
         let user_tool_names: Vec<&str> =
@@ -1674,6 +1704,14 @@ impl NatsNsedWorker {
             snap.current_job = Some(session_id.clone());
             snap.current_round = Some(context.round_number);
             snap.current_phase = Some(action.to_string());
+        }
+        {
+            let mut event = self.new_event(AgentEventKind::TaskStarted);
+            event.job_id = Some(session_id.clone());
+            event.round = Some(context.round_number);
+            event.phase = Some(action.to_string());
+            event.detail = format!("Round {} {}", context.round_number, action);
+            self.record_event(event).await;
         }
 
         // Record previous round's aggregated score for dashboard display.
@@ -2065,6 +2103,15 @@ impl NatsNsedWorker {
                         );
                     }
                 }
+                {
+                    let mut event = self.new_event(AgentEventKind::TaskCompleted);
+                    event.job_id = Some(session_id.clone());
+                    event.round = Some(context.round_number);
+                    event.phase = Some(action.to_string());
+                    event.status = Some("ok".to_string());
+                    event.detail = format!("{} ok {}ms", action, task_duration_ms);
+                    self.record_event(event).await;
+                }
 
                 // Task succeeded → the remote model is reachable. Clear the
                 // model-down strike count so a recovered model waits only the
@@ -2221,6 +2268,22 @@ impl NatsNsedWorker {
                         Some(&session_id),
                         &format!("{} failed: {}", action, err_str),
                     );
+                }
+                {
+                    let detail = format!("{} failed: {}", action, err_str);
+                    let mut failed = self.new_event(AgentEventKind::TaskFailed);
+                    failed.job_id = Some(session_id.clone());
+                    failed.round = Some(context.round_number);
+                    failed.phase = Some(action.to_string());
+                    failed.status = Some("error".to_string());
+                    failed.detail = detail.clone();
+                    self.record_event(failed).await;
+
+                    let mut errored = self.new_event(AgentEventKind::AgentError);
+                    errored.job_id = Some(session_id.clone());
+                    errored.round = Some(context.round_number);
+                    errored.detail = detail;
+                    self.record_event(errored).await;
                 }
 
                 let phase_budget_remaining_ms =

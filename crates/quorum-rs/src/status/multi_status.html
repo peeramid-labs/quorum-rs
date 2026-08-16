@@ -513,6 +513,32 @@
                 opacity: 0.4;
             }
 
+            .am-activity-note {
+                font-size: 11px;
+                color: var(--text-dim);
+                margin-bottom: 12px;
+            }
+            .am-activity-section {
+                margin-bottom: 18px;
+            }
+            .am-activity-head {
+                display: flex;
+                align-items: baseline;
+                gap: 8px;
+                margin-bottom: 6px;
+            }
+            .am-activity-title {
+                font-weight: 600;
+                color: var(--text);
+                font-size: 13px;
+            }
+            .am-activity-count {
+                margin-left: auto;
+                color: var(--text-dim);
+                font-size: 11px;
+                font-weight: 600;
+            }
+
             .queue-empty {
                 text-align: center;
                 color: var(--text-dim);
@@ -3716,9 +3742,10 @@
             }
 
             function renderAgentModalTabs(activeTab) {
-                var tabs = ["overview", "chat", "buffer", "config"];
+                var tabs = ["overview", "activity", "chat", "buffer", "config"];
                 var labels = {
                     overview: "Overview",
+                    activity: "Activity",
                     chat: "Chat",
                     buffer: "Buffer",
                     config: "Config",
@@ -3761,6 +3788,8 @@
 
                 if (tab === "overview") {
                     await renderOverviewTab(name, body, sid);
+                } else if (tab === "activity") {
+                    await renderActivityTab(name, body, sid);
                 } else if (tab === "chat") {
                     renderChatTab(name, body);
                 } else if (tab === "buffer") {
@@ -3784,6 +3813,128 @@
                 )
                     return true;
                 return false;
+            }
+
+            // ── Activity tab (tasks + tool calls, last 24h from NATS) ──
+            async function fetchActivity(name, suffix) {
+                try {
+                    var r = await fetchWithTimeout(
+                        "/api/agents/" + encodeURIComponent(name) + suffix,
+                    );
+                    return r.ok ? await r.json() : null;
+                } catch (e) {
+                    return null;
+                }
+            }
+
+            async function renderActivityTab(name, container, sessionId) {
+                var tasks = await fetchActivity(name, "/tasks");
+                var toolCalls = await fetchActivity(name, "/tool-calls");
+                if (isModalStale(name, "activity", sessionId)) return;
+
+                container.replaceChildren();
+                var note = errorsEl(
+                    "div",
+                    "am-activity-note",
+                    "Pending and completed activity over the last 24h, from the agent's NATS event log.",
+                );
+                container.appendChild(note);
+
+                if (!tasks && !toolCalls) {
+                    container.appendChild(
+                        errorsEl(
+                            "div",
+                            "am-buf-empty",
+                            "Unable to fetch agent activity.",
+                        ),
+                    );
+                    return;
+                }
+
+                var safeTasks = tasks || { in_flight: [], finished: [] };
+                var safeTools = toolCalls || { pending: [], finished: [] };
+                container.appendChild(
+                    renderTaskSection("Pending / in-flight tasks", safeTasks.in_flight),
+                );
+                container.appendChild(
+                    renderTaskSection("Finished tasks", safeTasks.finished),
+                );
+                container.appendChild(
+                    renderToolCallSection("Pending tool calls", safeTools.pending),
+                );
+                container.appendChild(
+                    renderToolCallSection("Completed tool calls", safeTools.finished),
+                );
+            }
+
+            function activitySection(title, count) {
+                var section = errorsEl("div", "am-activity-section");
+                var head = errorsEl("div", "am-activity-head");
+                head.appendChild(errorsEl("span", "am-activity-title", title));
+                head.appendChild(errorsEl("span", "am-activity-count", String(count)));
+                section.appendChild(head);
+                return section;
+            }
+
+            function activityTable(columns) {
+                var table = errorsEl("table", "errors-table");
+                var thead = document.createElement("thead");
+                var headRow = document.createElement("tr");
+                columns.forEach(function (label) {
+                    var th = document.createElement("th");
+                    th.textContent = label;
+                    headRow.appendChild(th);
+                });
+                thead.appendChild(headRow);
+                table.appendChild(thead);
+                return table;
+            }
+
+            function renderTaskSection(title, rows) {
+                rows = rows || [];
+                var section = activitySection(title, rows.length);
+                if (rows.length === 0) {
+                    section.appendChild(errorsEl("div", "am-buf-empty", "None."));
+                    return section;
+                }
+                var table = activityTable(["Job", "Round", "Phase", "Started", "State", "Detail"]);
+                var tbody = document.createElement("tbody");
+                rows.forEach(function (task) {
+                    var row = document.createElement("tr");
+                    row.appendChild(errorsCell("err-job", task.job_id || "—"));
+                    row.appendChild(errorsCell("", task.round != null ? String(task.round) : "—"));
+                    row.appendChild(errorsCell("", task.phase || "—"));
+                    row.appendChild(errorsCell("err-time", fmtErrorTime(task.started_at)));
+                    row.appendChild(errorsCell("", task.state || "—"));
+                    row.appendChild(errorsCell("err-detail", task.detail || ""));
+                    tbody.appendChild(row);
+                });
+                table.appendChild(tbody);
+                section.appendChild(table);
+                return section;
+            }
+
+            function renderToolCallSection(title, rows) {
+                rows = rows || [];
+                var section = activitySection(title, rows.length);
+                if (rows.length === 0) {
+                    section.appendChild(errorsEl("div", "am-buf-empty", "None."));
+                    return section;
+                }
+                var table = activityTable(["Tool", "Args", "Started", "State", "Result"]);
+                var tbody = document.createElement("tbody");
+                rows.forEach(function (call) {
+                    var row = document.createElement("tr");
+                    row.appendChild(errorsCell("", call.tool_name || "—"));
+                    row.appendChild(errorsCell("err-detail", call.args_summary || ""));
+                    row.appendChild(errorsCell("err-time", fmtErrorTime(call.started_at)));
+                    row.appendChild(errorsCell("", call.state || "—"));
+                    row.appendChild(errorsCell("err-detail", call.detail || ""));
+                    tbody.appendChild(row);
+                });
+                table.appendChild(tbody);
+                section.appendChild(table);
+                return section;
             }
 
             // ── Overview tab ──

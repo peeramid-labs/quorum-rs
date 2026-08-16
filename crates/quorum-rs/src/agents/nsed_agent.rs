@@ -10,6 +10,7 @@ use crate::emit_for;
 use crate::llms::LlmRequestSpan;
 use crate::llms::{AiModel, RequestConfig};
 use crate::prompts::PromptSet;
+use crate::status::agent_events::{AgentEvent, AgentEventKind};
 use crate::telemetry::RetryReason;
 use crate::tools::Tool;
 use crate::tools::context::{
@@ -441,6 +442,20 @@ pub async fn squeeze_scratchpad_if_full(
 }
 
 /// Apply [`TOOL_OUTPUT_FRACTION`] cap to `tool_output` in place.
+/// A short, single-line preview of tool arguments or output for the agent
+/// event log. Collapses whitespace and truncates on a char boundary so the
+/// dashboard shows a compact summary rather than a full payload.
+fn tool_event_preview(text: &str) -> String {
+    const MAX_CHARS: usize = 200;
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > MAX_CHARS {
+        let clipped: String = collapsed.chars().take(MAX_CHARS).collect();
+        format!("{clipped}…")
+    } else {
+        collapsed
+    }
+}
+
 /// Truncates on a UTF-8 char boundary and appends a marker so the
 /// model sees that the tool clipped its result. Returns `true`
 /// when the cap engaged.
@@ -3396,6 +3411,19 @@ async fn react_loop(
                 *tool_usage_stats.entry(tool_name.clone()).or_insert(0) += 1;
 
                 let tool_exec_start = std::time::Instant::now();
+                if let Some(store) = context.event_store.as_ref() {
+                    let mut started =
+                        AgentEvent::now(agent_config.name.clone(), AgentEventKind::ToolCallStarted);
+                    started.call_id = Some(tool_call.id.clone());
+                    started.tool_name = Some(tool_name.clone());
+                    started.args_summary = Some(tool_event_preview(&tool_call.function.arguments));
+                    started.job_id = context.session_id.clone();
+                    started.round = Some(context.round_number);
+                    started.detail = format!("calling {tool_name}");
+                    if let Err(e) = store.publish(&started).await {
+                        warn!("failed to record tool-call start: {e}");
+                    }
+                }
                 // `tool_success` is set explicitly in every branch
                 // alongside `tool_output` so the telemetry emission
                 // below records the real outcome rather than inferring
@@ -3606,6 +3634,22 @@ async fn react_loop(
                 );
 
                 let latency_ms = tool_exec_start.elapsed().as_millis() as u64;
+                if let Some(store) = context.event_store.as_ref() {
+                    let mut finished = AgentEvent::now(
+                        agent_config.name.clone(),
+                        AgentEventKind::ToolCallFinished,
+                    );
+                    finished.call_id = Some(tool_call.id.clone());
+                    finished.tool_name = Some(tool_name.clone());
+                    finished.job_id = context.session_id.clone();
+                    finished.round = Some(context.round_number);
+                    finished.status = Some(if tool_success { "ok" } else { "error" }.to_string());
+                    finished.detail =
+                        format!("{}ms · {}", latency_ms, tool_event_preview(&tool_output));
+                    if let Err(e) = store.publish(&finished).await {
+                        warn!("failed to record tool-call finish: {e}");
+                    }
+                }
                 let output_bytes = tool_output.len() as u64;
                 // 4 chars/token rule-of-thumb; ceiling so non-empty
                 // outputs under 4 bytes still report 1 token.

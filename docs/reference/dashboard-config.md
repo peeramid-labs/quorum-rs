@@ -103,23 +103,46 @@ Loopback binds stay open (local dev); anything wider requires a token. See
 [how-to/expose-agent-dashboard-on-lan.md] for the full recipe
 (token, bind, plus firewall / reverse-proxy hardening).
 
-## Fleet API-error feed
+## Agent event log (NATS-backed 24h history)
 
-`GET /api/agents/errors` aggregates the `agent_error` events every agent
-records into one fleet-wide feed, powering the dashboard's **Errors** view
-("API errors per agent · last 24h"). Response shape:
+The dashboard's 24h operator views — the fleet **Errors** view and the per-agent
+modal's **Activity** tab — are backed by a JetStream stream, not an in-memory
+buffer. Each agent persists its own lifecycle events to the subject
+`agent.events.<agent_name>` under a shared stream `agent_events` with **24h
+retention** (`max_age`) and a hard cap of **10,000** events
+(`STREAM_MAX_MESSAGES`). The window therefore survives restarts.
+
+Event kinds: `agent_error`, `task_started` / `task_completed` / `task_failed`,
+and `tool_call_started` / `tool_call_finished`.
+
+This log lives entirely in the agent's own NATS scope. The orchestrator never
+publishes to it or consumes from it. The dashboard runs in the agent process
+and holds each agent's JetStream context, so it reads the stream directly (an
+ephemeral pull consumer filtered to the agent subject, drained per request).
+
+```mermaid
+flowchart LR
+    Worker[Agent worker + react loop] -- publish --> Stream[(agent_events\nmax_age=24h)]
+    Stream -- read_since(now-24h) --> Dash[Dashboard endpoints]
+    Dash --> Errors[Errors view]
+    Dash --> Activity[Modal Activity tab]
+```
+
+### `GET /api/agents/errors`
+
+Fleet-wide `agent_error` feed, newest-first across all agents. The UI groups it
+per agent with a free-text filter (agent, model, job, detail).
 
 ```json
 {
   "window_hours": 24,
-  "event_log_cap": 200,
-  "total": 2,
+  "stream_cap": 10000,
+  "total": 1,
   "errors": [
     {
       "agent": "ALPHA",
       "model_name": "MiniMax-M2.5",
       "timestamp": "2026-08-16T10:15:03.512+00:00",
-      "event_type": "agent_error",
       "job_id": "job-1",
       "detail": "evaluate failed: API request failed with status 404"
     }
@@ -127,22 +150,28 @@ records into one fleet-wide feed, powering the dashboard's **Errors** view
 }
 ```
 
-Errors are returned newest-first across all agents; the UI groups them per
-agent and offers a free-text filter (agent, model, job, detail).
+### `GET /api/agents/{name}/tasks`
 
-**Retention window.** The feed reads each agent's in-memory event log, a
-fixed-size ring buffer of the last `event_log_cap` (200) lifecycle events —
-**not** a true 24h store. Entries are filtered to the last 24h by timestamp,
-but on an agent that emits more than 200 events inside that window the oldest
-in-window errors are evicted before the cutoff. `event_log_cap` is returned so
-the view can state the bound. `agent_error` events are rare relative to the
-total, so in normal operation the 24h window is fully covered; the cap only
-bites under a sustained event storm. Nothing is persisted — a restart clears
-the log.
+Reconstructs the agent's tasks/queries by pairing `task_started` with its
+finish event, split into `in_flight` (no finish yet) and `finished`.
+
+### `GET /api/agents/{name}/tool-calls`
+
+Reconstructs tool invocations by pairing `tool_call_started` with
+`tool_call_finished` on a shared `call_id`, split into `pending` and
+`finished` (each carries tool name, args summary, and result/status).
+
+**Retention honesty.** The window is a real 24h, time-based (JetStream
+`max_age`), and restart-surviving. The only remaining bound is the 10k-event
+hard cap per stream: an agent emitting more than 10,000 events inside 24h evicts
+its oldest events early. `stream_cap` is returned so the UI can state it. When
+the process has no NATS the views degrade to empty rather than erroring.
 
 ## See also
 
 - [how-to/expose-agent-dashboard-on-lan.md] — operator recipe
+- `crates/quorum-rs/src/status/agent_events.rs` — event log store, read, and
+  view reconciliation
 - `crates/quorum-rs/src/status/multi_server/mod.rs::run_control_plane`
   — bind resolution + boot
 - `crates/quorum-rs/src/status/multi_server/mod.rs::agents_errors`

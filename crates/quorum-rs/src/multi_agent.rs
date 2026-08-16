@@ -28,6 +28,7 @@
 use crate::agents::{AgentConfig, ChatCapable};
 use crate::orchestrator_registry::OrchestratorRegistry;
 use crate::status::SharedAgentStatus;
+use crate::status::agent_events::AgentEventStore;
 use crate::workers::NatsNsedWorker;
 use crate::workers::buffer::ResponseBuffer;
 use std::collections::HashMap;
@@ -54,6 +55,8 @@ pub struct MultiAgentRunner {
     buffers: HashMap<String, Arc<ResponseBuffer>>,
     /// Pause handles per agent — direct access to each worker's AtomicBool.
     pause_handles: HashMap<String, Arc<AtomicBool>>,
+    /// Per-agent NATS event-log read handles for the dashboard's 24h views.
+    event_stores: HashMap<String, AgentEventStore>,
     /// Optional unified dashboard port.
     dashboard_port: Option<u16>,
     /// Optional orchestrator registry for runtime management.
@@ -70,6 +73,7 @@ impl MultiAgentRunner {
             configs: HashMap::new(),
             buffers: HashMap::new(),
             pause_handles: HashMap::new(),
+            event_stores: HashMap::new(),
             dashboard_port: None,
             orchestrator_registry: None,
         }
@@ -114,6 +118,7 @@ impl MultiAgentRunner {
         }
         self.pause_handles
             .insert(name.clone(), worker.pause_handle());
+        self.event_stores.insert(name.clone(), worker.event_store());
         self.configs
             .insert(name.clone(), Arc::new(RwLock::new(config)));
         self.workers.push((name, worker));
@@ -228,6 +233,7 @@ impl MultiAgentRunner {
             let configs = self.configs.clone();
             let buffers = self.buffers.clone();
             let pause_handles = self.pause_handles.clone();
+            let event_stores = self.event_stores.clone();
             let registry = self.orchestrator_registry.clone();
             tokio::spawn(async move {
                 crate::status::multi_server::MultiAgentStatusServer::run_control_plane(
@@ -237,6 +243,7 @@ impl MultiAgentRunner {
                     configs,
                     buffers,
                     pause_handles,
+                    event_stores,
                     registry,
                     None, // Middleware pipeline — wired when MiddlewareConfig is available
                 )
