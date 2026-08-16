@@ -2792,6 +2792,25 @@ fn resolve_dashboard_bind_falls_back_on_garbage() {
 }
 
 #[test]
+fn refuses_non_loopback_bind_without_token() {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let any = IpAddr::V4(Ipv4Addr::UNSPECIFIED); // 0.0.0.0
+    // Non-loopback + no token → refuse (fail-closed).
+    assert!(super::refuse_unauthenticated_exposure(&any, false));
+    // Non-loopback + token → allowed.
+    assert!(!super::refuse_unauthenticated_exposure(&any, true));
+    // Loopback (v4/v6) + no token → allowed (local dev).
+    assert!(!super::refuse_unauthenticated_exposure(
+        &IpAddr::V4(Ipv4Addr::LOCALHOST),
+        false
+    ));
+    assert!(!super::refuse_unauthenticated_exposure(
+        &IpAddr::V6(Ipv6Addr::LOCALHOST),
+        false
+    ));
+}
+
+#[test]
 fn diagnostics_from_snapshot_surfaces_errors_and_metrics() {
     use crate::status::{AgentStatusSnapshot, EventLogEntry, TaskLogEntry};
     let mut snap = AgentStatusSnapshot::new("Corepunk18".into(), "gpt".into(), "openrouter".into());

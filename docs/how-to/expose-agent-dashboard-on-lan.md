@@ -93,13 +93,13 @@ segment access to the control plane **only** with the credential:
 - response-buffer inspection (mid-flight LLM output)
 - live config tuning (e.g. SLA changes that affect job routing)
 
-Boot a non-loopback bind **without** a token and the server emits
-a warn line to make the exposure visible:
+Boot a non-loopback bind **without** a token and the server **refuses to
+start the dashboard** (fail-closed — a missing token can't silently open it):
 
 ```text
-WARN dashboard bound to non-loopback address with no
-     QUORUM_DASHBOARD_TOKEN set — the control plane is reachable
-     from the network with no authentication.
+ERROR refusing to start the dashboard: bound to a non-loopback address with
+      no QUORUM_DASHBOARD_TOKEN — that would expose the control plane
+      unauthenticated. Set QUORUM_DASHBOARD_TOKEN, or bind to loopback.
 ```
 
 **Additional hardening (layer on top of the token):**
