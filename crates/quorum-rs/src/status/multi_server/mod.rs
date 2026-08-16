@@ -14,6 +14,7 @@ mod registry_handlers;
 mod status_handlers;
 
 use super::SharedAgentStatus;
+use super::agent_events::AgentEventStore;
 use crate::agents::{AgentConfig, ChatCapable};
 use crate::orchestrator_registry::OrchestratorRegistry;
 use crate::workers::buffer::ResponseBuffer;
@@ -43,6 +44,10 @@ pub(crate) struct MultiAppState {
     buffers: HashMap<String, Arc<ResponseBuffer>>,
     /// Pause handles for each agent — toggles the worker's AtomicBool directly.
     pause_handles: HashMap<String, Arc<AtomicBool>>,
+    /// Per-agent NATS event-log read handles, backing the 24h error feed and the
+    /// per-agent tasks / tool-calls views. Empty when the process has no NATS
+    /// (e.g. tests) — the views then report no history.
+    event_stores: HashMap<String, AgentEventStore>,
     /// Optional orchestrator registry for runtime orchestrator management.
     orchestrator_registry: Option<OrchestratorRegistry>,
     /// Global base hold duration in seconds (shared by all agent buffers).
@@ -222,6 +227,7 @@ impl MultiAgentStatusServer {
             rw_configs,
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
             registry,
             None, // No middleware in basic mode
         )
@@ -242,6 +248,7 @@ impl MultiAgentStatusServer {
         configs: HashMap<String, Arc<RwLock<AgentConfig>>>,
         buffers: HashMap<String, Arc<ResponseBuffer>>,
         pause_handles: HashMap<String, Arc<AtomicBool>>,
+        event_stores: HashMap<String, AgentEventStore>,
         registry: Option<OrchestratorRegistry>,
         middleware: Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
     ) {
@@ -262,6 +269,7 @@ impl MultiAgentStatusServer {
             configs,
             buffers,
             pause_handles,
+            event_stores,
             orchestrator_registry: registry,
             base_hold_secs: Arc::new(AtomicU64::new(base_secs)),
             response_sla_secs: Arc::new(AtomicU64::new(sla_secs)),
@@ -535,6 +543,187 @@ pub(super) async fn agent_diagnostics(
     Ok(Json(diagnostics_from_snapshot(&name, &snap)))
 }
 
+use super::agent_events::{AgentEvent, TasksView, ToolCallsView};
+
+const ERROR_WINDOW_HOURS: i64 = 24;
+
+/// One `agent_error` event, tagged with the agent it came from.
+#[derive(Serialize, ToSchema)]
+pub(super) struct AgentErrorEntry {
+    agent: String,
+    /// Model the agent runs — lets an operator spot a failing provider/model.
+    model_name: String,
+    /// RFC3339 timestamp of the error.
+    timestamp: String,
+    /// Job / session ID the error occurred under, if any.
+    job_id: Option<String>,
+    /// Human-readable detail, e.g. `"evaluate failed: API request failed with status 404"`.
+    detail: String,
+}
+
+/// Fleet-wide API error feed over a rolling time window.
+#[derive(Serialize, ToSchema)]
+pub(super) struct AgentErrorsReport {
+    /// Rolling window, in hours.
+    window_hours: i64,
+    /// Per-agent hard cap on retained events. The 24h window is bounded by this:
+    /// an agent emitting more than this many events inside the window loses its
+    /// oldest events to eviction.
+    stream_cap: i64,
+    /// Number of errors in `errors`.
+    total: usize,
+    /// Errors across all agents, newest first.
+    errors: Vec<AgentErrorEntry>,
+}
+
+/// One agent's raw error events together with the model it runs.
+struct AgentErrorSource {
+    agent: String,
+    model_name: String,
+    events: Vec<AgentEvent>,
+}
+
+/// Flatten per-agent error events into one newest-first feed. Pure — testable
+/// without NATS. Input events are assumed already error-kind and in-window
+/// (as produced by the store read + [`super::agent_events::collect_errors`]).
+fn flatten_error_feed(sources: &[AgentErrorSource]) -> Vec<AgentErrorEntry> {
+    let mut dated: Vec<(chrono::DateTime<chrono::Utc>, AgentErrorEntry)> = sources
+        .iter()
+        .flat_map(|source| {
+            source.events.iter().filter_map(move |event| {
+                let at = event.parsed_time()?;
+                Some((
+                    at,
+                    AgentErrorEntry {
+                        agent: source.agent.clone(),
+                        model_name: source.model_name.clone(),
+                        timestamp: event.timestamp.clone(),
+                        job_id: event.job_id.clone(),
+                        detail: event.detail.clone(),
+                    },
+                ))
+            })
+        })
+        .collect();
+    dated.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    dated.into_iter().map(|(_, entry)| entry).collect()
+}
+
+/// Model name the agent runs, from its live config (empty if unknown).
+async fn model_name_for(state: &MultiAppState, agent: &str) -> String {
+    match state.configs.get(agent) {
+        Some(config) => config.read().await.model_name.clone(),
+        None => String::new(),
+    }
+}
+
+/// `GET /api/agents/errors` — fleet-wide API errors over the last 24h.
+///
+/// Reads each agent's NATS-persisted event log (24h retention) and aggregates
+/// the `agent_error` events into one operator view, so infra can be watched at a
+/// glance without pulling each agent's diagnostics individually.
+#[utoipa::path(
+    get,
+    path = "/api/agents/errors",
+    responses(
+        (status = 200, description = "Fleet-wide API errors over the last 24h", body = AgentErrorsReport)
+    ),
+    tag = "Agents"
+)]
+pub(super) async fn agents_errors(State(state): State<MultiAppState>) -> Json<AgentErrorsReport> {
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(ERROR_WINDOW_HOURS);
+    let mut sources = Vec::with_capacity(state.event_stores.len());
+    for (agent, store) in &state.event_stores {
+        let events = match store.read_since(cutoff).await {
+            Ok(events) => super::agent_events::collect_errors(&events),
+            Err(e) => {
+                error!(agent = %agent, error = %e, "failed to read agent error log");
+                continue;
+            }
+        };
+        sources.push(AgentErrorSource {
+            agent: agent.clone(),
+            model_name: model_name_for(&state, agent).await,
+            events,
+        });
+    }
+    let errors = flatten_error_feed(&sources);
+    Json(AgentErrorsReport {
+        window_hours: ERROR_WINDOW_HOURS,
+        stream_cap: super::agent_events::STREAM_MAX_MESSAGES,
+        total: errors.len(),
+        errors,
+    })
+}
+
+/// Read one agent's events from the last 24h, or `None` if it has no event log.
+async fn read_agent_window(
+    state: &MultiAppState,
+    name: &str,
+) -> Option<Result<Vec<AgentEvent>, StatusCode>> {
+    let store = state.event_stores.get(name)?;
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(ERROR_WINDOW_HOURS);
+    Some(match store.read_since(cutoff).await {
+        Ok(events) => Ok(events),
+        Err(e) => {
+            error!(agent = %name, error = %e, "failed to read agent event log");
+            Err(StatusCode::BAD_GATEWAY)
+        }
+    })
+}
+
+/// `GET /api/agents/{name}/tasks` — the agent's in-flight and finished
+/// tasks/queries over the last 24h, from its NATS event log.
+#[utoipa::path(
+    get,
+    path = "/api/agents/{name}/tasks",
+    params(("name" = String, Path, description = "Agent name")),
+    responses(
+        (status = 200, description = "In-flight and finished tasks", body = TasksView),
+        (status = 404, description = "Unknown agent")
+    ),
+    tag = "Agents"
+)]
+pub(super) async fn agent_tasks(
+    State(state): State<MultiAppState>,
+    Path(name): Path<String>,
+) -> Result<Json<TasksView>, StatusCode> {
+    if !state.configs.contains_key(&name) && !state.statuses.contains_key(&name) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let events = match read_agent_window(&state, &name).await {
+        Some(result) => result?,
+        None => return Ok(Json(TasksView::default())),
+    };
+    Ok(Json(super::agent_events::reconcile_tasks(&events)))
+}
+
+/// `GET /api/agents/{name}/tool-calls` — the agent's pending and finished tool
+/// invocations over the last 24h, from its NATS event log.
+#[utoipa::path(
+    get,
+    path = "/api/agents/{name}/tool-calls",
+    params(("name" = String, Path, description = "Agent name")),
+    responses(
+        (status = 200, description = "Pending and finished tool calls", body = ToolCallsView),
+        (status = 404, description = "Unknown agent")
+    ),
+    tag = "Agents"
+)]
+pub(super) async fn agent_tool_calls(
+    State(state): State<MultiAppState>,
+    Path(name): Path<String>,
+) -> Result<Json<ToolCallsView>, StatusCode> {
+    if !state.configs.contains_key(&name) && !state.statuses.contains_key(&name) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let events = match read_agent_window(&state, &name).await {
+        Some(result) => result?,
+        None => return Ok(Json(ToolCallsView::default())),
+    };
+    Ok(Json(super::agent_events::reconcile_tool_calls(&events)))
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -555,7 +744,10 @@ fn build_router(state: MultiAppState) -> Router {
             get(registry_handlers::get_global_config).put(registry_handlers::update_global_config),
         )
         .route("/api/agents", get(list_agents))
+        .route("/api/agents/errors", get(agents_errors))
         .route("/api/agents/{name}/diagnostics", get(agent_diagnostics))
+        .route("/api/agents/{name}/tasks", get(agent_tasks))
+        .route("/api/agents/{name}/tool-calls", get(agent_tool_calls))
         .route(
             "/api/agents/register",
             post(registration_handlers::register_agent),

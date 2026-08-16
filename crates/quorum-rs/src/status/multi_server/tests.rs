@@ -64,12 +64,23 @@ fn test_state() -> MultiAppState {
         configs,
         buffers: HashMap::new(),
         pause_handles,
+        event_stores: HashMap::new(),
         orchestrator_registry: None,
         base_hold_secs: Arc::new(AtomicU64::new(10)),
         response_sla_secs: Arc::new(AtomicU64::new(10)),
         buffer_floor_pct: Arc::new(AtomicU64::new(0)),
         before_release_middleware: None,
         auth_token: None,
+    }
+}
+
+/// Connect to NATS for an end-to-end read-path test, or `None` to self-skip
+/// when no server is running locally.
+async fn try_jetstream() -> Option<async_nats::jetstream::Context> {
+    let url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".to_string());
+    match tokio::time::timeout(std::time::Duration::from_secs(3), async_nats::connect(&url)).await {
+        Ok(Ok(client)) => Some(async_nats::jetstream::new(client)),
+        _ => None,
     }
 }
 
@@ -284,6 +295,7 @@ async fn list_agents_empty_state() {
         configs: HashMap::new(),
         buffers: HashMap::new(),
         pause_handles: HashMap::new(),
+        event_stores: HashMap::new(),
         orchestrator_registry: None,
         base_hold_secs: Arc::new(AtomicU64::new(10)),
         response_sla_secs: Arc::new(AtomicU64::new(10)),
@@ -763,6 +775,7 @@ async fn default_sla_is_zero_when_no_buffers() {
         configs: HashMap::new(),
         buffers: HashMap::new(),
         pause_handles: HashMap::new(),
+        event_stores: HashMap::new(),
         orchestrator_registry: None,
         base_hold_secs: Arc::new(AtomicU64::new(0)),
         response_sla_secs: Arc::new(AtomicU64::new(0)),
@@ -1898,6 +1911,7 @@ async fn auto_all_empty_state_returns_zero_count() {
         configs: HashMap::new(),
         buffers: HashMap::new(),
         pause_handles: HashMap::new(),
+        event_stores: HashMap::new(),
         orchestrator_registry: None,
         base_hold_secs: Arc::new(AtomicU64::new(10)),
         response_sla_secs: Arc::new(AtomicU64::new(10)),
@@ -2885,6 +2899,204 @@ async fn agent_diagnostics_endpoint_serves_metrics_and_404s_unknown() {
     let app2 = build_router(test_state());
     let (status, _) = get_request(app2, "/api/agents/NOPE/diagnostics").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// -----------------------------------------------------------------------
+// Fleet-wide 24h error feed
+// -----------------------------------------------------------------------
+
+fn error_event(
+    agent: &str,
+    ts: &str,
+    job: &str,
+    detail: &str,
+) -> crate::status::agent_events::AgentEvent {
+    let mut event = crate::status::agent_events::AgentEvent::now(
+        agent,
+        crate::status::agent_events::AgentEventKind::AgentError,
+    );
+    event.timestamp = ts.to_string();
+    event.job_id = Some(job.to_string());
+    event.detail = detail.to_string();
+    event
+}
+
+#[test]
+fn flatten_error_feed_sorts_newest_first_across_agents() {
+    let now = chrono::Utc::now();
+    let recent = (now - chrono::Duration::hours(1)).to_rfc3339();
+    let older = (now - chrono::Duration::hours(3)).to_rfc3339();
+
+    let sources = vec![
+        super::AgentErrorSource {
+            agent: "ALPHA".to_string(),
+            model_name: "gpt".to_string(),
+            events: vec![error_event(
+                "ALPHA",
+                &older,
+                "job-older",
+                "evaluate failed: API request failed with status 404",
+            )],
+        },
+        super::AgentErrorSource {
+            agent: "BETA".to_string(),
+            model_name: "llama".to_string(),
+            events: vec![error_event(
+                "BETA",
+                &recent,
+                "job-recent",
+                "propose failed: API request failed with status 429",
+            )],
+        },
+    ];
+
+    let errors = super::flatten_error_feed(&sources);
+    assert_eq!(errors.len(), 2);
+    assert_eq!(errors[0].agent, "BETA");
+    assert_eq!(errors[0].model_name, "llama");
+    assert_eq!(errors[0].job_id.as_deref(), Some("job-recent"));
+    assert_eq!(errors[1].agent, "ALPHA");
+    assert!(errors[1].detail.contains("status 404"));
+}
+
+#[test]
+fn flatten_error_feed_drops_unparseable_timestamps() {
+    let sources = vec![super::AgentErrorSource {
+        agent: "ALPHA".to_string(),
+        model_name: "gpt".to_string(),
+        events: vec![error_event(
+            "ALPHA",
+            "not-a-timestamp",
+            "job",
+            "unparseable",
+        )],
+    }];
+    assert!(super::flatten_error_feed(&sources).is_empty());
+}
+
+#[tokio::test]
+async fn agents_errors_endpoint_returns_report_shape_without_nats() {
+    // well-formed report, sourced from the NATS-backed feed rather than the
+    // in-memory snapshot.
+    let app = build_router(test_state());
+    let (status, body) = get_request(app, "/api/agents/errors").await;
+    assert_eq!(status, StatusCode::OK);
+    let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(report["window_hours"], 24);
+    assert_eq!(
+        report["stream_cap"],
+        crate::status::agent_events::STREAM_MAX_MESSAGES
+    );
+    assert_eq!(report["total"], 0);
+    assert!(report["errors"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn agent_tasks_and_tool_calls_endpoints_404_unknown_agent() {
+    let app = build_router(test_state());
+    let (status, _) = get_request(app, "/api/agents/NOPE/tasks").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let app = build_router(test_state());
+    let (status, _) = get_request(app, "/api/agents/NOPE/tool-calls").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn agent_tasks_and_tool_calls_empty_without_nats() {
+    // A known agent with no event store → empty views, not a 404.
+    let app = build_router(test_state());
+    let (status, body) = get_request(app, "/api/agents/ALPHA/tasks").await;
+    assert_eq!(status, StatusCode::OK);
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(view["in_flight"].as_array().unwrap().is_empty());
+    assert!(view["finished"].as_array().unwrap().is_empty());
+
+    let app = build_router(test_state());
+    let (status, body) = get_request(app, "/api/agents/ALPHA/tool-calls").await;
+    assert_eq!(status, StatusCode::OK);
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(view["pending"].as_array().unwrap().is_empty());
+    assert!(view["finished"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn agent_tasks_endpoint_reads_nats_event_log() {
+    use crate::status::agent_events::{AgentEvent, AgentEventKind, AgentEventStore};
+
+    let js = match try_jetstream().await {
+        Some(js) => js,
+        None => return,
+    };
+    AgentEventStore::ensure_stream(&js)
+        .await
+        .expect("ensure stream");
+
+    let agent = format!("ALPHA_{}", uuid::Uuid::new_v4().simple());
+    let store = AgentEventStore::new(js.clone(), agent.clone());
+
+    let mut started = AgentEvent::now(&agent, AgentEventKind::TaskStarted);
+    started.job_id = Some("job-live".to_string());
+    started.round = Some(1);
+    started.phase = Some("propose".to_string());
+    store.publish(&started).await.expect("publish start");
+
+    let mut state = test_state();
+    state.configs.insert(
+        agent.clone(),
+        Arc::new(RwLock::new(AgentConfig {
+            name: agent.clone(),
+            ..Default::default()
+        })),
+    );
+    state.event_stores.insert(agent.clone(), store);
+
+    let app = build_router(state);
+    let (status, body) = get_request(app, &format!("/api/agents/{}/tasks", agent)).await;
+    assert_eq!(status, StatusCode::OK);
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let in_flight = view["in_flight"].as_array().unwrap();
+    assert_eq!(in_flight.len(), 1, "the started task shows as in-flight");
+    assert_eq!(in_flight[0]["job_id"], "job-live");
+    assert_eq!(in_flight[0]["state"], "in_flight");
+}
+
+#[tokio::test]
+async fn dashboard_html_contains_activity_modal_sections() {
+    let (_, body) = get_request(build_router(test_state()), "/").await;
+    assert!(
+        body.contains("renderActivityTab"),
+        "modal must wire the Activity tab"
+    );
+    assert!(
+        body.contains("/tool-calls"),
+        "modal must call the per-agent tool-calls endpoint"
+    );
+    assert!(
+        body.contains("renderTaskSection") && body.contains("renderToolCallSection"),
+        "modal must render both the tasks and tool-calls sections"
+    );
+    assert!(
+        body.contains("Pending tool calls"),
+        "modal must label the pending tool-calls section"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_html_contains_errors_view() {
+    let (_, body) = get_request(build_router(test_state()), "/").await;
+    assert!(
+        body.contains("data-view=\"errors\""),
+        "dashboard must expose the Errors view tab"
+    );
+    assert!(
+        body.contains("loadAgentErrors"),
+        "dashboard must wire the errors loader"
+    );
+    assert!(
+        body.contains("/api/agents/errors"),
+        "dashboard must call the fleet errors endpoint"
+    );
 }
 
 // -----------------------------------------------------------------------

@@ -103,10 +103,78 @@ Loopback binds stay open (local dev); anything wider requires a token. See
 [how-to/expose-agent-dashboard-on-lan.md] for the full recipe
 (token, bind, plus firewall / reverse-proxy hardening).
 
+## Agent event log (NATS-backed 24h history)
+
+The dashboard's 24h operator views — the fleet **Errors** view and the per-agent
+modal's **Activity** tab — are backed by a JetStream stream, not an in-memory
+buffer. Each agent persists its own lifecycle events to the subject
+`agent.events.<agent_name>` under a shared stream `agent_events` with **24h
+retention** (`max_age`) and a hard cap of **10,000** events
+(`STREAM_MAX_MESSAGES`). The window therefore survives restarts.
+
+Event kinds: `agent_error`, `task_started` / `task_completed` / `task_failed`,
+and `tool_call_started` / `tool_call_finished`.
+
+This log lives entirely in the agent's own NATS scope. The orchestrator never
+publishes to it or consumes from it. The dashboard runs in the agent process
+and holds each agent's JetStream context, so it reads the stream directly (an
+ephemeral pull consumer filtered to the agent subject, drained per request).
+
+```mermaid
+flowchart LR
+    Worker[Agent worker + react loop] -- publish --> Stream[(agent_events\nmax_age=24h)]
+    Stream -- read_since(now-24h) --> Dash[Dashboard endpoints]
+    Dash --> Errors[Errors view]
+    Dash --> Activity[Modal Activity tab]
+```
+
+### `GET /api/agents/errors`
+
+Fleet-wide `agent_error` feed, newest-first across all agents. The UI groups it
+per agent with a free-text filter (agent, model, job, detail).
+
+```json
+{
+  "window_hours": 24,
+  "stream_cap": 10000,
+  "total": 1,
+  "errors": [
+    {
+      "agent": "ALPHA",
+      "model_name": "MiniMax-M2.5",
+      "timestamp": "2026-08-16T10:15:03.512+00:00",
+      "job_id": "job-1",
+      "detail": "evaluate failed: API request failed with status 404"
+    }
+  ]
+}
+```
+
+### `GET /api/agents/{name}/tasks`
+
+Reconstructs the agent's tasks/queries by pairing `task_started` with its
+finish event, split into `in_flight` (no finish yet) and `finished`.
+
+### `GET /api/agents/{name}/tool-calls`
+
+Reconstructs tool invocations by pairing `tool_call_started` with
+`tool_call_finished` on a shared `call_id`, split into `pending` and
+`finished` (each carries tool name, args summary, and result/status).
+
+**Retention honesty.** The window is a real 24h, time-based (JetStream
+`max_age`), and restart-surviving. The only remaining bound is the 10k-event
+hard cap per stream: an agent emitting more than 10,000 events inside 24h evicts
+its oldest events early. `stream_cap` is returned so the UI can state it. When
+the process has no NATS the views degrade to empty rather than erroring.
+
 ## See also
 
 - [how-to/expose-agent-dashboard-on-lan.md] — operator recipe
+- `crates/quorum-rs/src/status/agent_events.rs` — event log store, read, and
+  view reconciliation
 - `crates/quorum-rs/src/status/multi_server/mod.rs::run_control_plane`
   — bind resolution + boot
+- `crates/quorum-rs/src/status/multi_server/mod.rs::agents_errors`
+  — fleet API-error feed handler
 - `crates/quorum-rs/src/config.rs::AgentFleetConfig` — `dashboard_port` field
 - `crates/quorum-rs/src/main.rs::Serve` — CLI flags

@@ -17,6 +17,9 @@ use utoipa::OpenApi;
         // Agent listing
         super::list_agents,
         super::agent_diagnostics,
+        super::agents_errors,
+        super::agent_tasks,
+        super::agent_tool_calls,
 
         // Per-agent status & config
         status_handlers::agent_status,
@@ -58,6 +61,12 @@ use utoipa::OpenApi;
             // Agent listing
             super::AgentSummary,
             super::AgentDiagnostics,
+            super::AgentErrorEntry,
+            super::AgentErrorsReport,
+            crate::status::agent_events::TaskView,
+            crate::status::agent_events::TasksView,
+            crate::status::agent_events::ToolCallView,
+            crate::status::agent_events::ToolCallsView,
 
             // Agent status snapshot (SDK types)
             crate::status::AgentStatusSnapshot,

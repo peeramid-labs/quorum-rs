@@ -144,6 +144,14 @@ pub struct AgentContext {
     #[schema(ignore)]
     #[schemars(skip)]
     pub submission_validator: Option<Arc<dyn SubmissionValidator>>,
+    /// Runtime-only: the agent's own NATS event log. Injected by the worker so
+    /// the react loop can record tool-call start/finish for the operator
+    /// dashboard's 24h history. Mirrors the `telemetry` runtime-only pattern:
+    /// skipped by serde, excluded from generated schemas.
+    #[serde(skip)]
+    #[schema(ignore)]
+    #[schemars(skip)]
+    pub event_store: Option<crate::status::agent_events::AgentEventStore>,
 }
 
 impl AgentContext {
@@ -2211,6 +2219,7 @@ mod tests {
             role_context: Some("Per-role context content".to_string()),
             telemetry: None,            // serde(skip)
             submission_validator: None, // serde(skip)
+            event_store: None,          // serde(skip)
             agent_id: String::new(),
             task_publish_ts: Some(1_776_790_000_000),
         };
