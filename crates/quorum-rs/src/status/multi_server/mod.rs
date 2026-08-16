@@ -31,7 +31,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use utoipa::ToSchema;
 
 /// Combined application state for the multi-agent status server.
@@ -100,6 +100,13 @@ fn resolve_dashboard_bind(raw: Option<&str>) -> std::net::IpAddr {
 /// `QUORUM_DASHBOARD_TOKEN=` does not silently enable an unmatchable guard.
 fn resolve_dashboard_token(raw: Option<String>) -> Option<Arc<str>> {
     raw.filter(|s| !s.is_empty()).map(Arc::from)
+}
+
+/// Fail-closed guard: `true` when the server must refuse to start because a
+/// non-loopback bind carries no auth token (which would expose the control
+/// plane unauthenticated).
+fn refuse_unauthenticated_exposure(ip: &std::net::IpAddr, auth_enabled: bool) -> bool {
+    !ip.is_loopback() && !auth_enabled
 }
 
 /// Constant-time byte comparison so token validation does not leak length or
@@ -282,21 +289,20 @@ impl MultiAgentStatusServer {
         // dispatching into the runner.
         let ip = resolve_dashboard_bind(std::env::var("QUORUM_DASHBOARD_BIND").ok().as_deref());
         let addr = SocketAddr::from((ip, port));
-        // Dashboard ships with NO authentication. Loopback binds
-        // (the default) are an implicit access control — anything
-        // wider exposes status, chat-capture, buffer inspection,
-        // and live config tuning to anyone on the network segment.
-        // Operators opt into this via `--dashboard-bind` or
-        // `QUORUM_DASHBOARD_BIND`; the warn line makes the
-        // decision visible in the boot log so it can't be missed.
-        if !ip.is_loopback() && !auth_enabled {
-            warn!(
+        // Fail-closed: a non-loopback bind with no token would expose the whole
+        // control plane (status, chat-capture, buffer inspection, live config,
+        // pause/auto-approve) to the network unauthenticated. Refuse to start
+        // rather than silently opening it — a missing QUORUM_DASHBOARD_TOKEN
+        // must never become an open door. Loopback stays open (local dev);
+        // non-loopback requires a token.
+        if refuse_unauthenticated_exposure(&ip, auth_enabled) {
+            error!(
                 bind = %ip,
-                "dashboard bound to non-loopback address with no QUORUM_DASHBOARD_TOKEN set \
-                 — the control plane is reachable from the network with no authentication. \
-                 Set QUORUM_DASHBOARD_TOKEN to require a bearer token, restrict access via \
-                 the host firewall or a reverse proxy, or revert to the loopback default."
+                "refusing to start the dashboard: bound to a non-loopback address with no \
+                 QUORUM_DASHBOARD_TOKEN — that would expose the control plane unauthenticated. \
+                 Set QUORUM_DASHBOARD_TOKEN, or bind to loopback (QUORUM_DASHBOARD_BIND)."
             );
+            return;
         }
         info!(
             "Multi-agent dashboard → http://{}/  ({} agents)  Swagger UI → http://{}/swagger-ui/",

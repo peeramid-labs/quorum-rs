@@ -89,15 +89,17 @@ historical loopback-default behaviour, intended for local dev.
 { "auth_required": true, "authenticated": false }
 ```
 
-On a non-loopback bind **without** a token set, the server emits:
+A non-loopback bind **without** a token is **fail-closed** — the server
+**refuses to start the dashboard** rather than expose the control plane
+unauthenticated:
 
 ```text
-WARN dashboard bound to non-loopback address with no
-     QUORUM_DASHBOARD_TOKEN set — the control plane is reachable
-     from the network with no authentication.
+ERROR refusing to start the dashboard: bound to a non-loopback address with
+      no QUORUM_DASHBOARD_TOKEN — that would expose the control plane
+      unauthenticated. Set QUORUM_DASHBOARD_TOKEN, or bind to loopback.
 ```
 
-Set the token before exposing the dashboard beyond loopback. See
+Loopback binds stay open (local dev); anything wider requires a token. See
 [how-to/expose-agent-dashboard-on-lan.md] for the full recipe
 (token, bind, plus firewall / reverse-proxy hardening).
 
