@@ -14,6 +14,7 @@
 //! See `docs/mcp-agent-protocol.md` for the full protocol specification.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::agents::config::McpProviderConfig;
@@ -87,6 +88,7 @@ fn mcp_eval_to_evaluation(e: McpEvaluationResult) -> Evaluation {
                 _ => ClaimVerdict::Unknown,
             },
             reason: ca.reason,
+            anchor: ca.anchor,
         })
         .collect();
 
@@ -157,6 +159,9 @@ pub struct NsedMcpServer {
     phase: ActivePhase,
     store: Option<Arc<dyn PersistenceStore>>,
     result_tx: Arc<Mutex<Option<oneshot::Sender<McpResult>>>>,
+    /// Re-quote attempts already spent on unresolvable claim citations. Shared
+    /// across clones so the budget is per-phase, not per-request.
+    cite_retries: Arc<AtomicU32>,
     // Referenced directly by the hand-rolled `list_tools`/`call_tool`.
     tool_router: ToolRouter<Self>,
 }
@@ -168,6 +173,7 @@ impl Clone for NsedMcpServer {
             phase: self.phase,
             store: self.store.clone(),
             result_tx: Arc::clone(&self.result_tx),
+            cite_retries: Arc::clone(&self.cite_retries),
             tool_router: Self::tool_router(),
         }
     }
@@ -183,6 +189,7 @@ struct SharedMcpState {
     phase: ActivePhase,
     store: Option<Arc<dyn PersistenceStore>>,
     result_tx: Arc<Mutex<Option<oneshot::Sender<McpResult>>>>,
+    cite_retries: Arc<AtomicU32>,
 }
 
 impl NsedMcpServer {
@@ -197,6 +204,7 @@ impl NsedMcpServer {
             phase,
             store,
             result_tx: Arc::new(Mutex::new(Some(result_tx))),
+            cite_retries: Arc::new(AtomicU32::new(0)),
             tool_router: Self::tool_router(),
         }
     }
@@ -208,6 +216,7 @@ impl NsedMcpServer {
             phase: shared.phase,
             store: shared.store.clone(),
             result_tx: Arc::clone(&shared.result_tx),
+            cite_retries: Arc::clone(&shared.cite_retries),
             tool_router: Self::tool_router(),
         }
     }
@@ -409,21 +418,43 @@ impl NsedMcpServer {
                 "nsed_evaluate can only be called during the evaluate phase",
             )]));
         }
-        // Ground each claim citation to an exact span of the proposal it targets,
-        // tolerating the quote decorations models add (see cite::resolve_cite).
-        // A resolved cite is substituted with the exact proposal substring so the
-        // client can string-match it; an unresolvable one (fabricated / rephrased
-        // beyond recognition) is rejected with feedback so the evaluator re-quotes
-        // — the error/react loop. Empty claims are claim_id back-references and
-        // are left untouched.
-        let unresolved = ground_evaluation_claims(&self.context.candidates, &mut input.evaluations);
+        // Ground each claim citation to an exact span of the proposal it targets
+        // (see cite::ground_all — the same seam the exec and native runtimes use).
+        // This path has a tool-error retry loop, so it takes the strict policy:
+        // an unresolvable cite is dropped and the evaluator is asked to re-quote.
+        //
+        // The rejection is per-claim. Only the offending citations are removed;
+        // sibling claims and every other evaluation in the batch survive, so one
+        // bad quote no longer costs a whole round of evaluation work.
+        let unresolved = super::cite::ground_all(
+            &self.context.candidates,
+            self.context.round_number,
+            &mut input.evaluations,
+            super::cite::GroundingPolicy::Reject,
+        );
         if !unresolved.is_empty() {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "These claim citations do not match any span of the proposal they target. \
-                 Quote each claim VERBATIM — copy-paste the exact text from the proposal \
-                 (no paraphrase) — then resubmit nsed_evaluate:\n{}",
-                unresolved.join("\n")
-            ))]));
+            // Bounded by the shared re-quote budget: a model that cannot produce a
+            // verbatim cite would otherwise hold the phase open forever. At
+            // exhaustion the already-pruned evaluations are accepted — losing
+            // the unanchored claims, never the whole evaluation.
+            let spent = self.cite_retries.fetch_add(1, Ordering::Relaxed);
+            if spent < super::cite::REQUOTE_BUDGET {
+                let detail = unresolved
+                    .iter()
+                    .map(|u| u.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "These claim citations do not match any span of the proposal they target. \
+                     Quote each claim VERBATIM — copy-paste the exact text from the proposal \
+                     (no paraphrase) — then resubmit nsed_evaluate:\n{detail}"
+                ))]));
+            }
+            tracing::warn!(
+                count = unresolved.len(),
+                "cite re-quote budget exhausted — dropping unanchored claims and accepting \
+                 the remaining evaluations"
+            );
         }
         let evals = input
             .evaluations
@@ -442,6 +473,7 @@ impl NsedMcpServer {
                         claim: ca.claim,
                         verdict: ca.verdict,
                         reason: ca.reason,
+                        anchor: ca.anchor,
                     })
                     .collect(),
                 disagreements: e
@@ -1464,6 +1496,7 @@ impl ClaudeAgent {
             phase,
             store: ctx.store.clone(),
             result_tx: Arc::new(Mutex::new(Some(result_tx))),
+            cite_retries: Arc::new(AtomicU32::new(0)),
         });
 
         let ct = CancellationToken::new();
@@ -2861,6 +2894,11 @@ fn extract_evaluate_args(
                                     .get("reason")
                                     .and_then(|v| v.as_str())
                                     .map(str::to_string),
+                                // Recovered from a transcript, so it never went
+                                // through the tool handler's grounding. Left
+                                // empty here and filled by the Repair pass in
+                                // `evaluate`, where the candidates are in hand.
+                                anchor: None,
                             })
                             .collect()
                     })
@@ -3001,10 +3039,26 @@ impl NsedAgent for ClaudeAgent {
             .run_phase_with_rate_limit_retry("evaluate", &prompt, &full_prompt, context)
             .await?;
         match mcp_result {
-            super::mcp_tools::McpResult::Evaluations(evals) => Ok(evals
-                .into_iter()
-                .map(|e| (e.target_id.clone(), mcp_eval_to_evaluation(e)))
-                .collect()),
+            super::mcp_tools::McpResult::Evaluations(evals) => {
+                let mut out: Vec<(String, Evaluation)> = evals
+                    .into_iter()
+                    .map(|e| (e.target_id.clone(), mcp_eval_to_evaluation(e)))
+                    .collect();
+                // Second grounding pass, Repair. The tool handler already ran
+                // the strict pass, and re-grounding an already-resolved cite is
+                // a no-op — it resolves to itself. This exists for the salvage
+                // path: evaluations recovered from the session transcript never
+                // reached the handler, so without this they would arrive with
+                // no anchors at all. Repair, not Reject, because a salvaged
+                // evaluation has no turn left in which to re-quote.
+                super::cite::ground_all(
+                    &context.candidates,
+                    context.round_number,
+                    &mut out,
+                    super::cite::GroundingPolicy::Repair,
+                );
+                Ok(out)
+            }
             _ => bail!(
                 "claude agent '{}': expected Evaluations result but got Proposal",
                 self.name
@@ -3534,60 +3588,6 @@ impl super::ChatCapable for ClaudeAgent {
     }
 }
 
-/// Ground each cited claim in `evaluations` to the exact span it quotes,
-/// substituting the claim with that span (so the client can string-match it),
-/// and return the citations that resolve to NO span — the caller rejects those
-/// and asks the evaluator to re-quote (the error/react loop).
-///
-/// Matches against exactly what the evaluator was SHOWN for each candidate: the
-/// full final solution (`content`, inlined whole) AND the first
-/// [`EVAL_THOUGHT_LIMIT`](crate::prompts::defaults::EVAL_THOUGHT_LIMIT) chars of
-/// the `thought_process` (the prompt truncates there). Grounding only against
-/// `content` would hard-reject a legitimate
-/// reasoning quote into an unbreakable retry loop; grounding against the FULL
-/// thought_process would instead scan an unbounded reasoning body and could
-/// false-accept a cite the evaluator never saw. Bounding the thoughts corpus to
-/// the shown window fixes both. Empty claims are claim_id back-references, left
-/// untouched; an evaluation targeting an unknown candidate id is skipped.
-fn ground_evaluation_claims(
-    candidates: &[crate::agents::CandidateProposal],
-    evaluations: &mut [crate::agents::mcp_tools::EvaluationItem],
-) -> Vec<String> {
-    // (content, thoughts_shown) per candidate id. `content` borrows in full;
-    // `thoughts_shown` is the truncated window the prompt actually inlined, so
-    // the match corpus never exceeds what the evaluator could quote.
-    let corpus_by_id: std::collections::HashMap<&str, (&str, String)> = candidates
-        .iter()
-        .map(|c| {
-            let thoughts_shown: String = c
-                .proposal
-                .thought_process
-                .chars()
-                .take(crate::prompts::defaults::EVAL_THOUGHT_LIMIT)
-                .collect();
-            (c.id.as_str(), (c.proposal.content.as_str(), thoughts_shown))
-        })
-        .collect();
-    let mut unresolved: Vec<String> = Vec::new();
-    for e in evaluations.iter_mut() {
-        let Some((content, thoughts)) = corpus_by_id.get(e.target_id.as_str()) else {
-            continue;
-        };
-        for ca in &mut e.claim_assessments {
-            if ca.claim.trim().is_empty() {
-                continue;
-            }
-            match super::cite::resolve_cite(content, &ca.claim)
-                .or_else(|| super::cite::resolve_cite(thoughts, &ca.claim))
-            {
-                Some(span) => ca.claim = span,
-                None => unresolved.push(format!("  • [{}] {:?}", e.target_id, ca.claim)),
-            }
-        }
-    }
-    unresolved
-}
-
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3596,7 +3596,20 @@ mod tests {
     use crate::agents::config::McpProviderConfig;
     use std::collections::HashMap;
 
-    // ── ground_evaluation_claims: nsed_evaluate citation grounding ───────────
+    // ── nsed_evaluate citation grounding (shared seam, Reject policy) ────────
+
+    /// The MCP runtime's grounding call, verbatim from `nsed_evaluate`.
+    fn ground_mcp(
+        cands: &[crate::agents::CandidateProposal],
+        evals: &mut [crate::agents::mcp_tools::EvaluationItem],
+    ) -> Vec<crate::agents::cite::UnresolvedCite> {
+        crate::agents::cite::ground_all(
+            cands,
+            1,
+            evals,
+            crate::agents::cite::GroundingPolicy::Reject,
+        )
+    }
 
     fn candidate(id: &str, content: &str, thoughts: &str) -> crate::agents::CandidateProposal {
         crate::agents::CandidateProposal {
@@ -3631,7 +3644,7 @@ mod tests {
             "Candidate_A",
             "\"sorts in O(n log n) time\"",
         )];
-        let unresolved = ground_evaluation_claims(&cands, &mut evals);
+        let unresolved = ground_mcp(&cands, &mut evals);
         assert!(unresolved.is_empty(), "a real solution cite must resolve");
         assert_eq!(
             evals[0].claim_assessments[0].claim, "sorts in O(n log n) time",
@@ -3654,7 +3667,7 @@ mod tests {
             "Candidate_A",
             "sorts in O(n log n) on average",
         )];
-        let unresolved = ground_evaluation_claims(&cands, &mut evals);
+        let unresolved = ground_mcp(&cands, &mut evals);
         assert!(
             unresolved.is_empty(),
             "a verbatim thought_process quote must resolve, got {unresolved:?}"
@@ -3676,25 +3689,99 @@ mod tests {
             "Candidate_A",
             "this text is nowhere in the proposal",
         )];
-        let unresolved = ground_evaluation_claims(&cands, &mut evals);
+        let unresolved = ground_mcp(&cands, &mut evals);
         assert_eq!(
             unresolved.len(),
             1,
             "a fabricated cite must be reported unresolved for reject-and-retry"
         );
-        assert!(unresolved[0].contains("Candidate_A"));
+        assert_eq!(unresolved[0].target_id, "Candidate_A");
+        assert!(
+            evals[0].claim_assessments.is_empty(),
+            "Reject drops the unanchored claim"
+        );
     }
 
     #[test]
-    fn ground_claims_skips_unknown_target_and_empty_cite() {
+    fn ground_claims_skips_unknown_target() {
         let cands = vec![candidate("Candidate_A", "content here", "thoughts")];
-        // Unknown target → skipped, NOT reported unresolved.
+        // Unknown target → no corpus to match against, so skipped rather than
+        // reported: the claims are left exactly as submitted.
         let mut unknown = vec![eval_with_cite("Candidate_Z", "content here")];
-        assert!(ground_evaluation_claims(&cands, &mut unknown).is_empty());
-        // Empty cite (a claim_id back-reference) → left untouched, not rejected.
+        assert!(ground_mcp(&cands, &mut unknown).is_empty());
+        assert_eq!(unknown[0].claim_assessments.len(), 1);
+    }
+
+    #[test]
+    fn ground_claims_rejects_a_blank_cite_with_no_claim_id() {
+        // Closes the blank-cite bypass: a claim with neither cite text nor a
+        // claim_id has no identity — it cannot be highlighted and is discarded
+        // by claim convergence, so it must not pass silently.
+        let cands = vec![candidate("Candidate_A", "content here", "thoughts")];
         let mut empty = vec![eval_with_cite("Candidate_A", "")];
-        assert!(ground_evaluation_claims(&cands, &mut empty).is_empty());
-        assert_eq!(empty[0].claim_assessments[0].claim, "");
+        assert_eq!(ground_mcp(&cands, &mut empty).len(), 1);
+        assert!(empty[0].claim_assessments.is_empty());
+    }
+
+    #[test]
+    fn ground_claims_keeps_a_blank_cite_that_carries_a_claim_id() {
+        // A blank cite WITH a claim_id is a legitimate cross-round
+        // back-reference: nothing to ground, and it must survive.
+        let cands = vec![candidate("Candidate_A", "content here", "thoughts")];
+        let mut evals: Vec<crate::agents::mcp_tools::EvaluationItem> =
+            vec![serde_json::from_value(serde_json::json!({
+                "target_id": "Candidate_A",
+                "score": 0.5,
+                "justification": "j",
+                "claim_assessments": [{ "cite": "", "claim_id": "a1b2c3", "verdict": "contested" }],
+            }))
+            .unwrap()];
+        assert!(ground_mcp(&cands, &mut evals).is_empty());
+        assert_eq!(evals[0].claim_assessments.len(), 1);
+    }
+
+    #[test]
+    fn ground_claims_drops_only_the_bad_cite_in_a_batch() {
+        // Per-claim, not per-batch: one unresolvable cite must not cost the
+        // sibling claim or the other candidate's evaluation.
+        let cands = vec![
+            candidate("Candidate_A", "The system sorts in O(n log n) time.", "t"),
+            candidate("Candidate_B", "A hash join avoids the sort.", "t"),
+        ];
+        let mut evals: Vec<crate::agents::mcp_tools::EvaluationItem> = vec![
+            serde_json::from_value(serde_json::json!({
+                "target_id": "Candidate_A",
+                "score": 0.5,
+                "justification": "j",
+                "claim_assessments": [
+                    { "cite": "sorts in O(n log n) time", "verdict": "verified" },
+                    { "cite": "runs in constant time", "verdict": "wrong" }
+                ],
+            }))
+            .unwrap(),
+        ];
+        evals.push(eval_with_cite(
+            "Candidate_B",
+            "A hash join avoids the sort.",
+        ));
+
+        let unresolved = ground_mcp(&cands, &mut evals);
+
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(
+            evals[0].claim_assessments.len(),
+            1,
+            "the sibling claim survives"
+        );
+        assert_eq!(
+            evals[0].claim_assessments[0].claim,
+            "sorts in O(n log n) time"
+        );
+        assert_eq!(
+            evals[1].claim_assessments.len(),
+            1,
+            "the clean evaluation is untouched"
+        );
     }
 
     #[test]
@@ -3709,7 +3796,7 @@ mod tests {
         thoughts.push_str("UNIQUE_BEYOND_WINDOW_MARKER");
         let cands = vec![candidate("Candidate_A", "final", &thoughts)];
         let mut evals = vec![eval_with_cite("Candidate_A", "UNIQUE_BEYOND_WINDOW_MARKER")];
-        let unresolved = ground_evaluation_claims(&cands, &mut evals);
+        let unresolved = ground_mcp(&cands, &mut evals);
         assert_eq!(
             unresolved.len(),
             1,
@@ -5402,6 +5489,7 @@ mod tests {
             phase: ActivePhase::Proposing,
             store: None,
             result_tx: std::sync::Arc::new(Mutex::new(Some(tx))),
+            cite_retries: std::sync::Arc::new(AtomicU32::new(0)),
         });
         let server = NsedMcpServer::from_shared(&shared);
 
@@ -5838,6 +5926,59 @@ mod tests {
         );
     }
 
+    /// The re-quote loop is bounded. An evaluator that keeps submitting an
+    /// unresolvable cite is asked to re-quote up to the shared budget; at
+    /// exhaustion the evaluation is accepted with the unanchored claim pruned,
+    /// rather than holding the phase open forever.
+    #[tokio::test]
+    async fn nsed_evaluate_bounds_the_cite_requote_loop() {
+        let mut ctx = minimal_context();
+        ctx.candidates = vec![candidate(
+            "Candidate_A",
+            "The system sorts in O(n log n) time.",
+            "t",
+        )];
+        let (tx, rx) = oneshot::channel();
+        let shared = Arc::new(SharedMcpState {
+            context: ctx,
+            phase: ActivePhase::Evaluating,
+            store: None,
+            result_tx: Arc::new(Mutex::new(Some(tx))),
+            cite_retries: Arc::new(AtomicU32::new(0)),
+        });
+        let server = NsedMcpServer::from_shared(&shared);
+
+        let bad = || {
+            Parameters(crate::agents::mcp_tools::EvaluateInput {
+                evaluations: vec![eval_with_cite("Candidate_A", "runs in constant time")],
+            })
+        };
+
+        for attempt in 0..crate::agents::cite::REQUOTE_BUDGET {
+            let res = server.nsed_evaluate(bad()).await.unwrap();
+            assert_eq!(
+                res.is_error,
+                Some(true),
+                "attempt {attempt} must ask for a re-quote"
+            );
+        }
+
+        // Budget spent — the evaluation is accepted without the bad claim.
+        let res = server.nsed_evaluate(bad()).await.unwrap();
+        assert_ne!(res.is_error, Some(true), "must stop looping at exhaustion");
+
+        match rx.await.expect("result delivered") {
+            McpResult::Evaluations(evals) => {
+                assert_eq!(evals.len(), 1);
+                assert!(
+                    evals[0].claim_assessments.is_empty(),
+                    "the unanchored claim is pruned, the evaluation survives"
+                );
+            }
+            other => panic!("expected evaluations, got {other:?}"),
+        }
+    }
+
     #[test]
     fn shared_mcp_state_factory_shares_result_tx() {
         let (tx, _rx) = oneshot::channel();
@@ -5846,6 +5987,7 @@ mod tests {
             phase: ActivePhase::Proposing,
             store: None,
             result_tx: Arc::new(Mutex::new(Some(tx))),
+            cite_retries: Arc::new(AtomicU32::new(0)),
         });
 
         let server1 = NsedMcpServer::from_shared(&shared);

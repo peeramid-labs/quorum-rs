@@ -779,9 +779,9 @@ fn emit_context_assembled(
 
 #[derive(Debug, Deserialize, serde::Serialize)]
 #[allow(dead_code)]
-struct BatchEvaluationItem {
+pub(crate) struct BatchEvaluationItem {
     #[serde(alias = "candidate_id", default)]
-    agent_id: String,
+    pub(crate) agent_id: String,
     #[serde(alias = "score")]
     endorsement_weight: f32,
     #[serde(default)]
@@ -791,7 +791,7 @@ struct BatchEvaluationItem {
     #[serde(default)]
     stance: Option<Stance>,
     #[serde(default)]
-    claim_assessments: Vec<ClaimAssessment>,
+    pub(crate) claim_assessments: Vec<ClaimAssessment>,
     #[serde(default)]
     disagreements: Vec<DisagreementPoint>,
     #[serde(default)]
@@ -1248,8 +1248,14 @@ impl NsedAgent for ProposerEvaluatorAgent {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "claim_id": { "type": ["string", "null"] },
-                        "claim": { "type": "string" },
+                        "claim_id": {
+                            "type": ["string", "null"],
+                            "description": "Stable 6-char hex id for cross-round tracking. Echo back the id of a claim flagged in an earlier round; otherwise null."
+                        },
+                        "claim": {
+                            "type": "string",
+                            "description": "The claim, quoted VERBATIM from the proposal — an exact, character-for-character substring. Copy-paste the span; do NOT paraphrase, summarize, shorten or reword. Common quote wrappers (\"…\", > …, `…`) are tolerated and stripped, and the quote is replaced with the exact proposal substring so the client can locate it. A quote matching no span of the proposal cannot be highlighted and is dropped from claim convergence. WRONG (paraphrase): \"the sort is efficient\". RIGHT (verbatim): \"sorts in O(n log n) time\"."
+                        },
                         "verdict": { "type": "string", "enum": ["verified", "contested", "unverified", "wrong"] },
                         "reason": { "type": ["string", "null"] }
                     },
@@ -1332,26 +1338,86 @@ impl NsedAgent for ProposerEvaluatorAgent {
 
         let all_tools = self.aggregate_tools(context);
 
+        // Generate, then ground the batch's claim citations. An unresolvable
+        // cite goes back to the model as an error it can act on — the same
+        // re-quote signal the tool-calling runtime sends — and the model gets
+        // another turn to produce a verbatim quote.
+        //
+        // The budget is counted HERE, separately from the parse-failure retries
+        // inside `generate_structured_output`. Sharing one budget would let a
+        // batch that merely needs re-quoting consume the attempts that a
+        // genuinely malformed batch needs to recover, turning a cosmetic fault
+        // into a lost evaluation.
+        let mut cite_attempts: u32 = 0;
+        let mut attempt_prompt = prompt.clone();
+        // Retries re-run generation, so tokens must accumulate across attempts
+        // or the discarded attempts bill as free.
+        let mut requote_input_tokens: u32 = 0;
+        let mut requote_output_tokens: u32 = 0;
+
         let (structured_response, agent_response): (
             StructuredBatchEvaluationResponse,
             AgentResponse,
-        ) = generate_structured_output(
-            &*self.llm,
-            &self.config,
-            &*self.prompt_set,
-            context,
-            prompt,
-            &all_tools,
-            batch_evaluation_tool,
-            "submit_batch_evaluation",
-            self.output_guard.as_deref(),
-        )
-        .await?;
+        ) = loop {
+            let (mut response, mut resp_meta): (StructuredBatchEvaluationResponse, AgentResponse) =
+                generate_structured_output(
+                    &*self.llm,
+                    &self.config,
+                    &*self.prompt_set,
+                    context,
+                    attempt_prompt.clone(),
+                    &all_tools,
+                    batch_evaluation_tool.clone(),
+                    "submit_batch_evaluation",
+                    self.output_guard.as_deref(),
+                )
+                .await?;
+
+            let unresolved = super::cite::ground_all(
+                &context.candidates,
+                context.round_number,
+                &mut response.evaluations,
+                super::cite::GroundingPolicy::Reject,
+            );
+
+            if unresolved.is_empty() {
+                break (response, resp_meta);
+            }
+
+            if cite_attempts >= super::cite::REQUOTE_BUDGET {
+                warn!(
+                    agent_name = %self.config.name,
+                    count = unresolved.len(),
+                    "cite re-quote budget exhausted — dropping unanchored claims and \
+                     accepting the remaining evaluations"
+                );
+                break (response, resp_meta);
+            }
+
+            cite_attempts += 1;
+            requote_input_tokens =
+                requote_input_tokens.saturating_add(resp_meta.input_tokens.take().unwrap_or(0));
+            requote_output_tokens =
+                requote_output_tokens.saturating_add(resp_meta.output_tokens.take().unwrap_or(0));
+            warn!(
+                agent_name = %self.config.name,
+                attempt = cite_attempts,
+                count = unresolved.len(),
+                "evaluation cites match no span of their target — asking for a verbatim re-quote"
+            );
+            attempt_prompt = format!("{prompt}\n\n{}", requote_feedback(&unresolved));
+        };
 
         // Token usage for this entire evaluation batch (one LLM call produces all evals)
         let batch_token_usage = Some(TokenUsage {
-            input_tokens: agent_response.input_tokens.unwrap_or(0),
-            output_tokens: agent_response.output_tokens.unwrap_or(0),
+            input_tokens: agent_response
+                .input_tokens
+                .unwrap_or(0)
+                .saturating_add(requote_input_tokens),
+            output_tokens: agent_response
+                .output_tokens
+                .unwrap_or(0)
+                .saturating_add(requote_output_tokens),
         });
 
         emit_context_assembled(
@@ -1454,6 +1520,22 @@ impl NsedAgent for ProposerEvaluatorAgent {
     fn name(&self) -> String {
         self.config.name.clone()
     }
+}
+
+/// The re-quote instruction fed back to the model, naming the exact cites that
+/// resolved to nothing. Mirrors the tool-calling runtime's wording so both
+/// strict paths teach the same lesson.
+fn requote_feedback(unresolved: &[super::cite::UnresolvedCite]) -> String {
+    let detail = unresolved
+        .iter()
+        .map(|u| u.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "These claim citations do not match any span of the proposal they target. \
+         Quote each claim VERBATIM — copy-paste the exact text from the proposal \
+         (no paraphrase) — then resubmit submit_batch_evaluation:\n{detail}"
+    )
 }
 
 /// Implement [`ChatCapable`] so `ProposerEvaluatorAgent` can be used with the
@@ -6998,5 +7080,115 @@ mod tests {
         let input = "Content without any working_memory tags";
         let result = strip_working_memory(input);
         assert_eq!(result, input);
+    }
+
+    // ── native-path citation grounding (shared seam, Reject policy) ──────────
+
+    use super::BatchEvaluationItem;
+    use crate::agents::{AgentContext, ClaimAssessment, ClaimVerdict};
+
+    /// The native runtime's grounding call, matching `evaluate`'s policy.
+    fn ground_native(
+        ctx: &AgentContext,
+        items: &mut [BatchEvaluationItem],
+    ) -> Vec<crate::agents::cite::UnresolvedCite> {
+        crate::agents::cite::ground_all(
+            &ctx.candidates,
+            ctx.round_number,
+            items,
+            crate::agents::cite::GroundingPolicy::Reject,
+        )
+    }
+
+    fn ctx_with_candidate(content: &str, thoughts: &str) -> AgentContext {
+        AgentContext {
+            round_number: 2,
+            candidates: vec![crate::agents::CandidateProposal {
+                id: "Candidate_A".to_string(),
+                proposal: crate::agents::Proposal {
+                    content: content.to_string(),
+                    thought_process: thoughts.to_string(),
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn batch(cites: &[&str]) -> Vec<BatchEvaluationItem> {
+        vec![BatchEvaluationItem {
+            agent_id: "Candidate_A".to_string(),
+            endorsement_weight: 0.5,
+            justification: Some("j".to_string()),
+            is_final_solution: false,
+            stance: None,
+            claim_assessments: cites
+                .iter()
+                .map(|c| ClaimAssessment {
+                    claim: (*c).to_string(),
+                    verdict: ClaimVerdict::Verified,
+                    ..Default::default()
+                })
+                .collect(),
+            disagreements: vec![],
+            category_scores: None,
+        }]
+    }
+
+    #[test]
+    fn native_grounding_substitutes_the_exact_span() {
+        let ctx = ctx_with_candidate("The system sorts in O(n log n) time.", "t");
+        let mut items = batch(&["\"sorts in O(n log n) time\""]);
+
+        let unresolved = ground_native(&ctx, &mut items);
+
+        assert!(unresolved.is_empty());
+        assert_eq!(
+            items[0].claim_assessments[0].claim, "sorts in O(n log n) time",
+            "a decorated cite is replaced by the exact proposal span"
+        );
+    }
+
+    /// Reproduces what this runtime published before it grounded anything: a
+    /// cite matching no span of its target, accepted in silence. It is now
+    /// reported so the caller can ask for a re-quote, and pruned per-claim.
+    #[test]
+    fn native_grounding_reports_and_prunes_only_the_bad_cite() {
+        let ctx = ctx_with_candidate("The system sorts in O(n log n) time.", "t");
+        let mut items = batch(&["sorts in O(n log n) time", "runs in constant time"]);
+
+        let unresolved = ground_native(&ctx, &mut items);
+
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].target_id, "Candidate_A");
+        assert_eq!(unresolved[0].cite, "runs in constant time");
+        assert_eq!(
+            items[0].claim_assessments.len(),
+            1,
+            "the sibling claim survives"
+        );
+    }
+
+    #[test]
+    fn requote_feedback_names_every_failed_cite() {
+        let unresolved = vec![
+            crate::agents::cite::UnresolvedCite {
+                target_id: "Candidate_A".to_string(),
+                cite: "runs in constant time".to_string(),
+            },
+            crate::agents::cite::UnresolvedCite {
+                target_id: "Candidate_B".to_string(),
+                cite: "is provably optimal".to_string(),
+            },
+        ];
+        let msg = super::requote_feedback(&unresolved);
+        assert!(msg.contains("VERBATIM"), "must carry the instruction");
+        assert!(
+            msg.contains("submit_batch_evaluation"),
+            "names the tool to retry"
+        );
+        assert!(msg.contains("runs in constant time"));
+        assert!(msg.contains("is provably optimal"));
+        assert!(msg.contains("Candidate_B"));
     }
 }
