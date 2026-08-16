@@ -135,6 +135,31 @@ async fn dashboard_returns_html() {
 }
 
 #[tokio::test]
+async fn dashboard_streams_job_feed_over_fetch_not_eventsource() {
+    // EventSource cannot set an Authorization header → it would 401 under a
+    // token. The job feed must stream over fetch()+ReadableStream.
+    let (_, body) = get_request(build_router(test_state()), "/").await;
+    assert!(
+        !body.contains("new EventSource"),
+        "job feed must not use EventSource (can't carry the bearer)"
+    );
+    assert!(
+        body.contains(".getReader()"),
+        "expected a fetch()+ReadableStream job feed"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_guards_bearer_token_to_same_origin() {
+    // The fetch wrapper must never attach the bearer to a cross-origin URL.
+    let (_, body) = get_request(build_router(test_state()), "/").await;
+    assert!(
+        body.contains("u.origin !== window.location.origin"),
+        "the fetch wrapper must gate the bearer on same-origin"
+    );
+}
+
+#[tokio::test]
 async fn list_agents_returns_all_agents_sorted() {
     let app = build_router(test_state());
     let (status, body) = get_request(app, "/api/agents").await;
