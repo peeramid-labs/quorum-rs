@@ -389,25 +389,30 @@ impl NsedAgent for ExecAgent {
 
         // Ground each claim citation to the exact span of the proposal it
         // targets (quote-wrapper + whitespace tolerant), leaving unresolvable
-        // ones unchanged — exec has no tool-error retry, so this is the
-        // non-destructive counterpart to the MCP path's reject-and-retry.
-        let content_by_id: std::collections::HashMap<&str, &str> = context
-            .candidates
-            .iter()
-            .map(|c| (c.id.as_str(), c.proposal.content.as_str()))
-            .collect();
+        // ones unchanged — exec is a one-shot subprocess with no tool-error
+        // retry, so Repair is the only policy that doesn't destroy signal.
+        let agent_name = self.name.clone();
         let ground = |response: ExecEvaluationResponse| -> Vec<(String, Evaluation)> {
-            response
+            let mut evals: Vec<(String, Evaluation)> = response
                 .evaluations
                 .into_iter()
-                .map(|item| {
-                    let mut eval = item.evaluation;
-                    if let Some(content) = content_by_id.get(item.target_id.as_str()) {
-                        super::cite::substitute_resolvable(content, &mut eval.claim_assessments);
-                    }
-                    (item.target_id, eval)
-                })
-                .collect()
+                .map(|item| (item.target_id, item.evaluation))
+                .collect();
+            let unresolved = super::cite::ground_all(
+                &context.candidates,
+                context.round_number,
+                &mut evals,
+                super::cite::GroundingPolicy::Repair,
+            );
+            if !unresolved.is_empty() {
+                warn!(
+                    agent_name = %agent_name,
+                    count = unresolved.len(),
+                    "exec evaluation carries cites that match no span of their target — kept \
+                     unanchored (no retry loop on this path)"
+                );
+            }
+            evals
         };
 
         // Try direct parse first (standard exec protocol).
@@ -1117,5 +1122,78 @@ echo '{"thought_process":"ok","content":"survived"}'
         assert_eq!(evals[1].0, "B");
         // Coerced to 0.5 neutral scores
         assert!((evals[0].1.score - 0.5).abs() < 0.01);
+    }
+
+    // ── Citation grounding: shared seam, Repair policy ───────────────────────
+
+    /// The exec runtime's grounding call, matching `evaluate`'s policy.
+    fn ground_exec(
+        cands: &[crate::agents::CandidateProposal],
+        evals: &mut [(String, Evaluation)],
+    ) -> Vec<crate::agents::cite::UnresolvedCite> {
+        crate::agents::cite::ground_all(
+            cands,
+            1,
+            evals,
+            crate::agents::cite::GroundingPolicy::Repair,
+        )
+    }
+
+    fn exec_candidates() -> Vec<crate::agents::CandidateProposal> {
+        vec![crate::agents::CandidateProposal {
+            id: "Candidate_A".to_string(),
+            proposal: crate::agents::Proposal {
+                content: "The system sorts in O(n log n) time.".to_string(),
+                thought_process: "I weighed a hash join first.".to_string(),
+                ..Default::default()
+            },
+        }]
+    }
+
+    fn exec_eval(cites: &[&str]) -> Vec<(String, Evaluation)> {
+        vec![(
+            "Candidate_A".to_string(),
+            Evaluation {
+                claim_assessments: cites
+                    .iter()
+                    .map(|c| crate::agents::ClaimAssessment {
+                        claim: (*c).to_string(),
+                        verdict: crate::agents::ClaimVerdict::Verified,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        )]
+    }
+
+    #[test]
+    fn exec_grounds_a_decorated_cite_to_the_exact_span() {
+        let cands = exec_candidates();
+        let mut evals = exec_eval(&["> \"sorts in O(n log n) time\""]);
+
+        let unresolved = ground_exec(&cands, &mut evals);
+
+        assert!(unresolved.is_empty());
+        assert_eq!(
+            evals[0].1.claim_assessments[0].claim,
+            "sorts in O(n log n) time"
+        );
+    }
+
+    #[test]
+    fn exec_reports_but_keeps_an_unresolvable_cite() {
+        let cands = exec_candidates();
+        let mut evals = exec_eval(&["sorts in O(n log n) time", "runs in constant time"]);
+
+        let unresolved = ground_exec(&cands, &mut evals);
+
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].cite, "runs in constant time");
+        assert_eq!(
+            evals[0].1.claim_assessments.len(),
+            2,
+            "Repair never drops a claim"
+        );
     }
 }

@@ -413,6 +413,54 @@ pub struct ClaimAssessment {
         alias = "reasoning"
     )]
     pub reason: Option<String>,
+    /// Where this claim's cite was located in the proposal, filled in by
+    /// citation grounding. `None` means the cite resolved to nothing.
+    ///
+    /// Computed once, by the agent that did the matching, against the exact
+    /// proposal string it matched against — never re-derived downstream from a
+    /// copy that may have been re-serialized since. Models do not supply this;
+    /// anything they send is overwritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<ClaimAnchor>,
+}
+
+/// Where a claim's cite was found, and — when it landed in the answer body —
+/// exactly where, so a client can highlight by offset instead of re-matching
+/// the quote against rendered output.
+///
+/// The two variants are distinct on purpose. A cite may legitimately resolve
+/// into the evaluator's view of the author's *thought process*, which is not
+/// part of the answer a client renders. Emitting an answer-body offset for such
+/// a cite would highlight the wrong span of the wrong string, so those carry no
+/// offsets at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema)]
+#[serde(tag = "in", rename_all = "snake_case")]
+pub enum ClaimAnchor {
+    /// Resolved inside the proposal's `content` — the answer body.
+    ///
+    /// Offsets are **UTF-16 code units** into `Proposal.content` exactly as
+    /// shipped: the raw markdown source, NOT the rendered HTML, and NOT
+    /// `content` concatenated with any thought-process window.
+    ///
+    /// UTF-16 because the consumer indexes in it (a browser `Range` over a DOM
+    /// text node, a JS string). Byte offsets would need the client to re-scan
+    /// the string to convert, which is the re-matching this exists to remove,
+    /// and would silently misplace every highlight after the first non-ASCII
+    /// character — real cited prose is full of typographic dashes and quotes.
+    ///
+    /// Invariant: slicing `content` by `[start_utf16, end_utf16)` in UTF-16
+    /// space yields exactly [`ClaimAssessment::claim`].
+    AnswerBody {
+        /// Start offset, in UTF-16 code units, inclusive.
+        start_utf16: usize,
+        /// End offset, in UTF-16 code units, exclusive.
+        end_utf16: usize,
+    },
+    /// Resolved only inside the shown window of the author's `thought_process`.
+    ///
+    /// Deliberately carries no offsets: the answer body does not contain this
+    /// text, so there is nothing for a client to highlight.
+    ThoughtWindow,
 }
 
 /// A specific point of disagreement between the evaluator and a proposal.
@@ -1293,12 +1341,14 @@ mod tests {
                     claim: "O(n log n) complexity".to_string(),
                     verdict: ClaimVerdict::Verified,
                     reason: Some("Confirmed via analysis".to_string()),
+                    anchor: None,
                 },
                 ClaimAssessment {
                     claim_id: None,
                     claim: "Thread safety guaranteed".to_string(),
                     verdict: ClaimVerdict::Wrong,
                     reason: Some("Missing lock in critical section".to_string()),
+                    anchor: None,
                 },
             ],
             disagreements: vec![DisagreementPoint {
@@ -1474,6 +1524,7 @@ mod tests {
                 claim: "Algorithm is correct".to_string(),
                 verdict: ClaimVerdict::Verified,
                 reason: Some("Confirmed".to_string()),
+                anchor: None,
             }],
             vec![],
             None,
@@ -1498,12 +1549,14 @@ mod tests {
                     claim: "Thread safe".to_string(),
                     verdict: ClaimVerdict::Contested,
                     reason: Some("Missing mutex".to_string()),
+                    anchor: None,
                 },
                 ClaimAssessment {
                     claim_id: None,
                     claim: "O(1) lookup".to_string(),
                     verdict: ClaimVerdict::Wrong,
                     reason: Some("Actually O(n)".to_string()),
+                    anchor: None,
                 },
             ],
             vec![],
@@ -1641,6 +1694,7 @@ mod tests {
                     claim: "Earth is round".to_string(),
                     verdict: ClaimVerdict::Verified,
                     reason: None,
+                    anchor: None,
                 }],
                 vec![],
                 None,
@@ -1654,6 +1708,7 @@ mod tests {
                     claim: "Earth is round".to_string(),
                     verdict: ClaimVerdict::Verified,
                     reason: None,
+                    anchor: None,
                 }],
                 vec![],
                 None,
@@ -1677,6 +1732,7 @@ mod tests {
                 claim: "Might be true".to_string(),
                 verdict: ClaimVerdict::Unverified,
                 reason: None,
+                anchor: None,
             }],
             vec![],
             None,

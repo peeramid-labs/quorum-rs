@@ -1,0 +1,168 @@
+{
+  "description": "Shared test vectors for citation resolution. A port in another language must produce these exact results. Offsets in `start`/`end` are BYTE offsets into `source` (UTF-8); `utf16_start`/`utf16_end` are the same span in UTF-16 code units. `expect: null` means the cite must NOT resolve.",
+  "ladder": [
+    "exact substring",
+    "normalised substring (emphasis dropped, whitespace collapsed, case folded)"
+  ],
+  "cases": [
+    {
+      "name": "exact_substring",
+      "why": "Byte-for-byte quote, the literal rung.",
+      "source": "The algorithm sorts in O(n log n) time and is stable.",
+      "cite": "sorts in O(n log n) time",
+      "expect": {
+        "text": "sorts in O(n log n) time",
+        "start": 14,
+        "end": 38,
+        "utf16_start": 14,
+        "utf16_end": 38
+      }
+    },
+    {
+      "name": "wrapped_in_quotes",
+      "why": "Models wrap the quote; one matched pair is stripped.",
+      "source": "The algorithm sorts in O(n log n) time and is stable.",
+      "cite": "\"sorts in O(n log n) time\"",
+      "expect": {
+        "text": "sorts in O(n log n) time",
+        "start": 14,
+        "end": 38,
+        "utf16_start": 14,
+        "utf16_end": 38
+      }
+    },
+    {
+      "name": "blockquote_prefix",
+      "why": "Markdown blockquote marker stripped per line.",
+      "source": "The algorithm sorts in O(n log n) time and is stable.",
+      "cite": "> sorts in O(n log n) time",
+      "expect": {
+        "text": "sorts in O(n log n) time",
+        "start": 14,
+        "end": 38,
+        "utf16_start": 14,
+        "utf16_end": 38
+      }
+    },
+    {
+      "name": "label_prefix",
+      "why": "`Label: \"quote\"` — take the part after the separator.",
+      "source": "The algorithm sorts in O(n log n) time and is stable.",
+      "cite": "Claim: \"sorts in O(n log n) time\"",
+      "expect": {
+        "text": "sorts in O(n log n) time",
+        "start": 14,
+        "end": 38,
+        "utf16_start": 14,
+        "utf16_end": 38
+      }
+    },
+    {
+      "name": "whitespace_run_and_newline",
+      "why": "Quote re-wrapped across lines; whitespace runs collapse.",
+      "source": "It is stable.\nIt uses a merge step.",
+      "cite": "It is stable. It uses a merge step.",
+      "expect": {
+        "text": "It is stable.\nIt uses a merge step.",
+        "start": 0,
+        "end": 35,
+        "utf16_start": 0,
+        "utf16_end": 35
+      }
+    },
+    {
+      "name": "markdown_emphasis_in_source",
+      "why": "Observed shape: emphasis lives in the source, the evaluator quoted plain. The span excludes the markers.",
+      "source": "| **De jure war‑criminal state** | A state formally adjudicated as such. |",
+      "cite": "De jure war‑criminal state",
+      "expect": {
+        "text": "De jure war‑criminal state",
+        "start": 4,
+        "end": 32,
+        "utf16_start": 4,
+        "utf16_end": 30
+      }
+    },
+    {
+      "name": "markdown_emphasis_in_cite",
+      "why": "Observed shape: the evaluator added emphasis the source does not have.",
+      "source": "The United States is not a de jure war-criminal state because no binding judgment exists.",
+      "cite": "**not a de jure war-criminal state**",
+      "expect": {
+        "text": "not a de jure war-criminal state",
+        "start": 21,
+        "end": 53,
+        "utf16_start": 21,
+        "utf16_end": 53
+      }
+    },
+    {
+      "name": "case_folded_leading_capital",
+      "why": "Observed shape: evaluator re-typed the leading capital as lowercase, so a byte-exact match failed on an otherwise perfect quote.",
+      "source": "**State‑level designation** – No international tribunal or UN body has formally declared the United States a war‑criminal state.",
+      "cite": "no international tribunal or UN body has formally declared the United States a war‑criminal state.",
+      "expect": {
+        "text": "No international tribunal or UN body has formally declared the United States a war‑criminal state.",
+        "start": 34,
+        "end": 134,
+        "utf16_start": 30,
+        "utf16_end": 128
+      }
+    },
+    {
+      "name": "non_ascii_offsets",
+      "why": "U+2011 is 3 bytes but 1 UTF-16 unit; byte offsets alone mis-highlight in a browser.",
+      "source": "a war‑criminal state was alleged",
+      "cite": "state was alleged",
+      "expect": {
+        "text": "state was alleged",
+        "start": 17,
+        "end": 34,
+        "utf16_start": 15,
+        "utf16_end": 32
+      }
+    },
+    {
+      "name": "ellipsis_elision_must_not_resolve",
+      "why": "Observed shape: `...` replaces the qualifying material. The elided middle is exactly where a quote's meaning changes, so this must NOT resolve.",
+      "source": "From a normative and empirical perspective, the pattern of documented conduct provides the evidentiary basis for the claim.",
+      "cite": "From a normative and empirical perspective, the pattern ... provides the evidentiary basis for the claim.",
+      "expect": null
+    },
+    {
+      "name": "fabricated_cite_must_not_resolve",
+      "why": "Quotes nothing in the source at all.",
+      "source": "The algorithm sorts in O(n log n) time and is stable.",
+      "cite": "runs in constant time",
+      "expect": null
+    },
+    {
+      "name": "paraphrase_must_not_resolve",
+      "why": "A reworded claim is precisely what verbatim citation exists to exclude.",
+      "source": "The algorithm sorts in O(n log n) time and is stable.",
+      "cite": "the sort is efficient",
+      "expect": null
+    },
+    {
+      "name": "underscore_not_stripped",
+      "why": "`_` is an identifier character; stripping it would conflate distinct symbols.",
+      "source": "the claimid field",
+      "cite": "the claim_id field",
+      "expect": null
+    },
+    {
+      "name": "spaced_asterisk_not_stripped",
+      "why": "`a * b` is arithmetic, not emphasis.",
+      "source": "compute a b here",
+      "cite": "compute a * b here",
+      "expect": null
+    },
+    {
+      "name": "empty_cite_never_resolves",
+      "why": "No identity to ground.",
+      "source": "The algorithm sorts in O(n log n) time.",
+      "cite": "   ",
+      "expect": null
+    }
+  ]
+}

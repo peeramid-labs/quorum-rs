@@ -91,6 +91,11 @@ pub struct McpClaimAssessment {
     /// Brief reasoning for the verdict.
     #[serde(default, alias = "explanation", alias = "reasoning")]
     pub reason: Option<String>,
+    /// Filled in by citation grounding, never by the model — hidden from both
+    /// the advertised tool schema and the wire format so it cannot be supplied.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub anchor: Option<crate::agents::ClaimAnchor>,
 }
 
 /// A specific point of disagreement between the evaluator and a proposal.
@@ -235,6 +240,11 @@ pub struct McpClaimAssessmentResult {
     pub verdict: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Grounded span, carried through to the internal
+    /// [`ClaimAssessment`](crate::agents::ClaimAssessment) so the offsets
+    /// computed at match time survive the hop out of the tool handler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<crate::agents::ClaimAnchor>,
 }
 
 /// Serializable disagreement result.
