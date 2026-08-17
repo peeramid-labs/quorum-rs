@@ -48,6 +48,10 @@ async fn publish_then_read_reconstructs_views_and_honours_cutoff() {
     let mut task_done = base_event(&agent, AgentEventKind::TaskCompleted);
     task_done.job_id = Some("job-1".to_string());
     task_done.round = Some(1);
+    // The emitter stamps the phase on both halves (workers::mod), and a task is
+    // identified by job + round + phase — so a fixture that omits it here no
+    // longer pairs with its start, and the task reads as still in flight.
+    task_done.phase = Some("propose".to_string());
     task_done.detail = "ok".to_string();
 
     // An in-flight task (no finish event).
