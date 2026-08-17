@@ -2069,9 +2069,14 @@ where
                 };
 
                 if attempts > max_retries {
-                    anyhow::bail!(
-                        "Failed to parse structured output after {attempts} attempts. Last error: {e}. FinishReason: {finish_reason}. Raw (truncated): '{truncated_raw}'"
-                    );
+                    anyhow::bail!(describe_parse_failure(ParseFailure {
+                        attempts,
+                        last_error: &e.to_string(),
+                        finish_reason,
+                        raw: &agent_response.content,
+                        cleaned: &cleaned_json,
+                        output_tokens: agent_response.output_tokens.unwrap_or(0),
+                    }));
                 }
 
                 // Dump failure details to file for debugging (opt-in via NSED_FAILURE_DUMPS=1|full)
@@ -3872,8 +3877,139 @@ fn resolve_finalize_window(raw: Option<&str>) -> usize {
         .unwrap_or(DEFAULT_FINALIZE_WINDOW)
 }
 
+/// What a failed structured-output parse looked like, in the terms a reader needs
+/// to act on it.
+pub(crate) struct ParseFailure<'a> {
+    pub attempts: usize,
+    /// The parser's own complaint.
+    pub last_error: &'a str,
+    pub finish_reason: &'a str,
+    /// The provider's content before any cleaning.
+    pub raw: &'a str,
+    /// What was actually handed to the parser.
+    pub cleaned: &'a str,
+    /// Output tokens the provider billed for the attempt.
+    pub output_tokens: u32,
+}
+
+/// Longest payload excerpt carried in an error message. Enough to see the shape
+/// of a malformed answer; the whole thing is in the debug log either way.
+const PARSE_FAILURE_EXCERPT: usize = 1_000;
+
+/// Explain a parse failure so the reason is visible without opening a log.
+///
+/// An empty payload is the case worth naming. `Raw: ''` reads as a parser bug
+/// when the truth is that there was nothing to parse, and the causes need
+/// different fixes: tokens billed with no content means the text went to a
+/// channel nobody is reading — a reasoning model whose answer never reached the
+/// content field — while zero tokens means the provider returned nothing at all.
+pub(crate) fn describe_parse_failure(f: ParseFailure<'_>) -> String {
+    let head = format!(
+        "Failed to parse structured output after {} attempts. Last error: {}. FinishReason: {}.",
+        f.attempts, f.last_error, f.finish_reason
+    );
+    if !f.cleaned.is_empty() {
+        let total = f.cleaned.chars().count();
+        let excerpt = if total > PARSE_FAILURE_EXCERPT {
+            format!(
+                "{}... (truncated, {total} chars total)",
+                f.cleaned
+                    .chars()
+                    .take(PARSE_FAILURE_EXCERPT)
+                    .collect::<String>()
+            )
+        } else {
+            f.cleaned.to_string()
+        };
+        return format!("{head} Raw: '{excerpt}'");
+    }
+    // Nothing reached the parser. Say which way it went missing.
+    if !f.raw.is_empty() {
+        return format!(
+            "{head} The payload was empty after cleaning, from {} chars of provider content \
+             (output_tokens={}) — cleaning discarded it, so the content did not look like the \
+             expected envelope.",
+            f.raw.chars().count(),
+            f.output_tokens
+        );
+    }
+    if f.output_tokens > 0 {
+        return format!(
+            "{head} The provider returned NO content while billing {} output tokens — the answer \
+             went somewhere this client does not read (a reasoning/thinking channel rather than \
+             the content field). Check the model's output format, not the parser.",
+            f.output_tokens
+        );
+    }
+    format!(
+        "{head} The provider returned no content and billed no output tokens — it produced \
+         nothing at all. Check the request (context length, content filter, upstream capacity), \
+         not the parser."
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{ParseFailure, describe_parse_failure};
+
+    fn failure<'a>(raw: &'a str, cleaned: &'a str, output_tokens: u32) -> ParseFailure<'a> {
+        ParseFailure {
+            attempts: 6,
+            last_error: "EOF while parsing a value at line 1 column 0",
+            finish_reason: "Stop",
+            raw,
+            cleaned,
+            output_tokens,
+        }
+    }
+
+    #[test]
+    fn a_malformed_payload_is_quoted() {
+        let msg = describe_parse_failure(failure("{oops", "{oops", 40));
+        assert!(msg.contains("Raw: '{oops'"), "{msg}");
+    }
+
+    #[test]
+    fn a_long_payload_says_how_much_was_cut() {
+        let long = "x".repeat(1_500);
+        let msg = describe_parse_failure(failure(&long, &long, 400));
+        assert!(msg.contains("truncated, 1500 chars total"), "{msg}");
+        assert!(msg.len() < 1_300, "the excerpt is bounded: {}", msg.len());
+    }
+
+    #[test]
+    fn an_empty_payload_that_cost_tokens_points_away_from_the_parser() {
+        // The live case: FinishReason Stop, nothing to parse, tokens billed. The
+        // answer went to a channel this client does not read, and reporting
+        // "Raw: \'\'" sent readers hunting through the parser instead.
+        let msg = describe_parse_failure(failure("", "", 512));
+        assert!(
+            msg.contains("NO content while billing 512 output tokens"),
+            "{msg}"
+        );
+        assert!(msg.contains("reasoning"), "names where to look: {msg}");
+        assert!(
+            !msg.contains("Raw:"),
+            "does not pretend to show a payload: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_empty_payload_that_cost_nothing_points_at_the_request() {
+        let msg = describe_parse_failure(failure("", "", 0));
+        assert!(msg.contains("billed no output tokens"), "{msg}");
+        assert!(msg.contains("Check the request"), "{msg}");
+    }
+
+    #[test]
+    fn cleaning_away_the_whole_payload_is_reported_as_such() {
+        // Distinct from the provider sending nothing: content arrived and our own
+        // cleaning discarded it, which is our bug rather than theirs.
+        let msg = describe_parse_failure(failure("Here you go! (no json)", "", 30));
+        assert!(msg.contains("empty after cleaning"), "{msg}");
+        assert!(msg.contains("22 chars of provider content"), "{msg}");
+    }
+
     // Echoes the content it was handed as the "reason" so a test can assert what
     // solution_content the react loop extracted; `reject=false` accepts (None).
     #[derive(Debug)]
