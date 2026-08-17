@@ -8,7 +8,6 @@ tagline: OpenAI-compatible /v1/chat/completions endpoint mapping model tags to N
 NSED exposes a standard OpenAI-compatible `/v1/chat/completions` endpoint that
 makes it plug-and-play with Cursor, Chatbox, and any Vercel AI SDK wrapper.
 
-See also: [Request Deduplication](dedup.md) | [Scheduling & Policies](scheduling.md)
 
 ## Endpoint
 
@@ -193,7 +192,7 @@ loops they cause.
 ## Deduplication
 
 The chat completions endpoint uses the same content-hash-based dedup cache as
-the Responses API. See [Request Deduplication](dedup.md) for details.
+the Responses API. Deduplication is handled by the orchestrator, not this SDK.
 
 ## Session Continuation & Mid-Flight Injection
 
