@@ -3122,6 +3122,16 @@ pub trait ModelDownDetector: Send + Sync + std::fmt::Debug {
 /// Default detector: substring-matches the common provider phrasings for a
 /// missing/removed model. Deliberately narrow — a bare "404" inside unrelated
 /// text (a job id) must not trip it.
+///
+/// `410 Gone` belongs here as much as `404`: a provider that retires a model
+/// answers it for a while, and it says more definitely than a 404 that the
+/// resource is deliberately no longer served. Leaving it out cost two agents an
+/// unbroken run of failures — they struck forever, never reported `model_down`,
+/// and the scheduler kept assigning them work that could not succeed.
+///
+/// `400` is deliberately absent. A bad request is usually ours — a malformed
+/// body, an unsupported parameter — and benching an agent for it would take a
+/// healthy model out of service over our own bug.
 #[derive(Debug, Default, Clone)]
 pub struct HeuristicModelDownDetector;
 
@@ -3130,10 +3140,13 @@ impl ModelDownDetector for HeuristicModelDownDetector {
         let e = error.to_ascii_lowercase();
         e.contains("status 404")
             || e.contains("404 not found")
+            || e.contains("status 410")
+            || e.contains("410 gone")
             || e.contains("model_not_found")
             || e.contains("model not found")
             || e.contains("does not exist")
             || e.contains("no such model")
+            || e.contains("no longer available")
     }
 }
 
@@ -7674,6 +7687,28 @@ mod tests {
     #[test]
     fn classify_fallback() {
         assert_eq!(classify_abstention_reason("kaboom"), "error");
+    }
+
+    #[test]
+    fn a_retired_model_counts_as_down() {
+        let d = HeuristicModelDownDetector;
+        // Observed: two agents striking forever on models the provider has
+        // withdrawn. 410 Gone says so more definitely than 404 — the resource
+        // existed and is deliberately no longer served — but only 404 was matched,
+        // so the agents never reported model_down and the scheduler kept handing
+        // them work that could not succeed.
+        assert!(d.is_model_down("propose failed: api error (status 410)"));
+        assert!(d.is_model_down("API request failed with status 410 Gone"));
+
+        // A retirement announced in prose rather than by status.
+        assert!(d.is_model_down("this model has been deprecated and is no longer available"));
+        assert!(d.is_model_down("model is no longer available"));
+
+        // Still not model-down: 410 inside unrelated text, and a 400 — which is
+        // usually a malformed request of ours, not a missing model, so treating it
+        // as down would bench a healthy agent over our own bug.
+        assert!(!d.is_model_down("job sphera_jobs-410 completed"));
+        assert!(!d.is_model_down("bad request (status 400)"));
     }
 
     #[test]
