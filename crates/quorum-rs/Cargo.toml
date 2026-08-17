@@ -61,7 +61,11 @@ libc = "0.2"
 libloading = "0.8"
 futures-util = "0.3.31"
 open = { version = "5", optional = true }
-utoipa-swagger-ui = { version = "9.0.2", features = ["axum"], optional = true }
+# `vendored` bundles the Swagger UI assets in the crate. Without it the build
+# script downloads them from github.com, which fails anywhere the build has no
+# network — docs.rs sandboxes its builds, so every published version failed to
+# document with `curl: (6) Could not resolve host`.
+utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"], optional = true }
 reqwest = { version = "0.12.4", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0.203", features = ["derive"] }
 serde_json = "1.0.117"
