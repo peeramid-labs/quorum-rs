@@ -31,6 +31,12 @@ nothing has to be installed.
 Pick a thread id now and keep it for every turn. It is the `conversation_id`;
 each turn still gets its own `room_id`.
 
+The id is yours to choose — a thread key from your own store. It must **not** be
+the room or job id: those carry a per-turn nonce, and a session keyed on them is
+new every turn. Nothing rejects a missing `conversation_id`; a Claude-backed
+agent simply starts a fresh session each time and you lose continuity quietly, so
+this is the field to get right first.
+
 ```bash
 THREAD="thread-9f2c"
 
@@ -107,6 +113,9 @@ hide the mistake. A `system` turn is rejected too: instructions belong in
 `system_instructions`, not in the task.
 
 This is the form to prefer from a language that cannot call the Rust renderer.
+Leave `new_turn` out when you send `messages` — deriving it is what this form is
+for, and stating it only adds a way to be rejected. If you do state it, it must
+be the last `user` turn.
 
 ## 3. Look at what the council actually received
 
@@ -150,6 +159,15 @@ can use:
 Send both and each agent type is served correctly. That is the whole design: the
 same request satisfies a council mixing both kinds, which is normal.
 
+It is worth knowing what that session is. `conversation_id` is hashed with the
+agent's name into a deterministic id — the same thread and agent always produce
+the same one — which the provider is then asked to *resume*, skipping the system
+prompts and context it already holds. That transcript lives with the agent, not
+in this service. So if an agent restarts, or a different host picks up the next
+turn, the resume finds nothing and the agent falls back to reading the full task.
+`user_query` is the only portable copy of your thread, which is the second reason
+to keep sending it.
+
 ## 5. See what goes wrong if you write prose instead
 
 Now break it deliberately. Put the thread in `user_query` as a narrative rather
@@ -179,16 +197,22 @@ it somewhere to look instead.
 
 ## 6. Keep the thread going
 
-Every later turn repeats step 2: append the newest exchange to the `user_query`
-you render, set `new_turn` to just the new message, keep the same
-`conversation_id`, and use a fresh `room_id`.
+Every later turn repeats step 2: append the newest exchange (or the new
+`messages` entry), keep the same `conversation_id`, and use a fresh `room_id`.
+
+**If your chat can branch** — an edit-and-resend from mid-thread, or a fork under
+an earlier answer — give the fork its own `conversation_id`. Reusing the parent's
+resumes a session whose transcript still contains the branch you abandoned, so
+the agent argues with a message your user retracted. The interactive client keys
+on a per-branch id for exactly this: a fork under a non-leaf node takes a fresh
+one, and a reply at the tip keeps its parent's.
 
 ## What you did
 
 You threaded a conversation while still choosing the council per turn. Two rules:
 
-> Render `user_query` as `[role]` turns — never as prose. Set `new_turn` to this
-> message alone, and keep `conversation_id` stable across the thread.
+> Send `messages` and let the server render. Keep `conversation_id` stable across
+> the thread — your own key, never the room id — and give a branch its own.
 
 ## Next
 
