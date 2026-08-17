@@ -47,6 +47,24 @@ fn compute_finalization_reserve(
     ratio_based.min(fixed)
 }
 
+/// Name of the KV bucket carrying one session's pending user tool calls.
+///
+/// The single definition on purpose. The agent writes these records and the
+/// orchestrator polls them, and each used to build the name itself — the reader
+/// with `nsed` hardcoded, the writer from its configured prefix. They agree only
+/// while the prefix is the default: change it and the agent creates a second
+/// bucket, writes a question nobody is watching, waits out the whole deadline,
+/// and the orchestrator's cleanup deletes the other name and leaks this one.
+/// Sharing the function makes that divergence unrepresentable rather than
+/// merely detectable.
+pub fn toolcalls_bucket_name(subject_prefix: &str, session_id: &str) -> String {
+    format!(
+        "{}_toolcalls_{}",
+        crate::nats_utils::sanitize_subject_component(subject_prefix),
+        crate::nats_utils::sanitize_subject_component(session_id)
+    )
+}
+
 /// Encapsulates the NATS state needed to handle user tool calls within the
 /// react loop. Created by the NatsNsedWorker and passed down to the agent.
 #[derive(Clone, Debug)]
@@ -144,11 +162,7 @@ impl UserToolHandler {
     }
 
     fn bucket_name(&self) -> String {
-        format!(
-            "{}_toolcalls_{}",
-            crate::nats_utils::sanitize_subject_component(&self.subject_prefix),
-            crate::nats_utils::sanitize_subject_component(&self.session_id)
-        )
+        toolcalls_bucket_name(&self.subject_prefix, &self.session_id)
     }
 
     /// Handle a user tool call: publish to KV, wait for response, return result.
@@ -593,6 +607,29 @@ mod tests {
             let parsed: ToolCallStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, status);
         }
+    }
+
+    #[test]
+    fn the_bucket_name_follows_the_configured_prefix() {
+        assert_eq!(
+            toolcalls_bucket_name("nsed", "room-f2205792"),
+            "nsed_toolcalls_room-f2205792"
+        );
+        // A non-default prefix must reach the name, or the reader and writer end
+        // up on different buckets.
+        assert_eq!(
+            toolcalls_bucket_name("staging", "room-1"),
+            "staging_toolcalls_room-1"
+        );
+        // Both components are sanitized, so a session id carrying subject
+        // metacharacters cannot escape into the bucket name.
+        assert_eq!(
+            toolcalls_bucket_name("nsed", "room.1 *>"),
+            toolcalls_bucket_name("nsed", "room.1 *>"),
+        );
+        let odd = toolcalls_bucket_name("ns.ed", "a>b");
+        assert!(!odd.contains('.'), "{odd}");
+        assert!(!odd.contains('>'), "{odd}");
     }
 
     #[test]
