@@ -159,7 +159,32 @@ impl UserToolHandler {
         round: u32,
         phase: DeliberationPhase,
     ) -> String {
-        // 1. Parse arguments — propagate parse error instead of silently defaulting
+        // 1. Refuse before touching anything if there is no time to wait for an
+        //    answer. This used to be asked after the bucket, the record and the
+        //    SSE event had all gone out, so a question that was already dead left
+        //    a trail: a poller could only ever catch it Expired, a live client
+        //    rendered and withdrew it in one breath, and an empty bucket outlived
+        //    both. The budget needs no NATS to read, so nothing has to happen
+        //    before this is known.
+        //
+        //    Reachable whenever a call lands inside the finalization reserve —
+        //    `force_finalize` withdraws these tools at three average iterations of
+        //    remaining budget, a shorter window than the reserve when iterations
+        //    are quick.
+        let remaining = self.remaining_budget();
+        let reserve = self.finalization_reserve();
+        if remaining <= reserve {
+            info!(
+                agent = %self.agent_id,
+                tool = %tool_name,
+                remaining_secs = remaining.as_secs_f64(),
+                reserve_secs = reserve.as_secs_f64(),
+                "Not asking: no budget beyond the finalization reserve."
+            );
+            return "[No response — phase budget exhausted. Proceed immediately.]".to_string();
+        }
+
+        // 2. Parse arguments — propagate parse error instead of silently defaulting
         let arguments: serde_json::Value = match serde_json::from_str(arguments_json) {
             Ok(v) => v,
             Err(e) => {
@@ -167,7 +192,7 @@ impl UserToolHandler {
             }
         };
 
-        // 2. Get or create the toolcalls KV bucket
+        // 3. Get or create the toolcalls KV bucket
         let bucket_name = self.bucket_name();
         let toolcall_store = match self.get_or_create_bucket(&bucket_name).await {
             Ok(store) => store,
@@ -240,17 +265,8 @@ impl UserToolHandler {
             "User tool call published. Waiting for response..."
         );
 
-        // 7. Compute deadline with finalization reserve
-        let remaining = self.remaining_budget();
-        let reserve = self.finalization_reserve();
-
-        if remaining <= reserve {
-            // No budget left beyond reserve — immediately expire
-            self.expire_call(&toolcall_store, &key, &call_id, tool_name)
-                .await;
-            return "[No response — phase budget exhausted. Proceed immediately.]".to_string();
-        }
-
+        // Deadline from the budget measured before publishing. Re-reading it here
+        // would only shave off the microseconds the publish took.
         let deadline = remaining.saturating_sub(reserve);
 
         // 8. Watch for response with timeout
@@ -593,6 +609,55 @@ mod tests {
             let parsed: ToolCallStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, status);
         }
+    }
+
+    /// A JetStream context over a live server, or `None` so the test skips.
+    async fn js() -> Option<(async_nats::Client, async_nats::jetstream::Context)> {
+        let url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
+        let client = async_nats::connect(&url).await.ok()?;
+        let js = async_nats::jetstream::new(client.clone());
+        Some((client, js))
+    }
+
+    #[tokio::test]
+    async fn a_call_with_no_time_to_wait_is_refused_before_anything_is_published() {
+        let Some((client, js)) = js().await else {
+            eprintln!("Skipping: NATS unavailable");
+            return;
+        };
+        let session = format!("test-refuse-{}", Uuid::new_v4());
+        // reserve = min(budget × 1.0, 1000s) = the whole budget, so the call lands
+        // inside the reserve on its first attempt — the same position a call
+        // reaches late in a real phase, without waiting for one.
+        let handler = UserToolHandler::new(
+            client,
+            js.clone(),
+            session.clone(),
+            "ALPHA".to_string(),
+            60.0,
+        )
+        .with_finalization_reserve(1000.0, 1.0);
+
+        let answer = handler
+            .handle_call(
+                "user_dm_user",
+                r#"{"message":"hi"}"#,
+                1,
+                DeliberationPhase::Proposing,
+            )
+            .await;
+        assert!(
+            answer.contains("phase budget exhausted"),
+            "the model is told to proceed: {answer}"
+        );
+
+        // Nothing was published: no bucket, so no record and no pending row for a
+        // client to render and immediately withdraw.
+        let bucket = format!("nsed_toolcalls_{session}");
+        assert!(
+            js.get_key_value(&bucket).await.is_err(),
+            "a question that cannot be waited for must not create {bucket}"
+        );
     }
 
     #[test]
