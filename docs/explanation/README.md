@@ -21,3 +21,4 @@ Read these away from the keyboard when you want to understand a design decision 
 | [About LLM context-window guards](llm-context-window-guards.md) | Why the shrink-guard counts tool schemas and why `max_tokens` isn't capped defensively. |
 | [About `compact_history` & scratchpad squeeze](compact-history-and-scratchpad-squeeze.md) | Why agents self-fold older tool results, and the shape of the structured summarisation prompt. |
 | [Why persona layer stacking, and why CWD-relative paths](persona-layer-stacking.md) | Why `persona:` accepts a layered form, why files are read at parse time, and why paths resolve against process CWD instead of the yaml file's parent. |
+| [About threading a conversation into one task](what-the-task-text-should-contain.md) | Why a flattened thread loses the live question, the two competing flattening conventions, and the `<task>` + summarised-background shape to aim for. |
