@@ -78,6 +78,36 @@ case is labelled.
 
 **`new_turn` carries only this send's message.** Not the thread, not a summary.
 
+### Or let the server render it
+
+Rendering that string by hand means keeping the rules in step with the server. If
+you would rather not, send `messages` instead and the server derives both fields:
+
+```bash
+curl -s https://api.example.xyz/deliberation \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"room_id\": \"room-$(openssl rand -hex 4)\",
+    \"conversation_id\": \"$THREAD\",
+    \"messages\": [
+      {\"role\": \"user\",      \"content\": \"What is the sound of one hand clapping?\"},
+      {\"role\": \"assistant\", \"content\": \"A Zen koan attributed to Hakuin Ekaku…\"},
+      {\"role\": \"user\",      \"content\": \"yo what about forests?\"}
+    ],
+    \"agent_names\": [\"Corepunk01\", \"Corepunk02\", \"Corepunk03\"],
+    \"deliberation_rounds\": 2
+  }"
+```
+
+`user_query` is flattened with the same function used everywhere else, and
+`new_turn` becomes the last `user` turn. Send `messages` **or** `user_query` — both
+together is rejected, because they would disagree and picking one silently would
+hide the mistake. A `system` turn is rejected too: instructions belong in
+`system_instructions`, not in the task.
+
+This is the form to prefer from a language that cannot call the Rust renderer.
+
 ## 3. Look at what the council actually received
 
 Do this once and the rest of the tutorial explains itself. The task the agents
