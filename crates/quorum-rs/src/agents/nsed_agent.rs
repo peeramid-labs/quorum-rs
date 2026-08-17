@@ -945,27 +945,52 @@ impl ProposerEvaluatorAgent {
                 .map(|t| dyn_clone::clone_box(t.as_ref())),
         );
 
-        // Automatically inject Context Tools if store is available
+        // Automatically inject Context Tools if store is available.
+        //
+        // Only the ones that have something to read. Offering a history reader in
+        // the first round advertises a capability with no data behind it: the
+        // model spends a turn calling it, gets nothing, and the tool definitions
+        // cost prompt tokens in every request of that round.
         if let Some(store) = &context.store {
-            let read_tool = ReadProposalTool::new(store.clone(), context.round_number)
-                .with_candidates(context.candidates.clone());
-            all_tools.push(Box::new(read_tool));
+            // `read_proposal` serves the current round's anonymized candidates
+            // during evaluation, and prior rounds' proposals from history — so it
+            // is useful whenever either exists.
+            let has_history = context.round_number > 1;
+            if has_history || !context.candidates.is_empty() {
+                let read_tool = ReadProposalTool::new(store.clone(), context.round_number)
+                    .with_candidates(context.candidates.clone());
+                all_tools.push(Box::new(read_tool));
+            }
 
-            let critiques_tool = ReadCritiquesTool::new(store.clone(), context.round_number);
-            all_tools.push(Box::new(critiques_tool));
+            // Critiques and one's own earlier proposal only exist once a round has
+            // been through evaluation.
+            if has_history {
+                let critiques_tool = ReadCritiquesTool::new(store.clone(), context.round_number);
+                all_tools.push(Box::new(critiques_tool));
 
-            let own_tool = ReadOwnProposalTool::new(
-                store.clone(),
-                context.round_number,
-                self.config.name.clone(),
+                let own_tool = ReadOwnProposalTool::new(
+                    store.clone(),
+                    context.round_number,
+                    self.config.name.clone(),
+                );
+                all_tools.push(Box::new(own_tool));
+            }
+
+            // Search spans the whole deliberation including the current round, so
+            // it is offered as soon as there is anything to search.
+            if has_history || !context.candidates.is_empty() {
+                let search_tool = SearchDeliberationTool::new(store.clone(), context.round_number)
+                    .with_candidates(context.candidates.clone());
+                all_tools.push(Box::new(search_tool));
+            }
+
+            debug!(
+                agent = %self.config.name,
+                round = context.round_number,
+                candidates = context.candidates.len(),
+                tools = all_tools.len(),
+                "Injected the NSED protocol tools that have data to serve."
             );
-            all_tools.push(Box::new(own_tool));
-
-            let search_tool = SearchDeliberationTool::new(store.clone(), context.round_number)
-                .with_candidates(context.candidates.clone());
-            all_tools.push(Box::new(search_tool));
-
-            debug!(agent=%self.config.name, "Injected NSED protocol tools (read_proposal, search_deliberation, etc.) via persistent store.");
         }
 
         // Inject user-defined tools if handler is available
@@ -3672,10 +3697,36 @@ async fn react_loop(
                         }
                     }
                 } else if !active_tool_names.contains(tool_name.as_str()) {
-                    // Tool was stripped (e.g., force_finalize); reject the call
-                    warn!(tool_name = %tool_name, "LLM called a stripped tool (not in active set).");
+                    // Two different causes reach here and they need different
+                    // responses from the model. Blaming "the current phase" for a
+                    // budget strip sent it looking for a phase it could retry in,
+                    // when what it actually had to do was answer now.
+                    let known_here = tool_map.contains_key(tool_name.as_str());
+                    warn!(
+                        tool_name = %tool_name,
+                        stripped_for_budget = known_here,
+                        "LLM called a tool that is not in the active set."
+                    );
                     tool_success = false;
-                    format!("Error: Tool `{tool_name}` is not available in the current phase.")
+                    if known_here {
+                        format!(
+                            "Error: Tool `{tool_name}` is withdrawn — this task is out of time \
+                             budget and must finalize now. Do not call any more tools; produce \
+                             your final answer with `{}` immediately.",
+                            terminal_tool_name.unwrap_or("the terminal tool")
+                        )
+                    } else {
+                        format!(
+                            "Error: Tool `{tool_name}` does not exist in this task. Available \
+                             tools: {}.",
+                            {
+                                let mut names: Vec<&str> =
+                                    active_tool_names.iter().copied().collect();
+                                names.sort_unstable();
+                                names.join(", ")
+                            }
+                        )
+                    }
                 } else if let Some(tool) = tool_map.get(tool_name) {
                     let arg_str = &tool_call.function.arguments;
                     let args_result = if arg_str.trim().is_empty() {
@@ -7278,6 +7329,102 @@ mod tests {
             items,
             crate::agents::cite::GroundingPolicy::Reject,
         )
+    }
+
+    /// A store that holds nothing — these tests care about which tools get
+    /// offered, which is decided before any read happens.
+    #[derive(Debug)]
+    struct EmptyStore;
+
+    #[async_trait::async_trait]
+    impl crate::agents::PersistenceStore for EmptyStore {
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn append(&self, _key: &str, _content: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn set(&self, _key: &str, _content: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_round_history(
+            &self,
+            _round: u32,
+        ) -> anyhow::Result<Option<Vec<crate::agents::ProposalRecord>>> {
+            Ok(None)
+        }
+    }
+
+    fn tool_names_for(round: u32, candidates: usize) -> Vec<String> {
+        let agent = super::ProposerEvaluatorAgent::new(
+            AgentConfig {
+                name: "ALPHA".to_string(),
+                ..Default::default()
+            },
+            Box::new(CannedSummaryModel {
+                text: String::new(),
+            }),
+            Box::new(crate::prompts::defaults::DefaultPromptSet::default()),
+            vec![],
+            vec![],
+        );
+        let context = AgentContext {
+            round_number: round,
+            store: Some(std::sync::Arc::new(EmptyStore)),
+            candidates: (0..candidates)
+                .map(|i| crate::agents::CandidateProposal {
+                    id: format!("Candidate_{i}"),
+                    proposal: crate::agents::Proposal::default(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut names: Vec<String> = agent
+            .aggregate_tools(&context)
+            .iter()
+            .map(|t| t.name())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_first_round_is_not_offered_history_readers() {
+        // Round 1 proposing: nothing has been proposed or critiqued yet. Offering
+        // a reader here advertises data that does not exist — the model spends a
+        // turn discovering that, and every request of the round pays for the tool
+        // definitions.
+        let names = tool_names_for(1, 0);
+        for absent in ["read_proposal", "read_critiques", "read_own_proposal"] {
+            assert!(
+                !names.contains(&absent.to_string()),
+                "{absent} should not be offered in round 1 with no candidates: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_round_evaluation_can_still_read_its_candidates() {
+        // Same round, but candidates are in hand: `read_proposal` serves those, so
+        // withholding it would remove the evaluator's only way to read past the
+        // truncation of an inlined candidate.
+        let names = tool_names_for(1, 2);
+        assert!(names.contains(&"read_proposal".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"read_critiques".to_string()),
+            "no critiques exist in the first round: {names:?}"
+        );
+    }
+
+    #[test]
+    fn later_rounds_are_offered_the_full_set() {
+        let names = tool_names_for(2, 0);
+        for present in ["read_proposal", "read_critiques", "read_own_proposal"] {
+            assert!(
+                names.contains(&present.to_string()),
+                "{present} missing once history exists: {names:?}"
+            );
+        }
     }
 
     fn ctx_with_candidate(content: &str, thoughts: &str) -> AgentContext {
