@@ -501,6 +501,14 @@
                 color: #ffa198;
                 word-break: break-word;
             }
+            .errors-table td.ok-detail {
+                color: var(--green);
+                word-break: break-word;
+            }
+            .errors-table td.neutral-detail {
+                color: var(--text-dim);
+                word-break: break-word;
+            }
             .errors-empty {
                 text-align: center;
                 color: var(--text-dim);
@@ -3890,6 +3898,16 @@
                 return table;
             }
 
+            /* Detail cell class for a row in `state`. A finished task reads as a
+               success, a failed one as an error, and anything still running or
+               unrecognised stays neutral rather than claiming either. */
+            function detailClass(state) {
+                var s = String(state || "").toLowerCase();
+                if (s === "completed" || s === "ok" || s === "succeeded") return "ok-detail";
+                if (s.indexOf("fail") !== -1 || s === "error" || s === "timeout") return "err-detail";
+                return "neutral-detail";
+            }
+
             function renderTaskSection(title, rows) {
                 rows = rows || [];
                 var section = activitySection(title, rows.length);
@@ -3906,7 +3924,7 @@
                     row.appendChild(errorsCell("", task.phase || "—"));
                     row.appendChild(errorsCell("err-time", fmtErrorTime(task.started_at)));
                     row.appendChild(errorsCell("", task.state || "—"));
-                    row.appendChild(errorsCell("err-detail", task.detail || ""));
+                    row.appendChild(errorsCell(detailClass(task.state), task.detail || ""));
                     tbody.appendChild(row);
                 });
                 table.appendChild(tbody);
@@ -3926,10 +3944,12 @@
                 rows.forEach(function (call) {
                     var row = document.createElement("tr");
                     row.appendChild(errorsCell("", call.tool_name || "—"));
-                    row.appendChild(errorsCell("err-detail", call.args_summary || ""));
+                    // Arguments describe the call, not its outcome — colouring them
+                    // as an error read every successful tool call as a failure.
+                    row.appendChild(errorsCell("neutral-detail", call.args_summary || ""));
                     row.appendChild(errorsCell("err-time", fmtErrorTime(call.started_at)));
                     row.appendChild(errorsCell("", call.state || "—"));
-                    row.appendChild(errorsCell("err-detail", call.detail || ""));
+                    row.appendChild(errorsCell(detailClass(call.state), call.detail || ""));
                     tbody.appendChild(row);
                 });
                 table.appendChild(tbody);
