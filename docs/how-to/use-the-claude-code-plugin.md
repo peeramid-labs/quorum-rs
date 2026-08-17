@@ -122,8 +122,7 @@ Or to bring up an agent fleet:
 - [tutorials/first-agent-from-invite.md](../tutorials/first-agent-from-invite.md)
   — the same flow without the plugin, useful for understanding
   what the slash commands hide.
-- [reference/cli.md](../reference/cli.md) — the binary's flag
-  surface, source of truth.
+- `quorum --help` — the binary's flag surface, source of truth.
 - <https://github.com/peeramid-labs/plugin-marketplace> — the
   marketplace + plugin source, including the prompts each slash
   command sends.

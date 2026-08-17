@@ -19,10 +19,10 @@ The combined resource envelope for a deliberation: wall-clock time (Phase 1), an
 A tag that declares what an agent is good at (e.g., `lang:rust`, `security:owasp`, `*` for general purpose). Policies use capability matching to select which agents participate in a deliberation.
 
 **Convergence**
-The condition under which the deliberation halts early — when thermodynamic evidence `E(r)` reaches the threshold `ε × B`. The `effort` parameter (0–1) controls how much accumulated evidence is required. See [convergence-protocol.md](convergence-protocol.md).
+The condition under which the deliberation halts early — when thermodynamic evidence `E(r)` reaches the threshold `ε × B`. The `effort` parameter (0–1) controls how much accumulated evidence is required. See the [whitepaper](https://arxiv.org/abs/2601.16863) for the halting protocol.
 
 **Decisiveness**
-`Σ|net_support[p]|` — the total absolute signed QV opinion mass across all proposals in a round. Used internally in the convergence pipeline; the primary halting signal is now **winner conviction** (see below). See [scoring-variables.md](scoring-variables.md).
+`Σ|net_support[p]|` — the total absolute signed QV opinion mass across all proposals in a round. Used internally in the convergence pipeline; the primary halting signal is now **winner conviction** (see below). See the [whitepaper](https://arxiv.org/abs/2601.16863) for the scoring definitions.
 
 **Effort**
 The user-facing halting sensitivity dial (`effort`, range [0, 1], default 0.6). Fraction of the thermodynamic positive budget `B` that must accumulate as evidence before the deliberation may halt. Lower effort halts sooner; higher effort requires stronger sustained consensus. Replaces `convergence_threshold` in policy configuration (`convergence_threshold` remains a backward-compatible alias).
@@ -31,7 +31,7 @@ The user-facing halting sensitivity dial (`effort`, range [0, 1], default 0.6). 
 A single end-to-end reasoning session. One deliberation produces one final answer through N rounds of propose + evaluate cycles. Identified by a `job_id` / `room_id`.
 
 **Domain A / Domain B**
-The two logical planes in the split-node architecture: **Domain A (AI Cortex)** runs the orchestrator worker and LLM inference, while **Domain B (Control Plane)** runs the API gateway, job manager, and NATS server. See [architecture.md](architecture.md).
+The two logical planes in the split-node architecture: **Domain A (AI Cortex)** runs the orchestrator worker and LLM inference, while **Domain B (Control Plane)** runs the API gateway, job manager, and NATS server.
 
 **Evaluation**
 The structured critique an agent writes about another agent's proposal. Contains a **signed** score in [-1, +1] (negative = explicit opposition, 0 = neutral, positive = endorsement) and a rationale. All evaluations are cross-evaluations — no agent scores its own proposal.
@@ -40,7 +40,7 @@ The structured critique an agent writes about another agent's proposal. Contains
 The orchestrator pattern that dispatches tasks to all agents concurrently (fan-out) and waits for responses before aggregating (fan-in). Used for both propose and evaluate phases.
 
 **HITL (Human-in-the-Loop)**
-The operator review mechanism. When `response_sla_secs > 0` in a policy, each agent's LLM response is held in a buffer before being forwarded to the orchestrator. An operator can inspect, edit, or reject the response within the review window. See [how-to/hitl.md](how-to/hitl.md).
+The operator review mechanism. When `response_sla_secs > 0` in a policy, each agent's LLM response is held in a buffer before being forwarded to the orchestrator. An operator can inspect, edit, or reject the response within the review window.
 
 **Job**
 The unit of work dispatched via the NATS job queue. A job carries the deliberation parameters (task, agents/policy, scope, budget). Each job has a unique `job_id`. After creation, a job is processed by an orchestrator worker. The terms "job" and "session" are often used interchangeably.
@@ -49,13 +49,13 @@ The unit of work dispatched via the NATS job queue. A job carries the deliberati
 The Domain B component that receives API requests, resolves agents from policies, serialises the `JobPayload`, and publishes to the NATS stream. The Dynamic Expertise Broker selects agents using a knapsack algorithm.
 
 **NATS / JetStream**
-The messaging backbone of NSED. NATS JetStream provides durable streams (job queue), key-value buckets (history, scratchpads, status), and publish-subscribe (SSE events). No external SQL database is used. See [NATS.md](NATS.md).
+The messaging backbone of NSED. NATS JetStream provides durable streams (job queue), key-value buckets (history, scratchpads, status), and publish-subscribe (SSE events). No external SQL database is used. See [NATS topology](../explanation/nats-topology.md).
 
 **nsed**
 Acronym: **N-Way Self-Evaluating Deliberation**. A Runtime Mixture-of-Models protocol where N agents propose answers and cross-evaluate every peer in turn, converging via a Macro-Scale RNN consensus loop. See the [whitepaper](https://arxiv.org/abs/2601.16863) for the full protocol specification, Dynamic Expertise Broker, and empirical results. Hallucinated alternative expansions (e.g. "Neural Swarm") are not correct.
 
 **Net Support**
-The per-proposal signed aggregate of evaluations. Positive net support means evaluators collectively favoured this proposal; negative means they rejected it. Used to rank proposals within a round. See [scoring-variables.md](scoring-variables.md).
+The per-proposal signed aggregate of evaluations. Positive net support means evaluators collectively favoured this proposal; negative means they rejected it. Used to rank proposals within a round. See the [whitepaper](https://arxiv.org/abs/2601.16863) for the scoring definitions.
 
 **Orchestrator**
 The server component (running as `the orchestrator` or embedded via the orchestrator server) that manages the NATS infrastructure, exposes the REST API and dashboard, dispatches jobs, and runs deliberation workers. One orchestrator can serve many simultaneous deliberations.
@@ -70,7 +70,7 @@ A named, content-addressable configuration that defines the rules for a delibera
 The structured answer produced by one agent in the propose phase. Contains the agent's text response, a round number, and metadata. After all proposals are collected, they are shared with all agents for the evaluate phase.
 
 **QV (Quadratic Voting)**
-The scoring mechanism used to aggregate evaluations. Raw evaluation scores are transformed so that extreme scores require more "votes" to express, reducing the impact of outlier evaluators. See [scoring-variables.md](scoring-variables.md).
+The scoring mechanism used to aggregate evaluations. Raw evaluation scores are transformed so that extreme scores require more "votes" to express, reducing the impact of outlier evaluators. See the [whitepaper](https://arxiv.org/abs/2601.16863) for the scoring definitions.
 
 **Room**
 A named workspace endpoint combining a policy and an orchestrator. When a client runs `nsed run`, it targets a room. The room determines which policy governs the deliberation and which orchestrator processes it. Configured in `quorum.yml`.
@@ -88,7 +88,7 @@ In NSED, SLA refers to the timing commitments for a deliberation job. `response_
 Synonymous with Job in most contexts. The session ID (`room_id`) identifies the NATS KV buckets (`nsed_hist_{id}`) and subjects (`nsed.{id}.*`) for a specific deliberation.
 
 **Winner Conviction**
-The primary halting signal: `w = ns[winner] / Σ|ns_p|` ∈ [-1, +1]. The winning proposal's signed net support divided by the total absolute net support mass across all proposals. +1 = unanimous endorsement, 0 = split verdict, -1 = unanimous rejection of the winner. Each round's contribution to the evidence accumulator is `Δe(r) = max(w, 0) × u'(r)`. See [convergence-protocol.md](convergence-protocol.md).
+The primary halting signal: `w = ns[winner] / Σ|ns_p|` ∈ [-1, +1]. The winning proposal's signed net support divided by the total absolute net support mass across all proposals. +1 = unanimous endorsement, 0 = split verdict, -1 = unanimous rejection of the winner. Each round's contribution to the evidence accumulator is `Δe(r) = max(w, 0) × u'(r)`. See the [whitepaper](https://arxiv.org/abs/2601.16863) for the halting protocol.
 
 **Workspace**
 The local directory containing `quorum.yml`. The CLI uses the unified config — orchestrators, rooms, policies, and the `providers:` / `agents:` fleet — to know which orchestrators, agents, and rooms to work with. (Legacy split `nsed.yaml` + `agent.yml` is still auto-detected.)

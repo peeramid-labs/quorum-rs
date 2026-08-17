@@ -234,7 +234,7 @@ agents:
 
 ## Reference Implementation
 
-See [`examples/exec_agent.py`](../examples/exec_agent.py) for a complete Python reference that demonstrates:
+See [`examples/exec_agent.py`](../../examples/exec_agent.py) for a complete Python reference that demonstrates:
 
 - Reading the JSON envelope from stdin
 - Dispatching by `phase` field
