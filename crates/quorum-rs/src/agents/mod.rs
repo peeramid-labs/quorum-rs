@@ -11,7 +11,7 @@ pub mod user_tools;
 
 pub use nsed_agent::{AgentResponse, ProposerEvaluatorAgent};
 pub use output_guard::{OutputLeakDetector, OutputScanResult};
-pub use user_tools::{NatsUserToolHandlerFactory, UserToolHandler};
+pub use user_tools::{NatsUserToolHandlerFactory, UserToolHandler, toolcalls_bucket_name};
 
 use anyhow::Result;
 use async_trait::async_trait;
