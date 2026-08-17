@@ -3523,6 +3523,11 @@ async fn react_loop(
                 *tool_usage_stats.entry(tool_name.clone()).or_insert(0) += 1;
 
                 let tool_exec_start = std::time::Instant::now();
+                // Armed for the duration of the call: if this task is abandoned
+                // while the tool is still awaiting (a question to a human is the
+                // usual one), the guard reports the cancellation so the started
+                // event does not sit unpaired forever.
+                let mut call_guard = None;
                 if let Some(store) = context.event_store.as_ref() {
                     let mut started =
                         AgentEvent::now(agent_config.name.clone(), AgentEventKind::ToolCallStarted);
@@ -3535,6 +3540,14 @@ async fn react_loop(
                     if let Err(e) = store.publish(&started).await {
                         warn!("failed to record tool-call start: {e}");
                     }
+                    call_guard = Some(ToolCallGuard::new(
+                        store.clone(),
+                        agent_config.name.clone(),
+                        tool_call.id.clone(),
+                        tool_name.clone(),
+                        context.session_id.clone(),
+                        context.round_number,
+                    ));
                 }
                 // `tool_success` is set explicitly in every branch
                 // alongside `tool_output` so the telemetry emission
@@ -3788,6 +3801,12 @@ async fn react_loop(
                         warn!("failed to record tool-call finish: {e}");
                     }
                 }
+                // The outcome is on the wire; the guard must not also claim a
+                // cancellation when it drops at the end of this iteration.
+                if let Some(guard) = call_guard.as_mut() {
+                    guard.disarm();
+                }
+                drop(call_guard);
                 let output_bytes = tool_output.len() as u64;
                 // 4 chars/token rule-of-thumb; ceiling so non-empty
                 // outputs under 4 bytes still report 1 token.
@@ -3997,6 +4016,95 @@ pub(crate) fn describe_parse_failure(f: ParseFailure<'_>) -> String {
          nothing at all. Check the request (context length, content filter, upstream capacity), \
          not the parser."
     )
+}
+
+/// Reports a tool call as cancelled if it never reached its own finish event.
+///
+/// A tool that waits on a human — `ask_user` and friends — is awaited inside the
+/// react loop, so when the phase budget abandons the task the future is dropped
+/// mid-await and the finish event is never published. The started event then sits
+/// unpaired forever, and the dashboard shows the call as still pending while the
+/// question it belongs to has already expired: two views of the same fact
+/// disagreeing, with the stuck one looking like a hang.
+///
+/// [`disarm`](Self::disarm) is called once the real outcome has been published.
+/// Anything else — a drop from cancellation, an early return, a panic — publishes
+/// `cancelled` instead. `Drop` cannot await, so the write is handed to a detached
+/// task; losing it costs a pending row, which is what we had before.
+struct ToolCallGuard {
+    store: crate::status::agent_events::AgentEventStore,
+    agent: String,
+    call_id: String,
+    tool_name: String,
+    job_id: Option<String>,
+    round: u32,
+    started: std::time::Instant,
+    armed: bool,
+}
+
+impl ToolCallGuard {
+    fn new(
+        store: crate::status::agent_events::AgentEventStore,
+        agent: String,
+        call_id: String,
+        tool_name: String,
+        job_id: Option<String>,
+        round: u32,
+    ) -> Self {
+        Self {
+            store,
+            agent,
+            call_id,
+            tool_name,
+            job_id,
+            round,
+            started: std::time::Instant::now(),
+            armed: true,
+        }
+    }
+
+    /// The call published its own outcome; stop reporting a cancellation.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ToolCallGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut event = AgentEvent::now(self.agent.clone(), AgentEventKind::ToolCallFinished);
+        event.call_id = Some(self.call_id.clone());
+        event.tool_name = Some(self.tool_name.clone());
+        event.job_id = self.job_id.clone();
+        event.round = Some(self.round);
+        event.status = Some("cancelled".to_string());
+        event.detail = format!(
+            "{}ms · cancelled — the task ended before this call returned",
+            self.started.elapsed().as_millis()
+        );
+        let store = self.store.clone();
+        let tool_name = self.tool_name.clone();
+        // `tokio::spawn` panics with no runtime, and a drop can land during
+        // shutdown. A panic in Drop is worse than a missing dashboard row, so ask
+        // for the handle rather than assuming one.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    if let Err(e) = store.publish(&event).await {
+                        warn!(tool_name = %tool_name, error = %e, "failed to record a cancelled tool call");
+                    }
+                });
+            }
+            Err(_) => {
+                warn!(
+                    tool_name = %tool_name,
+                    "tool call cancelled with no runtime to report it; leaving the call unpaired"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7425,6 +7533,59 @@ mod tests {
                 "{present} missing once history exists: {names:?}"
             );
         }
+    }
+
+    /// An event store over a throwaway JetStream, or `None` when NATS is absent.
+    async fn test_event_store() -> Option<crate::status::agent_events::AgentEventStore> {
+        let url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
+        let client = async_nats::connect(&url).await.ok()?;
+        Some(crate::status::agent_events::AgentEventStore::new(
+            async_nats::jetstream::new(client),
+            "ALPHA".to_string(),
+        ))
+    }
+
+    /// The guard's contract is which of the two outcomes it reports on drop.
+    /// Publishing needs a live JetStream, so these assert the arming decision —
+    /// the branch that decides whether a cancellation is claimed at all.
+    #[tokio::test]
+    async fn a_disarmed_tool_call_guard_reports_nothing() {
+        let Some(store) = test_event_store().await else {
+            eprintln!("Skipping: NATS unavailable");
+            return;
+        };
+        let mut guard = super::ToolCallGuard::new(
+            store,
+            "ALPHA".to_string(),
+            "call-1".to_string(),
+            "user_dm_user".to_string(),
+            Some("job-1".to_string()),
+            1,
+        );
+        assert!(guard.armed, "a live call is armed");
+        guard.disarm();
+        assert!(
+            !guard.armed,
+            "a call that published its own outcome must not also report a cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_tool_call_guard_stays_armed() {
+        let Some(store) = test_event_store().await else {
+            eprintln!("Skipping: NATS unavailable");
+            return;
+        };
+        let guard = super::ToolCallGuard::new(
+            store,
+            "ALPHA".to_string(),
+            "call-2".to_string(),
+            "user_dm_user".to_string(),
+            Some("job-1".to_string()),
+            1,
+        );
+        // Dropped without disarming — the case a question expiring produces.
+        assert!(guard.armed, "an unfinished call reports its cancellation");
     }
 
     fn ctx_with_candidate(content: &str, thoughts: &str) -> AgentContext {
