@@ -159,6 +159,12 @@ can use:
 Send both and each agent type is served correctly. That is the whole design: the
 same request satisfies a council mixing both kinds, which is normal.
 
+If your council is **all** plain-LLM agents — the common case — then
+`conversation_id` and `new_turn` do nothing for it today: no agent on that path
+consults the delta, so `user_query` is the whole story. Set them anyway. They cost
+one field each, and they begin working the moment a session-capable agent joins
+the council, without a client change.
+
 It is worth knowing what that session is. `conversation_id` is hashed with the
 agent's name into a deterministic id — the same thread and agent always produce
 the same one — which the provider is then asked to *resume*, skipping the system
