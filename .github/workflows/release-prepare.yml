@@ -165,21 +165,35 @@ jobs:
             exit 0
           fi
 
-          echo "--- Commits since $PREV_REF (range=$RANGE) ---"
-          echo "$COMMITS" | head -30 || true
+          # `sed -n` rather than `head`: head closes the pipe once it has its
+          # lines and the writer dies of SIGPIPE. The `|| true` here already
+          # swallowed that, but it would equally have swallowed a real failure.
+          TOTAL=$(echo "$COMMITS" | wc -l | tr -d ' ')
+          echo "--- Commits since $PREV_REF (range=$RANGE, $TOTAL commits) ---"
+          echo "$COMMITS" | sed -n '1,30p'
+          if [ "$TOTAL" -gt 30 ]; then
+            echo "... and $((TOTAL - 30)) more (all $TOTAL were classified)"
+          fi
           echo "---"
 
-          # Diagnostic counters so a future misclassification is
-          # visible without another instrumentation round.
-          echo "feats matched: $(echo "$COMMITS" | grep -cE '^[Ff]eat' || echo 0)"
-
-          # Classify bump from conventional commits. Same regex shape
-          # as slop-cli — proven working on a forgejo act runner.
+          # Classify the bump from conventional commits.
+          #
+          # Bracket expressions, single-quoted. The previous pattern —
+          # "^feat(\(|!|:)" in double quotes — matched nothing on the runner
+          # while the diagnostic beside it counted 118 feats, so a release full of
+          # features shipped as a patch. Two regexes over one input disagreeing
+          # means the shell reached the pattern before grep did: `!` and `\(`
+          # inside double quotes are the parts a shell can still touch. Inside
+          # brackets they are literal, and single quotes hand grep the pattern
+          # untouched, so neither the shell nor a busybox grep can reinterpret it.
           BUMP="patch"
-          if echo "$COMMITS" | grep -qiE "^feat(\(|!|:)"; then
+          FEATS=$(echo "$COMMITS" | grep -cE '^feat[(!:]' || true)
+          BREAKS=$(echo "$COMMITS" | grep -cE '^[a-z]+(\(.*\))?!:|BREAKING CHANGE' || true)
+          echo "feat commits: ${FEATS:-0} | breaking: ${BREAKS:-0}"
+          if [ "${FEATS:-0}" -gt 0 ]; then
             BUMP="minor"
           fi
-          if echo "$COMMITS" | grep -qiE "(^[a-z]+(\(.*\))?!:)|BREAKING CHANGE"; then
+          if [ "${BREAKS:-0}" -gt 0 ]; then
             BUMP="major"
           fi
 
