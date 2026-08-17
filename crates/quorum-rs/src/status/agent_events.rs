@@ -290,8 +290,13 @@ pub fn reconcile_tasks(events: &[AgentEvent]) -> TasksView {
     view
 }
 
-fn task_key(event: &AgentEvent) -> (Option<String>, Option<u32>) {
-    (event.job_id.clone(), event.round)
+/// Identity of one task: a job's round in a given phase.
+///
+/// Phase belongs here. Without it the propose and evaluate of the same round
+/// share a key, and pairing a start with the first matching finish hands propose
+/// whatever evaluate reported.
+fn task_key(event: &AgentEvent) -> (Option<String>, Option<u32>, Option<String>) {
+    (event.job_id.clone(), event.round, event.phase.clone())
 }
 
 /// A tool call reconstructed from its start + optional finish events.
@@ -397,6 +402,51 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_tasks_does_not_borrow_another_phase_result() {
+        // Two phases of the SAME round finish separately. Keyed on job+round
+        // alone they collide, and the newest-first scan hands propose whatever
+        // evaluate reported — a propose row claiming "evaluate ok".
+        let mut propose_start = event(AgentEventKind::TaskStarted, "2026-08-17T17:57:16+00:00");
+        propose_start.job_id = Some("room-f2205792".to_string());
+        propose_start.round = Some(1);
+        propose_start.phase = Some("propose".to_string());
+        let mut propose_done = event(AgentEventKind::TaskCompleted, "2026-08-17T17:57:20+00:00");
+        propose_done.job_id = Some("room-f2205792".to_string());
+        propose_done.round = Some(1);
+        propose_done.phase = Some("propose".to_string());
+        propose_done.detail = "propose ok 4100ms".to_string();
+
+        let mut eval_start = event(AgentEventKind::TaskStarted, "2026-08-17T17:57:27+00:00");
+        eval_start.job_id = Some("room-f2205792".to_string());
+        eval_start.round = Some(1);
+        eval_start.phase = Some("evaluate".to_string());
+        let mut eval_done = event(AgentEventKind::TaskCompleted, "2026-08-17T17:57:33+00:00");
+        eval_done.job_id = Some("room-f2205792".to_string());
+        eval_done.round = Some(1);
+        eval_done.phase = Some("evaluate".to_string());
+        eval_done.detail = "evaluate ok 6147ms".to_string();
+
+        // Newest first, as the store returns them.
+        let events = vec![eval_done, eval_start, propose_done, propose_start];
+        let view = reconcile_tasks(&events);
+
+        assert_eq!(view.finished.len(), 2, "both phases finished");
+        let detail_for = |phase: &str| {
+            view.finished
+                .iter()
+                .find(|t| t.phase.as_deref() == Some(phase))
+                .and_then(|t| t.detail.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(detail_for("evaluate"), "evaluate ok 6147ms");
+        assert_eq!(
+            detail_for("propose"),
+            "propose ok 4100ms",
+            "propose reports its own result, not the evaluate that followed it"
+        );
+    }
+
+    #[test]
     fn reconcile_tasks_splits_in_flight_from_finished() {
         let mut started_done = event(AgentEventKind::TaskStarted, "2026-08-16T10:00:00+00:00");
         started_done.job_id = Some("job-done".to_string());
@@ -405,6 +455,9 @@ mod tests {
         let mut completed = event(AgentEventKind::TaskCompleted, "2026-08-16T10:00:05+00:00");
         completed.job_id = Some("job-done".to_string());
         completed.round = Some(1);
+        // The emitter stamps the phase on both halves (workers::mod), so the
+        // fixture has to as well or the pair no longer identifies one task.
+        completed.phase = Some("propose".to_string());
         completed.detail = "ok".to_string();
 
         let mut started_live = event(AgentEventKind::TaskStarted, "2026-08-16T10:02:00+00:00");
