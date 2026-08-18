@@ -1255,6 +1255,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides {
             max_tokens: Some(500),
@@ -1318,6 +1319,7 @@ mod tests {
             tools: Some(tools),
             tool_choice: None,
             presence_penalty: Some(1.5),
+            service_tier: None,
         };
         let overrides = RequestOverrides { max_tokens: None };
 
@@ -1345,6 +1347,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: Some(1.5),
+            service_tier: None,
         };
         let body_no_tools = strategy
             .prepare_request(&agent, &request_no_tools, &overrides)
@@ -1402,6 +1405,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides {
             max_tokens: Some(100),
@@ -1476,6 +1480,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides {
             max_tokens: Some(200),
@@ -1521,6 +1526,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides {
             max_tokens: Some(200),
@@ -1567,6 +1573,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides {
             max_tokens: Some(100),
@@ -1637,6 +1644,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides {
             max_tokens: Some(100),
@@ -1714,6 +1722,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides {
             max_tokens: Some(200),
@@ -1769,6 +1778,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides {
             max_tokens: Some(100),

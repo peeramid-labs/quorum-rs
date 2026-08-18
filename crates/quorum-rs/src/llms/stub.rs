@@ -94,6 +94,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let result = model.chat_completion(&config, request).await.unwrap();
         let model_name = &result.raw_request;

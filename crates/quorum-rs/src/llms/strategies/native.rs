@@ -154,12 +154,7 @@ impl ChatStrategy for NativeStrategy {
         // Provider service tier, passed through verbatim. `flex` buys a cheaper
         // best-effort queue at the cost of latency and the risk of being turned
         // away under load, so it is opt-in per job rather than a default.
-        if let Some(tier) = agent
-            .service_tier
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-        {
+        if let Some(tier) = request_config.service_tier.as_deref() {
             v["service_tier"] = serde_json::json!(tier);
         }
 
@@ -561,6 +556,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides::default();
 
@@ -688,6 +684,7 @@ mod tests {
             }]),
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         }
     }
 
@@ -703,17 +700,48 @@ mod tests {
         // Opt-in per job: `flex` buys a cheaper best-effort queue at the cost
         // of latency, which trades against the phase budget.
         let strategy = NativeStrategy::default();
-        let agent = AgentConfig {
-            service_tier: Some("flex".to_string()),
-            ..json_mode_test_agent()
-        };
+        let request = one_tool_config().with_service_tier_flag(Some("flex"));
 
         let body = strategy
-            .prepare_request(&agent, &one_tool_config(), &RequestOverrides::default())
+            .prepare_request(
+                &json_mode_test_agent(),
+                &request,
+                &RequestOverrides::default(),
+            )
             .await
             .expect("request prepared");
 
         assert_eq!(body.get("service_tier"), Some(&serde_json::json!("flex")));
+    }
+
+    #[tokio::test]
+    async fn the_tier_belongs_to_the_request_not_the_agent() {
+        // Two calls, one agent, different tiers — the property that makes the
+        // per-call channel worth having. It does not exercise the react loop,
+        // so it is not a regression test for the older design's mutation of
+        // the agent config; it pins the shape that made that mutation possible.
+        let strategy = NativeStrategy::default();
+        let agent = json_mode_test_agent();
+
+        let first = strategy
+            .prepare_request(
+                &agent,
+                &one_tool_config().with_service_tier_flag(Some("flex")),
+                &RequestOverrides::default(),
+            )
+            .await
+            .expect("request prepared");
+        assert_eq!(first.get("service_tier"), Some(&serde_json::json!("flex")));
+
+        let second = strategy
+            .prepare_request(&agent, &one_tool_config(), &RequestOverrides::default())
+            .await
+            .expect("request prepared");
+
+        assert!(
+            second.get("service_tier").is_none(),
+            "the previous call's tier followed the agent into this one: {second}"
+        );
     }
 
     #[tokio::test]
@@ -739,13 +767,14 @@ mod tests {
         // An empty string falls out of YAML and JSON easily, and the provider
         // would reject it.
         let strategy = NativeStrategy::default();
-        let agent = AgentConfig {
-            service_tier: Some("   ".to_string()),
-            ..json_mode_test_agent()
-        };
+        let request = one_tool_config().with_service_tier_flag(Some("   "));
 
         let body = strategy
-            .prepare_request(&agent, &one_tool_config(), &RequestOverrides::default())
+            .prepare_request(
+                &json_mode_test_agent(),
+                &request,
+                &RequestOverrides::default(),
+            )
             .await
             .expect("request prepared");
 
@@ -897,6 +926,7 @@ mod tests {
             tools: Some(tools),
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides::default();
 
@@ -955,6 +985,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let body = strategy
             .prepare_request(&agent, &request_config, &RequestOverrides::default())
@@ -1020,6 +1051,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let body = strategy
             .prepare_request(&agent, &request_config, &RequestOverrides::default())
@@ -1064,6 +1096,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let body = strategy
             .prepare_request(&agent, &request_config, &RequestOverrides::default())
@@ -1111,6 +1144,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let body = strategy
             .prepare_request(&agent, &request_config, &RequestOverrides::default())
@@ -1159,6 +1193,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let body = strategy
             .prepare_request(&agent, &request_config, &RequestOverrides::default())
@@ -1197,6 +1232,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let body = strategy
             .prepare_request(&agent, &request_config, &RequestOverrides::default())
@@ -1230,6 +1266,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let body = strategy
             .prepare_request(&agent, &request_config, &RequestOverrides::default())

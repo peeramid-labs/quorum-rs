@@ -243,6 +243,7 @@ pub async fn compact_message_history(
         tools: None,
         tool_choice: None,
         presence_penalty: None,
+        service_tier: None,
     };
 
     let result = llm_client
@@ -415,6 +416,7 @@ pub async fn squeeze_scratchpad_if_full(
         tools: None,
         tool_choice: None,
         presence_penalty: None,
+        service_tier: None,
     };
     let result = llm_client
         .chat_completion(agent_config, request_config)
@@ -1118,6 +1120,7 @@ impl ProposerEvaluatorAgent {
             tools: None,
             tool_choice: None,
             presence_penalty: self.config.presence_penalty,
+            service_tier: None,
         };
 
         let result = self
@@ -2685,18 +2688,6 @@ async fn react_loop(
     outer_attempt: u32,
     running_tool_output_bytes: &mut u64,
 ) -> Result<AgentResponse> {
-    // A job may ask for a different service tier than the agent's own default —
-    // it is the caller's cost-versus-latency choice, not a property of the
-    // model. Applied here because this is where the per-task config and the
-    // per-job context are both in hand.
-    if let Some(tier) = context
-        .service_tier
-        .as_deref()
-        .filter(|t| !t.trim().is_empty())
-    {
-        agent_config.service_tier = Some(tier.to_string());
-    }
-
     // Telemetry emitter comes from the context (populated by the
     // worker after deserialize). Reading it here keeps the function
     // signature short and avoids the parameter-and-context double
@@ -3158,7 +3149,9 @@ async fn react_loop(
             } else {
                 agent_config.presence_penalty
             },
-        };
+            service_tier: None,
+        }
+        .with_service_tier_flag(context.service_tier.as_deref());
 
         // Estimate input tokens for telemetry
         let messages_json = serde_json::to_string(&request_config.messages).unwrap_or_default();

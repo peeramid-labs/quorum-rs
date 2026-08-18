@@ -175,15 +175,6 @@ pub struct AgentConfig {
     pub compact_history_default_keep: usize,
     #[serde(default)]
     pub json_mode: bool,
-    /// Provider service tier for this agent's calls, e.g. `flex` for the
-    /// cheaper best-effort queue. Passed through verbatim, so the accepted
-    /// values are the provider's. `None` leaves the provider's default, which
-    /// is what a latency-sensitive deliberation wants: a slower tier trades
-    /// against the phase budget and can be refused under load.
-    ///
-    /// A job may override this per request — see `AgentContext::service_tier`.
-    #[serde(default)]
-    pub service_tier: Option<String>,
     #[serde(default)]
     pub disable_native_tools: bool,
     #[serde(default = "default_context_window")]
@@ -1008,7 +999,6 @@ impl Default for AgentConfig {
             scratchpad_squeeze_fraction: default_scratchpad_squeeze_fraction(),
             compact_history_default_keep: default_compact_history_keep(),
             json_mode: false,
-            service_tier: None,
             disable_native_tools: false,
             context_window: default_context_window(),
             reasoning_effort: None,
