@@ -338,6 +338,8 @@ impl LlmRequestSpan {
                     })
                     .unwrap_or(0),
                 cost_usd,
+                reported_cost_usd: result.provider_usage.cost_usd,
+                cache_write_tokens: result.provider_usage.cache_write_tokens,
                 finish_reason,
                 provider_backend: result.provider_backend.clone(),
                 claim_assessments_emitted: None,

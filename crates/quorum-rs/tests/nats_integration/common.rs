@@ -68,6 +68,7 @@ impl NsedAgent for MockAgent {
             token_usage_stats: Some(TokenUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                ..Default::default()
             }),
             ..Default::default()
         })
@@ -87,6 +88,7 @@ impl NsedAgent for MockAgent {
                     token_usage: Some(TokenUsage {
                         input_tokens: 200,
                         output_tokens: 100,
+                        ..Default::default()
                     }),
                     ..Default::default()
                 },

@@ -52,3 +52,4 @@ Discussion-mode material — why, design rationale, tradeoffs.
 | [About scoped `read_file` tool](explanation/scoped-read-file.md) | Sandbox semantics for non-claude bots reading from configured roots |
 | [About LLM context-window guards](explanation/llm-context-window-guards.md) | Why the shrink-guard counts tool schemas and why the SDK doesn't cap `max_tokens` |
 | [About `compact_history` and scratchpad squeeze](explanation/compact-history-and-scratchpad-squeeze.md) | Why the agent gets a self-driven fold for older tool results and how the structured prompt is shaped |
+| [About provider-reported cost](explanation/provider-reported-cost.md) | Why the SDK carries the charge a provider reported alongside its own estimate, and why that figure is optional |

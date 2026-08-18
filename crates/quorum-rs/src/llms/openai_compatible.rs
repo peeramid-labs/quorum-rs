@@ -3,7 +3,9 @@
 
 use crate::agents::config::AgentConfig;
 use crate::llms::strategies::{RequestOverrides, StrategyResolver};
-use crate::llms::{AiModel, ChatCompletionResult, RequestConfig, ShrinkInfo, TimingMetadata};
+use crate::llms::{
+    AiModel, ChatCompletionResult, ProviderUsage, RequestConfig, ShrinkInfo, TimingMetadata,
+};
 use crate::telemetry::LlmError;
 use async_openai::types::{
     ChatChoice, ChatCompletionMessageToolCall, ChatCompletionToolType,
@@ -357,6 +359,10 @@ impl AiModel for OpenAICompatibleModel {
             // `parse_response` already returns `LlmError`; propagate
             // via `?` so the caller sees the original variant.
             let chat_response = strategy.parse_response(&body).await?;
+            // `parse_response` hands back the OpenAI-shaped struct, which has
+            // no room for a provider's cost extension — read it off the raw
+            // body before it is discarded.
+            let provider_usage = ProviderUsage::from_response_body(&body);
             // Non-streaming has no first-chunk visibility — TTFT and the
             // first-token-to-finish split are unobservable. The span emits
             // the total `latency_ms` separately so dashboards still get
@@ -370,6 +376,7 @@ impl AiModel for OpenAICompatibleModel {
                 },
                 provider_backend: provider_backend.clone(),
                 shrink_info: shrink_info.clone(),
+                provider_usage,
             });
         }
 
@@ -389,6 +396,7 @@ impl AiModel for OpenAICompatibleModel {
         let mut model = agent.model_name.clone();
         let mut system_fingerprint = None;
         let mut usage = None;
+        let mut provider_usage = ProviderUsage::default();
 
         // Simple SSE parser loop
         let mut buffer = String::new();
@@ -424,6 +432,7 @@ impl AiModel for OpenAICompatibleModel {
                             "CreateChatCompletionStreamResponse: Found usage in stream chunk: {:?}",
                             usage_val
                         );
+                        provider_usage = ProviderUsage::from_usage_value(usage_val);
                         if let Ok(parsed_usage) = serde_json::from_value(usage_val.clone()) {
                             usage = Some(parsed_usage);
                         } else {
@@ -605,6 +614,7 @@ impl AiModel for OpenAICompatibleModel {
             },
             provider_backend,
             shrink_info,
+            provider_usage,
         })
     }
 }
@@ -1314,5 +1324,121 @@ mod tests {
         assert_eq!(2u64.pow(3).min(30), 8);
         assert_eq!(2u64.pow(4).min(30), 16);
         assert_eq!(2u64.pow(5).min(30), 30); // capped
+    }
+
+    // ---------------------------------------------------------------
+    // Provider-reported cost: a gateway puts the exact charge for the
+    // call in `usage.cost`, which the OpenAI response schema has no room
+    // for. Drive `chat_completion` end to end and assert it survives the
+    // round trip — and that a backend which reports nothing still
+    // completes, leaving the cost unknown rather than zero.
+    // ---------------------------------------------------------------
+
+    const GATEWAY_BODY_WITH_COST: &str = r#"{
+        "id": "gen-1",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "z-ai/glm-5.2",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"},
+                     "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": 6, "completion_tokens": 2, "total_tokens": 8,
+            "cost": 7.434e-07,
+            "is_byok": false,
+            "cost_details": {"upstream_inference_cost": 7.434e-07},
+            "prompt_tokens_details": {"cached_tokens": 4, "cache_write_tokens": 2},
+            "completion_tokens_details": {"reasoning_tokens": 0}
+        }
+    }"#;
+
+    const SELF_HOSTED_BODY_NO_COST: &str = r#"{
+        "id": "cmpl-1",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "local/qwen3",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 6, "completion_tokens": 2, "total_tokens": 8}
+    }"#;
+
+    #[tokio::test]
+    async fn chat_completion_captures_the_cost_a_gateway_reported() {
+        let server = mock_status_body(200, GATEWAY_BODY_WITH_COST).await;
+        let model = OpenAICompatibleModel::new(server.uri(), "test-key".to_string(), None);
+
+        let result = model
+            .chat_completion(&hello_agent("Metered", "z-ai/glm-5.2"), hello_request())
+            .await
+            .expect("mocked 200 must parse");
+
+        assert_eq!(result.provider_usage.cost_usd, Some(7.434e-07));
+        assert_eq!(result.provider_usage.cached_tokens, Some(4));
+        assert_eq!(result.provider_usage.cache_write_tokens, Some(2));
+        // The token counts the OpenAI schema does model are untouched.
+        let usage = result.response.usage.expect("usage present");
+        assert_eq!(usage.prompt_tokens, 6);
+        assert_eq!(usage.completion_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_reports_no_cost_still_completes_with_cost_unknown() {
+        let server = mock_status_body(200, SELF_HOSTED_BODY_NO_COST).await;
+        let model = OpenAICompatibleModel::new(server.uri(), "test-key".to_string(), None);
+
+        let result = model
+            .chat_completion(&hello_agent("SelfHosted", "local/qwen3"), hello_request())
+            .await
+            .expect("a cost-free backend must still parse");
+
+        assert!(
+            result.provider_usage.is_empty(),
+            "silence must read as unknown, not as free: {:?}",
+            result.provider_usage
+        );
+        assert_eq!(
+            result.response.usage.expect("usage present").total_tokens,
+            8
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_captures_the_cost_off_the_final_usage_chunk() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let stream = concat!(
+            "data: {\"id\":\"gen-2\",\"object\":\"chat.completion.chunk\",\"created\":0,",
+            "\"model\":\"z-ai/glm-5.2\",\"choices\":[{\"index\":0,",
+            "\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n",
+            "data: {\"id\":\"gen-2\",\"object\":\"chat.completion.chunk\",\"created\":0,",
+            "\"model\":\"z-ai/glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{},",
+            "\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":6,",
+            "\"completion_tokens\":2,\"total_tokens\":8,\"cost\":1.5e-06,",
+            "\"prompt_tokens_details\":{\"cached_tokens\":3}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(stream),
+            )
+            .mount(&server)
+            .await;
+        let model = OpenAICompatibleModel::new(server.uri(), "test-key".to_string(), None);
+
+        let agent = AgentConfig {
+            use_streaming: true,
+            ..hello_agent("Streamed", "z-ai/glm-5.2")
+        };
+        let result = model
+            .chat_completion(&agent, hello_request())
+            .await
+            .expect("stream must assemble");
+
+        assert_eq!(result.provider_usage.cost_usd, Some(1.5e-06));
+        assert_eq!(result.provider_usage.cached_tokens, Some(3));
     }
 }

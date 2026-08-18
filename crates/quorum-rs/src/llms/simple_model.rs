@@ -173,6 +173,7 @@ impl AiModel for SimpleOpenAIModel {
             },
             provider_backend: None,
             shrink_info: None,
+            provider_usage: Default::default(),
         })
     }
 }

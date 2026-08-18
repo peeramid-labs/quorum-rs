@@ -232,6 +232,8 @@ fn sample_events() -> Vec<TelemetryEvent> {
             reasoning_tokens: 120,
             cached_tokens: 0,
             cost_usd: 0.0041,
+            reported_cost_usd: Some(0.0039),
+            cache_write_tokens: None,
             finish_reason: FinishReason::Stop,
             provider_backend: Some("openrouter/deepinfra".into()),
             claim_assessments_emitted: Some(12),

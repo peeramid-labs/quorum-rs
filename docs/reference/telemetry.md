@@ -86,7 +86,9 @@ Fired when the LLM response finishes.
 | `output_tokens` | int | From provider usage stats |
 | `reasoning_tokens` | int | For reasoning-model families |
 | `cached_tokens` | int | Prompt-cache hits |
-| `cost_usd` | float | Billable cost from provider |
+| `cache_write_tokens` | int \| null | Prompt tokens written into the provider's cache. `null` when the backend does not report cache accounting |
+| `cost_usd` | float | Our own estimate, priced from the model's configured rate against the token counts |
+| `reported_cost_usd` | float \| null | What the provider said the call cost, in USD, read from the non-standard `usage.cost` field. `null` for backends that report no cost — self-hosted and direct-to-vendor endpoints never do. Where both are present, this one is the charge and `cost_usd` is the guess |
 | `finish_reason` | enum | `stop` / `length` / `tool_calls` / `error` |
 | `provider_backend` | string \| null | e.g. `openrouter/deepinfra` |
 | `claim_assessments_emitted` | int \| null | Evaluate-phase only |

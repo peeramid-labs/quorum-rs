@@ -1908,6 +1908,7 @@ impl AiModel for SimulatedModel {
                 },
                 provider_backend: None,
                 shrink_info: None,
+                provider_usage: Default::default(),
             });
         }
 
@@ -2002,6 +2003,7 @@ impl AiModel for SimulatedModel {
             },
             provider_backend: None,
             shrink_info: None,
+            provider_usage: Default::default(),
         })
     }
 }

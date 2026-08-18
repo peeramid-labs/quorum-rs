@@ -49,6 +49,7 @@ fn empty_chat_result() -> ChatCompletionResult {
         },
         provider_backend: None,
         shrink_info: None,
+        provider_usage: Default::default(),
     }
 }
 
