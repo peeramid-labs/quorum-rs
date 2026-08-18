@@ -705,6 +705,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         }
     }
 
@@ -1130,12 +1131,14 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let with_tools = RequestConfig {
             messages,
             tools: Some(tools),
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
 
         let no_tools_estimate = estimate_input_tokens(&no_tools).unwrap();

@@ -455,6 +455,7 @@ impl LlmModerationMiddleware {
             tools: Some(vec![tool]),
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
 
         match model.chat_completion(&self.agent_config, request).await {

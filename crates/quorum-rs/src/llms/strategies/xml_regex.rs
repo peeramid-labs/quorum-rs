@@ -694,6 +694,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides::default();
 
@@ -1170,6 +1171,7 @@ mod tests {
             tools: Some(vec![tool]),
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides::default();
 
@@ -1222,6 +1224,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides::default();
 
@@ -1259,6 +1262,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides::default();
 
@@ -1437,6 +1441,7 @@ mod tests {
             tools: Some(vec![tool]),
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides::default();
 
@@ -1489,6 +1494,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: Some(0.5),
+            service_tier: None,
         };
         let overrides = RequestOverrides {
             max_tokens: Some(999),
@@ -1611,6 +1617,7 @@ mod tests {
             tools: Some(tools),
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides {
             max_tokens: Some(100),
@@ -1663,6 +1670,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides {
             max_tokens: Some(100),
@@ -1727,6 +1735,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides {
             max_tokens: Some(100),
