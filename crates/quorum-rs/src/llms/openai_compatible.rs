@@ -362,7 +362,11 @@ impl AiModel for OpenAICompatibleModel {
             // `parse_response` hands back the OpenAI-shaped struct, which has
             // no room for a provider's cost extension — read it off the raw
             // body before it is discarded.
-            let provider_usage = ProviderUsage::from_response_body(&body);
+            // The strategy owns this: what a provider reports about cost, and
+            // whether it reports anything, is part of its dialect.
+            let provider_usage = serde_json::from_str::<serde_json::Value>(&body)
+                .map(|v| strategy.provider_usage(&v))
+                .unwrap_or_default();
             // Non-streaming has no first-chunk visibility — TTFT and the
             // first-token-to-finish split are unobservable. The span emits
             // the total `latency_ms` separately so dashboards still get
@@ -432,7 +436,7 @@ impl AiModel for OpenAICompatibleModel {
                             "CreateChatCompletionStreamResponse: Found usage in stream chunk: {:?}",
                             usage_val
                         );
-                        provider_usage = ProviderUsage::from_usage_value(usage_val);
+                        provider_usage = strategy.provider_usage(&json_val);
                         if let Ok(parsed_usage) = serde_json::from_value(usage_val.clone()) {
                             usage = Some(parsed_usage);
                         } else {
