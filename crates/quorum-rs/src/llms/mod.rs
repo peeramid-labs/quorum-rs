@@ -134,20 +134,6 @@ pub trait ChatStrategy: Send + Sync {
     }
 
     /// What the provider said this call cost, and what it served from cache.
-    ///
-    /// Provider-specific by nature: there is no standard for it. A gateway may
-    /// return a `cost` field beside `usage`; a first-party API returns none and
-    /// expects you to price the tokens yourself; a self-hosted backend has no
-    /// meaningful notion of one at all.
-    ///
-    /// The default reports nothing, which is the honest answer for most
-    /// backends and leaves the caller to fall back to its price list. Override
-    /// where the provider actually says.
-    ///
-    /// Takes the parsed body rather than performing its own request: a second
-    /// round trip per call would double the request count and put provider
-    /// latency inside the deliberation's phase budget. A provider that only
-    /// exposes cost through a separate endpoint is better served out of band.
     fn provider_usage(&self, _response: &serde_json::Value) -> ProviderUsage {
         ProviderUsage::default()
     }
