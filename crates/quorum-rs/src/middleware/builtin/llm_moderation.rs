@@ -220,7 +220,11 @@ impl LlmModerationMiddleware {
             model_name: cfg.model_name.unwrap_or_else(|| "moderation".to_string()),
             temperature: 0.0, // Deterministic for safety classification
             max_tokens: 1000,
-            json_mode: true,
+            // This classifier sends a tool and reads the tool call, so
+            // `response_format` would only stop some models reaching it. The
+            // guard in the native strategy already drops it; the field is set
+            // honestly here so the config does not claim otherwise.
+            json_mode: false,
             disable_native_tools: false,
             ..Default::default()
         };
