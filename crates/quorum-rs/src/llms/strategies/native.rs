@@ -151,6 +151,18 @@ impl ChatStrategy for NativeStrategy {
             }
         }
 
+        // Provider service tier, passed through verbatim. `flex` buys a cheaper
+        // best-effort queue at the cost of latency and the risk of being turned
+        // away under load, so it is opt-in per job rather than a default.
+        if let Some(tier) = agent
+            .service_tier
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            v["service_tier"] = serde_json::json!(tier);
+        }
+
         // Ensure all tool definitions have a `parameters` field.
         // OpenAI allows omitting it, but providers like Together AI reject
         // requests where `parameters` is missing from a function definition.
@@ -684,6 +696,60 @@ mod tests {
             tools: None,
             ..one_tool_config()
         }
+    }
+
+    #[tokio::test]
+    async fn a_service_tier_is_passed_through() {
+        // Opt-in per job: `flex` buys a cheaper best-effort queue at the cost
+        // of latency, which trades against the phase budget.
+        let strategy = NativeStrategy::default();
+        let agent = AgentConfig {
+            service_tier: Some("flex".to_string()),
+            ..json_mode_test_agent()
+        };
+
+        let body = strategy
+            .prepare_request(&agent, &one_tool_config(), &RequestOverrides::default())
+            .await
+            .expect("request prepared");
+
+        assert_eq!(body.get("service_tier"), Some(&serde_json::json!("flex")));
+    }
+
+    #[tokio::test]
+    async fn no_service_tier_leaves_the_provider_default() {
+        // Absent rather than an explicit "default": the provider's own default
+        // is not ours to name, and naming it wrongly is a 400.
+        let strategy = NativeStrategy::default();
+
+        let body = strategy
+            .prepare_request(
+                &json_mode_test_agent(),
+                &one_tool_config(),
+                &RequestOverrides::default(),
+            )
+            .await
+            .expect("request prepared");
+
+        assert!(body.get("service_tier").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_blank_service_tier_is_not_sent() {
+        // An empty string falls out of YAML and JSON easily, and the provider
+        // would reject it.
+        let strategy = NativeStrategy::default();
+        let agent = AgentConfig {
+            service_tier: Some("   ".to_string()),
+            ..json_mode_test_agent()
+        };
+
+        let body = strategy
+            .prepare_request(&agent, &one_tool_config(), &RequestOverrides::default())
+            .await
+            .expect("request prepared");
+
+        assert!(body.get("service_tier").is_none(), "{body}");
     }
 
     #[tokio::test]
