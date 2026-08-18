@@ -767,6 +767,9 @@ pub struct AgentResponse {
     pub request_body: Option<String>,
     pub history: Vec<ChatCompletionRequestMessage>,
     pub final_scratchpad: Option<String>,
+    /// Provider-reported cost and cache figures, summed over every LLM call
+    /// the ReAct loop made to produce this response.
+    pub provider_usage: crate::llms::ProviderUsage,
 }
 
 /// Emit a [`DeliberationContextAssembled`](crate::telemetry::DeliberationContextAssembled)
@@ -1260,6 +1263,9 @@ impl NsedAgent for ProposerEvaluatorAgent {
             token_usage_stats: Some(TokenUsage {
                 input_tokens: agent_response.input_tokens.unwrap_or(0),
                 output_tokens: agent_response.output_tokens.unwrap_or(0),
+                reported_cost_usd: agent_response.provider_usage.cost_usd,
+                cached_tokens: agent_response.provider_usage.cached_tokens,
+                cache_write_tokens: agent_response.provider_usage.cache_write_tokens,
             }),
             // Propagate terminal signal ("max_iterations" partial
             // fallback, otherwise LLM-driven stop/tool_calls). Lets
@@ -1397,6 +1403,7 @@ impl NsedAgent for ProposerEvaluatorAgent {
         // or the discarded attempts bill as free.
         let mut requote_input_tokens: u32 = 0;
         let mut requote_output_tokens: u32 = 0;
+        let mut requote_provider_usage = crate::llms::ProviderUsage::default();
 
         let (structured_response, agent_response): (
             StructuredBatchEvaluationResponse,
@@ -1442,6 +1449,7 @@ impl NsedAgent for ProposerEvaluatorAgent {
                 requote_input_tokens.saturating_add(resp_meta.input_tokens.take().unwrap_or(0));
             requote_output_tokens =
                 requote_output_tokens.saturating_add(resp_meta.output_tokens.take().unwrap_or(0));
+            requote_provider_usage.accumulate(&resp_meta.provider_usage);
             warn!(
                 agent_name = %self.config.name,
                 attempt = cite_attempts,
@@ -1452,6 +1460,11 @@ impl NsedAgent for ProposerEvaluatorAgent {
         };
 
         // Token usage for this entire evaluation batch (one LLM call produces all evals)
+        let batch_provider_usage = {
+            let mut total = requote_provider_usage;
+            total.accumulate(&agent_response.provider_usage);
+            total
+        };
         let batch_token_usage = Some(TokenUsage {
             input_tokens: agent_response
                 .input_tokens
@@ -1461,6 +1474,9 @@ impl NsedAgent for ProposerEvaluatorAgent {
                 .output_tokens
                 .unwrap_or(0)
                 .saturating_add(requote_output_tokens),
+            reported_cost_usd: batch_provider_usage.cost_usd,
+            cached_tokens: batch_provider_usage.cached_tokens,
+            cache_write_tokens: batch_provider_usage.cache_write_tokens,
         });
 
         emit_context_assembled(
@@ -2700,6 +2716,7 @@ async fn react_loop(
     let mut last_request_body: Option<String> = None;
     let mut total_input_tokens = 0;
     let mut total_output_tokens = 0;
+    let mut total_provider_usage = crate::llms::ProviderUsage::default();
     let mut scratchpad_content = if let Some(store) = &context.store {
         if let Ok(Some(content)) = store.get(&agent_config.name).await {
             info!(agent=%agent_config.name, "Loaded persistent scratchpad from Sovereign Store.");
@@ -3258,6 +3275,8 @@ async fn react_loop(
             }
         };
 
+        total_provider_usage.accumulate(&result.provider_usage);
+
         // Complete LLM request span with telemetry
         let cost_usd = {
             let usage = result.response.usage.clone();
@@ -3513,6 +3532,7 @@ async fn react_loop(
                         finish_reason: finish_reason.or(response_message.refusal.clone()),
                         input_tokens: Some(total_input_tokens),
                         output_tokens: Some(total_output_tokens),
+                        provider_usage: total_provider_usage,
                         system_prompt: last_system_message.clone(),
                         request_body: last_request_body.clone(),
                         history: messages.clone(),
@@ -3874,6 +3894,7 @@ async fn react_loop(
                 finish_reason,
                 input_tokens: Some(total_input_tokens),
                 output_tokens: Some(total_output_tokens),
+                provider_usage: total_provider_usage,
                 system_prompt: last_system_message,
                 request_body: last_request_body,
                 history: messages.clone(),
@@ -3922,6 +3943,7 @@ async fn react_loop(
         finish_reason: Some("max_iterations".to_string()),
         input_tokens: Some(total_input_tokens),
         output_tokens: Some(total_output_tokens),
+        provider_usage: total_provider_usage,
         system_prompt: last_system_message,
         request_body: last_request_body,
         history: messages.clone(),
@@ -4481,6 +4503,7 @@ mod tests {
                 },
                 provider_backend: None,
                 shrink_info: None,
+                provider_usage: Default::default(),
             })
         }
     }
@@ -4551,6 +4574,7 @@ mod tests {
                 },
                 provider_backend: None,
                 shrink_info: None,
+                provider_usage: Default::default(),
             })
         }
     }

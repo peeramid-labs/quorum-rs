@@ -498,6 +498,16 @@ impl ChatStrategy for NativeStrategy {
     fn supports_streaming(&self) -> bool {
         self.engine.as_deref() != Some("vllm_responses")
     }
+
+    /// Gateways fronting the OpenAI-compatible API report the true cost beside
+    /// `usage`; first-party OpenAI and self-hosted backends report none, and
+    /// this yields all-`None` for them without special-casing either.
+    fn provider_usage(&self, response: &serde_json::Value) -> crate::llms::ProviderUsage {
+        response
+            .get("usage")
+            .map(crate::llms::ProviderUsage::from_usage_value)
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -647,6 +657,41 @@ mod tests {
         assert_eq!(usage.completion_tokens, 20);
         // total_tokens is computed from prompt + completion when missing
         assert_eq!(usage.total_tokens, 30);
+    }
+
+    #[test]
+    fn the_openai_compatible_dialect_reads_a_gateway_reported_cost() {
+        let body = serde_json::json!({
+            "usage": { "prompt_tokens": 6, "completion_tokens": 2, "cost": 7.434e-07,
+                       "prompt_tokens_details": { "cached_tokens": 4, "cache_write_tokens": 2 } }
+        });
+
+        let usage = NativeStrategy::default().provider_usage(&body);
+
+        assert_eq!(usage.cost_usd, Some(7.434e-07));
+        assert_eq!(usage.cached_tokens, Some(4));
+        assert_eq!(usage.cache_write_tokens, Some(2));
+    }
+
+    #[test]
+    fn a_provider_that_reports_no_cost_yields_nothing() {
+        // First-party OpenAI and self-hosted backends: tokens, no cost. The
+        // caller falls back to its price list rather than inventing a figure.
+        let body = serde_json::json!({
+            "usage": { "prompt_tokens": 6, "completion_tokens": 2 }
+        });
+
+        let usage = NativeStrategy::default().provider_usage(&body);
+
+        assert_eq!(usage.cost_usd, None);
+    }
+
+    #[test]
+    fn a_response_with_no_usage_at_all_yields_nothing() {
+        let usage = NativeStrategy::default().provider_usage(&serde_json::json!({"id": "x"}));
+
+        assert_eq!(usage.cost_usd, None);
+        assert_eq!(usage.cached_tokens, None);
     }
 
     /// A minimal agent for the `response_format` cases. `json_mode` is off by

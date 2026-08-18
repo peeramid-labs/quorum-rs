@@ -8,6 +8,7 @@
 
 pub mod error;
 pub mod openai_compatible;
+pub mod provider_usage;
 pub mod rate_limiter;
 pub mod simple_model;
 pub mod simulated;
@@ -16,6 +17,7 @@ pub mod strategies;
 pub mod stub;
 pub use error::LlmError;
 pub use openai_compatible::OpenAICompatibleModel;
+pub use provider_usage::ProviderUsage;
 pub use rate_limiter::RateLimiter;
 pub use simple_model::SimpleOpenAIModel;
 pub use span::LlmRequestSpan;
@@ -75,6 +77,9 @@ pub struct ChatCompletionResult {
     pub provider_backend: Option<String>,
     /// `Some` when the SDK shrink-guard rewrote `max_tokens`.
     pub shrink_info: Option<ShrinkInfo>,
+    /// Cost and cache figures the provider reported outside the OpenAI schema.
+    /// All-`None` for backends that report none of it.
+    pub provider_usage: ProviderUsage,
 }
 
 /// Timing metadata for an LLM call.
@@ -153,6 +158,11 @@ pub trait ChatStrategy: Send + Sync {
     /// Returns whether this strategy supports streaming responses.
     fn supports_streaming(&self) -> bool {
         true
+    }
+
+    /// What the provider said this call cost, and what it served from cache.
+    fn provider_usage(&self, _response: &serde_json::Value) -> ProviderUsage {
+        ProviderUsage::default()
     }
 }
 

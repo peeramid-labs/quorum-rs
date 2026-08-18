@@ -77,6 +77,7 @@ impl AiModel for StubModel {
             },
             provider_backend: None,
             shrink_info: None,
+            provider_usage: Default::default(),
         })
     }
 }

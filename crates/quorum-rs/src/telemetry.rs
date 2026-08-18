@@ -512,6 +512,14 @@ pub struct LlmRequestComplete {
     pub cached_tokens: u32,
     #[serde(default)]
     pub cost_usd: f64,
+    /// What the provider said the call cost, in USD. `cost_usd` above is our
+    /// own estimate from a price list; this is the charge itself. `None` for
+    /// backends that report no cost, which is most of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_cost_usd: Option<f64>,
+    /// Prompt tokens the provider wrote into its cache on this call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u32>,
     pub finish_reason: FinishReason,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_backend: Option<String>,
@@ -2049,6 +2057,8 @@ mod tests {
             reasoning_tokens: 120,
             cached_tokens: 0,
             cost_usd: 0.0041,
+            reported_cost_usd: Some(0.0039),
+            cache_write_tokens: Some(64),
             finish_reason: FinishReason::Stop,
             provider_backend: Some("openrouter/deepinfra".into()),
             claim_assessments_emitted: Some(12),
@@ -2108,6 +2118,8 @@ mod tests {
                 reasoning_tokens: 0,
                 cached_tokens: 0,
                 cost_usd: 0.0,
+                reported_cost_usd: None,
+                cache_write_tokens: None,
                 finish_reason: FinishReason::Stop,
                 provider_backend: None,
                 claim_assessments_emitted: None,

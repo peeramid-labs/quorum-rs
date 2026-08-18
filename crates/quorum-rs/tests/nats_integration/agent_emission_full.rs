@@ -75,6 +75,8 @@ async fn every_event_type_lands_on_nats_and_validates() {
         reasoning_tokens: 10,
         cached_tokens: 0,
         cost_usd: 0.003,
+        reported_cost_usd: Some(0.0028),
+        cache_write_tokens: None,
         finish_reason: quorum_rs::telemetry::FinishReason::Stop,
         provider_backend: None,
         claim_assessments_emitted: None,

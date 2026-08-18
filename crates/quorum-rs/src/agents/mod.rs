@@ -335,6 +335,18 @@ pub struct Proposal {
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// What the provider said this work cost, in USD, summed over every call
+    /// behind it. `None` when the backend reports no cost — self-hosted and
+    /// direct-to-vendor endpoints never do — and a consumer must then fall
+    /// back to pricing the token counts itself rather than reading it as free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_cost_usd: Option<f64>,
+    /// Prompt tokens the provider served from its cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
+    /// Prompt tokens the provider wrote into its cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u32>,
 }
 
 // =============================================================================
@@ -1343,6 +1355,7 @@ mod tests {
             token_usage: Some(TokenUsage {
                 input_tokens: 1500,
                 output_tokens: 300,
+                ..Default::default()
             }),
             claim_assessments: vec![
                 ClaimAssessment {
@@ -2227,6 +2240,7 @@ mod tests {
                 token_usage_stats: Some(TokenUsage {
                     input_tokens: 100,
                     output_tokens: 50,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -2394,6 +2408,7 @@ mod tests {
                 token_usage_stats: Some(TokenUsage {
                     input_tokens: 200,
                     output_tokens: 80,
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -2434,6 +2449,7 @@ mod tests {
             token_usage_stats: Some(TokenUsage {
                 input_tokens: 500,
                 output_tokens: 150,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -2520,6 +2536,7 @@ mod tests {
         let tu = TokenUsage {
             input_tokens: 1234,
             output_tokens: 567,
+            ..Default::default()
         };
         let json = serde_json::to_string(&tu).unwrap();
         let deserialized: TokenUsage = serde_json::from_str(&json).unwrap();
