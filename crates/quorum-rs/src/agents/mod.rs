@@ -50,6 +50,15 @@ pub struct AgentContext {
     /// User-defined tool definitions for this job. Empty if none registered.
     #[serde(default)]
     pub user_tools: Vec<UserToolDefinition>,
+    /// Provider service tier requested for this job, overriding the agent's
+    /// own setting. `None` leaves the agent config alone.
+    ///
+    /// Carried per job rather than per agent because it is the caller's
+    /// cost-versus-latency choice, not a property of the model: the same
+    /// council may be run cheaply and slowly for a background question, or at
+    /// the default tier when someone is waiting.
+    #[serde(default)]
+    pub service_tier: Option<String>,
     /// Remaining phase budget in seconds at the time the task was published.
     /// The agent uses this as the upper bound for user tool call wait times.
     #[serde(default)]
@@ -2258,6 +2267,7 @@ mod tests {
                 strict: Some(true),
             }],
             phase_budget_remaining_secs: 42.5,
+            service_tier: Some("flex".to_string()),
             session_id: Some("sess-123".to_string()),
             conversation_id: None,
             new_turn: None,

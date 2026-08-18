@@ -2685,6 +2685,18 @@ async fn react_loop(
     outer_attempt: u32,
     running_tool_output_bytes: &mut u64,
 ) -> Result<AgentResponse> {
+    // A job may ask for a different service tier than the agent's own default —
+    // it is the caller's cost-versus-latency choice, not a property of the
+    // model. Applied here because this is where the per-task config and the
+    // per-job context are both in hand.
+    if let Some(tier) = context
+        .service_tier
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())
+    {
+        agent_config.service_tier = Some(tier.to_string());
+    }
+
     // Telemetry emitter comes from the context (populated by the
     // worker after deserialize). Reading it here keeps the function
     // signature short and avoids the parameter-and-context double
