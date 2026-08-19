@@ -187,8 +187,8 @@ jobs:
           # brackets they are literal, and single quotes hand grep the pattern
           # untouched, so neither the shell nor a busybox grep can reinterpret it.
           BUMP="patch"
-          FEATS=$(echo "$COMMITS" | grep -cE '^feat[(!:]' || true)
-          BREAKS=$(echo "$COMMITS" | grep -cE '^[a-z]+(\(.*\))?!:|BREAKING CHANGE' || true)
+          FEATS=$(echo "$COMMITS" | grep -ciE '^feat[(!:]' || true)
+          BREAKS=$(echo "$COMMITS" | grep -ciE '^[a-z]+(\(.*\))?!:|BREAKING CHANGE' || true)
           echo "feat commits: ${FEATS:-0} | breaking: ${BREAKS:-0}"
           if [ "${FEATS:-0}" -gt 0 ]; then
             BUMP="minor"
