@@ -1,3 +1,8 @@
+---
+title: Task SKIP Protocol
+order: 10
+tagline: How an agent deliberately sits out a task as an explicit answer instead of silence.
+---
 # Task SKIP protocol
 
 An agent may answer any deliberation task with an explicit SKIP instead of
