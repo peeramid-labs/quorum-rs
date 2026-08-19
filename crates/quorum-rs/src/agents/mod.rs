@@ -303,6 +303,9 @@ impl OperatorAnnotation {
 pub struct Proposal {
     pub thought_process: String,
     pub content: String,
+    /// Explicit SKIP answer — see `docs/reference/skip.md`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skipped: bool,
     /// Restore scratchpad field to ensure benchmarks can capture it
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_scratchpad: Option<String>,
@@ -930,6 +933,20 @@ pub trait NsedAgent: Send + Sync + Debug + dyn_clone::DynClone {
     async fn propose(&self, context: &AgentContext) -> Result<Proposal>;
     async fn evaluate(&self, context: &AgentContext) -> Result<Vec<(String, Evaluation)>>;
     fn name(&self) -> String;
+
+    /// Implementation-owned strategy hook: whether to work this task or
+    /// answer it with an explicit SKIP. The SDK only pipes the decision —
+    /// see `docs/reference/skip.md`.
+    fn task_disposition(&self, _context: &AgentContext, _action: &str) -> TaskDisposition {
+        TaskDisposition::Work
+    }
+}
+
+/// Answer of [`NsedAgent::task_disposition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskDisposition {
+    Work,
+    Skip,
 }
 
 dyn_clone::clone_trait_object!(NsedAgent);
@@ -1218,6 +1235,37 @@ pub fn calculate_qv_score(raw_weight: f32, total_weight: f32) -> (f32, f32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_default_disposition_is_work() {
+        // Every existing agent keeps working unchanged unless it overrides
+        // the hook — the SKIP protocol is strictly opt-in.
+        #[derive(Debug, Clone)]
+        struct Plain;
+        #[async_trait::async_trait]
+        impl crate::agents::NsedAgent for Plain {
+            async fn propose(
+                &self,
+                _c: &crate::agents::AgentContext,
+            ) -> anyhow::Result<crate::agents::Proposal> {
+                unreachable!()
+            }
+            async fn evaluate(
+                &self,
+                _c: &crate::agents::AgentContext,
+            ) -> anyhow::Result<Vec<(String, crate::agents::Evaluation)>> {
+                unreachable!()
+            }
+            fn name(&self) -> String {
+                "plain".into()
+            }
+        }
+        let ctx = crate::agents::AgentContext::default();
+        assert_eq!(
+            crate::agents::NsedAgent::task_disposition(&Plain, &ctx, "propose"),
+            crate::agents::TaskDisposition::Work
+        );
+    }
+
     use super::*;
 
     #[test]

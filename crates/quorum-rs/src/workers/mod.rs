@@ -1870,6 +1870,52 @@ impl NatsNsedWorker {
             context.round_number,
         );
 
+        // Implementation-owned SKIP: pipe the decision upstream and stop —
+        // an explicit answer the orchestrator can act on, never silence.
+        // See docs/reference/skip.md.
+        if self.agent.task_disposition(&context, action) == crate::agents::TaskDisposition::Skip {
+            info!(
+                agent_id = %self.agent_id,
+                round = context.round_number,
+                action,
+                "Task answered with SKIP by the agent's strategy"
+            );
+            let payload = match action {
+                "propose" => serde_json::to_vec(&crate::agents::Proposal {
+                    skipped: true,
+                    published_at_ms: chrono::Utc::now().timestamp_millis(),
+                    ..Default::default()
+                })?,
+                _ => Vec::new(),
+            };
+            let subject = if action == "propose" {
+                // A skipped proposal rides the normal result subject: the
+                // payload itself carries the flag.
+                format!(
+                    "{}.{}.result.{}.{}.{}",
+                    self.config.subject_prefix,
+                    session_id,
+                    context.round_number,
+                    self.agent_id,
+                    action
+                )
+            } else {
+                // Evaluations have no flagged payload — an empty batch is
+                // ambiguous with an LLM that produced nothing — so the skip
+                // is its own subject, mirroring the `.failed` marker.
+                skipped_result_subject(
+                    &self.config.subject_prefix,
+                    &session_id,
+                    context.round_number,
+                    &self.agent_id,
+                    action,
+                )
+            };
+            self.nats.publish(subject, payload.into()).await?;
+            msg.ack().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            return Ok(());
+        }
+
         let task_start = Instant::now();
         // Retry loop for transient transport errors (broken pipe, connection reset, etc.).
         // Wraps the full propose/evaluate call because the SDK cannot pinpoint where inside
@@ -3187,6 +3233,20 @@ fn classify_abstention_reason(err: &str) -> String {
 /// with a `.failed` tail. Pure-format so the exact wire shape is
 /// pinned by unit test and the orchestrator can derive matching
 /// `filter_subjects` from the same constants.
+/// Subject for an explicit task SKIP — same hierarchy as `.failed`, so a
+/// `filter_subjects=[verdict, verdict.failed, verdict.skipped]` consumer
+/// distinguishes work, failure and deliberate abstention without payload
+/// snooping.
+fn skipped_result_subject(
+    prefix: &str,
+    session_id: &str,
+    round: u32,
+    agent_id: &str,
+    action: &str,
+) -> String {
+    format!("{prefix}.{session_id}.result.{round}.{agent_id}.{action}.skipped")
+}
+
 fn failed_result_subject(
     prefix: &str,
     session_id: &str,
@@ -3428,6 +3488,14 @@ mod tests {
             v.validate("ok").await,
             None,
             "a passing pipeline accepts the submission (None)"
+        );
+    }
+
+    #[test]
+    fn skipped_subject_mirrors_the_failed_hierarchy() {
+        assert_eq!(
+            super::skipped_result_subject("nsed", "sess-abc", 3, "Condenser", "evaluate"),
+            "nsed.sess-abc.result.3.Condenser.evaluate.skipped"
         );
     }
 
