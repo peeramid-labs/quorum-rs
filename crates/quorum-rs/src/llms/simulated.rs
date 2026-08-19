@@ -1908,6 +1908,7 @@ impl AiModel for SimulatedModel {
                 },
                 provider_backend: None,
                 shrink_info: None,
+                provider_usage: Default::default(),
             });
         }
 
@@ -2002,6 +2003,7 @@ impl AiModel for SimulatedModel {
             },
             provider_backend: None,
             shrink_info: None,
+            provider_usage: Default::default(),
         })
     }
 }
@@ -2042,6 +2044,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
 
         let result = model.chat_completion(&agent, request).await.unwrap();
@@ -2072,6 +2075,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
 
         let result = model.chat_completion(&agent, request).await.unwrap();
@@ -2108,6 +2112,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
 
         let result = model.chat_completion(&agent, request).await.unwrap();
@@ -2134,6 +2139,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
 
         let start = std::time::Instant::now();
@@ -2163,6 +2169,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
 
         let result = model.chat_completion(&agent, request).await.unwrap();
@@ -2187,6 +2194,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
 
         let result = model.chat_completion(&agent, request).await.unwrap();
@@ -2219,6 +2227,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
 
         let _ = model_a
@@ -2418,6 +2427,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
 
         let result = model.chat_completion(&agent, request).await.unwrap();
@@ -2454,6 +2464,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         }
         };
 

@@ -107,18 +107,55 @@ impl ChatStrategy for NativeStrategy {
 
         let mut v = serde_json::to_value(&request).map_err(|e| LlmError::Parse(e.into()))?;
 
-        // Inject `response_format: {type: "json_object"}` when the agent
-        // has `json_mode: true`. Tells providers that support JSON mode
-        // (OpenAI, OpenRouter w/ provider-routed backends, Together, etc.)
-        // to constrain the model's `content` output to valid JSON.
+        // Inject `response_format: {type: "json_object"}` when the agent has
+        // `json_mode: true` AND the request carries no tools, constraining the
+        // model's `content` to valid JSON.
         //
-        // NOTE: json_mode does not affect tool_call arguments — those are
-        // already bound to the tool's JSON schema. It's a content-only
-        // constraint. Still useful as an additional signal for models
-        // (e.g. Gemma-4 on OR) that emit Python-kwargs syntax inside
-        // tool-call arguments because they're "thinking in code" mode.
+        // Never alongside tools. It was believed to be a content-only
+        // constraint that tool-call arguments were immune to, since those are
+        // bound to the tool's own schema. That is not how providers implement
+        // it: JSON mode is a grammar applied from the first token, and a
+        // model whose tool-call syntax is not JSON — GLM emits `<tool_call>`
+        // XML — simply cannot reach it. Measured across a 16-model roster, one
+        // variable changed: deepseek-v4-flash, glm-5.2, llama-4-scout and
+        // kimi-k3 stopped calling tools entirely and answered with a JSON blob
+        // in `content`, while command-r, kimi-k2, gpt-5.6-terra-pro and
+        // solar-pro4 had the provider reject the request outright (422/400).
+        // Only models that scope the two grammars separately (grok, which
+        // documents the combination) were unaffected.
+        //
+        // Nothing is lost by skipping it: with tools the answer arrives as
+        // tool-call arguments, which are already schema-bound — OpenAI
+        // documents JSON mode as always on when function calling is used, and
+        // frames `response_format` and function calling as alternatives. The
+        // constraint would apply to a channel we are not reading.
+        //
+        // The check is here rather than in config validation because tool sets
+        // are dynamic: the same agent sends tools on one turn and none on the
+        // next, and this is the one place that sees what actually goes out.
+        let has_tools = v
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .is_some_and(|t| !t.is_empty());
         if agent.json_mode {
-            v["response_format"] = serde_json::json!({"type": "json_object"});
+            if has_tools {
+                tracing::warn!(
+                    agent = %agent.name,
+                    model = %agent.model_name,
+                    "json_mode requested with native tools — not sending response_format, \
+                     which would stop this model reaching its tools. Pair json_mode with \
+                     disable_native_tools, or drop it."
+                );
+            } else {
+                v["response_format"] = serde_json::json!({"type": "json_object"});
+            }
+        }
+
+        // Provider service tier, passed through verbatim. `flex` buys a cheaper
+        // best-effort queue at the cost of latency and the risk of being turned
+        // away under load, so it is opt-in per job rather than a default.
+        if let Some(tier) = request_config.service_tier.as_deref() {
+            v["service_tier"] = serde_json::json!(tier);
         }
 
         // Ensure all tool definitions have a `parameters` field.
@@ -461,6 +498,16 @@ impl ChatStrategy for NativeStrategy {
     fn supports_streaming(&self) -> bool {
         self.engine.as_deref() != Some("vllm_responses")
     }
+
+    /// Gateways fronting the OpenAI-compatible API report the true cost beside
+    /// `usage`; first-party OpenAI and self-hosted backends report none, and
+    /// this yields all-`None` for them without special-casing either.
+    fn provider_usage(&self, response: &serde_json::Value) -> crate::llms::ProviderUsage {
+        response
+            .get("usage")
+            .map(crate::llms::ProviderUsage::from_usage_value)
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -519,6 +566,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides::default();
 
@@ -611,6 +659,239 @@ mod tests {
         assert_eq!(usage.total_tokens, 30);
     }
 
+    #[test]
+    fn the_openai_compatible_dialect_reads_a_gateway_reported_cost() {
+        let body = serde_json::json!({
+            "usage": { "prompt_tokens": 6, "completion_tokens": 2, "cost": 7.434e-07,
+                       "prompt_tokens_details": { "cached_tokens": 4, "cache_write_tokens": 2 } }
+        });
+
+        let usage = NativeStrategy::default().provider_usage(&body);
+
+        assert_eq!(usage.cost_usd, Some(7.434e-07));
+        assert_eq!(usage.cached_tokens, Some(4));
+        assert_eq!(usage.cache_write_tokens, Some(2));
+    }
+
+    #[test]
+    fn a_provider_that_reports_no_cost_yields_nothing() {
+        // First-party OpenAI and self-hosted backends: tokens, no cost. The
+        // caller falls back to its price list rather than inventing a figure.
+        let body = serde_json::json!({
+            "usage": { "prompt_tokens": 6, "completion_tokens": 2 }
+        });
+
+        let usage = NativeStrategy::default().provider_usage(&body);
+
+        assert_eq!(usage.cost_usd, None);
+    }
+
+    #[test]
+    fn a_response_with_no_usage_at_all_yields_nothing() {
+        let usage = NativeStrategy::default().provider_usage(&serde_json::json!({"id": "x"}));
+
+        assert_eq!(usage.cost_usd, None);
+        assert_eq!(usage.cached_tokens, None);
+    }
+
+    /// A minimal agent for the `response_format` cases. `json_mode` is off by
+    /// default so each test states the one thing it is exercising.
+    fn json_mode_test_agent() -> AgentConfig {
+        AgentConfig {
+            name: "test".to_string(),
+            provider_id: "test".to_string(),
+            model_name: "model".to_string(),
+            temperature: 0.0,
+            max_tokens: 100,
+            json_mode: false,
+            ..Default::default()
+        }
+    }
+
+    /// Build a minimal one-tool request config.
+    fn one_tool_config() -> RequestConfig {
+        use async_openai::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
+        RequestConfig {
+            messages: vec![ChatCompletionRequestMessage::User(
+                ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Text("Hello".to_string()),
+                    name: None,
+                },
+            )],
+            tools: Some(vec![ChatCompletionTool {
+                r#type: ChatCompletionToolType::Function,
+                function: FunctionObject {
+                    name: "submit_proposal".to_string(),
+                    description: Some("Submit a proposal".to_string()),
+                    parameters: Some(serde_json::json!({"type": "object"})),
+                    strict: None,
+                },
+            }]),
+            tool_choice: None,
+            presence_penalty: None,
+            service_tier: None,
+        }
+    }
+
+    fn no_tool_config() -> RequestConfig {
+        RequestConfig {
+            tools: None,
+            ..one_tool_config()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_service_tier_is_passed_through() {
+        // Opt-in per job: `flex` buys a cheaper best-effort queue at the cost
+        // of latency, which trades against the phase budget.
+        let strategy = NativeStrategy::default();
+        let request = one_tool_config().with_service_tier_flag(Some("flex"));
+
+        let body = strategy
+            .prepare_request(
+                &json_mode_test_agent(),
+                &request,
+                &RequestOverrides::default(),
+            )
+            .await
+            .expect("request prepared");
+
+        assert_eq!(body.get("service_tier"), Some(&serde_json::json!("flex")));
+    }
+
+    #[tokio::test]
+    async fn the_tier_belongs_to_the_request_not_the_agent() {
+        // Two calls, one agent, different tiers — the property that makes the
+        // per-call channel worth having. It does not exercise the react loop,
+        // so it is not a regression test for the older design's mutation of
+        // the agent config; it pins the shape that made that mutation possible.
+        let strategy = NativeStrategy::default();
+        let agent = json_mode_test_agent();
+
+        let first = strategy
+            .prepare_request(
+                &agent,
+                &one_tool_config().with_service_tier_flag(Some("flex")),
+                &RequestOverrides::default(),
+            )
+            .await
+            .expect("request prepared");
+        assert_eq!(first.get("service_tier"), Some(&serde_json::json!("flex")));
+
+        let second = strategy
+            .prepare_request(&agent, &one_tool_config(), &RequestOverrides::default())
+            .await
+            .expect("request prepared");
+
+        assert!(
+            second.get("service_tier").is_none(),
+            "the previous call's tier followed the agent into this one: {second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_service_tier_leaves_the_provider_default() {
+        // Absent rather than an explicit "default": the provider's own default
+        // is not ours to name, and naming it wrongly is a 400.
+        let strategy = NativeStrategy::default();
+
+        let body = strategy
+            .prepare_request(
+                &json_mode_test_agent(),
+                &one_tool_config(),
+                &RequestOverrides::default(),
+            )
+            .await
+            .expect("request prepared");
+
+        assert!(body.get("service_tier").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_blank_service_tier_is_not_sent() {
+        // An empty string falls out of YAML and JSON easily, and the provider
+        // would reject it.
+        let strategy = NativeStrategy::default();
+        let request = one_tool_config().with_service_tier_flag(Some("   "));
+
+        let body = strategy
+            .prepare_request(
+                &json_mode_test_agent(),
+                &request,
+                &RequestOverrides::default(),
+            )
+            .await
+            .expect("request prepared");
+
+        assert!(body.get("service_tier").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn json_mode_is_not_sent_alongside_tools() {
+        // `response_format` and a tool definition in the same request is what
+        // stopped four of the roster's models from calling tools at all: they
+        // answered with a JSON blob in `content` and `finish_reason: stop`,
+        // while four more had the provider reject the request outright.
+        let strategy = NativeStrategy::default();
+        let agent = AgentConfig {
+            json_mode: true,
+            ..json_mode_test_agent()
+        };
+
+        let body = strategy
+            .prepare_request(&agent, &one_tool_config(), &RequestOverrides::default())
+            .await
+            .expect("request prepared");
+
+        assert!(
+            body.get("response_format").is_none(),
+            "response_format was sent with tools: {body}"
+        );
+        assert!(
+            body.get("tools")
+                .is_some_and(|t| !t.as_array().unwrap().is_empty()),
+            "the tools themselves must survive: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_mode_is_sent_when_there_are_no_tools() {
+        // The case it exists for: with `disable_native_tools` the answer has to
+        // arrive in `content`, so constraining that channel is the right lever
+        // and there is no tool call for it to displace.
+        let strategy = NativeStrategy::default();
+        let agent = AgentConfig {
+            json_mode: true,
+            ..json_mode_test_agent()
+        };
+
+        let body = strategy
+            .prepare_request(&agent, &no_tool_config(), &RequestOverrides::default())
+            .await
+            .expect("request prepared");
+
+        assert_eq!(
+            body.get("response_format"),
+            Some(&serde_json::json!({"type": "json_object"})),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_json_mode_means_no_response_format() {
+        let strategy = NativeStrategy::default();
+        let body = strategy
+            .prepare_request(
+                &json_mode_test_agent(),
+                &no_tool_config(),
+                &RequestOverrides::default(),
+            )
+            .await
+            .expect("request prepared");
+
+        assert!(body.get("response_format").is_none(), "{body}");
+    }
+
     #[tokio::test]
     async fn test_prepare_request_injects_missing_parameters() {
         // Together AI (and other providers) require `parameters` on all function tools.
@@ -690,6 +971,7 @@ mod tests {
             tools: Some(tools),
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let overrides = RequestOverrides::default();
 
@@ -748,6 +1030,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let body = strategy
             .prepare_request(&agent, &request_config, &RequestOverrides::default())
@@ -813,6 +1096,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let body = strategy
             .prepare_request(&agent, &request_config, &RequestOverrides::default())
@@ -857,6 +1141,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let body = strategy
             .prepare_request(&agent, &request_config, &RequestOverrides::default())
@@ -904,6 +1189,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let body = strategy
             .prepare_request(&agent, &request_config, &RequestOverrides::default())
@@ -952,6 +1238,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let body = strategy
             .prepare_request(&agent, &request_config, &RequestOverrides::default())
@@ -990,6 +1277,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let body = strategy
             .prepare_request(&agent, &request_config, &RequestOverrides::default())
@@ -1023,6 +1311,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             presence_penalty: None,
+            service_tier: None,
         };
         let body = strategy
             .prepare_request(&agent, &request_config, &RequestOverrides::default())

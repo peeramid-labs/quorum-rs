@@ -270,6 +270,7 @@ fn chat_request() -> RequestConfig {
         tools: None,
         tool_choice: None,
         presence_penalty: None,
+        service_tier: None,
     }
 }
 
@@ -298,6 +299,7 @@ fn tool_request() -> RequestConfig {
         tools: Some(vec![echo]),
         tool_choice: Some(ChatCompletionToolChoiceOption::Auto),
         presence_penalty: None,
+        service_tier: None,
     }
 }
 

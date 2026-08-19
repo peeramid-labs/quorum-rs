@@ -8,6 +8,7 @@
 
 pub mod error;
 pub mod openai_compatible;
+pub mod provider_usage;
 pub mod rate_limiter;
 pub mod simple_model;
 pub mod simulated;
@@ -16,6 +17,7 @@ pub mod strategies;
 pub mod stub;
 pub use error::LlmError;
 pub use openai_compatible::OpenAICompatibleModel;
+pub use provider_usage::ProviderUsage;
 pub use rate_limiter::RateLimiter;
 pub use simple_model::SimpleOpenAIModel;
 pub use span::LlmRequestSpan;
@@ -38,6 +40,33 @@ pub struct RequestConfig {
     pub tools: Option<Vec<ChatCompletionTool>>,
     pub tool_choice: Option<ChatCompletionToolChoiceOption>,
     pub presence_penalty: Option<f32>,
+    /// Provider service tier for this call, e.g. `flex` for a cheaper
+    /// best-effort queue.
+    ///
+    /// Belongs to the call, not the agent: it is the caller's cost-versus-
+    /// latency choice about one job, and the same council may be run cheaply
+    /// for a background question and at the default tier when someone is
+    /// waiting. Riding the request also means one job's choice cannot outlive
+    /// it and settle onto the agent's later work.
+    ///
+    /// Carried verbatim and read per provider — a tier is not a universal
+    /// concept, so each [`ChatStrategy`] decides in its own `prepare_request`
+    /// whether it means anything at all.
+    pub service_tier: Option<String>,
+}
+
+impl RequestConfig {
+    /// Ask the provider for a specific service tier on this call.
+    ///
+    /// Blank is treated as absent: an empty string survives a round trip
+    /// through YAML or JSON easily, and providers reject it.
+    pub fn with_service_tier_flag(mut self, tier: Option<&str>) -> Self {
+        self.service_tier = tier
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
+        self
+    }
 }
 
 /// Result of a chat completion including the response, raw request, and timing.
@@ -48,6 +77,9 @@ pub struct ChatCompletionResult {
     pub provider_backend: Option<String>,
     /// `Some` when the SDK shrink-guard rewrote `max_tokens`.
     pub shrink_info: Option<ShrinkInfo>,
+    /// Cost and cache figures the provider reported outside the OpenAI schema.
+    /// All-`None` for backends that report none of it.
+    pub provider_usage: ProviderUsage,
 }
 
 /// Timing metadata for an LLM call.
@@ -126,6 +158,11 @@ pub trait ChatStrategy: Send + Sync {
     /// Returns whether this strategy supports streaming responses.
     fn supports_streaming(&self) -> bool {
         true
+    }
+
+    /// What the provider said this call cost, and what it served from cache.
+    fn provider_usage(&self, _response: &serde_json::Value) -> ProviderUsage {
+        ProviderUsage::default()
     }
 }
 

@@ -119,6 +119,8 @@ async fn g15_llm_request_complete_carries_shrunk_to_floor() {
         reasoning_tokens: 0,
         cached_tokens: 0,
         cost_usd: 0.001,
+        reported_cost_usd: None,
+        cache_write_tokens: None,
         finish_reason: FinishReason::Length,
         provider_backend: None,
         claim_assessments_emitted: None,

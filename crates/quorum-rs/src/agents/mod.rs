@@ -50,6 +50,15 @@ pub struct AgentContext {
     /// User-defined tool definitions for this job. Empty if none registered.
     #[serde(default)]
     pub user_tools: Vec<UserToolDefinition>,
+    /// Provider service tier requested for this job, overriding the agent's
+    /// own setting. `None` leaves the agent config alone.
+    ///
+    /// Carried per job rather than per agent because it is the caller's
+    /// cost-versus-latency choice, not a property of the model: the same
+    /// council may be run cheaply and slowly for a background question, or at
+    /// the default tier when someone is waiting.
+    #[serde(default)]
+    pub service_tier: Option<String>,
     /// Remaining phase budget in seconds at the time the task was published.
     /// The agent uses this as the upper bound for user tool call wait times.
     #[serde(default)]
@@ -294,6 +303,9 @@ impl OperatorAnnotation {
 pub struct Proposal {
     pub thought_process: String,
     pub content: String,
+    /// Explicit SKIP answer — see `docs/reference/skip.md`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skipped: bool,
     /// Restore scratchpad field to ensure benchmarks can capture it
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_scratchpad: Option<String>,
@@ -326,6 +338,18 @@ pub struct Proposal {
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// What the provider said this work cost, in USD, summed over every call
+    /// behind it. `None` when the backend reports no cost — self-hosted and
+    /// direct-to-vendor endpoints never do — and a consumer must then fall
+    /// back to pricing the token counts itself rather than reading it as free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_cost_usd: Option<f64>,
+    /// Prompt tokens the provider served from its cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
+    /// Prompt tokens the provider wrote into its cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u32>,
 }
 
 // =============================================================================
@@ -909,6 +933,20 @@ pub trait NsedAgent: Send + Sync + Debug + dyn_clone::DynClone {
     async fn propose(&self, context: &AgentContext) -> Result<Proposal>;
     async fn evaluate(&self, context: &AgentContext) -> Result<Vec<(String, Evaluation)>>;
     fn name(&self) -> String;
+
+    /// Implementation-owned strategy hook: whether to work this task or
+    /// answer it with an explicit SKIP. The SDK only pipes the decision —
+    /// see `docs/reference/skip.md`.
+    fn task_disposition(&self, _context: &AgentContext, _action: &str) -> TaskDisposition {
+        TaskDisposition::Work
+    }
+}
+
+/// Answer of [`NsedAgent::task_disposition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskDisposition {
+    Work,
+    Skip,
 }
 
 dyn_clone::clone_trait_object!(NsedAgent);
@@ -1197,6 +1235,37 @@ pub fn calculate_qv_score(raw_weight: f32, total_weight: f32) -> (f32, f32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_default_disposition_is_work() {
+        // Every existing agent keeps working unchanged unless it overrides
+        // the hook — the SKIP protocol is strictly opt-in.
+        #[derive(Debug, Clone)]
+        struct Plain;
+        #[async_trait::async_trait]
+        impl crate::agents::NsedAgent for Plain {
+            async fn propose(
+                &self,
+                _c: &crate::agents::AgentContext,
+            ) -> anyhow::Result<crate::agents::Proposal> {
+                unreachable!()
+            }
+            async fn evaluate(
+                &self,
+                _c: &crate::agents::AgentContext,
+            ) -> anyhow::Result<Vec<(String, crate::agents::Evaluation)>> {
+                unreachable!()
+            }
+            fn name(&self) -> String {
+                "plain".into()
+            }
+        }
+        let ctx = crate::agents::AgentContext::default();
+        assert_eq!(
+            crate::agents::NsedAgent::task_disposition(&Plain, &ctx, "propose"),
+            crate::agents::TaskDisposition::Work
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1334,6 +1403,7 @@ mod tests {
             token_usage: Some(TokenUsage {
                 input_tokens: 1500,
                 output_tokens: 300,
+                ..Default::default()
             }),
             claim_assessments: vec![
                 ClaimAssessment {
@@ -2218,6 +2288,7 @@ mod tests {
                 token_usage_stats: Some(TokenUsage {
                     input_tokens: 100,
                     output_tokens: 50,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -2258,6 +2329,7 @@ mod tests {
                 strict: Some(true),
             }],
             phase_budget_remaining_secs: 42.5,
+            service_tier: Some("flex".to_string()),
             session_id: Some("sess-123".to_string()),
             conversation_id: None,
             new_turn: None,
@@ -2384,6 +2456,7 @@ mod tests {
                 token_usage_stats: Some(TokenUsage {
                     input_tokens: 200,
                     output_tokens: 80,
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -2424,6 +2497,7 @@ mod tests {
             token_usage_stats: Some(TokenUsage {
                 input_tokens: 500,
                 output_tokens: 150,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -2510,6 +2584,7 @@ mod tests {
         let tu = TokenUsage {
             input_tokens: 1234,
             output_tokens: 567,
+            ..Default::default()
         };
         let json = serde_json::to_string(&tu).unwrap();
         let deserialized: TokenUsage = serde_json::from_str(&json).unwrap();

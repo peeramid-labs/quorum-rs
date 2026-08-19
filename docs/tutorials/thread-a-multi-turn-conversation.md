@@ -117,6 +117,11 @@ Leave `new_turn` out when you send `messages` — deriving it is what this form 
 for, and stating it only adds a way to be rejected. If you do state it, it must
 be the last `user` turn.
 
+Turns you send this way come back as turns: the job keeps them, so reading it
+later returns `messages` alongside `user_query`. Use those. Do **not** try to
+split `user_query` back into turns — see step 3 for why that string cannot be
+parsed, only rendered.
+
 ## 3. Look at what the council actually received
 
 Do this once and the rest of the tutorial explains itself. The task the agents
@@ -139,8 +144,21 @@ nats --creds ~/.nsed/agent.creds -s "$NATS_URL" \
 That string is what a **stateless** agent sees. The deliberation core takes one
 task *string* — the agents are N proposers and evaluators, each building its own
 prompt — and for an agent talking to a plain LLM, every call rebuilds that prompt
-from scratch. There is no session holding the earlier turns. This string is the
-only place they exist.
+from scratch. There is no session holding the earlier turns; for that agent, this
+string is where they exist.
+
+Notice that it is a rendering, and only that. Nothing escapes the `[user]`
+labels, blank turns were dropped on the way in, and a lone user turn is written
+bare with no label at all. So the arrow only points one way: ask this string what
+turns it was built from and a message that happens to contain a line like
+`[user] foo` answers with a turn nobody sent. That is why the job keeps the turns
+as well, and why you read those instead of splitting this:
+
+```bash
+nats --creds ~/.nsed/agent.creds -s "$NATS_URL" \
+  kv get nsed_hist_room-<the id you sent> manifest --raw \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["messages"])'
+```
 
 ## 4. Why both fields, and not just `new_turn`
 
@@ -158,6 +176,12 @@ can use:
 
 Send both and each agent type is served correctly. That is the whole design: the
 same request satisfies a council mixing both kinds, which is normal.
+
+If your council is **all** plain-LLM agents — the common case — then
+`conversation_id` and `new_turn` do nothing for it today: no agent on that path
+consults the delta, so `user_query` is the whole story. Set them anyway. They cost
+one field each, and they begin working the moment a session-capable agent joins
+the council, without a client change.
 
 It is worth knowing what that session is. `conversation_id` is hashed with the
 agent's name into a deterministic id — the same thread and agent always produce
