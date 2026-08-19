@@ -33,6 +33,16 @@ pub trait NatsNsedWorkerExt {
         config: WorkerConfig,
         telemetry: Option<TelemetryEmitterMux>,
     ) -> impl std::future::Future<Output = Result<NatsNsedWorker>> + Send;
+
+    /// Like [`from_agent`](Self::from_agent), but runs `wrapped` — a
+    /// strategy wrapper around `inner` (e.g. a SKIP-until-round condenser) —
+    /// while `inner` still supplies the agent config and chat capability.
+    fn from_wrapped_agent<A: crate::agents::NsedAgent + 'static>(
+        inner: ProposerEvaluatorAgent,
+        wrapped: A,
+        config: WorkerConfig,
+        telemetry: Option<TelemetryEmitterMux>,
+    ) -> impl std::future::Future<Output = Result<NatsNsedWorker>> + Send;
 }
 
 impl NatsNsedWorkerExt for NatsNsedWorker {
@@ -45,6 +55,23 @@ impl NatsNsedWorkerExt for NatsNsedWorker {
         let chat_agent: Arc<dyn ChatCapable> = Arc::new(agent.clone());
 
         let worker = NatsNsedWorker::new(agent, agent_config, config, telemetry)
+            .await?
+            .with_user_tool_factory(Arc::new(NatsUserToolHandlerFactory))
+            .with_chat(chat_agent);
+
+        Ok(worker)
+    }
+
+    async fn from_wrapped_agent<A: crate::agents::NsedAgent + 'static>(
+        inner: ProposerEvaluatorAgent,
+        wrapped: A,
+        config: WorkerConfig,
+        telemetry: Option<TelemetryEmitterMux>,
+    ) -> Result<NatsNsedWorker> {
+        let agent_config = inner.config.clone();
+        let chat_agent: Arc<dyn ChatCapable> = Arc::new(inner);
+
+        let worker = NatsNsedWorker::new(wrapped, agent_config, config, telemetry)
             .await?
             .with_user_tool_factory(Arc::new(NatsUserToolHandlerFactory))
             .with_chat(chat_agent);
