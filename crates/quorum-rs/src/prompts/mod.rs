@@ -6,6 +6,7 @@
 //! changing the agent's core implementation.
 
 pub mod defaults;
+pub mod shape;
 
 use dyn_clone::DynClone;
 use std::fmt::Debug;

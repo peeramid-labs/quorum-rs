@@ -36,6 +36,14 @@ pub struct ProposalShape {
     pub outline: Vec<(usize, String)>,
 }
 
+/// Measure a proposal's structure, dispatching on what kind of content it is.
+///
+/// Kept here as the entry point every caller already uses; the measuring lives
+/// in [`crate::prompts::shape`], one analyzer per content kind.
+pub fn proposal_shape(text: &str) -> ProposalShape {
+    crate::prompts::shape::analyze(text)
+}
+
 impl ProposalShape {
     /// Compact one-line outline for the candidate block. Empty when the
     /// proposal has no structure to point at.
@@ -48,75 +56,11 @@ impl ProposalShape {
     }
 }
 
-/// Neutralise the three characters that let candidate-authored text close the
-/// tag it is quoted inside and continue as if it were the prompt talking.
+/// Escape the characters that would let candidate text close its own tag.
 fn escape_markup(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
-}
-
-/// Summarise markdown structure without a full parser: fences, ATX headings,
-/// list markers and pipe-tables are enough to tell a navigable annex from a
-/// wall of prose.
-pub fn proposal_shape(text: &str) -> ProposalShape {
-    let mut shape = ProposalShape {
-        chars: text.chars().count(),
-        ..Default::default()
-    };
-    let mut in_code = false;
-    let mut lead_done = false;
-    let mut table_open = false;
-    for (idx, line) in text.lines().enumerate() {
-        let lineno = idx + 1;
-        shape.lines = lineno;
-        let t = line.trim_start();
-        if t.starts_with("```") || t.starts_with("~~~") {
-            if !in_code {
-                shape.code_blocks += 1;
-                shape.outline.push((lineno, "code".to_string()));
-            }
-            in_code = !in_code;
-            lead_done = true;
-            table_open = false;
-            continue;
-        }
-        if in_code {
-            continue;
-        }
-        let is_heading = t.starts_with('#');
-        let is_list = t.starts_with("- ")
-            || t.starts_with("* ")
-            || t.starts_with("+ ")
-            || t.split_once('.').is_some_and(|(n, rest)| {
-                !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && rest.starts_with(' ')
-            });
-        let is_table = t.starts_with('|') && t.matches('|').count() >= 2;
-
-        if is_heading {
-            shape.headings += 1;
-            shape.outline.push((lineno, t.chars().take(60).collect()));
-        }
-        if is_list {
-            shape.list_items += 1;
-        }
-        if is_table {
-            shape.table_rows += 1;
-            if !table_open {
-                shape.outline.push((lineno, "table".to_string()));
-            }
-        }
-        table_open = is_table;
-        if is_heading || is_list || is_table {
-            lead_done = true;
-        } else {
-            shape.prose_chars += line.chars().count();
-            if !lead_done {
-                shape.lead_chars += line.chars().count();
-            }
-        }
-    }
-    shape
 }
 
 fn render_user_updates(injections: &[UserInjection], context: &str) -> String {
@@ -474,6 +418,12 @@ impl PromptSet for DefaultPromptSet {
             };
 
             let shape = proposal_shape(&candidate.proposal.content);
+            // A structured proposal is stored compactly on one line. Show it
+            // the way it was measured, or the outline's line anchors point at
+            // lines the reader was never given.
+            let rendered_content =
+                crate::prompts::shape::json::readable_form(&candidate.proposal.content)
+                    .unwrap_or_else(|| candidate.proposal.content.clone());
             candidates_text.push_str(&format!(
                 "<candidate id=\"{}\" chars=\"{}\" lines=\"{}\" lead_chars=\"{}\" prose_chars=\"{}\" headings=\"{}\" code_blocks=\"{}\" list_items=\"{}\" table_rows=\"{}\">\n<outline>{}</outline>\nFINAL SOLUTION: {}\nTHOUGHT PROCESS: {}{}\n</candidate>\n\n",
                 candidate.id,
@@ -486,7 +436,7 @@ impl PromptSet for DefaultPromptSet {
                 shape.list_items,
                 shape.table_rows,
                 shape.outline_text(),
-                candidate.proposal.content,
+                rendered_content,
                 thoughts_text,
                 if truncated {
                     format!("\n(Truncated — use `read_proposal(round={current_round}, agent_id=\"{}\")` with offset={thought_limit} to read the rest)", candidate.id)
@@ -574,7 +524,7 @@ impl PromptSet for DefaultPromptSet {
                     Reward: input validation, brevity, structural scaffolding, empirical fact-grounding, high semantic density. Penalize: epistemic gaps, semantic incoherence.\n\
                     Measure, do not eyeball: `chars`, `lead_chars` (delay before the answer lands), `prose_chars` (text outside code/lists/tables — where padding hides), `headings`, `code_blocks`, `list_items`, `table_rows`. `<outline>` anchors as `L<line> <label>`; confirm a suspicion with `read_proposal(agent_id, from_line, to_line)` or `search_deliberation` rather than guessing.\n\
                     Shape over size: low `lead_chars` plus high structure is the best shape and must outscore the same `chars` as undifferentiated prose. Bloat is high `prose_chars` with little structure and a long lead, not a large `chars`.\n\
-                    Spread the range — densest highest, most padded NEGATIVE, not every candidate positive. Near-empty is incomplete, not concise: score it under completeness. Precise domain terminology beats a bloated plain-language paraphrase where the topic warrants it.
+                    Spread the range — densest highest, most padded NEGATIVE, not every candidate positive. Near-empty is incomplete, not concise: score it under completeness.
                * If a claim was flagged in a previous round (has a claim_id), include that claim_id so we can track resolution across rounds.
 
             6. Call `submit_batch_evaluation` with your evaluations.
@@ -722,6 +672,12 @@ impl PromptSet for DefaultPromptSet {
                 (candidate.proposal.thought_process.clone(), false)
             };
             let shape = proposal_shape(&candidate.proposal.content);
+            // A structured proposal is stored compactly on one line. Show it
+            // the way it was measured, or the outline's line anchors point at
+            // lines the reader was never given.
+            let rendered_content =
+                crate::prompts::shape::json::readable_form(&candidate.proposal.content)
+                    .unwrap_or_else(|| candidate.proposal.content.clone());
             candidates_text.push_str(&format!(
                 "<candidate id=\"{}\" chars=\"{}\" lines=\"{}\" lead_chars=\"{}\" prose_chars=\"{}\" headings=\"{}\" code_blocks=\"{}\" list_items=\"{}\" table_rows=\"{}\">\n<outline>{}</outline>\nFINAL SOLUTION: {}\nTHOUGHT PROCESS: {}{}\n</candidate>\n\n",
                 candidate.id,
@@ -734,7 +690,7 @@ impl PromptSet for DefaultPromptSet {
                 shape.list_items,
                 shape.table_rows,
                 shape.outline_text(),
-                candidate.proposal.content,
+                rendered_content,
                 thoughts_text,
                 if truncated {
                     format!("\n(Truncated — use `read_proposal(round={current_round}, agent_id=\"{}\")` with offset={thought_limit} to read the rest)", candidate.id)
@@ -1747,6 +1703,110 @@ mod tests {
 
         assert!(!prompt.contains("<user_updates>"));
         assert!(prompt.contains("<candidates>"));
+    }
+
+    /// The conciseness axis is worth nothing without the half that tells an
+    /// evaluator what to read and how to spread the scores. Compressing the
+    /// wording is fine; dropping the measured fields, the relative framing or
+    /// the negative end turns the axis back into an eyeballed length guess.
+    /// The outline sends the evaluator to a line number. If the block shows
+    /// the compact stored form while the outline was measured on the rendered
+    /// one, every anchor points somewhere the reader cannot go.
+    #[test]
+    fn a_structured_candidate_is_shown_the_shape_it_was_measured_on() {
+        use crate::agents::{CandidateProposal, Proposal};
+        let prompt_set = DefaultPromptSet::new();
+        let candidates = vec![CandidateProposal {
+            id: "agent_1".to_string(),
+            proposal: Proposal {
+                content: r#"{"reply":"Short answer.","ops":[{"path":"a.rs"}]}"#.to_string(),
+                ..Default::default()
+            },
+        }];
+        let prompt = prompt_set.get_batch_evaluator_prompt("Task", &candidates, None, 1, &[]);
+
+        assert!(
+            prompt.contains("\"reply\": \"Short answer.\""),
+            "the candidate block still shows the compact stored form"
+        );
+        assert!(
+            prompt.contains("<outline>L2 reply"),
+            "the outline must anchor at the line the reader can actually read"
+        );
+    }
+
+    /// End to end through the evaluator prompt: a proposal submitted as JSON
+    /// is stored on one line, and measured as prose it would report no
+    /// structure at all — the profile the axis scores most negatively. The
+    /// block an evaluator actually reads must describe it as structure.
+    #[test]
+    fn a_structured_candidate_reaches_the_evaluator_as_structure() {
+        use crate::agents::{CandidateProposal, Proposal};
+        let prompt_set = DefaultPromptSet::new();
+        let candidates = vec![CandidateProposal {
+            id: "agent_1".to_string(),
+            proposal: Proposal {
+                content: r#"{"reply":"Short answer.","ops":[{"path":"a.rs"},{"path":"b.rs"}]}"#
+                    .to_string(),
+                ..Default::default()
+            },
+        }];
+        let prompt = prompt_set.get_batch_evaluator_prompt("Task", &candidates, None, 1, &[]);
+
+        assert!(
+            prompt.contains("headings=\"2\""),
+            "keys are the sections: {prompt}"
+        );
+        assert!(
+            prompt.contains("list_items=\"2\""),
+            "arrays are the lists: {prompt}"
+        );
+        assert!(
+            !prompt.contains("lines=\"1\""),
+            "measured on the rendered form, not the stored single line"
+        );
+        assert!(
+            prompt.contains("\"reply\": \"Short answer.\""),
+            "the block shows the rendered form the outline anchors into"
+        );
+        assert!(
+            prompt.contains("<outline>L2 reply"),
+            "anchors name lines the read tool returns"
+        );
+    }
+
+    #[test]
+    fn the_conciseness_axis_keeps_what_makes_it_measurable() {
+        use crate::agents::{CandidateProposal, Proposal};
+        let prompt_set = DefaultPromptSet::new();
+        let candidates = vec![CandidateProposal {
+            id: "agent_1".to_string(),
+            proposal: Proposal::default(),
+        }];
+        let prompt = prompt_set.get_batch_evaluator_prompt("Task", &candidates, None, 1, &[]);
+
+        for field in [
+            "lead_chars",
+            "prose_chars",
+            "headings",
+            "code_blocks",
+            "list_items",
+            "table_rows",
+            "read_proposal",
+        ] {
+            assert!(
+                prompt.contains(field),
+                "the axis stopped naming {field}, so nothing points the evaluator at the measurement"
+            );
+        }
+        assert!(
+            prompt.contains("RELATIVE"),
+            "scored against the round's field, not on an absolute scale"
+        );
+        assert!(
+            prompt.contains("NEGATIVE"),
+            "without the negative end every candidate scores positive and the axis stops ranking"
+        );
     }
 
     #[test]

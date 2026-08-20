@@ -152,6 +152,10 @@ pub struct ProposalScoreEntry {
     /// Non-zero means at least one evaluator timed out or returned partial results.
     #[serde(default)]
     pub synthetic_eval_count: u32,
+    /// Measured shape of the proposal these scores were given to, so score and
+    /// size can be correlated without re-deriving either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<ProposalShapeMetrics>,
 }
 
 /// Aggregated category scores across all evaluators for a single proposal.
@@ -162,11 +166,101 @@ pub struct CategoryScoreBreakdown {
     pub novelty: f32,
     pub feasibility: f32,
     pub evidence_quality: f32,
+    #[serde(default)]
+    pub conciseness: f32,
+}
+
+/// The measured shape a proposal's scores were given to.
+///
+/// Emitted beside the score so the two correlate per proposal per round.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ProposalShapeMetrics {
+    pub chars: u32,
+    pub lines: u32,
+    /// Characters before the first structural break.
+    pub lead_chars: u32,
+    /// Characters outside code fences, lists and tables.
+    pub prose_chars: u32,
+    pub headings: u32,
+    pub code_blocks: u32,
+    pub list_items: u32,
+    pub table_rows: u32,
+}
+
+impl From<&crate::prompts::defaults::ProposalShape> for ProposalShapeMetrics {
+    fn from(s: &crate::prompts::defaults::ProposalShape) -> Self {
+        Self {
+            chars: s.chars as u32,
+            lines: s.lines as u32,
+            lead_chars: s.lead_chars as u32,
+            prose_chars: s.prose_chars as u32,
+            headings: s.headings as u32,
+            code_blocks: s.code_blocks as u32,
+            list_items: s.list_items as u32,
+            table_rows: s.table_rows as u32,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The conciseness axis is a judgement about size, so the only way to know
+    /// whether evaluators are applying it — rather than rewarding length — is
+    /// to emit the score and the measured shape in the same record. Split
+    /// across two events they cannot be joined per proposal per round.
+    #[test]
+    fn a_score_entry_carries_the_shape_its_score_was_given_to() {
+        let shape = crate::prompts::defaults::proposal_shape(
+            "Answer.\n\n## Why\n\n- a\n- b\n\n```\ncode\n```\n",
+        );
+        let entry = ProposalScoreEntry {
+            agent_id: "agent_1".to_string(),
+            aggregated_score: 4.5,
+            category_breakdown: Some(CategoryScoreBreakdown {
+                correctness: 50.0,
+                completeness: 40.0,
+                novelty: 20.0,
+                feasibility: 30.0,
+                evidence_quality: 35.0,
+                conciseness: -25.0,
+            }),
+            shape: Some((&shape).into()),
+            ..Default::default()
+        };
+
+        let wire = serde_json::to_value(&entry).expect("score entry serialises");
+        assert_eq!(wire["category_breakdown"]["conciseness"], -25.0);
+        assert_eq!(wire["shape"]["headings"], 1);
+        assert_eq!(wire["shape"]["code_blocks"], 1);
+        assert_eq!(wire["shape"]["list_items"], 2);
+        assert!(
+            wire["shape"]["lead_chars"].as_u64().is_some(),
+            "lead_chars is the size signal the axis is supposed to punish; it must ship"
+        );
+    }
+
+    /// Consumers predate both fields.
+    #[test]
+    fn a_score_entry_without_shape_or_conciseness_still_parses() {
+        let wire = serde_json::json!({
+            "agent_id": "agent_1",
+            "aggregated_score": 1.0,
+            "category_breakdown": {
+                "correctness": 1.0, "completeness": 1.0, "novelty": 1.0,
+                "feasibility": 1.0, "evidence_quality": 1.0
+            }
+        });
+        let entry: ProposalScoreEntry =
+            serde_json::from_value(wire).expect("an older entry must still parse");
+        assert!(entry.shape.is_none());
+        assert_eq!(
+            entry.category_breakdown.map(|c| c.conciseness),
+            Some(0.0),
+            "an omitted axis reads neutral, like its siblings"
+        );
+    }
 
     #[test]
     fn job_complete_event_deserializes_orchestrator_wire() {
@@ -217,6 +311,7 @@ mod tests {
                         novelty: 60.0,
                         feasibility: 90.0,
                         evidence_quality: 75.0,
+                        conciseness: 0.0,
                     }),
                     controversy_score: Some(2.5),
                     ..Default::default()
@@ -389,6 +484,7 @@ mod tests {
             novelty: 50.5,
             feasibility: 99.9,
             evidence_quality: 33.3,
+            conciseness: 0.0,
         };
         let json = serde_json::to_vec(&bd).unwrap();
         let parsed: CategoryScoreBreakdown = serde_json::from_slice(&json).unwrap();
