@@ -509,6 +509,12 @@ impl NsedMcpServer {
             .unwrap_or(self.context.round_number.saturating_sub(1));
         let offset = input.offset.unwrap_or(0);
         let limit = input.limit.unwrap_or(5000);
+        // Either bound switches the solution to numbered lines, so the outline's
+        // anchors address the same lines the reader gets back.
+        let lines = |content: &str| {
+            crate::tools::context::render_content_lines(content, input.from_line, input.to_line)
+        };
+        let ranged = input.from_line.is_some() || input.to_line.is_some();
 
         // Current-round anonymized candidates (Candidate_A/B/…) aren't in the store
         // during evaluation — it keys real author ids. Resolve them from the context
@@ -524,6 +530,9 @@ impl NsedMcpServer {
                 .find(|c| agent_id_match(&c.id, &input.agent_id))
             {
                 let content = &c.proposal.content;
+                if ranged {
+                    return lines(content);
+                }
                 let char_count = content.chars().count();
                 if offset >= char_count {
                     return "Offset beyond content length".to_string();
@@ -541,6 +550,9 @@ impl NsedMcpServer {
                 for record in &records {
                     if agent_id_match(&record.author_agent_id, &input.agent_id) {
                         let content = &record.proposal.content;
+                        if ranged {
+                            return lines(content);
+                        }
                         let char_count = content.chars().count();
                         if offset >= char_count {
                             return "Offset beyond content length".to_string();
@@ -3593,6 +3605,45 @@ impl super::ChatCapable for ClaudeAgent {
 
 #[cfg(test)]
 mod tests {
+
+    /// The evaluator prompt tells agents to call `read_proposal` with a line
+    /// range. If this transport's input type does not carry those fields, the
+    /// instruction names parameters the tool cannot accept.
+    #[test]
+    fn the_mcp_read_proposal_input_accepts_a_line_range() {
+        let raw = serde_json::json!({
+            "agent_id": "Candidate_A",
+            "from_line": 3,
+            "to_line": 9,
+        });
+        let input: crate::agents::mcp_tools::ReadProposalInput =
+            serde_json::from_value(raw).expect("a line range must parse");
+        assert_eq!(input.from_line, Some(3));
+        assert_eq!(input.to_line, Some(9));
+    }
+
+    /// Two transports expose the same tool through different input types, and
+    /// only one is derived from the internal args. A field added to the
+    /// internal side is silently missing here until something compares them.
+    #[test]
+    fn every_read_proposal_argument_is_offered_on_both_transports() {
+        let native = schemars::schema_for!(crate::tools::context::ReadProposalArgs);
+        let mcp = schemars::schema_for!(crate::agents::mcp_tools::ReadProposalInput);
+        let native_json = serde_json::to_value(&native).expect("native schema");
+        let mcp_json = serde_json::to_value(&mcp).expect("mcp schema");
+        let native_props = native_json["properties"].as_object().expect("native props");
+        let mcp_props = mcp_json["properties"].as_object().expect("mcp props");
+
+        let missing: Vec<&String> = native_props
+            .keys()
+            .filter(|k| !mcp_props.contains_key(*k))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the MCP transport does not offer {missing:?}, so an agent there \
+             cannot use what the prompt tells it to call"
+        );
+    }
     use super::*;
     use crate::agents::config::McpProviderConfig;
     use std::collections::HashMap;
@@ -3948,6 +3999,33 @@ mod tests {
         }
     }
 
+    /// End to end through the MCP handler: an evaluator asks for a line range
+    /// and gets those lines, numbered, the way the outline's anchors promise.
+    #[tokio::test]
+    async fn an_mcp_evaluator_reads_a_line_range_of_a_candidate() {
+        let body = "Answer.\n\n## Why\n\n- fast\n- terse\n\nTail.\n";
+        let ctx = ctx_with_candidate(3, "Candidate_B", body, "reasoning");
+        let (tx, _rx) = oneshot::channel();
+        let server = NsedMcpServer::new(ctx, ActivePhase::Evaluating, None, tx);
+        let out = server
+            .nsed_read_proposal(Parameters(ReadProposalInput {
+                round: Some(3),
+                agent_id: "Candidate_B".to_string(),
+                offset: None,
+                limit: None,
+                from_line: Some(3),
+                to_line: Some(6),
+            }))
+            .await;
+        assert!(
+            out.contains("<lines from=\"3\" to=\"6\""),
+            "range header: {out}"
+        );
+        assert!(out.contains("   3| ## Why"), "numbered lines: {out}");
+        assert!(out.contains("   6| - terse"), "numbered lines: {out}");
+        assert!(!out.contains("Tail."), "line 8 is outside the range: {out}");
+    }
+
     #[tokio::test]
     async fn nsed_read_proposal_resolves_current_round_anonymized_candidate() {
         // MCP path parity with ReadProposalTool: the store keys real author ids and
@@ -3962,6 +4040,8 @@ mod tests {
                 agent_id: "Candidate_B".to_string(),
                 offset: None,
                 limit: None,
+                from_line: None,
+                to_line: None,
             }))
             .await;
         assert!(out.contains("answer from B"), "resolves candidate: {out}");

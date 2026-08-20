@@ -56,7 +56,11 @@ impl ReadProposalTool {
 /// Render `content` as 1-indexed numbered lines, optionally clipped to
 /// `from..=to`. The evaluator gets structural line anchors in the candidate
 /// block; this is what makes those anchors addressable.
-fn render_content_lines(content: &str, from: Option<usize>, to: Option<usize>) -> String {
+pub(crate) fn render_content_lines(
+    content: &str,
+    from: Option<usize>,
+    to: Option<usize>,
+) -> String {
     let total = content.lines().count();
     let from = from.unwrap_or(1).max(1);
     let to = to.unwrap_or(total).min(total);
@@ -145,7 +149,7 @@ fn agent_id_match(stored_id: &str, requested_id: &str) -> bool {
 }
 
 #[derive(Deserialize, JsonSchema)]
-struct ReadProposalArgs {
+pub(crate) struct ReadProposalArgs {
     /// The round number to retrieve the proposal from. Defaults to the previous round.
     round: Option<u32>,
     /// The ID of the agent who authored the proposal (e.g., "agent_0").
