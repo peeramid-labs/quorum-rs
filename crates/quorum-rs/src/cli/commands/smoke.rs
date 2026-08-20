@@ -2,7 +2,7 @@
 //! own agents, run entirely IN-PROCESS (no orchestrator, no NATS, no peers):
 //!
 //! 1. **chat** — call the agent's model directly N times with a trivial prompt;
-//!    report success / avg-latency / error-rate.
+//!    report success / latency distribution / error-rate.
 //! 2. **tool-calling** — same model, N times, expecting a tool call back.
 //! 3. **NSED** — build the agent and call `propose()` directly with a synthetic
 //!    context. `propose()` is the full NSED wrapper (ReAct loop + tool-calling),
@@ -132,6 +132,10 @@ struct StageStats {
     ok: u32,
     runs: u32,
     total_latency_ms: u128,
+    /// Latency of every successful sample, so the report can show the
+    /// distribution. An average hides the one call in ten that stalls, and
+    /// that call is what burns a deliberation's phase budget.
+    latencies_ms: Vec<u64>,
     failures: Vec<Failure>,
 }
 
@@ -141,8 +145,27 @@ impl StageStats {
             ok: 0,
             runs,
             total_latency_ms: 0,
+            latencies_ms: Vec::new(),
             failures: Vec::new(),
         }
+    }
+
+    /// Record a successful sample's latency.
+    fn record(&mut self, latency_ms: u128) {
+        self.total_latency_ms += latency_ms;
+        self.latencies_ms.push(latency_ms as u64);
+    }
+
+    /// Nearest-rank percentile over successful samples. `0` when none
+    /// succeeded.
+    fn pct_latency_ms(&self, p: f64) -> u64 {
+        if self.latencies_ms.is_empty() {
+            return 0;
+        }
+        let mut v = self.latencies_ms.clone();
+        v.sort_unstable();
+        let idx = ((p * v.len() as f64).ceil() as usize).saturating_sub(1);
+        v[idx.min(v.len() - 1)]
     }
 
     fn avg_latency_ms(&self) -> u64 {
@@ -161,9 +184,12 @@ impl StageStats {
 
     fn line(&self, label: &str) -> String {
         format!(
-            "{label}: {}/{} ok \u{b7} avg {}ms \u{b7} errors {}%",
+            "{label}: {}/{} ok \u{b7} median {}ms \u{b7} p95 {}ms \u{b7} max {}ms \u{b7} avg {}ms \u{b7} errors {}%",
             self.ok,
             self.runs,
+            self.pct_latency_ms(0.5),
+            self.pct_latency_ms(0.95),
+            self.pct_latency_ms(1.0),
             self.avg_latency_ms(),
             self.error_rate_pct()
         )
@@ -364,7 +390,7 @@ async fn run_direct_stage(
             Ok(res) => {
                 if !with_tools || has_tool_call(&res.response) {
                     stats.ok += 1;
-                    stats.total_latency_ms += latency();
+                    stats.record(latency());
                 } else {
                     stats.failures.push(Failure::direct_no_tool(seq, latency()));
                 }
@@ -433,18 +459,22 @@ async fn run_nsed_stage(
     deliberations: u32,
     rounds: u32,
     bar: &ProgressBar,
-) -> (StageStats, Vec<RoundDetail>) {
+) -> (StageStats, Vec<RoundDetail>, Vec<(&'static str, u64)>) {
     let mut stats = StageStats::new(deliberations);
     let mut first_detail: Vec<RoundDetail> = Vec::new();
+    // Every propose / evaluate call, timed separately: a deliberation total
+    // hides which of the two tasks the model is slow at, and they are not
+    // interchangeable — the orchestrator budgets them as distinct phases.
+    let mut task_latencies: Vec<(&'static str, u64)> = Vec::new();
     for seq in 1..=deliberations {
         let started = Instant::now();
-        match run_one_deliberation(agent, rounds, seq).await {
+        match run_one_deliberation(agent, rounds, seq, &mut task_latencies).await {
             Ok(details) => {
                 if first_detail.is_empty() {
                     first_detail = details;
                 }
                 stats.ok += 1;
-                stats.total_latency_ms += started.elapsed().as_millis();
+                stats.record(started.elapsed().as_millis());
             }
             Err(mut failure) => {
                 failure.latency_ms = started.elapsed().as_millis();
@@ -455,7 +485,38 @@ async fn run_nsed_stage(
         bar.inc(1);
     }
     bar.finish_and_clear();
-    (stats, first_detail)
+    (stats, first_detail, task_latencies)
+}
+
+/// Per-task line for the NSED stage: median / p95 / max of `propose` and
+/// `evaluate` separately, mirroring the orchestrator's per-phase
+/// `agent_responded` telemetry so a local smoke run and a live deliberation
+/// are read the same way.
+fn task_latency_lines(task_latencies: &[(&'static str, u64)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for task in ["propose", "evaluate"] {
+        let mut v: Vec<u64> = task_latencies
+            .iter()
+            .filter(|(t, _)| *t == task)
+            .map(|(_, ms)| *ms)
+            .collect();
+        if v.is_empty() {
+            continue;
+        }
+        v.sort_unstable();
+        let pct = |p: f64| -> u64 {
+            let idx = ((p * v.len() as f64).ceil() as usize).saturating_sub(1);
+            v[idx.min(v.len() - 1)]
+        };
+        out.push(format!(
+            "  {task}: {} ok \u{b7} median {}ms \u{b7} p95 {}ms \u{b7} max {}ms",
+            v.len(),
+            pct(0.5),
+            pct(0.95),
+            pct(1.0),
+        ));
+    }
+    out
 }
 
 /// One full deliberation: `rounds` rounds, each running BOTH NSED phases — the
@@ -469,6 +530,7 @@ async fn run_one_deliberation(
     agent: &dyn NsedAgent,
     rounds: u32,
     seq: u32,
+    task_latencies: &mut Vec<(&'static str, u64)>,
 ) -> Result<Vec<RoundDetail>, Failure> {
     let mut details = Vec::new();
     let mut previous: Option<Proposal> = None;
@@ -484,6 +546,7 @@ async fn run_one_deliberation(
         pctx.previous_own_proposal = previous.clone();
         pctx.previous_own_score = previous_score;
         pctx.previous_critiques = previous_critiques.clone();
+        let propose_started = Instant::now();
         let proposal = agent.propose(&pctx).await.map_err(|e| {
             Failure::nsed(
                 seq,
@@ -491,6 +554,7 @@ async fn run_one_deliberation(
                 &e,
             )
         })?;
+        task_latencies.push(("propose", propose_started.elapsed().as_millis() as u64));
         if proposal.content.trim().is_empty() {
             return Err(Failure::nsed_empty(seq, round));
         }
@@ -504,6 +568,7 @@ async fn run_one_deliberation(
             id: cand_id.clone(),
             proposal: proposal.clone(),
         }];
+        let evaluate_started = Instant::now();
         let evals = agent.evaluate(&ectx).await.map_err(|e| {
             Failure::nsed(
                 seq,
@@ -511,6 +576,7 @@ async fn run_one_deliberation(
                 &e,
             )
         })?;
+        task_latencies.push(("evaluate", evaluate_started.elapsed().as_millis() as u64));
         let eval = evals.iter().find(|(id, _)| *id == cand_id).map(|(_, e)| e);
 
         details.push(RoundDetail {
@@ -682,8 +748,12 @@ pub async fn run(
             return ExitCode::FAILURE;
         }
     };
-    let (nsed, details) = run_nsed_stage(&*agent, runs, rounds, &stage_bar("nsed ", runs)).await;
+    let (nsed, details, task_latencies) =
+        run_nsed_stage(&*agent, runs, rounds, &stage_bar("nsed ", runs)).await;
     eprintln!("{}", nsed.line("nsed"));
+    for line in task_latency_lines(&task_latencies) {
+        eprintln!("{line}");
+    }
     nsed.print_failures();
     if !details.is_empty() {
         eprintln!(
@@ -710,13 +780,16 @@ mod tests {
     #[test]
     fn stage_stats_math_and_line() {
         let mut s = StageStats::new(10);
-        s.ok = 9;
-        s.total_latency_ms = 9 * 400;
+        for _ in 0..9 {
+            s.ok += 1;
+            s.record(400);
+        }
         assert_eq!(s.avg_latency_ms(), 400);
         assert_eq!(s.error_rate_pct(), 10);
         let line = s.line("chat");
         assert!(line.contains("9/10 ok"));
         assert!(line.contains("avg 400ms"));
+        assert!(line.contains("median 400ms"));
         assert!(line.contains("errors 10%"));
     }
 
@@ -810,6 +883,28 @@ mod tests {
     #[test]
     fn report_lines_empty_when_no_failures() {
         assert!(StageStats::new(5).report_lines().is_empty());
+    }
+
+    #[test]
+    fn latency_distribution_separates_a_tail_from_a_slow_median() {
+        // Nine fast calls and one stall: the average lies about both.
+        let mut s = StageStats::new(10);
+        for ms in [100, 100, 100, 100, 100, 100, 100, 100, 100, 5000] {
+            s.ok += 1;
+            s.record(ms);
+        }
+        assert_eq!(s.pct_latency_ms(0.5), 100, "median ignores the stall");
+        assert_eq!(s.pct_latency_ms(0.95), 5000, "p95 catches it");
+        assert_eq!(s.pct_latency_ms(1.0), 5000);
+        assert_eq!(s.avg_latency_ms(), 590, "the average shows neither");
+    }
+
+    #[test]
+    fn latency_percentiles_are_zero_without_a_successful_sample() {
+        let s = StageStats::new(4);
+        assert_eq!(s.pct_latency_ms(0.5), 0);
+        assert_eq!(s.pct_latency_ms(1.0), 0);
+        assert!(s.line("chat").contains("median 0ms"));
     }
 
     #[test]
@@ -924,7 +1019,14 @@ mod tests {
             vec![],
             vec![],
         );
-        let (stats, details) = run_nsed_stage(&agent, 3, 2, &ProgressBar::hidden()).await;
+        let (stats, details, task_latencies) =
+            run_nsed_stage(&agent, 3, 2, &ProgressBar::hidden()).await;
+        // 3 deliberations x 2 rounds x (propose + evaluate).
+        assert_eq!(task_latencies.len(), 12);
+        let lines = task_latency_lines(&task_latencies);
+        assert_eq!(lines.len(), 2, "propose and evaluate reported separately");
+        assert!(lines[0].contains("propose: 6 ok"), "{:?}", lines);
+        assert!(lines[1].contains("evaluate: 6 ok"), "{:?}", lines);
         assert_eq!(stats.ok, 3, "simulated propose should succeed every run");
         assert_eq!(stats.error_rate_pct(), 0);
         assert_eq!(details.len(), 2);
