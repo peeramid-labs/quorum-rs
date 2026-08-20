@@ -155,6 +155,12 @@ pub struct ReadProposalInput {
     pub offset: Option<usize>,
     /// Max characters to return (default 5000).
     pub limit: Option<usize>,
+    /// First line of the final solution to return, 1-indexed. Set either bound
+    /// to get the solution back as numbered lines — use the anchors from the
+    /// candidate block's outline.
+    pub from_line: Option<usize>,
+    /// Last line to return, 1-indexed and inclusive.
+    pub to_line: Option<usize>,
 }
 
 /// Input for `nsed_read_critiques` — read evaluator feedback.
