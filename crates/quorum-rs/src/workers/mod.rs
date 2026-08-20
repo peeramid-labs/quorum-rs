@@ -2398,6 +2398,12 @@ impl NatsNsedWorker {
             status: hb_status,
             model_name: self.agent_config.model_name.clone(),
             provider_id: self.agent_config.provider_id.clone(),
+            pinned_endpoints: self
+                .agent_config
+                .openrouter
+                .as_ref()
+                .map(|o| o.only.clone())
+                .unwrap_or_default(),
             current_job: active_job.clone(),
             uptime_secs: uptime,
             timestamp: chrono::Utc::now().to_rfc3339(),

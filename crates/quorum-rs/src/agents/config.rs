@@ -317,6 +317,18 @@ pub struct AgentConfig {
     /// implementation and its security model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub builtin_tools: Vec<BuiltinToolGrant>,
+    /// Tools the PROVIDER executes, named exactly as that backend expects.
+    ///
+    /// Declared to the model as `builtin_function` rather than `function`, and
+    /// never dispatched locally: when the model calls one, its arguments are
+    /// echoed straight back as the tool result and the backend does the work
+    /// itself. Empty for every agent whose backend offers none.
+    ///
+    /// These usually cost a fee per call, and their results are billed as
+    /// prompt tokens on the FOLLOWING request — neither of which a per-token
+    /// estimate models.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_executed_tools: Vec<String>,
 
     /// Enable the `prompt_exposure` safety guardrail on this agent's LLM
     /// responses. When `true`, the agent scans every terminal tool-call
@@ -1029,6 +1041,7 @@ impl Default for AgentConfig {
             provider_config: HashMap::new(),
             openrouter: None,
             builtin_tools: Vec::new(),
+            provider_executed_tools: Vec::new(),
             prompt_exposure_guard: false,
             read_file_roots: Vec::new(),
             middleware: Default::default(),
