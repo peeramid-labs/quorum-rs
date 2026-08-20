@@ -2568,6 +2568,34 @@ where
 }
 
 /// content is re-merged with a fresh scratchpad injection.
+/// Delimits the user request inside a merged prompt, so the mutable
+/// scratchpad can sit after it and still be separable on a retry.
+const USER_REQUEST_OPEN: &str = "<user_request>";
+const USER_REQUEST_CLOSE: &str = "</user_request>";
+
+/// Recover the user request from a prompt this loop previously assembled.
+///
+/// The scratchpad is rewritten every iteration, so it is appended AFTER the
+/// request: everything a provider's prefix cache can reuse then precedes the
+/// first byte that changes. `merged` also carries the regenerated system
+/// message ahead of the request, which must not be re-merged into it.
+fn extract_user_request(raw: &str, merged: bool) -> String {
+    if let Some(start) = raw.find(USER_REQUEST_OPEN) {
+        let body = &raw[start + USER_REQUEST_OPEN.len()..];
+        if let Some(end) = body.find(USER_REQUEST_CLOSE) {
+            return body[..end].trim().to_string();
+        }
+    }
+    // Histories written before the request was delimited: the scratchpad led,
+    // so the request is whatever followed it.
+    if merged {
+        if let Some(end) = raw.find("</scratchpad>") {
+            return raw[end + "</scratchpad>".len()..].trim_start().to_string();
+        }
+    }
+    strip_scratchpad(raw)
+}
+
 fn strip_scratchpad(text: &str) -> String {
     if let Some(start) = text.find("<scratchpad>") {
         if let Some(end_tag) = text[start..].find("</scratchpad>") {
@@ -2854,21 +2882,7 @@ async fn react_loop(
                 None
             })
             .unwrap_or_default();
-        if agent_config.merge_system_prompt {
-            // When merge_system_prompt is active, the scratchpad sits between the system
-            // prompt and the user content. Extract only what follows </scratchpad>.
-            if let Some(end_idx) = raw.find("</scratchpad>") {
-                raw[end_idx + "</scratchpad>".len()..]
-                    .trim_start()
-                    .to_string()
-            } else {
-                // No scratchpad found — fresh start or first iteration. strip_scratchpad is
-                // a no-op anyway, but keeps the fallback safe.
-                strip_scratchpad(&raw)
-            }
-        } else {
-            strip_scratchpad(&raw)
-        }
+        extract_user_request(&raw, agent_config.merge_system_prompt)
     };
 
     let mut tool_schemas: Vec<ChatCompletionTool> = tools.iter().map(|t| t.schema()).collect();
@@ -3017,8 +3031,9 @@ async fn react_loop(
         // Update the message with system prompt content and scratchpad
         if agent_config.merge_system_prompt {
             if let Some(ChatCompletionRequestMessage::User(user_msg)) = messages.first_mut() {
-                let merged =
-                    format!("{system_message}\n\n{scratchpad_text}\n\n{original_user_content}");
+                let merged = format!(
+                    "{system_message}\n\n{USER_REQUEST_OPEN}\n{original_user_content}\n{USER_REQUEST_CLOSE}{scratchpad_text}"
+                );
                 user_msg.content =
                     async_openai::types::ChatCompletionRequestUserMessageContent::Text(merged);
             }
@@ -3029,7 +3044,9 @@ async fn react_loop(
             // Inject scratchpad into the first User message (which contains the prompt)
             for msg in messages.iter_mut() {
                 if let ChatCompletionRequestMessage::User(user_msg) = msg {
-                    let merged = format!("{scratchpad_text}\n\n{original_user_content}");
+                    let merged = format!(
+                        "{USER_REQUEST_OPEN}\n{original_user_content}\n{USER_REQUEST_CLOSE}{scratchpad_text}"
+                    );
                     user_msg.content =
                         async_openai::types::ChatCompletionRequestUserMessageContent::Text(merged);
                     break;
@@ -4147,6 +4164,43 @@ impl Drop for ToolCallGuard {
 
 #[cfg(test)]
 mod tests {
+    use crate::agents::nsed_agent::extract_user_request;
+
+    #[test]
+    fn user_request_is_recovered_from_a_prompt_with_a_trailing_scratchpad() {
+        let merged = "SYSTEM PROMPT v2\n\n<user_request>\nWhat is 2+2?\n</user_request>\n\n<scratchpad>\nnotes\n</scratchpad>";
+        assert_eq!(extract_user_request(merged, true), "What is 2+2?");
+        assert_eq!(extract_user_request(merged, false), "What is 2+2?");
+    }
+
+    #[test]
+    fn re_merging_does_not_accumulate_system_prompts_or_scratchpads() {
+        // One iteration's output is the next iteration's input; the loop must
+        // converge on the same request rather than nesting its own wrapper.
+        let first =
+            "SYS A\n\n<user_request>\nQ\n</user_request>\n\n<scratchpad>\nn1\n</scratchpad>";
+        let recovered = extract_user_request(first, true);
+        let second = format!(
+            "SYS B\n\n<user_request>\n{recovered}\n</user_request>\n\n<scratchpad>\nn2\n</scratchpad>"
+        );
+        assert_eq!(extract_user_request(&second, true), "Q");
+        assert_eq!(second.matches("<user_request>").count(), 1);
+        assert!(!second.contains("SYS A"));
+    }
+
+    #[test]
+    fn legacy_leading_scratchpad_prompts_still_parse() {
+        // Histories in flight when this ordering changed.
+        let legacy = "SYSTEM\n\n<scratchpad>\nnotes\n</scratchpad>\n\nWhat is 2+2?";
+        assert_eq!(extract_user_request(legacy, true), "What is 2+2?");
+    }
+
+    #[test]
+    fn an_undelimited_prompt_falls_back_to_stripping_the_scratchpad() {
+        let plain = "What is 2+2?";
+        assert_eq!(extract_user_request(plain, false), "What is 2+2?");
+    }
+
     use super::{ParseFailure, describe_parse_failure};
 
     /// The prompt can describe an axis at any length; this schema decides

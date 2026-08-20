@@ -1,3 +1,4 @@
+use super::apply_sampling_params;
 use super::{ChatStrategy, RequestOverrides};
 use crate::agents::config::AgentConfig;
 use crate::llms::RequestConfig;
@@ -148,7 +149,9 @@ impl ChatStrategy for XmlRegexStrategy {
         overrides: &RequestOverrides,
     ) -> Result<serde_json::Value, LlmError> {
         let max_tokens = overrides.max_tokens.unwrap_or(agent.max_tokens as u32);
-        let presence_penalty = request.presence_penalty.or(agent.presence_penalty);
+        let presence_penalty = (!agent.omit_sampling_params)
+            .then(|| request.presence_penalty.or(agent.presence_penalty))
+            .flatten();
 
         // Clone messages to modify them with XML instructions
         let mut messages = request.messages.clone();
@@ -209,11 +212,9 @@ impl ChatStrategy for XmlRegexStrategy {
         let mut body = json!({
             "model": agent.model_name,
             "messages": messages,
-            "temperature": agent.temperature,
-            "max_tokens": max_tokens,
-            "presence_penalty": presence_penalty,
             "stream": false,
         });
+        apply_sampling_params(&mut body, agent, max_tokens, presence_penalty);
 
         if let Some(regex) = &regex_pattern {
             body["guided_regex"] = json!(regex);

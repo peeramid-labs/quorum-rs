@@ -83,11 +83,12 @@ impl AiModel for SimpleOpenAIModel {
             "messages": request_config.messages,
         });
 
-        // Always send temperature — 0.0 is a valid explicit value (deterministic output)
-        body["temperature"] = serde_json::json!(agent.temperature);
-        if agent.max_tokens > 0 {
-            body["max_tokens"] = serde_json::json!(agent.max_tokens);
-        }
+        crate::llms::strategies::apply_sampling_params(
+            &mut body,
+            agent,
+            agent.max_tokens.max(0) as u32,
+            None,
+        );
         if let Some(tools) = &request_config.tools {
             if !tools.is_empty() {
                 body["tools"] = serde_json::json!(tools);

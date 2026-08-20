@@ -119,6 +119,13 @@ pub struct AgentConfig {
     pub model_name: String,
     #[serde(default)]
     pub temperature: f32,
+    /// Send no sampling parameters at all: `temperature`, `presence_penalty`
+    /// and `frequency_penalty` are omitted from the request. For backends that
+    /// fix these server-side and reject any value rather than clamping it —
+    /// `temperature: 0.0` is a real value, so there is otherwise no way to say
+    /// "unset". See docs/reference/sampling-params.md.
+    #[serde(default)]
+    pub omit_sampling_params: bool,
     #[serde(default)]
     pub max_tokens: i32,
     #[serde(default)]
@@ -980,6 +987,7 @@ impl Default for AgentConfig {
             provider_id: String::new(),
             model_name: String::new(),
             temperature: 0.0,
+            omit_sampling_params: false,
             max_tokens: 0,
             system_prompt_override: None,
             persona: None,

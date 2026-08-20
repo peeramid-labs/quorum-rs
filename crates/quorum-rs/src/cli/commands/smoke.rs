@@ -855,6 +855,8 @@ mod tests {
             engine: None,
             latency_ms: 0,
             models: std::collections::HashMap::new(),
+            concurrency: None,
+            qps: None,
         }
     }
 
