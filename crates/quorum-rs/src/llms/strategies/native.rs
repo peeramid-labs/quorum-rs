@@ -137,6 +137,25 @@ impl ChatStrategy for NativeStrategy {
 
         let mut v = serde_json::to_value(&request).map_err(|e| LlmError::Parse(e.into()))?;
 
+        // Provider-executed tools ride alongside our own in `tools`, with a
+        // type that tells the backend it runs them itself.
+        if !agent.provider_executed_tools.is_empty() {
+            let declared: Vec<serde_json::Value> = agent
+                .provider_executed_tools
+                .iter()
+                .map(|name| {
+                    serde_json::json!({
+                        "type": "builtin_function",
+                        "function": { "name": name },
+                    })
+                })
+                .collect();
+            match v.get_mut("tools").and_then(|t| t.as_array_mut()) {
+                Some(existing) => existing.extend(declared),
+                None => v["tools"] = serde_json::Value::Array(declared),
+            }
+        }
+
         normalise_sampling_values(&mut v);
 
         // Inject `response_format: {type: "json_object"}` when the agent has
@@ -1382,6 +1401,113 @@ mod tests {
             .unwrap();
 
         assert!(body.get("provider").is_none());
+    }
+
+    /// No account id, no stable pseudonym a provider could accumulate across
+    /// sessions, no app-attribution header. Adding one is a one-line change.
+    #[tokio::test]
+    async fn outbound_request_carries_no_operator_identifier() {
+        let strategy = NativeStrategy::default();
+        let agent = AgentConfig {
+            name: "Corepunk99".to_string(),
+            model_name: "some/model".to_string(),
+            max_tokens: 128,
+            ..Default::default()
+        };
+        let request_config = RequestConfig {
+            messages: vec![ChatCompletionRequestMessage::User(
+                ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Text("Hi".to_string()),
+                    name: None,
+                },
+            )],
+            tools: None,
+            tool_choice: None,
+            presence_penalty: None,
+            service_tier: None,
+        };
+        let body = strategy
+            .prepare_request(&agent, &request_config, &RequestOverrides::default())
+            .await
+            .unwrap();
+
+        for key in [
+            "user",
+            "user_id",
+            "safety_identifier",
+            "prompt_cache_key",
+            "metadata",
+            "session_id",
+            "end_user",
+            "safety_id",
+        ] {
+            assert!(
+                body.get(key).is_none(),
+                "`{key}` identifies the operator to the provider: {body}"
+            );
+        }
+    }
+
+    /// A provider-executed tool is declared with a type that tells the backend
+    /// it runs the tool itself, and sits alongside our own tools rather than
+    /// replacing them.
+    #[tokio::test]
+    async fn provider_executed_tools_are_declared_for_the_backend_to_run() {
+        let strategy = NativeStrategy::default();
+        let agent = AgentConfig {
+            model_name: "some/model".to_string(),
+            max_tokens: 128,
+            provider_executed_tools: vec!["$some_provider_tool".to_string()],
+            ..Default::default()
+        };
+        let request_config = RequestConfig {
+            messages: vec![ChatCompletionRequestMessage::User(
+                ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Text("Hi".to_string()),
+                    name: None,
+                },
+            )],
+            tools: None,
+            tool_choice: None,
+            presence_penalty: None,
+            service_tier: None,
+        };
+        let body = strategy
+            .prepare_request(&agent, &request_config, &RequestOverrides::default())
+            .await
+            .unwrap();
+
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "builtin_function");
+        assert_eq!(tools[0]["function"]["name"], "$some_provider_tool");
+    }
+
+    #[tokio::test]
+    async fn an_agent_with_no_provider_tools_declares_none() {
+        let strategy = NativeStrategy::default();
+        let agent = AgentConfig {
+            model_name: "some/model".to_string(),
+            max_tokens: 128,
+            ..Default::default()
+        };
+        let request_config = RequestConfig {
+            messages: vec![ChatCompletionRequestMessage::User(
+                ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Text("Hi".to_string()),
+                    name: None,
+                },
+            )],
+            tools: None,
+            tool_choice: None,
+            presence_penalty: None,
+            service_tier: None,
+        };
+        let body = strategy
+            .prepare_request(&agent, &request_config, &RequestOverrides::default())
+            .await
+            .unwrap();
+        assert!(body.get("tools").is_none(), "nothing to declare: {body}");
     }
 
     #[tokio::test]

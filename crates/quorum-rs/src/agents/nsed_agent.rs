@@ -836,6 +836,10 @@ pub struct AgentResponse {
     /// Provider-reported cost and cache figures, summed over every LLM call
     /// the ReAct loop made to produce this response.
     pub provider_usage: crate::llms::ProviderUsage,
+    /// Which backend actually served the last call of this response, when the
+    /// provider reports one. Recorded so a completed deliberation can answer
+    /// where it ran, rather than only which endpoints it was allowed to use.
+    pub served_by: Option<String>,
 }
 
 /// Emit a [`DeliberationContextAssembled`](crate::telemetry::DeliberationContextAssembled)
@@ -1341,6 +1345,7 @@ impl NsedAgent for ProposerEvaluatorAgent {
                 .finish_reason
                 .as_deref()
                 .map(normalize_finish_reason),
+            served_by: agent_response.served_by.clone(),
             ..Default::default()
         })
     }
@@ -2756,6 +2761,9 @@ async fn react_loop(
     let mut total_input_tokens = 0;
     let mut total_output_tokens = 0;
     let mut total_provider_usage = crate::llms::ProviderUsage::default();
+    // Last backend to answer wins: a retry may land elsewhere, and where the
+    // returned content came from is the one worth recording.
+    let mut served_by: Option<String> = None;
     let mut scratchpad_content = if let Some(store) = &context.store {
         if let Ok(Some(content)) = store.get(&agent_config.name).await {
             info!(agent=%agent_config.name, "Loaded persistent scratchpad from Sovereign Store.");
@@ -3304,6 +3312,7 @@ async fn react_loop(
         };
 
         total_provider_usage.accumulate(&result.provider_usage);
+        served_by = result.provider_backend.clone().or(served_by);
 
         // Complete LLM request span with telemetry
         let cost_usd = {
@@ -3561,6 +3570,7 @@ async fn react_loop(
                         input_tokens: Some(total_input_tokens),
                         output_tokens: Some(total_output_tokens),
                         provider_usage: total_provider_usage,
+                        served_by,
                         system_prompt: last_system_message.clone(),
                         request_body: last_request_body.clone(),
                         history: messages.clone(),
@@ -3793,6 +3803,20 @@ async fn react_loop(
                             }
                         )
                     }
+                } else if agent_config
+                    .provider_executed_tools
+                    .iter()
+                    .any(|t| t == tool_name)
+                {
+                    // The backend runs this one. Its contract is that we hand
+                    // the arguments straight back: the result the model reads
+                    // is produced provider-side, not here.
+                    debug!(
+                        agent = %agent_config.name,
+                        tool = %tool_name,
+                        "Provider-executed tool — echoing arguments back for the backend to run"
+                    );
+                    tool_call.function.arguments.clone()
                 } else if let Some(tool) = tool_map.get(tool_name) {
                     let arg_str = &tool_call.function.arguments;
                     let args_result = if arg_str.trim().is_empty() {
@@ -3923,6 +3947,7 @@ async fn react_loop(
                 input_tokens: Some(total_input_tokens),
                 output_tokens: Some(total_output_tokens),
                 provider_usage: total_provider_usage,
+                served_by,
                 system_prompt: last_system_message,
                 request_body: last_request_body,
                 history: messages.clone(),
@@ -3972,6 +3997,7 @@ async fn react_loop(
         input_tokens: Some(total_input_tokens),
         output_tokens: Some(total_output_tokens),
         provider_usage: total_provider_usage,
+        served_by,
         system_prompt: last_system_message,
         request_body: last_request_body,
         history: messages.clone(),

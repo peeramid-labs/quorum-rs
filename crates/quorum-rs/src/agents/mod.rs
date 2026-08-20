@@ -325,6 +325,12 @@ pub struct Proposal {
     ///     distinguish partial fallbacks from full completions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+    /// Backend that actually served this proposal, when the provider names
+    /// one. Persisted with the round so a finished deliberation can answer
+    /// where each part of it ran — an allowlist states intent, this states
+    /// what happened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_by: Option<String>,
     /// Wall-clock instant the agent published this proposal, in
     /// milliseconds since the Unix epoch. Populated by the agent worker
     /// at publish time so the orchestrator can compute propagation
@@ -1097,6 +1103,14 @@ pub struct AgentHeartbeat {
     /// `health.state == Down`.
     #[serde(default)]
     pub health: AgentHealth,
+    /// Endpoints this agent restricts itself to, if any. Empty means the
+    /// request may be served by whichever endpoint the provider selects.
+    ///
+    /// Reported so a reader can tell where an agent's traffic goes without
+    /// holding a copy of its configuration — the agent is the only party that
+    /// knows what it pinned.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_endpoints: Vec<String>,
     /// Job ID if currently processing, else None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_job: Option<String>,
@@ -1244,6 +1258,43 @@ pub fn calculate_qv_score(raw_weight: f32, total_weight: f32) -> (f32, f32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_proposal_records_which_backend_served_it() {
+        // An allowlist states where a request was permitted to go; this
+        // states where it went. Persisted with the round so the answer
+        // survives the deliberation.
+        let p = Proposal {
+            content: "answer".into(),
+            served_by: Some("some-host/some-region".into()),
+            ..Default::default()
+        };
+        let back: Proposal = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back.served_by.as_deref(), Some("some-host/some-region"));
+
+        // Providers that name no backend leave it absent rather than empty,
+        // and proposals written before the field still deserialize.
+        let bare = serde_json::to_value(Proposal::default()).unwrap();
+        assert!(bare.get("served_by").is_none());
+        let back: Proposal = serde_json::from_value(bare).unwrap();
+        assert!(back.served_by.is_none());
+    }
+
+    #[test]
+    fn pinned_endpoints_survive_the_wire_and_stay_absent_when_empty() {
+        let json = serde_json::to_string(&AgentHeartbeat {
+            pinned_endpoints: vec!["some-host/some-region".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        let back: AgentHeartbeat = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pinned_endpoints, vec!["some-host/some-region"]);
+
+        let bare = serde_json::to_value(AgentHeartbeat::default()).unwrap();
+        assert!(bare.get("pinned_endpoints").is_none());
+        let back: AgentHeartbeat = serde_json::from_value(bare).unwrap();
+        assert!(back.pinned_endpoints.is_empty());
+    }
+
     #[test]
     fn an_evaluation_without_conciseness_loads_neutral() {
         let old = r#"{"correctness": 50.0, "completeness": 10.0, "novelty": 0.0,
@@ -2889,6 +2940,7 @@ mod tests {
             status: AgentLiveStatus::Busy,
             model_name: "gpt-4".to_string(),
             provider_id: "openai".to_string(),
+            pinned_endpoints: Vec::new(),
             current_job: Some("job-42".to_string()),
             uptime_secs: 3600,
             timestamp: "2025-01-01T00:00:00Z".to_string(),
