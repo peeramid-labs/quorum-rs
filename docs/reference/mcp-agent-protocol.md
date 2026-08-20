@@ -146,7 +146,8 @@ submission (no `content` and no envelope fields) is rejected so the agent retrie
         "completeness": 70.0,
         "novelty": 60.0,
         "feasibility": 90.0,
-        "evidence_quality": 75.0
+        "evidence_quality": 75.0,
+        "conciseness": 40.0
       }
     }
   ]
@@ -163,7 +164,7 @@ The structured evaluation fields align with the NSED Vector Alignment protocol u
 | `is_final_solution` | Whether this proposal is viable as a final answer |
 | `claim_assessments` | Assessment of key claims with verdicts (verified/contested/unverified/wrong). Each `cite` must be an exact verbatim quote from the proposal — matched against the final solution and the shown thought-process window — or the evaluation is rejected for re-quoting. |
 | `disagreements` | Specific disagreement points with counter-positions |
-| `category_scores` | Per-category quality scores on a 0–100 scale |
+| `category_scores` | Per-category signed quality scores, −100 to +100. Negative undermines the proposal, positive supports it |
 
 #### `nsed_read_proposal`
 
