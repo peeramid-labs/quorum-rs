@@ -143,11 +143,15 @@ impl ChatStrategy for NativeStrategy {
             let declared: Vec<serde_json::Value> = agent
                 .provider_executed_tools
                 .iter()
-                .map(|name| {
-                    serde_json::json!({
+                .map(|name| match name.strip_prefix('$') {
+                    // A `$`-prefixed name is a backend that wraps its own tools
+                    // in a function envelope; a bare name is one that takes the
+                    // tool as a type on its own.
+                    Some(_) => serde_json::json!({
                         "type": "builtin_function",
                         "function": { "name": name },
-                    })
+                    }),
+                    None => serde_json::json!({ "type": name }),
                 })
                 .collect();
             match v.get_mut("tools").and_then(|t| t.as_array_mut()) {
@@ -563,6 +567,39 @@ impl ChatStrategy for NativeStrategy {
 
 #[cfg(test)]
 mod tests {
+
+    /// Two backends spell a provider-run tool differently: one wraps it in a
+    /// function envelope, the other takes the tool as a type on its own.
+    /// Sending the wrong shape is rejected by the router before the model sees
+    /// it, so the name decides the shape.
+    #[test]
+    fn a_dollar_prefixed_tool_is_wrapped_and_a_bare_one_is_not() {
+        use crate::agents::config::AgentConfig;
+        let agent = AgentConfig {
+            provider_executed_tools: vec!["$web_search".into(), "web_search".into()],
+            ..Default::default()
+        };
+        let declared: Vec<serde_json::Value> = agent
+            .provider_executed_tools
+            .iter()
+            .map(|name| match name.strip_prefix('$') {
+                Some(_) => serde_json::json!({
+                    "type": "builtin_function",
+                    "function": { "name": name },
+                }),
+                None => serde_json::json!({ "type": name }),
+            })
+            .collect();
+
+        assert_eq!(declared[0]["type"], "builtin_function");
+        assert_eq!(declared[0]["function"]["name"], "$web_search");
+        assert_eq!(declared[1]["type"], "web_search");
+        assert!(
+            declared[1].get("function").is_none(),
+            "a bare tool takes no function envelope: {}",
+            declared[1]
+        );
+    }
 
     #[test]
     fn sampling_values_are_rounded_at_the_json_boundary() {

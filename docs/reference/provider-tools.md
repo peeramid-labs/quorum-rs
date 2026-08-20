@@ -20,6 +20,17 @@ and mixing the two breaks the loop.
 Names are whatever that backend expects, verbatim. The list is empty for every
 agent whose backend offers none, which is most of them.
 
+The name also decides the shape sent on the wire, because backends disagree
+about it:
+
+| Name | Sent as | Used by |
+| --- | --- | --- |
+| `$web_search` | `{"type": "builtin_function", "function": {"name": "$web_search"}}` | a backend that wraps its own tools in a function envelope |
+| `web_search` | `{"type": "web_search"}` | a router that takes the tool as a type on its own |
+
+Sending the wrong shape is rejected before the model sees it, so a name that
+does not match its backend fails the whole call rather than degrading.
+
 ## What happens on a call
 
 1. The tool is declared alongside ours in `tools`, but with
