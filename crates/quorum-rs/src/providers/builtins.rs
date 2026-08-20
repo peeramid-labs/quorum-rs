@@ -4,6 +4,7 @@
 //! [`crate::serve::build_worker`] dispatch verbatim, including its
 //! "missing config section → skip cleanly (`Ok(None)`)" behaviour.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -168,6 +169,15 @@ impl ProviderFactory for ClaudeFactory {
 pub struct OpenAiCompatibleFactory {
     provider_type: String,
     requires_api_key: bool,
+    /// Throttles keyed by endpoint, so every agent pointed at one provider
+    /// shares its budget. Provider limits are per account, not per agent.
+    throttles: std::sync::Mutex<HashMap<String, Throttle>>,
+}
+
+#[derive(Clone, Default)]
+struct Throttle {
+    semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    rate_limiter: Option<Arc<crate::llms::RateLimiter>>,
 }
 
 impl OpenAiCompatibleFactory {
@@ -175,7 +185,35 @@ impl OpenAiCompatibleFactory {
         Self {
             provider_type: provider_type.into(),
             requires_api_key,
+            throttles: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The throttle for `base_url`, created on first use. A poisoned lock
+    /// falls back to an unthrottled build: losing a rate limit is worse than
+    /// nothing, but not worse than refusing to start the fleet.
+    fn throttle_for(&self, base_url: &str, provider: &ProviderEntry) -> Throttle {
+        let Ok(mut map) = self.throttles.lock() else {
+            warn!(
+                base_url,
+                "throttle registry poisoned — building unthrottled"
+            );
+            return Throttle::default();
+        };
+        // Keyed on the endpoint, not on how it was spelled: the budget belongs
+        // to the host, so a trailing slash must not open a second one.
+        map.entry(base_url.trim_end_matches('/').to_string())
+            .or_insert_with(|| Throttle {
+                semaphore: provider
+                    .concurrency
+                    .filter(|c| *c > 0)
+                    .map(|c| Arc::new(tokio::sync::Semaphore::new(c))),
+                rate_limiter: provider
+                    .qps
+                    .filter(|q| *q > 0.0)
+                    .map(|q| Arc::new(crate::llms::RateLimiter::new(q))),
+            })
+            .clone()
     }
 }
 
@@ -205,8 +243,15 @@ impl ProviderFactory for OpenAiCompatibleFactory {
             }
         };
 
-        let llm =
+        let throttle = self.throttle_for(&base_url, provider);
+        let mut llm =
             OpenAICompatibleModel::new(base_url, provider.api_key.clone(), provider.engine.clone());
+        if let Some(sem) = throttle.semaphore {
+            llm = llm.with_semaphore(sem);
+        }
+        if let Some(limiter) = throttle.rate_limiter {
+            llm = llm.with_rate_limiter(limiter);
+        }
 
         let builtin_tools = match instantiate_builtin_tools(agent_config) {
             Ok(tools) => tools,
@@ -239,6 +284,103 @@ impl ProviderFactory for OpenAiCompatibleFactory {
 
 #[cfg(test)]
 mod tests {
+    /// The rate limit belongs to the endpoint, so two spellings of the same
+    /// endpoint must not each get their own budget — a stray trailing slash in
+    /// one config entry would otherwise double the traffic we send that host.
+    #[test]
+    fn a_trailing_slash_does_not_buy_a_second_rate_budget() {
+        let factory = OpenAiCompatibleFactory::new("openai", true);
+        let bare = ProviderEntry {
+            provider_type: "openai".into(),
+            base_url: "https://example.test/v1".into(),
+            api_key: "k".into(),
+            concurrency: Some(3),
+            ..Default::default()
+        };
+        let slashed = ProviderEntry {
+            base_url: "https://example.test/v1/".into(),
+            ..bare.clone()
+        };
+        let a = factory.throttle_for(&bare.base_url, &bare);
+        let b = factory.throttle_for(&slashed.base_url, &slashed);
+        let (Some(sa), Some(sb)) = (a.semaphore, b.semaphore) else {
+            panic!("a configured concurrency must produce a semaphore");
+        };
+        assert!(
+            Arc::ptr_eq(&sa, &sb),
+            "the same endpoint spelled two ways got two separate budgets"
+        );
+    }
+
+    #[test]
+    fn agents_on_one_endpoint_share_a_throttle() {
+        let factory = OpenAiCompatibleFactory::new("openai", true);
+        let provider = ProviderEntry {
+            provider_type: "openai".into(),
+            base_url: "https://example.test/v1".into(),
+            api_key: "k".into(),
+            concurrency: Some(3),
+            qps: Some(5.0),
+            ..Default::default()
+        };
+        let a = factory.throttle_for(&provider.base_url, &provider);
+        let b = factory.throttle_for(&provider.base_url, &provider);
+        let (Some(sa), Some(sb)) = (a.semaphore, b.semaphore) else {
+            panic!("a configured concurrency must produce a semaphore");
+        };
+        assert!(
+            Arc::ptr_eq(&sa, &sb),
+            "one endpoint, one budget — the limit is per account, not per agent"
+        );
+        assert_eq!(sa.available_permits(), 3);
+    }
+
+    #[test]
+    fn separate_endpoints_do_not_share_a_budget() {
+        let factory = OpenAiCompatibleFactory::new("openai", true);
+        let mut one = ProviderEntry {
+            provider_type: "openai".into(),
+            base_url: "https://one.test/v1".into(),
+            concurrency: Some(2),
+            ..Default::default()
+        };
+        let first = factory.throttle_for(&one.base_url, &one).semaphore.unwrap();
+        one.base_url = "https://two.test/v1".into();
+        let second = factory.throttle_for(&one.base_url, &one).semaphore.unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn an_unconfigured_endpoint_stays_unthrottled() {
+        let factory = OpenAiCompatibleFactory::new("openai", true);
+        let provider = ProviderEntry {
+            provider_type: "openai".into(),
+            base_url: "https://none.test/v1".into(),
+            ..Default::default()
+        };
+        let t = factory.throttle_for(&provider.base_url, &provider);
+        assert!(t.semaphore.is_none());
+        assert!(t.rate_limiter.is_none());
+    }
+
+    #[test]
+    fn a_zero_limit_is_treated_as_unset_not_as_a_total_block() {
+        let factory = OpenAiCompatibleFactory::new("openai", true);
+        let provider = ProviderEntry {
+            provider_type: "openai".into(),
+            base_url: "https://zero.test/v1".into(),
+            concurrency: Some(0),
+            qps: Some(0.0),
+            ..Default::default()
+        };
+        let t = factory.throttle_for(&provider.base_url, &provider);
+        assert!(
+            t.semaphore.is_none(),
+            "a 0-permit semaphore would deadlock every request"
+        );
+        assert!(t.rate_limiter.is_none());
+    }
+
     use super::*;
 
     #[test]

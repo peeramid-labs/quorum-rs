@@ -34,6 +34,24 @@ pub struct OpenAICompatibleModel {
     engine: Option<String>,
 }
 
+/// Join a configured `base_url` with a strategy's endpoint suffix.
+///
+/// A base that already names an API version is used as-is; one that does not
+/// gets `/v1`, which is the near-universal default. Assuming `/v1`
+/// unconditionally silently breaks every endpoint versioned differently — the
+/// request lands on `/v4/v1/...` and 404s.
+fn chat_endpoint(base_url: &str, suffix: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let ends_with_version = base.rsplit('/').next().is_some_and(|seg| {
+        seg.len() > 1 && seg.starts_with('v') && seg[1..].chars().all(|c| c.is_ascii_digit())
+    });
+    if ends_with_version {
+        format!("{base}{suffix}")
+    } else {
+        format!("{base}/v1{suffix}")
+    }
+}
+
 impl OpenAICompatibleModel {
     pub fn new(base_url: String, api_key: String, engine: Option<String>) -> Self {
         info!(
@@ -123,9 +141,7 @@ impl AiModel for OpenAICompatibleModel {
         // Resolve Strategy
         let strategy = StrategyResolver::resolve(self.engine.as_deref());
 
-        let base = self.base_url.trim_end_matches('/');
-        let clean_base = base.strip_suffix("/v1").unwrap_or(base);
-        let endpoint = format!("{}/v1{}", clean_base, strategy.endpoint_suffix());
+        let endpoint = chat_endpoint(&self.base_url, strategy.endpoint_suffix());
 
         let mut attempts = 0;
         let loop_start = std::time::Instant::now();
@@ -668,6 +684,31 @@ fn parse_vllm_context_error(body: &str) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn endpoint_keeps_a_base_that_already_names_its_version() {
+        assert_eq!(
+            chat_endpoint("https://api.example.test/api/paas/v4", "/chat/completions"),
+            "https://api.example.test/api/paas/v4/chat/completions"
+        );
+        assert_eq!(
+            chat_endpoint("https://api.example.test/api/v1/", "/chat/completions"),
+            "https://api.example.test/api/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn endpoint_defaults_to_v1_when_the_base_names_no_version() {
+        assert_eq!(
+            chat_endpoint("https://api.example.test", "/chat/completions"),
+            "https://api.example.test/v1/chat/completions"
+        );
+        // `paas` is not a version segment, so it must not be mistaken for one.
+        assert_eq!(
+            chat_endpoint("https://api.example.test/paas", "/completions"),
+            "https://api.example.test/paas/v1/completions"
+        );
+    }
+
     use super::*;
 
     #[test]

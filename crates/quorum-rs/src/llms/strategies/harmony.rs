@@ -1,3 +1,4 @@
+use super::apply_sampling_params;
 use super::{ChatStrategy, RequestOverrides};
 use crate::agents::config::AgentConfig;
 use crate::llms::RequestConfig;
@@ -214,17 +215,18 @@ impl ChatStrategy for HarmonyStrategy {
 
         // 5. Build Request Body for /v1/completions
         let max_tokens = overrides.max_tokens.unwrap_or(agent.max_tokens as u32);
-        let presence_penalty = request.presence_penalty.or(agent.presence_penalty);
+        let presence_penalty = (!agent.omit_sampling_params)
+            .then(|| request.presence_penalty.or(agent.presence_penalty))
+            .flatten();
 
-        let body = json!({
+        let mut body = json!({
             "model": agent.model_name,
             "prompt": tokens,
-            "max_tokens": max_tokens,
-            "temperature": agent.temperature,
             "stream": false,
             "skip_special_tokens": false,
-            "presence_penalty": presence_penalty,
         });
+        apply_sampling_params(&mut body, agent, max_tokens, presence_penalty);
+        let body = body;
 
         debug!(
             "HarmonyStrategy: Prepared request with {} tokens",

@@ -6,6 +6,31 @@ use async_openai::types::{CreateChatCompletionRequest, CreateChatCompletionRespo
 use async_trait::async_trait;
 use tracing::{debug, warn};
 
+/// Rewrite the sampling values at the JSON boundary: f32s serialise as their
+/// binary approximation, and a non-finite one serialises as `null`.
+fn normalise_sampling_values(v: &mut serde_json::Value) {
+    for key in ["temperature", "presence_penalty", "frequency_penalty"] {
+        let rounded = match v.get(key) {
+            None => continue,
+            // A non-finite f32 is already `null` by the time the typed request
+            // reaches JSON, so only the key remains. Sending it asks the
+            // backend to parse a parameter nobody set.
+            Some(serde_json::Value::Null) => None,
+            Some(other) => other
+                .as_f64()
+                .and_then(|n| super::round_sampling_value(n as f32)),
+        };
+        match rounded {
+            Some(n) => v[key] = serde_json::json!(n),
+            None => {
+                if let Some(o) = v.as_object_mut() {
+                    o.remove(key);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct NativeStrategy {
     engine: Option<String>,
@@ -81,7 +106,9 @@ impl ChatStrategy for NativeStrategy {
         overrides: &RequestOverrides,
     ) -> Result<serde_json::Value, LlmError> {
         let max_tokens = overrides.max_tokens.unwrap_or(agent.max_tokens as u32);
-        let presence_penalty = request_config.presence_penalty.or(agent.presence_penalty);
+        let presence_penalty = (!agent.omit_sampling_params)
+            .then(|| request_config.presence_penalty.or(agent.presence_penalty))
+            .flatten();
 
         // Last-line-of-defense history hygiene: ensure every assistant
         // `tool_calls` id has a matching `role: "tool"` follow-up.
@@ -94,9 +121,12 @@ impl ChatStrategy for NativeStrategy {
         #[allow(deprecated)]
         let request = CreateChatCompletionRequest {
             model: agent.model_name.clone(),
-            temperature: Some(agent.temperature),
-            max_tokens: Some(max_tokens),
-            frequency_penalty: agent.frequency_penalty,
+            temperature: (!agent.omit_sampling_params).then_some(agent.temperature),
+            // 0 is not "unlimited" to every backend — some reject it outright.
+            max_tokens: (max_tokens > 0).then_some(max_tokens),
+            frequency_penalty: (!agent.omit_sampling_params)
+                .then_some(agent.frequency_penalty)
+                .flatten(),
             presence_penalty,
             messages,
             tools: request_config.tools.clone(),
@@ -106,6 +136,8 @@ impl ChatStrategy for NativeStrategy {
         };
 
         let mut v = serde_json::to_value(&request).map_err(|e| LlmError::Parse(e.into()))?;
+
+        normalise_sampling_values(&mut v);
 
         // Inject `response_format: {type: "json_object"}` when the agent has
         // `json_mode: true` AND the request carries no tools, constraining the
@@ -512,6 +544,37 @@ impl ChatStrategy for NativeStrategy {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn sampling_values_are_rounded_at_the_json_boundary() {
+        let mut v = serde_json::json!({
+            "temperature": 0.699_999_988_079_071_f64,
+            "presence_penalty": 1.5,
+            "model": "m",
+        });
+        super::normalise_sampling_values(&mut v);
+        assert_eq!(v["temperature"].to_string(), "0.7");
+        assert_eq!(v["presence_penalty"].to_string(), "1.5");
+        assert_eq!(v["model"], "m", "non-sampling keys are untouched");
+    }
+
+    #[test]
+    fn a_non_finite_sampling_value_is_dropped_not_sent_as_null() {
+        let mut v = serde_json::json!({ "model": "m" });
+        v["temperature"] = serde_json::json!(f64::NAN);
+        super::normalise_sampling_values(&mut v);
+        assert!(
+            v.get("temperature").is_none(),
+            "a knob nobody set must not be sent: {v}"
+        );
+    }
+
+    #[test]
+    fn an_absent_sampling_key_is_not_invented() {
+        let mut v = serde_json::json!({ "model": "m" });
+        super::normalise_sampling_values(&mut v);
+        assert!(v.get("frequency_penalty").is_none());
+    }
     use super::*;
     use async_openai::types::{
         ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,

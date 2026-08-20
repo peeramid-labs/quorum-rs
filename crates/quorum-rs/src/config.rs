@@ -66,7 +66,7 @@ pub struct ModelDef {
 }
 
 /// Minimal provider config — just enough to extract base_url, api_key, engine.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct ProviderEntry {
     /// Provider type: "openai" (default), "ollama", or "simulated"
     #[serde(rename = "type", default = "default_provider_type")]
@@ -77,6 +77,14 @@ pub struct ProviderEntry {
     pub api_key: String,
     #[serde(default)]
     pub engine: Option<String>,
+    /// Max in-flight requests to this endpoint, shared by every agent using
+    /// it. `None` leaves the endpoint unthrottled.
+    #[serde(default)]
+    pub concurrency: Option<usize>,
+    /// Max requests per second to this endpoint, shared by every agent using
+    /// it. `None` leaves the rate unthrottled.
+    #[serde(default)]
+    pub qps: Option<f64>,
     /// Simulated provider: artificial latency per response (milliseconds)
     #[serde(default)]
     pub latency_ms: u64,
@@ -93,13 +101,15 @@ fn default_provider_type() -> String {
 /// Overlay variant of [`ProviderEntry`] where every field is optional.
 /// Used during config merge so a single-field overlay (e.g. just `api_key`)
 /// does not wipe inherited fields.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct ProviderOverlay {
     #[serde(rename = "type")]
     provider_type: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
     engine: Option<String>,
+    concurrency: Option<usize>,
+    qps: Option<f64>,
     latency_ms: Option<u64>,
     models: Option<HashMap<String, ModelDef>>,
 }
@@ -111,6 +121,8 @@ impl From<ProviderOverlay> for ProviderEntry {
             base_url: o.base_url.unwrap_or_default(),
             api_key: o.api_key.unwrap_or_default(),
             engine: o.engine,
+            concurrency: o.concurrency,
+            qps: o.qps,
             latency_ms: o.latency_ms.unwrap_or(0),
             models: o.models.unwrap_or_default(),
         }
@@ -131,6 +143,12 @@ fn merge_provider(base: &mut ProviderEntry, overlay: &ProviderOverlay) {
     }
     if let Some(ref eng) = overlay.engine {
         base.engine = Some(eng.clone());
+    }
+    if let Some(c) = overlay.concurrency {
+        base.concurrency = Some(c);
+    }
+    if let Some(q) = overlay.qps {
+        base.qps = Some(q);
     }
     if let Some(ms) = overlay.latency_ms {
         base.latency_ms = ms;
@@ -669,6 +687,37 @@ pub fn derive_orch_id(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_overlay_sets_the_endpoint_rate_limits_and_leaves_the_rest() {
+        let mut base = ProviderEntry {
+            base_url: "https://example.test/v1".into(),
+            ..Default::default()
+        };
+        merge_provider(
+            &mut base,
+            &ProviderOverlay {
+                concurrency: Some(4),
+                qps: Some(2.5),
+                ..Default::default()
+            },
+        );
+        assert_eq!(base.concurrency, Some(4));
+        assert_eq!(base.qps, Some(2.5));
+        assert_eq!(base.base_url, "https://example.test/v1");
+    }
+
+    #[test]
+    fn an_overlay_that_names_no_rate_limit_does_not_clear_one() {
+        let mut base = ProviderEntry {
+            concurrency: Some(8),
+            qps: Some(5.0),
+            ..Default::default()
+        };
+        merge_provider(&mut base, &ProviderOverlay::default());
+        assert_eq!(base.concurrency, Some(8));
+        assert_eq!(base.qps, Some(5.0));
+    }
     use super::*;
     use serial_test::serial;
 
@@ -1085,6 +1134,8 @@ agents:
             engine: None,
             latency_ms: 0,
             models: HashMap::new(),
+            concurrency: None,
+            qps: None,
         }
     }
 
@@ -1163,6 +1214,8 @@ agents:
                     engine: None,
                     latency_ms: 0,
                     models: HashMap::new(),
+                    concurrency: None,
+                    qps: None,
                 },
             )]),
             agents: vec![AgentConfig {
@@ -1199,6 +1252,8 @@ agents:
                     engine: None,
                     latency_ms: 0,
                     models: HashMap::new(),
+                    concurrency: None,
+                    qps: None,
                 },
             )]),
             agents: vec![AgentConfig {
@@ -1436,6 +1491,8 @@ agents:
                     engine: None,
                     latency_ms: 0,
                     models: HashMap::new(),
+                    concurrency: None,
+                    qps: None,
                 },
             )]),
             agents: vec![AgentConfig {
@@ -1581,6 +1638,8 @@ base_url: "http://localhost"
                             ..Default::default()
                         },
                     )]),
+                    concurrency: None,
+                    qps: None,
                 },
             )]),
             agents: vec![AgentConfig {
@@ -1636,6 +1695,8 @@ base_url: "http://localhost"
                     engine: None,
                     latency_ms: 0,
                     models: HashMap::from([("full".to_string(), model_def)]),
+                    concurrency: None,
+                    qps: None,
                 },
             )]),
             agents: vec![AgentConfig {
@@ -1692,6 +1753,8 @@ base_url: "http://localhost"
                             ..Default::default()
                         },
                     )]),
+                    concurrency: None,
+                    qps: None,
                 },
             )]),
             agents: vec![AgentConfig {
@@ -1798,6 +1861,8 @@ base_url: "http://localhost"
                             ..Default::default()
                         },
                     )]),
+                    concurrency: None,
+                    qps: None,
                 },
             )]),
             agents: vec![AgentConfig {
