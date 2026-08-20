@@ -57,7 +57,8 @@ pub struct EvaluationItem {
     /// Points of disagreement with the proposal.
     #[serde(default)]
     pub disagreements: Vec<McpDisagreementPoint>,
-    /// Per-category quality scores (correctness, completeness, novelty, feasibility, evidence_quality).
+    /// Per-category quality scores (correctness, completeness, novelty,
+    /// feasibility, evidence_quality, conciseness).
     #[serde(default)]
     pub category_scores: Option<McpCategoryScores>,
 }
@@ -119,7 +120,8 @@ fn default_confidence() -> String {
     "medium".to_string()
 }
 
-/// Per-category quality scores (0-100 scale).
+/// Per-category signed quality scores, -100 to +100. Negative means the
+/// dimension actively undermines the proposal; positive means it supports it.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct McpCategoryScores {
     /// Correctness of reasoning and conclusions.
@@ -137,6 +139,10 @@ pub struct McpCategoryScores {
     /// Quality of supporting evidence.
     #[serde(default)]
     pub evidence_quality: f32,
+    /// Clarity per token, judged against the other candidates this round.
+    /// Omit rather than sending 0 — 0 is a neutral verdict, absent is unscored.
+    #[serde(default)]
+    pub conciseness: Option<f32>,
 }
 
 /// Input for `nsed_read_proposal` — read a past proposal.
@@ -261,12 +267,13 @@ pub struct McpDisagreementResult {
 impl Serialize for McpCategoryScores {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("McpCategoryScores", 5)?;
+        let mut s = serializer.serialize_struct("McpCategoryScores", 6)?;
         s.serialize_field("correctness", &self.correctness)?;
         s.serialize_field("completeness", &self.completeness)?;
         s.serialize_field("novelty", &self.novelty)?;
         s.serialize_field("feasibility", &self.feasibility)?;
         s.serialize_field("evidence_quality", &self.evidence_quality)?;
+        s.serialize_field("conciseness", &self.conciseness)?;
         s.end()
     }
 }
@@ -277,6 +284,54 @@ impl Serialize for McpCategoryScores {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hand-written serializer declares its own field count; nothing type-checks it.
+    #[test]
+    fn every_category_the_struct_carries_is_written_out() {
+        let scores = McpCategoryScores {
+            correctness: 10.0,
+            completeness: 20.0,
+            novelty: 30.0,
+            feasibility: 40.0,
+            evidence_quality: 50.0,
+            conciseness: Some(-60.0),
+        };
+        let wire = serde_json::to_value(&scores).expect("category scores serialise");
+        let written = wire.as_object().expect("an object");
+        for axis in [
+            "correctness",
+            "completeness",
+            "novelty",
+            "feasibility",
+            "evidence_quality",
+            "conciseness",
+        ] {
+            assert!(written.contains_key(axis), "{axis} was not written out");
+        }
+        assert_eq!(
+            written.len(),
+            6,
+            "declared count and written fields drifted"
+        );
+        assert_eq!(wire["conciseness"], -60.0);
+    }
+
+    #[test]
+    fn an_unscored_conciseness_is_written_as_absent_not_as_zero() {
+        let scores = McpCategoryScores {
+            correctness: 0.0,
+            completeness: 0.0,
+            novelty: 0.0,
+            feasibility: 0.0,
+            evidence_quality: 0.0,
+            conciseness: None,
+        };
+        let wire = serde_json::to_value(&scores).expect("category scores serialise");
+        assert!(
+            wire["conciseness"].is_null(),
+            "unscored read back as neutral: {wire}"
+        );
+    }
 
     #[test]
     fn claim_assessment_accepts_cite_quote_and_legacy_names() {

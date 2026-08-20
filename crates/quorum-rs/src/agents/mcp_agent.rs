@@ -113,6 +113,7 @@ fn mcp_eval_to_evaluation(e: McpEvaluationResult) -> Evaluation {
         novelty: cs.novelty,
         feasibility: cs.feasibility,
         evidence_quality: cs.evidence_quality,
+        conciseness: cs.conciseness,
     });
 
     Evaluation {
@@ -3595,6 +3596,55 @@ mod tests {
     use super::*;
     use crate::agents::config::McpProviderConfig;
     use std::collections::HashMap;
+
+    #[test]
+    fn an_mcp_evaluator_can_score_conciseness() {
+        let raw = serde_json::json!({
+            "target_id": "agent_1",
+            "score": 0.4,
+            "justification": "dense",
+            "category_scores": {
+                "correctness": 40.0,
+                "completeness": 30.0,
+                "novelty": 10.0,
+                "feasibility": 20.0,
+                "evidence_quality": 25.0,
+                "conciseness": -60.0
+            }
+        });
+        let parsed: crate::agents::mcp_tools::McpEvaluationResult =
+            serde_json::from_value(raw).expect("evaluation with a conciseness score must parse");
+        let eval = mcp_eval_to_evaluation(parsed);
+        assert_eq!(
+            eval.category_scores.and_then(|cs| cs.conciseness),
+            Some(-60.0),
+            "the score the evaluator sent was dropped on the way in"
+        );
+    }
+
+    #[test]
+    fn an_mcp_evaluator_that_omits_conciseness_leaves_it_unscored() {
+        let raw = serde_json::json!({
+            "target_id": "agent_1",
+            "score": 0.4,
+            "justification": "no conciseness",
+            "category_scores": {
+                "correctness": 40.0,
+                "completeness": 30.0,
+                "novelty": 10.0,
+                "feasibility": 20.0,
+                "evidence_quality": 25.0
+            }
+        });
+        let parsed: crate::agents::mcp_tools::McpEvaluationResult =
+            serde_json::from_value(raw).expect("an evaluation without the field must still parse");
+        let eval = mcp_eval_to_evaluation(parsed);
+        assert_eq!(
+            eval.category_scores.and_then(|cs| cs.conciseness),
+            None,
+            "absent must stay unscored, never neutral"
+        );
+    }
 
     // ── nsed_evaluate citation grounding (shared seam, Reject policy) ────────
 

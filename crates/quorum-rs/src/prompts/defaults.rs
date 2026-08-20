@@ -205,8 +205,9 @@ impl PromptSet for DefaultPromptSet {
 
             if let Some(ref cb) = sf.category_breakdown {
                 brief.push_str(&format!(
-                    "  <category_breakdown>correctness: {:.2} | completeness: {:.2} | novelty: {:.2} | feasibility: {:.2} | evidence_quality: {:.2}</category_breakdown>\n",
-                    cb.correctness, cb.completeness, cb.novelty, cb.feasibility, cb.evidence_quality
+                    "  <category_breakdown>correctness: {:.2} | completeness: {:.2} | novelty: {:.2} | feasibility: {:.2} | evidence_quality: {:.2} | conciseness: {}</category_breakdown>\n",
+                    cb.correctness, cb.completeness, cb.novelty, cb.feasibility, cb.evidence_quality,
+                    cb.conciseness.map(|c| format!("{c:.2}")).unwrap_or_else(|| "n/a".into())
                 ));
             }
 
@@ -447,12 +448,15 @@ impl PromptSet for DefaultPromptSet {
                * **stance**: your overall position (strong_agree/agree/neutral/disagree/strong_disagree)
                * **claim_assessments**: The 2-3 MOST PIVOTAL claims only. `claim` MUST be an EXACT verbatim substring copy-pasted from the proposal (never paraphrase/summarize — the client highlights by substring match, so a reworded claim can't be located), plus a verdict (verified/contested/unverified/wrong). Do NOT exhaustively list minor details.
                * **disagreements**: For contested/wrong claims only — what the proposal claims vs. what you believe, with your confidence (high/medium/low).
-               * **category_scores**: Break your endorsement into the five axes below (each -100 to +100, same scale as endorsement_weight — negative undermines the proposal, positive supports it).
+               * **category_scores**: Break your endorsement into all axes below (each -100 to +100, same scale as endorsement_weight — negative undermines the proposal, positive supports it).
                   - **correctness**: technical claims true; cited file:line and anchors match reality.
                   - **completeness**: User intent deliverable coverage. Does it cover every section TEAM is tasked to work at (deliverables / sections / output schema)?
                   - **novelty**: findings the peer surfaced that other agents missed; cross-cutting observations score higher than restated single-subsystem claims.
                   - **feasibility**: auto-fix sketches actually compile, match in-tree precedent, don't introduce regressions.
                   - **evidence_quality**: anchors are verbatim and locatable; paraphrased / fabricated anchors drop heavily.
+                  - **conciseness**: parsimony and semantic density — maximize signal-to-noise ratio (SNR), scored RELATIVE to this round's field, never absolutely. Distils complex propositions into high-density, highly accessible formulations via pedagogical simplification (ELI5 architecture).\n\
+                    Reward: input validation, brevity, structural scaffolding, empirical fact-grounding, high semantic density. Penalize: epistemic gaps, semantic incoherence.\n\
+                    Spread the range — densest highest, most padded NEGATIVE, not every candidate positive. Near-empty is incomplete, not concise: score it under completeness. Precise domain terminology beats a bloated plain-language paraphrase where the topic warrants it.
                * If a claim was flagged in a previous round (has a claim_id), include that claim_id so we can track resolution across rounds.
 
             6. Call `submit_batch_evaluation` with your evaluations.
@@ -506,8 +510,9 @@ impl PromptSet for DefaultPromptSet {
             }
             if let Some(ref cb) = sf.category_breakdown {
                 brief.push_str(&format!(
-                    "  <category_breakdown>correctness: {:.2} | completeness: {:.2} | novelty: {:.2} | feasibility: {:.2} | evidence_quality: {:.2}</category_breakdown>\n",
-                    cb.correctness, cb.completeness, cb.novelty, cb.feasibility, cb.evidence_quality
+                    "  <category_breakdown>correctness: {:.2} | completeness: {:.2} | novelty: {:.2} | feasibility: {:.2} | evidence_quality: {:.2} | conciseness: {}</category_breakdown>\n",
+                    cb.correctness, cb.completeness, cb.novelty, cb.feasibility, cb.evidence_quality,
+                    cb.conciseness.map(|c| format!("{c:.2}")).unwrap_or_else(|| "n/a".into())
                 ));
             }
             brief.push_str("  <guidance>\n");
@@ -1794,6 +1799,7 @@ mod tests {
                 novelty: 0.50,
                 feasibility: 0.90,
                 evidence_quality: 0.65,
+                conciseness: None,
             }),
         };
 

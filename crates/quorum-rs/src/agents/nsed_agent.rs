@@ -74,6 +74,76 @@ fn should_auto_compact(
     pct >= 90.0
 }
 
+/// Property schema for one item of `submit_batch_evaluation`.
+///
+/// Lifted out of the call site so the advertised shape can be asserted: the
+/// object closes with `additionalProperties: false`, so an axis missing here
+/// is one an evaluator is forbidden to send, however well the prompt
+/// describes it.
+fn eval_item_properties_schema() -> serde_json::Value {
+    json!({
+        "agent_id": { "type": "string" },
+        "endorsement_weight": { "type": "number" },
+        "justification": { "type": "string" },
+        "is_final_solution": { "type": "boolean" },
+        "stance": {
+            "type": ["string", "null"],
+            "enum": ["strong_agree", "agree", "neutral", "disagree", "strong_disagree", null]
+        },
+        "claim_assessments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "claim_id": {
+                        "type": ["string", "null"],
+                        "description": "Stable 6-char hex id for cross-round tracking. Echo back the id of a claim flagged in an earlier round; otherwise null."
+                    },
+                    "claim": {
+                        "type": "string",
+                        "description": "The claim, quoted VERBATIM from the proposal — an exact, character-for-character substring. Copy-paste the span; do NOT paraphrase, summarize, shorten or reword. Common quote wrappers (\"…\", > …, `…`) are tolerated and stripped, and the quote is replaced with the exact proposal substring so the client can locate it. A quote matching no span of the proposal cannot be highlighted and is dropped from claim convergence. WRONG (paraphrase): \"the sort is efficient\". RIGHT (verbatim): \"sorts in O(n log n) time\"."
+                    },
+                    "verdict": { "type": "string", "enum": ["verified", "contested", "unverified", "wrong"] },
+                    "reason": { "type": ["string", "null"] }
+                },
+                "required": ["claim_id", "claim", "verdict", "reason"],
+                "additionalProperties": false
+            }
+        },
+        "disagreements": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "claim_id": { "type": ["string", "null"] },
+                    "proposal_claims": { "type": "string" },
+                    "evaluator_position": { "type": "string" },
+                    "confidence": { "type": "string", "enum": ["high", "medium", "low"] }
+                },
+                "required": ["claim_id", "proposal_claims", "evaluator_position", "confidence"],
+                "additionalProperties": false
+            }
+        },
+        "category_scores": {
+            "type": ["object", "null"],
+            "properties": {
+                "correctness": { "type": "number" },
+                "completeness": { "type": "number" },
+                "novelty": { "type": "number" },
+                "feasibility": { "type": "number" },
+                "evidence_quality": { "type": "number" },
+                "conciseness": { "type": ["number", "null"] }
+            },
+            // conciseness stays out of `required`: an evaluator that did not
+            // judge it sends nothing, and absent is counted as unscored. A
+            // required field would force a 0, which on this signed scale is a
+            // neutral verdict and would drag the round's average.
+            "required": ["correctness", "completeness", "novelty", "feasibility", "evidence_quality"],
+            "additionalProperties": false
+        }
+    })
+}
+
 /// Outcome of a `compact_history` call.
 pub struct CompactionResult {
     /// New message history with older tool calls folded into a
@@ -1283,62 +1353,7 @@ impl NsedAgent for ProposerEvaluatorAgent {
     async fn evaluate(&self, context: &AgentContext) -> Result<Vec<(String, Evaluation)>> {
         info!("🕵️ Agent is starting the batch proposal evaluation process.");
 
-        let eval_item_properties = json!({
-            "agent_id": { "type": "string" },
-            "endorsement_weight": { "type": "number" },
-            "justification": { "type": "string" },
-            "is_final_solution": { "type": "boolean" },
-            "stance": {
-                "type": ["string", "null"],
-                "enum": ["strong_agree", "agree", "neutral", "disagree", "strong_disagree", null]
-            },
-            "claim_assessments": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "claim_id": {
-                            "type": ["string", "null"],
-                            "description": "Stable 6-char hex id for cross-round tracking. Echo back the id of a claim flagged in an earlier round; otherwise null."
-                        },
-                        "claim": {
-                            "type": "string",
-                            "description": "The claim, quoted VERBATIM from the proposal — an exact, character-for-character substring. Copy-paste the span; do NOT paraphrase, summarize, shorten or reword. Common quote wrappers (\"…\", > …, `…`) are tolerated and stripped, and the quote is replaced with the exact proposal substring so the client can locate it. A quote matching no span of the proposal cannot be highlighted and is dropped from claim convergence. WRONG (paraphrase): \"the sort is efficient\". RIGHT (verbatim): \"sorts in O(n log n) time\"."
-                        },
-                        "verdict": { "type": "string", "enum": ["verified", "contested", "unverified", "wrong"] },
-                        "reason": { "type": ["string", "null"] }
-                    },
-                    "required": ["claim_id", "claim", "verdict", "reason"],
-                    "additionalProperties": false
-                }
-            },
-            "disagreements": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "claim_id": { "type": ["string", "null"] },
-                        "proposal_claims": { "type": "string" },
-                        "evaluator_position": { "type": "string" },
-                        "confidence": { "type": "string", "enum": ["high", "medium", "low"] }
-                    },
-                    "required": ["claim_id", "proposal_claims", "evaluator_position", "confidence"],
-                    "additionalProperties": false
-                }
-            },
-            "category_scores": {
-                "type": ["object", "null"],
-                "properties": {
-                    "correctness": { "type": "number" },
-                    "completeness": { "type": "number" },
-                    "novelty": { "type": "number" },
-                    "feasibility": { "type": "number" },
-                    "evidence_quality": { "type": "number" }
-                },
-                "required": ["correctness", "completeness", "novelty", "feasibility", "evidence_quality"],
-                "additionalProperties": false
-            }
-        });
+        let eval_item_properties = eval_item_properties_schema();
 
         let batch_evaluation_tool = ChatCompletionTool {
             r#type: ChatCompletionToolType::Function,
@@ -4137,6 +4152,45 @@ impl Drop for ToolCallGuard {
 #[cfg(test)]
 mod tests {
     use super::{ParseFailure, describe_parse_failure};
+
+    /// The prompt can describe an axis at any length; this schema decides
+    /// whether an evaluator is allowed to answer on it. With
+    /// `additionalProperties: false`, an axis absent here is one a strict
+    /// backend rejects the whole tool call for attempting.
+    #[test]
+    fn the_evaluation_schema_lets_an_evaluator_answer_on_every_axis() {
+        let schema = super::eval_item_properties_schema();
+        let cats = &schema["category_scores"];
+        let props = cats["properties"]
+            .as_object()
+            .expect("category_scores advertises properties");
+
+        for axis in [
+            "correctness",
+            "completeness",
+            "novelty",
+            "feasibility",
+            "evidence_quality",
+            "conciseness",
+        ] {
+            assert!(
+                props.contains_key(axis),
+                "{axis} is scored internally but the schema forbids sending it"
+            );
+        }
+
+        let required: Vec<&str> = cats["required"]
+            .as_array()
+            .expect("required list")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            !required.contains(&"conciseness"),
+            "conciseness must stay optional: an evaluator that did not score it \
+             sends nothing rather than a neutral 0"
+        );
+    }
 
     fn failure<'a>(raw: &'a str, cleaned: &'a str, output_tokens: u32) -> ParseFailure<'a> {
         ParseFailure {
