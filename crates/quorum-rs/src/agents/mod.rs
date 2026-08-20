@@ -535,15 +535,18 @@ pub struct DisagreementPoint {
 /// positive = this dimension supports it. Used for diagnostic breakdown.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ToSchema, Default)]
 pub struct CategoryScores {
+    #[serde(default)]
     pub correctness: f32,
+    #[serde(default)]
     pub completeness: f32,
+    #[serde(default)]
     pub novelty: f32,
+    #[serde(default)]
     pub feasibility: f32,
+    #[serde(default)]
     pub evidence_quality: f32,
-    /// Clarity per token. `None` is unscored, which is not the same as 0 —
-    /// 0 is a neutral verdict on this signed scale.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conciseness: Option<f32>,
+    #[serde(default)]
+    pub conciseness: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ToSchema, Default)]
@@ -659,8 +662,6 @@ pub fn build_structured_feedback(evaluations: &[EvaluationRecord]) -> Structured
     let mut stance_sum = 0.0f32;
     let mut stance_count = 0u32;
     let mut cat_totals = CategoryScores::default();
-    let mut conciseness_total = 0.0f32;
-    let mut conciseness_count = 0u32;
     let mut cat_count = 0u32;
 
     for er in evaluations {
@@ -685,10 +686,7 @@ pub fn build_structured_feedback(evaluations: &[EvaluationRecord]) -> Structured
             cat_totals.novelty += cs.novelty;
             cat_totals.feasibility += cs.feasibility;
             cat_totals.evidence_quality += cs.evidence_quality;
-            if let Some(c) = cs.conciseness {
-                conciseness_total += c;
-                conciseness_count += 1;
-            }
+            cat_totals.conciseness += cs.conciseness;
             cat_count += 1;
         }
 
@@ -748,10 +746,7 @@ pub fn build_structured_feedback(evaluations: &[EvaluationRecord]) -> Structured
             novelty: cat_totals.novelty / cat_count as f32,
             feasibility: cat_totals.feasibility / cat_count as f32,
             evidence_quality: cat_totals.evidence_quality / cat_count as f32,
-            // Averaged only over evaluators that scored the axis — a phantom
-            // neutral from pre-axis agents must not drag the mean.
-            conciseness: (conciseness_count > 0)
-                .then(|| conciseness_total / conciseness_count as f32),
+            conciseness: cat_totals.conciseness / cat_count as f32,
         })
     } else {
         None
@@ -1250,11 +1245,14 @@ pub fn calculate_qv_score(raw_weight: f32, total_weight: f32) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn an_evaluation_without_conciseness_loads_unscored() {
+    fn an_evaluation_without_conciseness_loads_neutral() {
         let old = r#"{"correctness": 50.0, "completeness": 10.0, "novelty": 0.0,
                       "feasibility": 20.0, "evidence_quality": 30.0}"#;
         let cs: crate::agents::CategoryScores = serde_json::from_str(old).expect("old shape loads");
-        assert_eq!(cs.conciseness, None, "absent means unscored, never neutral");
+        assert_eq!(
+            cs.conciseness, 0.0,
+            "absent reads neutral, like its siblings"
+        );
         assert_eq!(cs.correctness, 50.0);
     }
 
@@ -1458,7 +1456,7 @@ mod tests {
                 novelty: 40.0,
                 feasibility: 90.0,
                 evidence_quality: 55.0,
-                conciseness: None,
+                conciseness: 0.0,
             }),
             ..Default::default()
         };
@@ -1520,7 +1518,7 @@ mod tests {
                 novelty: 50.0,
                 feasibility: 90.0,
                 evidence_quality: 60.0,
-                conciseness: None,
+                conciseness: 0.0,
             }),
         };
         let json = serde_json::to_string(&sf).unwrap();
@@ -1745,7 +1743,7 @@ mod tests {
             novelty: 40.0,
             feasibility: 90.0,
             evidence_quality: 70.0,
-            conciseness: None,
+            conciseness: 0.0,
         };
         let cs2 = CategoryScores {
             correctness: 60.0,
@@ -1753,7 +1751,7 @@ mod tests {
             novelty: 60.0,
             feasibility: 70.0,
             evidence_quality: 50.0,
-            conciseness: None,
+            conciseness: 0.0,
         };
 
         let evals = vec![
