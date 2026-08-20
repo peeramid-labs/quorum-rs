@@ -53,16 +53,43 @@ impl ReadProposalTool {
 /// Render a proposal to the paginated `<proposal>` tool output. Shared by the
 /// current-round candidate branch and the store-history branch so both format
 /// identically.
+/// Render `content` as 1-indexed numbered lines, optionally clipped to
+/// `from..=to`. The evaluator gets structural line anchors in the candidate
+/// block; this is what makes those anchors addressable.
+fn render_content_lines(content: &str, from: Option<usize>, to: Option<usize>) -> String {
+    let total = content.lines().count();
+    let from = from.unwrap_or(1).max(1);
+    let to = to.unwrap_or(total).min(total);
+    if from > total {
+        return format!("Line {from} exceeds the proposal's {total} lines.");
+    }
+    let body: String = content
+        .lines()
+        .enumerate()
+        .filter(|(i, _)| {
+            let n = i + 1;
+            n >= from && n <= to
+        })
+        .map(|(i, l)| format!("{:>4}| {}\n", i + 1, l))
+        .collect();
+    format!("<lines from=\"{from}\" to=\"{to}\" total=\"{total}\">\n{body}</lines>")
+}
+
 fn render_proposal(
     round: u32,
     agent_id: &str,
     proposal: &Proposal,
     offset: usize,
     limit: usize,
+    from_line: Option<usize>,
+    to_line: Option<usize>,
 ) -> String {
     let thoughts = &proposal.thought_process;
     let total_chars = thoughts.chars().count();
     if offset >= total_chars {
+        if from_line.is_some() || to_line.is_some() {
+            return render_content_lines(&proposal.content, from_line, to_line);
+        }
         return format!(
             "Offset {offset} exceeds thought_process length {total_chars} chars. No more content."
         );
@@ -70,9 +97,14 @@ fn render_proposal(
     let snippet: String = thoughts.chars().skip(offset).take(limit).collect();
     let snippet_len = snippet.chars().count();
     let remaining = total_chars.saturating_sub(offset + snippet_len);
+    let solution = if from_line.is_some() || to_line.is_some() {
+        render_content_lines(&proposal.content, from_line, to_line)
+    } else {
+        proposal.content.clone()
+    };
     let mut output = format!(
         "<proposal round=\"{}\" agent=\"{}\">\n<final_solution>{}</final_solution>\n\n<thought_process offset=\"{}\" length=\"{}\" total=\"{}\">\n{}\n",
-        round, agent_id, proposal.content, offset, snippet_len, total_chars, snippet
+        round, agent_id, solution, offset, snippet_len, total_chars, snippet
     );
     if remaining > 0 {
         output.push_str(&format!(
@@ -122,6 +154,12 @@ struct ReadProposalArgs {
     offset: Option<usize>,
     /// The maximum number of characters to return. Defaults to 5000.
     limit: Option<usize>,
+    /// First line of the final solution to return, 1-indexed. Set either
+    /// line bound to get the solution back as numbered lines instead of raw
+    /// text — use the line anchors from the candidate block's outline.
+    from_line: Option<usize>,
+    /// Last line of the final solution to return, 1-indexed and inclusive.
+    to_line: Option<usize>,
 }
 
 #[async_trait]
@@ -174,6 +212,8 @@ impl Tool for ReadProposalTool {
                     &c.proposal,
                     offset,
                     limit,
+                    args.from_line,
+                    args.to_line,
                 ));
             }
         }
@@ -196,6 +236,8 @@ impl Tool for ReadProposalTool {
                     &record.proposal,
                     offset,
                     limit,
+                    args.from_line,
+                    args.to_line,
                 ))
             } else {
                 Ok(format!(
@@ -523,11 +565,25 @@ impl Tool for SearchDeliberationTool {
                         || keywords_lower.iter().all(|kw| text.contains(kw.as_str()));
 
                     if keyword_match {
+                        let hits = matching_lines(&record.proposal.content, &keywords_lower);
+                        let hits_attr = if hits.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                " matched_lines=\"{}\"",
+                                hits.iter()
+                                    .map(|n| n.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            )
+                        };
                         results.push(format!(
-                            "<proposal round=\"{}\" agent=\"{}\" score=\"{:.2}\">\n<content>{}</content>\n</proposal>",
+                            "<proposal round=\"{}\" agent=\"{}\" score=\"{:.2}\" lines=\"{}\"{}>\n<content>{}</content>\n</proposal>",
                             round,
                             record.author_agent_id,
                             record.aggregated_score,
+                            record.proposal.content.lines().count(),
+                            hits_attr,
                             truncate_str(&record.proposal.content, 2000),
                         ));
                     }
@@ -677,6 +733,26 @@ impl Tool for SearchDeliberationTool {
     }
 }
 
+/// 1-indexed lines of `content` containing any keyword. Paired with
+/// `read_proposal(from_line, to_line)`: search points, read fetches — the
+/// truncated `<content>` alone leaves long proposals unreachable past 2000
+/// chars.
+fn matching_lines(content: &str, keywords_lower: &[String]) -> Vec<usize> {
+    if keywords_lower.is_empty() {
+        return Vec::new();
+    }
+    content
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            let lower = line.to_lowercase();
+            keywords_lower.iter().any(|kw| lower.contains(kw.as_str()))
+        })
+        .map(|(i, _)| i + 1)
+        .take(20)
+        .collect()
+}
+
 /// Truncate a string to max_chars, appending "..." if truncated.
 fn truncate_str(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
@@ -689,6 +765,38 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn content_lines_are_numbered_and_clipped_to_the_requested_range() {
+        let content = "one\ntwo\nthree\nfour\n";
+        let out = render_content_lines(content, Some(2), Some(3));
+        assert!(out.contains("from=\"2\" to=\"3\" total=\"4\""), "{out}");
+        assert!(out.contains("   2| two"), "{out}");
+        assert!(out.contains("   3| three"), "{out}");
+        assert!(!out.contains("one"), "clipped away: {out}");
+        assert!(!out.contains("four"), "clipped away: {out}");
+    }
+
+    #[test]
+    fn content_lines_clamp_an_open_upper_bound_and_reject_a_start_past_the_end() {
+        let content = "one\ntwo\n";
+        let open = render_content_lines(content, Some(2), None);
+        assert!(open.contains("from=\"2\" to=\"2\""), "{open}");
+        let past = render_content_lines(content, Some(9), None);
+        assert!(past.contains("exceeds"), "{past}");
+    }
+
+    #[test]
+    fn search_reports_the_lines_a_keyword_hit_so_a_read_can_follow() {
+        let content = "intro\nthe Widget is slow\nfiller\nwidget again\n";
+        assert_eq!(
+            matching_lines(content, &["widget".to_string()]),
+            vec![2, 4],
+            "case-insensitive, 1-indexed"
+        );
+        assert!(matching_lines(content, &[]).is_empty());
+        assert!(matching_lines(content, &["absent".to_string()]).is_empty());
+    }
+
     use super::*;
     use crate::agents::{Evaluation, EvaluationRecord, Proposal, ProposalRecord};
     use anyhow::Result;
@@ -1892,7 +2000,7 @@ mod tests {
             thought_process: "short".into(),
             ..Default::default()
         };
-        let out = render_proposal(7, "Candidate_A", &p, 100, 50);
+        let out = render_proposal(7, "Candidate_A", &p, 100, 50, None, None);
         assert!(out.contains("Offset 100 exceeds"), "offset overflow: {out}");
         assert!(out.contains("No more content"));
     }
@@ -1905,7 +2013,7 @@ mod tests {
             ..Default::default()
         };
         // offset 3, limit 4 → the window "3456", 3 chars remaining.
-        let out = render_proposal(2, "Candidate_A", &p, 3, 4);
+        let out = render_proposal(2, "Candidate_A", &p, 3, 4, None, None);
         assert!(out.contains("3456"), "windowed thoughts: {out}");
         assert!(out.contains("the answer"), "includes final_solution");
         assert!(
