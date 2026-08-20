@@ -84,7 +84,12 @@ nsed: 5/10 ok · avg 4820ms · errors 50%
   …
 ```
 
-Each stage reports **success / avg latency / error rate**. **Every** failure is
+Each stage reports **success / latency distribution / error rate**:
+`median`, `p95` and `max` over the successful samples, plus the average. Read
+the median for "how fast is this model normally" and the gap to `p95` for
+"how often does it stall" — a model whose median is 3s and p95 is 40s costs a
+council far more than its average suggests, because one stalled call consumes
+the whole phase budget. **Every** failure is
 listed (not just the last) under `failures by error:` — an aggregate count per
 distinct error, then each failure with its full breakdown: which sample, the
 round/phase, the prior context fed in (proposal / critiques / candidates), the

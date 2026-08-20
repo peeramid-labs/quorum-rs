@@ -18,7 +18,7 @@ pub const EVAL_THOUGHT_LIMIT: usize = 4000;
 /// well-structured annex beats the same length of undifferentiated prose,
 /// so the evaluator gets time-to-answer and navigability separately.
 #[derive(Debug, Default, PartialEq)]
-pub(crate) struct ProposalShape {
+pub struct ProposalShape {
     pub chars: usize,
     /// Characters before the first structural break — how long the reader
     /// waits for the answer.
@@ -59,7 +59,7 @@ fn escape_markup(text: &str) -> String {
 /// Summarise markdown structure without a full parser: fences, ATX headings,
 /// list markers and pipe-tables are enough to tell a navigable annex from a
 /// wall of prose.
-pub(crate) fn proposal_shape(text: &str) -> ProposalShape {
+pub fn proposal_shape(text: &str) -> ProposalShape {
     let mut shape = ProposalShape {
         chars: text.chars().count(),
         ..Default::default()

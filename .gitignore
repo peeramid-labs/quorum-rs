@@ -12,3 +12,7 @@ review*.txt
 qwen_review*
 .slop/
 .git-worktrees/
+
+# Smoke-test failure dumps: local triage artifacts, and they quote
+# provider names, model ids and prompt content.
+failures/
