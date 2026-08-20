@@ -132,13 +132,9 @@ fn eval_item_properties_schema() -> serde_json::Value {
                 "novelty": { "type": "number" },
                 "feasibility": { "type": "number" },
                 "evidence_quality": { "type": "number" },
-                "conciseness": { "type": ["number", "null"] }
+                "conciseness": { "type": "number" }
             },
-            // conciseness stays out of `required`: an evaluator that did not
-            // judge it sends nothing, and absent is counted as unscored. A
-            // required field would force a 0, which on this signed scale is a
-            // neutral verdict and would drag the round's average.
-            "required": ["correctness", "completeness", "novelty", "feasibility", "evidence_quality"],
+            "required": ["correctness", "completeness", "novelty", "feasibility", "evidence_quality", "conciseness"],
             "additionalProperties": false
         }
     })
@@ -4185,10 +4181,14 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
+        let optional: Vec<&String> = props
+            .keys()
+            .filter(|a| !required.contains(&a.as_str()))
+            .collect();
         assert!(
-            !required.contains(&"conciseness"),
-            "conciseness must stay optional: an evaluator that did not score it \
-             sends nothing rather than a neutral 0"
+            optional.is_empty(),
+            "advertised but not required: {optional:?} — a partial score object \
+             would be accepted and the missing axes read as neutral zeros"
         );
     }
 

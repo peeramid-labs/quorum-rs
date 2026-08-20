@@ -140,9 +140,8 @@ pub struct McpCategoryScores {
     #[serde(default)]
     pub evidence_quality: f32,
     /// Clarity per token, judged against the other candidates this round.
-    /// Omit rather than sending 0 — 0 is a neutral verdict, absent is unscored.
     #[serde(default)]
-    pub conciseness: Option<f32>,
+    pub conciseness: f32,
 }
 
 /// Input for `nsed_read_proposal` — read a past proposal.
@@ -294,7 +293,7 @@ mod tests {
             novelty: 30.0,
             feasibility: 40.0,
             evidence_quality: 50.0,
-            conciseness: Some(-60.0),
+            conciseness: -60.0,
         };
         let wire = serde_json::to_value(&scores).expect("category scores serialise");
         let written = wire.as_object().expect("an object");
@@ -314,23 +313,6 @@ mod tests {
             "declared count and written fields drifted"
         );
         assert_eq!(wire["conciseness"], -60.0);
-    }
-
-    #[test]
-    fn an_unscored_conciseness_is_written_as_absent_not_as_zero() {
-        let scores = McpCategoryScores {
-            correctness: 0.0,
-            completeness: 0.0,
-            novelty: 0.0,
-            feasibility: 0.0,
-            evidence_quality: 0.0,
-            conciseness: None,
-        };
-        let wire = serde_json::to_value(&scores).expect("category scores serialise");
-        assert!(
-            wire["conciseness"].is_null(),
-            "unscored read back as neutral: {wire}"
-        );
     }
 
     #[test]
