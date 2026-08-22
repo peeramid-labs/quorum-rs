@@ -166,10 +166,8 @@ pub struct CategoryScoreBreakdown {
     pub novelty: f32,
     pub feasibility: f32,
     pub evidence_quality: f32,
-    /// `None` when no evaluator scored the axis. Signed −100..+100 with 0
-    /// meaning neutral, so an absent verdict must not be published as one.
     #[serde(default)]
-    pub conciseness: Option<f32>,
+    pub conciseness: f32,
 }
 
 /// The measured shape a proposal's scores were given to.
@@ -226,7 +224,7 @@ mod tests {
                 novelty: 20.0,
                 feasibility: 30.0,
                 evidence_quality: 35.0,
-                conciseness: Some(-25.0),
+                conciseness: -25.0,
             }),
             shape: Some((&shape).into()),
             ..Default::default()
@@ -258,10 +256,9 @@ mod tests {
             serde_json::from_value(wire).expect("an older entry must still parse");
         assert!(entry.shape.is_none());
         assert_eq!(
-            entry.category_breakdown.and_then(|c| c.conciseness),
-            None,
-            "an entry written before the axis existed carries no verdict on it, \
-             and publishing a neutral 0 would invent one"
+            entry.category_breakdown.map(|c| c.conciseness),
+            Some(0.0),
+            "an omitted axis reads neutral, like its siblings"
         );
     }
 
@@ -314,7 +311,7 @@ mod tests {
                         novelty: 60.0,
                         feasibility: 90.0,
                         evidence_quality: 75.0,
-                        conciseness: Some(0.0),
+                        conciseness: 0.0,
                     }),
                     controversy_score: Some(2.5),
                     ..Default::default()
@@ -487,7 +484,7 @@ mod tests {
             novelty: 50.5,
             feasibility: 99.9,
             evidence_quality: 33.3,
-            conciseness: Some(0.0),
+            conciseness: 0.0,
         };
         let json = serde_json::to_vec(&bd).unwrap();
         let parsed: CategoryScoreBreakdown = serde_json::from_slice(&json).unwrap();
