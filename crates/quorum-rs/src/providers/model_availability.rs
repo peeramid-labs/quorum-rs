@@ -49,9 +49,60 @@ pub struct ModelAvailability {
     provider_id: String,
     /// `None` until the first successful fetch; then the set of catalog model ids.
     ids: RwLock<Option<HashSet<String>>>,
+    /// Optional endpoint for confirming the provider will actually serve a
+    /// model, not merely list it. `None` = catalog-only.
+    serving: Option<ServingProbe>,
+}
+
+/// Where to send a minimal completion to confirm a model is really served.
+#[derive(Debug)]
+struct ServingProbe {
+    chat_url: String,
+    api_key: String,
 }
 
 impl ModelAvailability {
+    /// Also confirm the provider will serve a model, not only list it.
+    ///
+    /// A catalog is an advertisement. A provider can list an id whose endpoint
+    /// answers 404, and then a catalog-only verdict reports an agent healthy
+    /// while every task it is given fails — which is exactly what hid a dead
+    /// seat for two days.
+    pub fn with_serving_probe(mut self, chat_url: String, api_key: String) -> Self {
+        self.serving = Some(ServingProbe { chat_url, api_key });
+        self
+    }
+
+    /// Ask the endpoint for one token and read the answer as a verdict.
+    ///
+    /// [`Availability::Unavailable`] ONLY when the endpoint says this model is
+    /// not there (404). Every other outcome — a rate limit, an auth failure, a
+    /// provider 500, a transport error, or no probe configured — is
+    /// [`Availability::Unknown`], because the alternative is a provider hiccup
+    /// benching the whole fleet at once.
+    pub async fn probe_serving(&self, model_name: &str) -> Availability {
+        let Some(serving) = self.serving.as_ref() else {
+            return Availability::Unknown;
+        };
+        let body = serde_json::json!({
+            "model": model_name,
+            "messages": [{ "role": "user", "content": "ping" }],
+            "max_tokens": 1,
+        });
+        let response = self
+            .client
+            .post(&serving.chat_url)
+            .bearer_auth(&serving.api_key)
+            .json(&body)
+            .send()
+            .await;
+        match response {
+            Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => Availability::Unavailable,
+            Ok(r) if r.status().is_success() => Availability::Available,
+            _ => Availability::Unknown,
+        }
+    }
+
     /// `catalog_url` is the provider's OpenAI-compatible `/models` endpoint;
     /// `provider_id` is the provider whose agents this catalog governs. Both are
     /// caller-supplied so the probe stays provider-agnostic.
@@ -61,6 +112,7 @@ impl ModelAvailability {
             catalog_url,
             provider_id,
             ids: RwLock::new(None),
+            serving: None,
         }
     }
 
@@ -237,5 +289,74 @@ mod tests {
         assert_eq!(ids.len(), 3);
         assert!(parse_catalog_ids("not json").is_err());
         assert!(parse_catalog_ids(r#"{"no_data":1}"#).is_err());
+    }
+
+    /// A catalog listing is not proof of serving: a provider can advertise an id
+    /// its endpoint answers 404 for, and then the probe reports the agent
+    /// healthy while every task it is given fails. Observed in production on a
+    /// seat whose model was listed and unusable for two days.
+    #[tokio::test]
+    async fn a_listed_model_the_endpoint_will_not_serve_is_unavailable() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+        let probe = ModelAvailability::new("http://unused".to_string(), PROVIDER.to_string())
+            .with_serving_probe(format!("{}/v1/chat/completions", server.uri()), "k".into());
+
+        assert_eq!(
+            probe.probe_serving("vendor/model-a").await,
+            Availability::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_the_endpoint_answers_is_available() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(r#"{"choices":[]}"#))
+            .mount(&server)
+            .await;
+        let probe = ModelAvailability::new("http://unused".to_string(), PROVIDER.to_string())
+            .with_serving_probe(format!("{}/v1/chat/completions", server.uri()), "k".into());
+
+        assert_eq!(
+            probe.probe_serving("vendor/model-a").await,
+            Availability::Available
+        );
+    }
+
+    /// Fail-open, and this is the case that matters most: a rate limit, an auth
+    /// blip or a provider 500 must never bench the fleet. Only "this model is
+    /// not here" does.
+    #[tokio::test]
+    async fn every_other_failure_leaves_the_verdict_unknown() {
+        for status in [400u16, 401, 429, 500, 503] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(wiremock::ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            let probe = ModelAvailability::new("http://unused".to_string(), PROVIDER.to_string())
+                .with_serving_probe(format!("{}/v1/chat/completions", server.uri()), "k".into());
+
+            assert_eq!(
+                probe.probe_serving("vendor/model-a").await,
+                Availability::Unknown,
+                "status {status} must not bench an agent"
+            );
+        }
+    }
+
+    /// No probe configured is the default, and must stay a no-op.
+    #[tokio::test]
+    async fn without_a_serving_probe_the_verdict_is_unknown() {
+        let probe = ModelAvailability::new("http://unused".to_string(), PROVIDER.to_string());
+        assert_eq!(
+            probe.probe_serving("vendor/model-a").await,
+            Availability::Unknown
+        );
     }
 }

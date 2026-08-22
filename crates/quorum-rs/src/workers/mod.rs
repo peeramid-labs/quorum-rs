@@ -672,11 +672,24 @@ impl NatsNsedWorker {
             warn!(agent_id = %self.agent_id, error = %e, "model-availability probe refresh failed — keeping agent up");
             return false;
         }
-        if probe.is_available(
+        let listed = probe.is_available(
             &self.agent_config.provider_id,
             &self.agent_config.model_name,
-        ) == Availability::Unavailable
+        );
+        // A catalog is an advertisement, so a listed model is asked for one
+        // token before it is believed. Only when the catalog omits the id is
+        // that call skipped — the answer is already known.
+        let reason = if listed == Availability::Unavailable {
+            Some("absent from the provider catalog")
+        } else if probe.probe_serving(&self.agent_config.model_name).await
+            == Availability::Unavailable
         {
+            Some("listed by the provider but not served")
+        } else {
+            None
+        };
+
+        if let Some(reason) = reason {
             let strikes = self.model_down_strikes.fetch_add(1, Ordering::Relaxed) + 1;
             let cooldown = escalated_cooldown_ms(strikes);
             let until = now + cooldown;
@@ -685,7 +698,8 @@ impl NatsNsedWorker {
                 agent_id = %self.agent_id,
                 model = %self.agent_config.model_name,
                 cooldown_secs = cooldown / 1000,
-                "Model absent from provider catalog — self-benching (proactive) until cooldown expires"
+                reason,
+                "Model unusable — self-benching (proactive) until cooldown expires"
             );
             return true;
         }
