@@ -66,3 +66,32 @@ The same model reached through a different route generally cannot run these —
 the tool belongs to the backend, not the weights. An agent that needs one must
 point at the endpoint that offers it, which may constrain where that agent's
 traffic goes.
+
+## When a backend refuses a mixed tool array
+
+Some backends accept their search tool only when it is the *only* tool in the
+request. Vertex answers a mixed array with:
+
+```
+Multiple tools are supported only when they are all search tools.
+```
+
+A deliberating agent always sends function tools — the propose tool, the
+scratchpad, any user tools — so declaring a provider search tool beside them
+makes **every** task fail with a 400, not just the search.
+
+Set `delegated_search` instead of `provider_executed_tools` for such a seat:
+
+```yaml
+delegated_search: "web_search"   # the backend's own name for the tool
+```
+
+The agent is then given an ordinary `web_search` function tool. Calling it
+issues a second completion that declares the provider's search tool alone —
+the shape those backends do accept — and returns what came back. Costs one
+extra round trip per search.
+
+Which of the two a model needs is measured against the endpoint, not inferred
+from the vendor: of the models on one EU router, some accept the mix, one
+accepts search only when alone, and others reject the search tool in any shape
+and should carry neither field.
