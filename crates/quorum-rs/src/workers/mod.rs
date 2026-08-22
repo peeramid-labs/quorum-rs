@@ -1913,6 +1913,18 @@ impl NatsNsedWorker {
             };
             self.nats.publish(subject, payload.into()).await?;
             msg.ack().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            // A skipped task is answered, not abandoned: without this the
+            // start event never pairs and the task reads as in-flight forever.
+            {
+                let mut event = self.new_event(AgentEventKind::TaskCompleted);
+                event.job_id = Some(session_id.clone());
+                event.round = Some(context.round_number);
+                event.phase = Some(action.to_string());
+                event.status = Some("skipped".to_string());
+                event.detail = format!("{action} skipped by the agent's strategy");
+                self.record_event(event).await;
+            }
+
             return Ok(());
         }
 
@@ -3281,6 +3293,7 @@ fn should_publish_failure_marker(action: &str, is_payment_error: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::middleware::pipeline::MiddlewarePipeline;
     use crate::middleware::{
