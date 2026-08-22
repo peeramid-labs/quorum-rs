@@ -474,6 +474,7 @@ mod tests {
 
     fn minimal_context() -> AgentContext {
         AgentContext {
+            issued_at: None,
             task_description: "Solve the problem".to_string(),
             round_number: 1,
             phase_budget_remaining_secs: 60.0,

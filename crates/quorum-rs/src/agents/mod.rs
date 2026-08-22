@@ -59,6 +59,14 @@ pub struct AgentContext {
     /// the default tier when someone is waiting.
     #[serde(default)]
     pub service_tier: Option<String>,
+    /// The date the orchestrator issued this task, as `YYYY-MM-DD`.
+    ///
+    /// Stamped server-side rather than read from the agent's own clock: agents
+    /// run wherever they run, and a per-agent clock lets two seats in one round
+    /// disagree about what day it is. `None` for callers that stamp none, which
+    /// renders no clock at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_at: Option<String>,
     /// Remaining phase budget in seconds at the time the task was published.
     /// The agent uses this as the upper bound for user tool call wait times.
     #[serde(default)]
@@ -2353,6 +2361,7 @@ mod tests {
     #[test]
     fn agent_context_serde_roundtrip() {
         let ctx = AgentContext {
+            issued_at: None,
             task_description: "Solve the halting problem".to_string(),
             round_number: 3,
             total_rounds: 5,

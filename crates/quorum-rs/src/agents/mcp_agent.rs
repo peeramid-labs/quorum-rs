@@ -2991,10 +2991,14 @@ impl NsedAgent for ClaudeAgent {
 
         // Dynamic per-turn state lives in the user message (the system prompt is
         // static for cache reuse) — prepend it to both the delta and full prompts.
-        let turn = self.prompt_set.get_turn_header(
-            context.round_number as usize,
-            context.total_rounds as usize,
-            context.phase,
+        let turn = format!(
+            "{}{}",
+            crate::prompts::clock_block(context.issued_at.as_deref()),
+            self.prompt_set.get_turn_header(
+                context.round_number as usize,
+                context.total_rounds as usize,
+                context.phase,
+            )
         );
         let prompt = format!("{turn}{prompt}");
         let full_prompt = format!("{turn}{full_prompt}");
@@ -3040,10 +3044,14 @@ impl NsedAgent for ClaudeAgent {
         );
 
         // Per-turn state → user message (static system prompt for cache reuse).
-        let turn = self.prompt_set.get_turn_header(
-            context.round_number as usize,
-            context.total_rounds as usize,
-            context.phase,
+        let turn = format!(
+            "{}{}",
+            crate::prompts::clock_block(context.issued_at.as_deref()),
+            self.prompt_set.get_turn_header(
+                context.round_number as usize,
+                context.total_rounds as usize,
+                context.phase,
+            )
         );
         let prompt = format!("{turn}{prompt}");
         let full_prompt = format!("{turn}{full_prompt}");

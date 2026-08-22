@@ -1229,7 +1229,8 @@ impl NsedAgent for ProposerEvaluatorAgent {
         // Dynamic round + phase go in the user message; the system message is static
         // for prompt-cache reuse.
         let prompt = format!(
-            "{}{prompt}",
+            "{}{}{prompt}",
+            crate::prompts::clock_block(context.issued_at.as_deref()),
             self.prompt_set.get_turn_header(
                 context.round_number as usize,
                 context.total_rounds as usize,
@@ -1393,7 +1394,8 @@ impl NsedAgent for ProposerEvaluatorAgent {
         );
         // Dynamic round + phase → user message (static system prompt for cache reuse).
         let prompt = format!(
-            "{}{prompt}",
+            "{}{}{prompt}",
+            crate::prompts::clock_block(context.issued_at.as_deref()),
             self.prompt_set.get_turn_header(
                 context.round_number as usize,
                 context.total_rounds as usize,
