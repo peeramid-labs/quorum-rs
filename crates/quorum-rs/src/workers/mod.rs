@@ -2194,7 +2194,11 @@ impl NatsNsedWorker {
                 );
             }
             Err(e) => {
-                let err_str = e.to_string();
+                // The whole chain, not just the outermost message: a parse
+                // failure's Display is the single word "parse" and everything
+                // that identifies it — finish reason, the excerpt of what the
+                // model actually returned — hangs off the source.
+                let err_str = format!("{e:#}");
                 error!("❌ Task Execution Failed: {:?}", e);
 
                 // Detect 402 Payment Required — auto-pause agent instead of

@@ -122,6 +122,29 @@ impl LlmError {
 
 #[cfg(test)]
 mod tests {
+
+    /// A parse failure's own Display is one word; everything that identifies
+    /// it — the finish reason, an excerpt of what the model actually returned —
+    /// hangs off the source. Reporting only the outer message is what made
+    /// every parse failure in the dashboard read identically.
+    #[test]
+    fn a_parse_failure_says_nothing_useful_without_its_source() {
+        let inner =
+            std::io::Error::other("FinishReason: length. Raw: '{\"content\":\"the answer beg");
+        let err = super::LlmError::Parse(Box::new(inner));
+
+        assert_eq!(
+            err.to_string(),
+            "parse",
+            "the outer message alone is a label"
+        );
+
+        let full = format!("{:#}", anyhow::Error::from(err));
+        assert!(
+            full.contains("FinishReason"),
+            "the chain must carry what the model returned: {full}"
+        );
+    }
     use super::*;
 
     /// Every variant maps to the telemetry class with the expected
