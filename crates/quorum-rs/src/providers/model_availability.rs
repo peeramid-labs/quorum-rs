@@ -108,7 +108,14 @@ impl ModelAvailability {
     /// caller-supplied so the probe stays provider-agnostic.
     pub fn new(catalog_url: String, provider_id: String) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            // A probe with no timeout can hang on an endpoint that accepts the
+            // connection and never answers. It runs inline before the
+            // heartbeat, so a hung probe stops the agent reporting at all and
+            // the orchestrator ages it out of every tier it seats.
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
             catalog_url,
             provider_id,
             ids: RwLock::new(None),
