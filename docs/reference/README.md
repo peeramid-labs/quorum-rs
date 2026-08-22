@@ -13,6 +13,7 @@ Authoritative descriptions — API surface, types, schemas. Mirrors the code str
 | [`persona` yaml shapes](persona-yaml-shapes.md) | Grammar for the inline-string and stacked-layer forms `persona:` accepts; path semantics and error modes. |
 | [`openrouter` agent-config block](openrouter-provider-config.md) | OpenRouter-only request extensions: provider routing (`provider_sort`/`ignore`/`only`), ZDR, reasoning-token handling, and the opt-in `web_search` plugin. |
 | [Thread TUI](thread-tui.md) | `quorum` thread-TUI keymap (per screen), reader/inbox line formats, and the persisted Message/Thread data model. |
+| [Task clock](task-clock.md) | `AgentContext.issued_at` and the `<clock>` block it renders: wire form, wording, and why the caller stamps the date. |
 | [Glossary](glossary.md) | Key terms used across the documentation. |
 
 Per-crate rustdoc on docs.rs: [`quorum-rs`](https://docs.rs/quorum-rs), [`llm-repair`](https://docs.rs/llm-repair), [`quorum-crypto-core`](https://docs.rs/quorum-crypto-core).
