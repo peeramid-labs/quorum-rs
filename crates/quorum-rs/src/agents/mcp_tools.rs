@@ -141,7 +141,10 @@ pub struct McpCategoryScores {
     pub evidence_quality: f32,
     /// Clarity per token, judged against the other candidates this round.
     #[serde(default)]
-    pub conciseness: f32,
+    /// `None` when the evaluator did not score the axis. Signed −100..+100,
+    /// where 0 is neutral rather than bad, so an absent score must not be
+    /// folded in as one.
+    pub conciseness: Option<f32>,
 }
 
 /// Input for `nsed_read_proposal` — read a past proposal.
@@ -299,7 +302,7 @@ mod tests {
             novelty: 30.0,
             feasibility: 40.0,
             evidence_quality: 50.0,
-            conciseness: -60.0,
+            conciseness: Some(-60.0),
         };
         let wire = serde_json::to_value(&scores).expect("category scores serialise");
         let written = wire.as_object().expect("an object");

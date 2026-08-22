@@ -672,11 +672,24 @@ impl NatsNsedWorker {
             warn!(agent_id = %self.agent_id, error = %e, "model-availability probe refresh failed — keeping agent up");
             return false;
         }
-        if probe.is_available(
+        let listed = probe.is_available(
             &self.agent_config.provider_id,
             &self.agent_config.model_name,
-        ) == Availability::Unavailable
+        );
+        // A catalog is an advertisement, so a listed model is asked for one
+        // token before it is believed. Only when the catalog omits the id is
+        // that call skipped — the answer is already known.
+        let reason = if listed == Availability::Unavailable {
+            Some("absent from the provider catalog")
+        } else if probe.probe_serving(&self.agent_config.model_name).await
+            == Availability::Unavailable
         {
+            Some("listed by the provider but not served")
+        } else {
+            None
+        };
+
+        if let Some(reason) = reason {
             let strikes = self.model_down_strikes.fetch_add(1, Ordering::Relaxed) + 1;
             let cooldown = escalated_cooldown_ms(strikes);
             let until = now + cooldown;
@@ -685,7 +698,8 @@ impl NatsNsedWorker {
                 agent_id = %self.agent_id,
                 model = %self.agent_config.model_name,
                 cooldown_secs = cooldown / 1000,
-                "Model absent from provider catalog — self-benching (proactive) until cooldown expires"
+                reason,
+                "Model unusable — self-benching (proactive) until cooldown expires"
             );
             return true;
         }
@@ -2198,14 +2212,25 @@ impl NatsNsedWorker {
                 // failure's Display is the single word "parse" and everything
                 // that identifies it — finish reason, the excerpt of what the
                 // model actually returned — hangs off the source.
-                let err_str = format!("{e:#}");
+                let llm_err = e.downcast_ref::<crate::llms::LlmError>();
+                // A 400's real reason is the provider's response body, which
+                // `Display` deliberately withholds and no `source` carries — so
+                // the chain alone reports "bad request (status 400)" and the
+                // operator surfaces show a status code where the provider sent
+                // an explanation.
+                let err_str = match llm_err.and_then(crate::llms::LlmError::detail) {
+                    Some(detail) => format!("{e:#}: {detail}"),
+                    None => format!("{e:#}"),
+                };
                 error!("❌ Task Execution Failed: {:?}", e);
 
                 // Detect 402 Payment Required — auto-pause agent instead of
-                // continuing to hammer a provider with no credits left.
-                let is_payment_error = err_str.contains("402 Payment Required")
-                    || err_str.contains("insufficient_quota")
-                    || err_str.contains("billing");
+                // continuing to hammer a provider with no credits left. Matched
+                // on the typed variant: its `Display` is the lowercase phrase
+                // "payment required", so no substring of the rendered string
+                // ever matched and the pause could not fire.
+                let is_payment_error =
+                    matches!(llm_err, Some(crate::llms::LlmError::PaymentRequired { .. }));
 
                 // Remove failed job from active set
                 {
@@ -5348,68 +5373,95 @@ mod tests {
     // Payment error detection logic (pure string matching)
     // ===================================================================
 
-    /// Extracts the payment error detection logic into a testable form.
-    /// This mirrors the inline logic at lines ~1157-1170 of handle_message.
-    fn is_payment_error(err_str: &str) -> bool {
-        err_str.contains("402 Payment Required")
-            || err_str.contains("insufficient_quota")
-            || err_str.contains("billing")
+    /// Classify exactly as `handle_message` does — by the typed variant.
+    ///
+    /// The previous helper duplicated a substring match on the rendered error
+    /// and fed it strings the typed path cannot produce: `PaymentRequired`
+    /// renders as the lowercase phrase "payment required", carries no body and
+    /// no "402", so every one of those assertions passed against a function
+    /// production had stopped resembling.
+    fn is_payment_error(e: &anyhow::Error) -> bool {
+        matches!(
+            e.downcast_ref::<crate::llms::LlmError>(),
+            Some(crate::llms::LlmError::PaymentRequired { .. })
+        )
     }
 
-    fn should_suppress_error_event(err_str: &str, propagate_payment_error: bool) -> bool {
-        is_payment_error(err_str) && !propagate_payment_error
+    fn should_suppress_error_event(e: &anyhow::Error, propagate_payment_error: bool) -> bool {
+        is_payment_error(e) && !propagate_payment_error
+    }
+
+    /// The provider's explanation must survive to the operator surfaces. A 400
+    /// carries its reason in the response body, which `Display` withholds and
+    /// no `source` exposes — so the chain alone renders "bad request (status
+    /// 400)" and an operator debugging a dead agent sees a status code where
+    /// the provider sent a sentence.
+    #[test]
+    fn a_bad_request_reports_the_providers_reason_not_just_its_status() {
+        let body = r#"{"error":{"message":"Multiple tools are supported only when they are all search tools."}}"#;
+        let e = anyhow::Error::new(crate::llms::LlmError::BadRequest {
+            status: 400,
+            body: body.to_string(),
+        });
+
+        let chain_only = format!("{e:#}");
+        assert!(
+            !chain_only.contains("search tools"),
+            "the chain cannot reach the body — that is the bug"
+        );
+
+        let reported = match e
+            .downcast_ref::<crate::llms::LlmError>()
+            .and_then(crate::llms::LlmError::detail)
+        {
+            Some(detail) => format!("{e:#}: {detail}"),
+            None => chain_only,
+        };
+        assert!(reported.contains("bad request (status 400)"));
+        assert!(
+            reported.contains("Multiple tools are supported"),
+            "got {reported}"
+        );
     }
 
     #[test]
-    fn test_payment_error_402() {
-        assert!(is_payment_error("HTTP error: 402 Payment Required"));
-        assert!(is_payment_error("402 Payment Required: no credits"));
+    fn a_payment_required_is_recognised_from_the_typed_error() {
+        let e = anyhow::Error::new(crate::llms::LlmError::PaymentRequired { status: 402 });
+        assert!(is_payment_error(&e));
+        // And the rendered string it produces contains none of the substrings
+        // the old matcher looked for — which is why it never fired.
+        let rendered = format!("{e:#}");
+        assert!(!rendered.contains("402"));
+        assert!(!rendered.contains("insufficient_quota"));
+        assert!(!rendered.contains("billing"));
     }
 
     #[test]
-    fn test_payment_error_insufficient_quota() {
-        assert!(is_payment_error("OpenAI error: insufficient_quota"));
-        assert!(is_payment_error("insufficient_quota for this model"));
+    fn other_provider_failures_are_not_payment_errors() {
+        for e in [
+            anyhow::Error::new(crate::llms::LlmError::ServerError { status: 500 }),
+            anyhow::Error::new(crate::llms::LlmError::BadRequest {
+                status: 400,
+                body: "billing information required".to_string(),
+            }),
+            anyhow::anyhow!("Connection timeout"),
+        ] {
+            assert!(
+                !is_payment_error(&e),
+                "only a PaymentRequired pauses the agent, got {e:#}"
+            );
+        }
     }
 
     #[test]
-    fn test_payment_error_billing() {
-        assert!(is_payment_error("Your billing account has been suspended"));
-        assert!(is_payment_error("billing information required"));
-    }
+    fn suppression_follows_the_agent_s_propagate_setting() {
+        let e = anyhow::Error::new(crate::llms::LlmError::PaymentRequired { status: 402 });
+        assert!(should_suppress_error_event(&e, false));
+        assert!(!should_suppress_error_event(&e, true));
 
-    #[test]
-    fn test_non_payment_errors_not_detected() {
-        assert!(!is_payment_error("500 Internal Server Error"));
-        assert!(!is_payment_error("Connection timeout"));
-        assert!(!is_payment_error("rate limit exceeded"));
-        assert!(!is_payment_error("model not found"));
-        assert!(!is_payment_error(""));
-    }
-
-    #[test]
-    fn test_suppress_error_when_payment_and_not_propagate() {
-        // propagate_payment_error = false → should suppress
-        assert!(should_suppress_error_event("402 Payment Required", false));
-        assert!(should_suppress_error_event("insufficient_quota", false));
-        assert!(should_suppress_error_event("billing issue", false));
-    }
-
-    #[test]
-    fn test_no_suppress_when_payment_and_propagate() {
-        // propagate_payment_error = true → should NOT suppress
-        assert!(!should_suppress_error_event("402 Payment Required", true));
-        assert!(!should_suppress_error_event("insufficient_quota", true));
-    }
-
-    #[test]
-    fn test_no_suppress_when_not_payment_error() {
-        // Non-payment errors → never suppress regardless of propagate flag
-        assert!(!should_suppress_error_event(
-            "500 Internal Server Error",
-            false
-        ));
-        assert!(!should_suppress_error_event("Connection refused", true));
+        let other = anyhow::Error::new(crate::llms::LlmError::ServerError { status: 500 });
+        assert!(!should_suppress_error_event(&other, false));
+        assert!(!should_suppress_error_event(&other, true));
     }
 
     // ===================================================================

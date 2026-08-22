@@ -14,6 +14,7 @@ Authoritative descriptions — API surface, types, schemas. Mirrors the code str
 | [`openrouter` agent-config block](openrouter-provider-config.md) | OpenRouter-only request extensions: provider routing (`provider_sort`/`ignore`/`only`), ZDR, reasoning-token handling, and the opt-in `web_search` plugin. |
 | [Thread TUI](thread-tui.md) | `quorum` thread-TUI keymap (per screen), reader/inbox line formats, and the persisted Message/Thread data model. |
 | [Task clock](task-clock.md) | `AgentContext.issued_at` and the `<clock>` block it renders: wire form, wording, and why the caller stamps the date. |
+| [Model health](model-health.md) | How an agent judges its own model — catalog listing plus a serving probe — and the fail-open rule that decides when it benches itself. |
 | [Glossary](glossary.md) | Key terms used across the documentation. |
 
 Per-crate rustdoc on docs.rs: [`quorum-rs`](https://docs.rs/quorum-rs), [`llm-repair`](https://docs.rs/llm-repair), [`quorum-crypto-core`](https://docs.rs/quorum-crypto-core).

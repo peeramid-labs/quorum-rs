@@ -330,6 +330,19 @@ pub struct AgentConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_executed_tools: Vec<String>,
 
+    /// Run the provider's search tool from a nested, search-only call instead
+    /// of declaring it beside our function tools.
+    ///
+    /// The value is the backend's own name for the tool, spelled as
+    /// [`Self::provider_executed_tools`] spells it. Set this instead of that
+    /// field for a backend that rejects a mixed tool array — Vertex answers
+    /// `Multiple tools are supported only when they are all search tools` with
+    /// a 400, which fails every task rather than only the search. Costs one
+    /// extra round trip per search. `None` leaves the agent with whatever
+    /// `provider_executed_tools` declares.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_search: Option<String>,
+
     /// Enable the `prompt_exposure` safety guardrail on this agent's LLM
     /// responses. When `true`, the agent scans every terminal tool-call
     /// content (proposal / batch evaluation) for internal-prompt leakage
@@ -1042,6 +1055,7 @@ impl Default for AgentConfig {
             openrouter: None,
             builtin_tools: Vec::new(),
             provider_executed_tools: Vec::new(),
+            delegated_search: None,
             prompt_exposure_guard: false,
             read_file_roots: Vec::new(),
             middleware: Default::default(),
