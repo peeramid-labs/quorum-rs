@@ -255,9 +255,13 @@ impl PromptSet for DefaultPromptSet {
 
             if let Some(ref cb) = sf.category_breakdown {
                 brief.push_str(&format!(
-                    "  <category_breakdown>correctness: {:.2} | completeness: {:.2} | novelty: {:.2} | feasibility: {:.2} | evidence_quality: {:.2} | conciseness: {:.2}</category_breakdown>\n",
+                    "  <category_breakdown>correctness: {:.2} | completeness: {:.2} | novelty: {:.2} | feasibility: {:.2} | evidence_quality: {:.2} | conciseness: {}</category_breakdown>\n",
                     cb.correctness, cb.completeness, cb.novelty, cb.feasibility, cb.evidence_quality,
+                    // "unscored" rather than a number, so a reader is not told
+                    // the panel returned a neutral verdict it never gave.
                     cb.conciseness
+                        .map(|c| format!("{c:.2}"))
+                        .unwrap_or_else(|| "unscored".to_string())
                 ));
             }
 
@@ -578,9 +582,11 @@ impl PromptSet for DefaultPromptSet {
             }
             if let Some(ref cb) = sf.category_breakdown {
                 brief.push_str(&format!(
-                    "  <category_breakdown>correctness: {:.2} | completeness: {:.2} | novelty: {:.2} | feasibility: {:.2} | evidence_quality: {:.2} | conciseness: {:.2}</category_breakdown>\n",
+                    "  <category_breakdown>correctness: {:.2} | completeness: {:.2} | novelty: {:.2} | feasibility: {:.2} | evidence_quality: {:.2} | conciseness: {}</category_breakdown>\n",
                     cb.correctness, cb.completeness, cb.novelty, cb.feasibility, cb.evidence_quality,
                     cb.conciseness
+                        .map(|c| format!("{c:.2}"))
+                        .unwrap_or_else(|| "unscored".to_string())
                 ));
             }
             brief.push_str("  <guidance>\n");
@@ -2085,7 +2091,7 @@ mod tests {
                 novelty: 0.50,
                 feasibility: 0.90,
                 evidence_quality: 0.65,
-                conciseness: 0.0,
+                conciseness: Some(0.0),
             }),
         };
 

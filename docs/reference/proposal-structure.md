@@ -109,8 +109,12 @@ The same measurement is published with the score it earned. Each
 `ProposalScoreEntry` in a round summary carries a `shape` object holding the
 attributes above, beside the `conciseness` mean in its `category_breakdown`.
 
-`conciseness` is a category like the other five: required of every evaluator,
-signed, and averaged over all of them. `shape` is optional, absent on entries
+`conciseness` is a category like the other five in where it lives, and unlike
+them in what its zero means: the other five run 0..100 with 0 the worst score,
+while conciseness is signed −100..+100 with 0 a *neutral* verdict. So it is
+`Option`, and the mean is taken over the evaluators who scored it. Folding an
+abstention in as a zero would publish a verdict nobody gave — a panel of four
+where one scores −80 and three skip the axis reports −80, not −20. `shape` is optional, absent on entries
 written before it existed.
 
 Emitting both in one entry is what makes score and size correlatable per
