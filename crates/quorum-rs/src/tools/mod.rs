@@ -7,11 +7,13 @@ use std::error::Error;
 pub mod context;
 pub mod delegated_search;
 pub mod sandbox;
+pub mod scoped_edit;
 pub mod scoped_grep;
 pub mod scoped_read;
 pub mod user_call;
 
 pub use delegated_search::DelegatedSearchTool;
+pub use scoped_edit::{ScopedEditTool, ScopedWriteTool};
 pub use scoped_grep::ScopedGrepTool;
 pub use scoped_read::ScopedReadFileTool;
 

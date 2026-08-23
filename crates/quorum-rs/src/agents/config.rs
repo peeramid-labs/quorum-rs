@@ -433,6 +433,24 @@ pub enum BuiltinToolGrant {
         #[serde(default = "default_grep_timeout_secs")]
         timeout_secs: u64,
     },
+    /// Replace an exact string in a file under one of the configured roots —
+    /// the `edit_file` tool. Same sandbox rule as `ReadFile`: a path resolving
+    /// outside every root is rejected.
+    ///
+    /// Granting this without `ReadFile` is a trap. The edit matches
+    /// byte-for-byte, so an agent that cannot read the file first has nothing
+    /// exact to quote and falls back to rewriting whole files.
+    EditFile {
+        /// Allowed root directories, canonicalized once at construction.
+        roots: Vec<String>,
+    },
+    /// Create or entirely replace a file under one of the configured roots —
+    /// the `write_file` tool. Unlike `EditFile` the target need not exist, but
+    /// its parent directory must still resolve inside a root.
+    WriteFile {
+        /// Allowed root directories, canonicalized once at construction.
+        roots: Vec<String>,
+    },
     /// Semantic PDF lookup via PageIndex `pdf_query.py`. The agent
     /// supplies a tree filename (basename — slashes and `..` are
     /// rejected) and a query string; the tool resolves the tree to

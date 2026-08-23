@@ -221,6 +221,22 @@ pub(crate) fn instantiate_builtin_tools(
                 )?;
                 tools.push(Box::new(tool));
             }
+            BuiltinToolGrant::EditFile { roots } => {
+                let root_paths: Vec<std::path::PathBuf> =
+                    roots.iter().map(std::path::PathBuf::from).collect();
+                tools.push(Box::new(crate::tools::ScopedEditTool::new(
+                    agent_config.name.clone(),
+                    &root_paths,
+                )));
+            }
+            BuiltinToolGrant::WriteFile { roots } => {
+                let root_paths: Vec<std::path::PathBuf> =
+                    roots.iter().map(std::path::PathBuf::from).collect();
+                tools.push(Box::new(crate::tools::ScopedWriteTool::new(
+                    agent_config.name.clone(),
+                    &root_paths,
+                )));
+            }
             other => {
                 // Most likely `PdfQuery` — log loudly and skip the
                 // whole agent. Booting an agent whose system prompt
