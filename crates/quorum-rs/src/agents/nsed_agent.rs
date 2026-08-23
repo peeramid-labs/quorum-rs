@@ -1655,6 +1655,22 @@ fn relaxed_without_forced_choice(config: &RequestConfig) -> Option<RequestConfig
     Some(relaxed)
 }
 
+/// The text to judge a refusal on: the provider's response body when the error
+/// carries one, else the error itself.
+///
+/// `Display` on an HTTP error is deliberately terse — the body can echo a
+/// fragment of the prompt, so it is kept out of logs and dumps and reached only
+/// through `detail`. That makes the formatted error `"bad request (status 400)"`
+/// with the reason stripped, so matching on it can never recognise a refusal.
+/// Measured live: two seats hit exactly this and their round was lost while the
+/// retry sat inert.
+fn refusal_text(error: &crate::llms::LlmError) -> String {
+    match error.detail() {
+        Some(body) => body.to_string(),
+        None => format!("{error:#}"),
+    }
+}
+
 /// Whether a request failed because the backend refuses a forced tool choice.
 ///
 /// Several backends reject `tool_choice: required` outright — most when the model
@@ -3291,7 +3307,7 @@ async fn react_loop(
             .chat_completion(agent_config, request_config)
             .await;
         let completed = match (completed, relaxed_retry) {
-            (Err(e), Some(relaxed)) if rejects_forced_tool_choice(&format!("{e:#}")) => {
+            (Err(e), Some(relaxed)) if rejects_forced_tool_choice(refusal_text(&e).as_str()) => {
                 warn!(
                     agent_name = %agent_config.name,
                     error = %e,
@@ -4572,6 +4588,39 @@ mod tests {
             })
             .is_none(),
             "a request we never forced has nothing to retry"
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_judged_on_the_response_body_not_the_terse_display() {
+        use super::refusal_text;
+        use crate::llms::LlmError;
+
+        // What a live run actually produced: Display strips the reason, so a
+        // detector reading the formatted error sees nothing to match on.
+        let refused = LlmError::BadRequest {
+            status: 400,
+            body: "{\"error\":{\"message\":\"Thinking mode does not support this tool_choice\"}}"
+                .to_string(),
+        };
+        assert_eq!(
+            refused.to_string(),
+            "bad request (status 400)",
+            "the terse Display is what made the retry inert"
+        );
+        assert!(
+            super::rejects_forced_tool_choice(&refusal_text(&refused)),
+            "the refusal must be recognised from the body the error carries"
+        );
+
+        // An error with no body still falls back to its own text.
+        let overflow = LlmError::ContextOverflow {
+            tokens: 10,
+            limit: 5,
+        };
+        assert!(
+            !super::rejects_forced_tool_choice(&refusal_text(&overflow)),
+            "an unrelated failure must not be read as a refusal"
         );
     }
 
