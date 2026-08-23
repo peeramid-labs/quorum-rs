@@ -1646,6 +1646,26 @@ fn force_tool_choice(
     }
 }
 
+/// The same request with the tool choice left to the model, or `None` when we
+/// never forced one — there is then nothing to relax and no retry to make.
+fn relaxed_without_forced_choice(config: &RequestConfig) -> Option<RequestConfig> {
+    config.tool_choice.as_ref()?;
+    let mut relaxed = config.clone();
+    relaxed.tool_choice = None;
+    Some(relaxed)
+}
+
+/// Whether a request failed because the backend refuses a forced tool choice.
+///
+/// Several backends reject `tool_choice: required` outright when the model is in
+/// a thinking/reasoning mode, each wording it differently, and one wraps the
+/// refusal in a generic gateway error with the original nested inside. What they
+/// share is naming the parameter, so that is what this matches — a 400 that
+/// mentions `tool_choice` is a refusal of ours, not a fault in the prompt.
+fn rejects_forced_tool_choice(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("tool_choice")
+}
+
 /// Run the injected [`SubmissionValidator`](crate::agents::SubmissionValidator) on
 /// the proposal `content`, returning `Some(reason)` when rejected. Only
 /// `submit_proposal` submissions are validated; without a validator or on any
@@ -3260,10 +3280,27 @@ async fn react_loop(
             *running_tool_output_bytes,
         );
 
-        let result = match llm_client
+        // A forced tool choice is a guarantee some backends will not honour: they
+        // refuse the request outright rather than ignore the parameter. Keep a
+        // copy without it, so a refusal costs one retry instead of the turn.
+        let relaxed_retry = relaxed_without_forced_choice(&request_config);
+
+        let completed = llm_client
             .chat_completion(agent_config, request_config)
-            .await
-        {
+            .await;
+        let completed = match (completed, relaxed_retry) {
+            (Err(e), Some(relaxed)) if rejects_forced_tool_choice(&format!("{e:#}")) => {
+                warn!(
+                    agent_name = %agent_config.name,
+                    error = %e,
+                    "backend refused the forced tool choice; retrying without it"
+                );
+                llm_client.chat_completion(agent_config, relaxed).await
+            }
+            (completed, _) => completed,
+        };
+
+        let completion = match completed {
             Ok(res) => res,
             Err(e) => {
                 span.fail(&e).await;
@@ -3313,12 +3350,12 @@ async fn react_loop(
             }
         };
 
-        total_provider_usage.accumulate(&result.provider_usage);
-        served_by = result.provider_backend.clone().or(served_by);
+        total_provider_usage.accumulate(&completion.provider_usage);
+        served_by = completion.provider_backend.clone().or(served_by);
 
         // Complete LLM request span with telemetry
         let cost_usd = {
-            let usage = result.response.usage.clone();
+            let usage = completion.response.usage.clone();
             let (input_tokens, output_tokens, reasoning_tokens, cached_tokens) =
                 if let Some(u) = &usage {
                     let cached = u
@@ -3333,7 +3370,7 @@ async fn react_loop(
                         .unwrap_or(0);
                     (u.prompt_tokens, u.completion_tokens, reasoning, cached)
                 } else {
-                    let content_len = result
+                    let content_len = completion
                         .response
                         .choices
                         .first()
@@ -3363,11 +3400,11 @@ async fn react_loop(
         } else {
             None
         };
-        span.complete(&result, cost_usd, messages_chars, max_tokens_requested)
+        span.complete(&completion, cost_usd, messages_chars, max_tokens_requested)
             .await;
 
-        let response = result.response;
-        let request_body = result.raw_request;
+        let response = completion.response;
+        let request_body = completion.raw_request;
         last_request_body = Some(request_body);
         let choice = response
             .choices
@@ -4505,6 +4542,64 @@ mod tests {
             run_submission_validator(envelope, "submit_proposal", Some(&accept)).await,
             None
         );
+    }
+
+    #[test]
+    fn relaxing_a_request_keeps_it_whole_and_only_frees_the_choice() {
+        use super::relaxed_without_forced_choice;
+        let base = RequestConfig {
+            messages: vec![],
+            tools: None,
+            tool_choice: Some(async_openai::types::ChatCompletionToolChoiceOption::Required),
+            presence_penalty: Some(1.5),
+            service_tier: None,
+        };
+        let relaxed = relaxed_without_forced_choice(&base).expect("a forced choice can be relaxed");
+        assert!(
+            relaxed.tool_choice.is_none(),
+            "the retry must leave the choice to the model"
+        );
+        assert_eq!(
+            relaxed.presence_penalty, base.presence_penalty,
+            "the retry must otherwise be the same request"
+        );
+        assert!(
+            relaxed_without_forced_choice(&RequestConfig {
+                tool_choice: None,
+                ..base
+            })
+            .is_none(),
+            "a request we never forced has nothing to retry"
+        );
+    }
+
+    #[test]
+    fn a_refused_forced_tool_choice_is_recognised_however_it_is_worded() {
+        use super::rejects_forced_tool_choice;
+        // Measured refusals. Three backends, three wordings, one shared parameter
+        // name; the third arrives nested inside a generic gateway envelope.
+        for msg in [
+            "Thinking mode does not support this tool_choice",
+            "tool_choice 'required' is incompatible with thinking enabled",
+            "Provider returned error; raw: the tool_choice parameter does not support being set to required in thinking mode",
+        ] {
+            assert!(
+                rejects_forced_tool_choice(msg),
+                "a refusal naming the parameter must be recognised: {msg}"
+            );
+        }
+        // A failure that is not about our choice of parameter must not be retried
+        // as though it were — the retry drops the guarantee the parameter buys.
+        for msg in [
+            "1 validation error for ToolDescription: description must be a string",
+            "context length exceeded",
+            "insufficient credits",
+        ] {
+            assert!(
+                !rejects_forced_tool_choice(msg),
+                "an unrelated failure must not be read as a refusal: {msg}"
+            );
+        }
     }
 
     #[test]
