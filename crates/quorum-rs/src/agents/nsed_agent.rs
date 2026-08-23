@@ -1657,13 +1657,15 @@ fn relaxed_without_forced_choice(config: &RequestConfig) -> Option<RequestConfig
 
 /// Whether a request failed because the backend refuses a forced tool choice.
 ///
-/// Several backends reject `tool_choice: required` outright when the model is in
-/// a thinking/reasoning mode, each wording it differently, and one wraps the
-/// refusal in a generic gateway error with the original nested inside. What they
-/// share is naming the parameter, so that is what this matches — a 400 that
-/// mentions `tool_choice` is a refusal of ours, not a fault in the prompt.
+/// Several backends reject `tool_choice: required` outright — most when the model
+/// is in a thinking/reasoning mode — each wording it differently, and some wrap
+/// the refusal in a generic gateway error with the original nested inside. Most
+/// name the parameter; one describes the behaviour instead, without naming it.
+/// Either way the request was refused for the choice we forced, not for anything
+/// in the prompt.
 fn rejects_forced_tool_choice(error: &str) -> bool {
-    error.to_ascii_lowercase().contains("tool_choice")
+    let error = error.to_ascii_lowercase();
+    error.contains("tool_choice") || error.contains("forced function calling")
 }
 
 /// Run the injected [`SubmissionValidator`](crate::agents::SubmissionValidator) on
@@ -4582,6 +4584,8 @@ mod tests {
             "Thinking mode does not support this tool_choice",
             "tool_choice 'required' is incompatible with thinking enabled",
             "Provider returned error; raw: the tool_choice parameter does not support being set to required in thinking mode",
+            // Named by behaviour rather than by parameter, and nested likewise.
+            "Provider returned error; raw: unable to submit request because the forced function calling (mode = ANY) is not supported",
         ] {
             assert!(
                 rejects_forced_tool_choice(msg),
