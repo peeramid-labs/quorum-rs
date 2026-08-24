@@ -145,6 +145,18 @@ pub struct AgentConfig {
     /// `None` (default) leaves it unbounded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_jobs: Option<usize>,
+    /// This agent's own public key, hex-encoded. Identity is additive: `name` stays
+    /// the handle every subject, roster and config keys on, and this is the key that
+    /// handle binds to — a peer that has both can check a signature came from the
+    /// agent it names. Encoding follows the signing algorithm (33-byte compressed
+    /// secp256k1, 32-byte Ed25519), and is validated where it is consumed, not here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_pubkey: Option<String>,
+    /// Public keys authorised to act for this agent — an operator editing its buffer
+    /// before release. Several, because an agent may be run by more than one person
+    /// and a key may be rotated without a window where neither works.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operator_pubkeys: Vec<String>,
     #[serde(default)]
     pub supports_native_thinking: bool,
     #[serde(default)]
@@ -1020,6 +1032,8 @@ impl Default for AgentConfig {
             max_scratchpad_size: default_max_scratchpad_size(),
             max_retries: default_max_retries(),
             max_concurrent_jobs: None,
+            agent_pubkey: None,
+            operator_pubkeys: Vec::new(),
             supports_native_thinking: false,
             frequency_penalty: None,
             presence_penalty: default_presence_penalty(),
@@ -2086,6 +2100,42 @@ provider_config:
         assert_eq!(with.max_concurrent_jobs, Some(1));
         let without = serde_yaml::from_str::<AgentConfig>("name: a\n").unwrap();
         assert_eq!(without.max_concurrent_jobs, None);
+    }
+
+    /// Identity keys are additive: an agent carries its own public key and the
+    /// operator keys authorised to act for it. Every existing fleet config predates
+    /// both, so their absence must stay a silent default rather than a boot failure.
+    #[test]
+    fn identity_keys_parse_and_default_empty() {
+        let with = serde_yaml::from_str::<AgentConfig>(
+            "name: a\n\
+             agent_pubkey: \"0x02aa\"\n\
+             operator_pubkeys:\n  - \"0x03bb\"\n  - \"0x03cc\"\n",
+        )
+        .unwrap();
+        assert_eq!(with.agent_pubkey.as_deref(), Some("0x02aa"));
+        assert_eq!(with.operator_pubkeys, vec!["0x03bb", "0x03cc"]);
+
+        let without = serde_yaml::from_str::<AgentConfig>("name: a\n").unwrap();
+        assert_eq!(without.agent_pubkey, None);
+        assert!(without.operator_pubkeys.is_empty());
+    }
+
+    /// An agent that declares no keys must not advertise empty ones: a serialized
+    /// config is what a peer reads to decide whether this agent can be verified at
+    /// all, and `agent_pubkey: null` there reads as a key that failed to load.
+    #[test]
+    fn identity_keys_are_omitted_when_unset() {
+        let cfg = serde_yaml::from_str::<AgentConfig>("name: a\n").unwrap();
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert!(
+            json.get("agent_pubkey").is_none(),
+            "an unset agent_pubkey must not serialize: {json}"
+        );
+        assert!(
+            json.get("operator_pubkeys").is_none(),
+            "empty operator_pubkeys must not serialize: {json}"
+        );
     }
 
     /// Missing md file → parse error naming the path. Operators see
