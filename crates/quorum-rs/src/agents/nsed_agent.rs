@@ -1726,6 +1726,20 @@ fn rejects_forced_tool_choice(error: &str) -> bool {
     error.contains("tool_choice") || error.contains("forced function calling")
 }
 
+/// Whether a request failed because the backend refuses our function tools declared
+/// beside a provider-executed one.
+///
+/// A seat carrying `provider_executed_tools` sends both in a single array, which
+/// several backends reject outright — and the rejection takes down EVERY tool call
+/// that seat makes, so it reads as an agent that simply never proposes. Recognising
+/// it is what turns that silence into a cause a reader can act on: move the tool to
+/// the nested search-only call instead of declaring it alongside.
+fn rejects_mixed_tool_array(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("all search tools")
+        || (error.contains("multiple tools") && error.contains("supported"))
+}
+
 /// Run the injected [`SubmissionValidator`](crate::agents::SubmissionValidator) on
 /// the proposal `content`, returning `Some(reason)` when rejected. Only
 /// `submit_proposal` submissions are validated; without a validator or on any
@@ -3350,6 +3364,24 @@ async fn react_loop(
         let completed = llm_client
             .chat_completion(agent_config, request_config)
             .await;
+        // Diagnosis, not control flow: this refusal is not retryable, but it is the
+        // one that takes every tool call a seat makes down with it, so it must not
+        // reach the log as an anonymous request failure.
+        if let Err(e) = &completed {
+            if !agent_config.provider_executed_tools.is_empty()
+                && rejects_mixed_tool_array(refusal_text(e).as_str())
+            {
+                warn!(
+                    agent_name = %agent_config.name,
+                    model = %agent_config.model_name,
+                    provider_executed_tools = ?agent_config.provider_executed_tools,
+                    error = %e,
+                    "backend refuses our tools declared beside a provider-executed one — \
+                     every tool call from this seat will fail. Use the nested search-only \
+                     call instead of declaring the tool alongside."
+                );
+            }
+        }
         let completed = match (completed, relaxed_retry) {
             (Err(e), Some(relaxed)) if rejects_forced_tool_choice(refusal_text(&e).as_str()) => {
                 warn!(
@@ -4388,6 +4420,32 @@ mod tests {
             raw,
             cleaned,
             output_tokens,
+        }
+    }
+
+    /// The refusal that takes every tool call from a seat with it. Recognising it
+    /// by wording is what turns an agent that never proposes into a named cause;
+    /// an unrelated failure must not be labelled with a fix that would not help.
+    #[test]
+    fn a_mixed_tool_array_refusal_is_told_apart_from_other_failures() {
+        for refused in [
+            "Multiple tools are supported only when they are all search tools",
+            "multiple tools are supported only when they are ALL SEARCH TOOLS",
+        ] {
+            assert!(
+                super::rejects_mixed_tool_array(refused),
+                "must recognise the refusal: {refused}"
+            );
+        }
+        for unrelated in [
+            "context length exceeded",
+            "tool_choice is not supported for this model",
+            "rate limit reached",
+        ] {
+            assert!(
+                !super::rejects_mixed_tool_array(unrelated),
+                "must not blame the tool array for: {unrelated}"
+            );
         }
     }
 
