@@ -83,9 +83,17 @@ fn normalize_lexical(p: &Path) -> PathBuf {
 /// per-project session directory.
 ///
 /// claude's convention is to take the absolute working-dir path and
-/// replace every path separator (`/`) with `-`. So
-/// `/home/dev/project` becomes `-home-dev-project`. The
+/// replace every path separator (`/`) AND every `.` with `-`. So
+/// `/home/dev/project` becomes `-home-dev-project`, and a dotted
+/// component like `/srv/.worktrees/…` becomes `-srv--worktrees-…` (the
+/// `/` and the `.` each map to `-`, giving the double dash). The
 /// leading `-` is preserved because the original starts with `/`.
+///
+/// The `.` is load-bearing: agent worktrees live under a dotted
+/// directory, so omitting the `.` mapping produced a slug that never
+/// matched claude's on-disk `<uuid>.jsonl` — the recoverability check
+/// always missed the session and forced a fresh `--session-id` run with
+/// the FULL prompt every round (the token-bloat regression).
 ///
 /// We don't try to canonicalize symlinks here — claude doesn't
 /// either, so the path string we get from `claude_config.working_dir`
@@ -94,7 +102,7 @@ pub fn claude_project_dir_name(working_dir: &Path) -> String {
     let s = working_dir.to_string_lossy();
     // Normalize backslashes too in case a Windows-style path slips
     // through the absolute-path coercion upstream.
-    s.replace(['/', '\\'], "-")
+    s.replace(['/', '\\', '.'], "-")
 }
 
 /// Resolve the per-session jsonl path under the user's
@@ -506,6 +514,15 @@ mod tests {
             "-home-dev-project"
         );
         assert_eq!(claude_project_dir_name(&PathBuf::from("/work")), "-work");
+        // Dotted component (the agent worktrees live under `.pd-worktrees`): the `.`
+        // must map to `-` too, matching claude's on-disk slug byte-for-byte, or the
+        // session is never found and every round re-sends the full prompt.
+        assert_eq!(
+            claude_project_dir_name(&PathBuf::from(
+                "/srv/deliberation/.worktrees/thread-abc/ReviewerBot"
+            )),
+            "-srv-deliberation--worktrees-thread-abc-ReviewerBot"
+        );
         // Backslash form (Windows-y path passed through to_string_lossy).
         let mut p = PathBuf::from("");
         p.push("C:");

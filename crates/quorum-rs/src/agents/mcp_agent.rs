@@ -1891,6 +1891,14 @@ impl ClaudeAgent {
         (session_not_found || already_in_use) && !session_recoverable
     }
 
+    /// True when a phase that should have resumed (`round > 0`) instead has to restart
+    /// fresh — i.e. the `--resume` delta silently degraded to a full-prompt re-send. This
+    /// is the token-bloat signature (worktree/session-key drift moving the cwd off the
+    /// session jsonl); callers surface it loudly so the regression can't hide.
+    fn resume_degraded_to_full(round_number: u32, restart_fresh: bool) -> bool {
+        round_number > 0 && restart_fresh
+    }
+
     /// Effective cwd for the claude phase subprocess: a per-task override declared
     /// by a `before_prompt` middleware (the `agent_working_dir` key) wins over the
     /// agent's static `working_dir`, falling back to the process cwd. Used for the
@@ -2524,6 +2532,28 @@ impl ClaudeAgent {
                     is_already_in_use,
                     session_recoverable,
                 );
+                // Perf guard (retained-conversation): a fresh restart on a round that
+                // should have resumed means the delta path silently degraded to a FULL
+                // re-send — the exact token-bloat signature of worktree/session-key drift
+                // (which moved the cwd so claude's session jsonl wasn't at the expected
+                // path). Surface it LOUDLY + measurably instead of hiding it at info, so a
+                // future drift is caught the moment it costs tokens, not weeks later.
+                if Self::resume_degraded_to_full(ctx.round_number, restart_fresh) {
+                    tracing::warn!(
+                        agent = %self.name,
+                        phase = %phase,
+                        round = ctx.round_number,
+                        session_uuid = %claude_session_uuid,
+                        working_dir = %self.phase_working_dir(ctx).display(),
+                        full_prompt_bytes = full_prompt.len(),
+                        delta_prompt_bytes = prompt.len(),
+                        "RESUME DEGRADED: round>0 expected --resume but the session was not \
+                         found — re-sending the FULL prompt ({} B vs {} B delta). Likely \
+                         worktree/session-key drift moved the cwd off claude's session jsonl.",
+                        full_prompt.len(),
+                        prompt.len(),
+                    );
+                }
                 let had_session_collision = is_session_not_found || is_already_in_use;
                 if had_session_collision {
                     // Either recovery path needs a clean lock: the dead child
@@ -4822,6 +4852,18 @@ mod tests {
             false, false, false
         ));
         assert!(!ClaudeAgent::restart_fresh_on_collision(false, false, true));
+    }
+
+    #[test]
+    fn resume_degradation_flags_only_a_fresh_restart_past_round_zero() {
+        // Round 0 is legitimately fresh (no prior session) — never a degradation.
+        assert!(!ClaudeAgent::resume_degraded_to_full(0, true));
+        assert!(!ClaudeAgent::resume_degraded_to_full(0, false));
+        // A resumed round that restarts fresh = the delta silently became a full re-send.
+        assert!(ClaudeAgent::resume_degraded_to_full(1, true));
+        assert!(ClaudeAgent::resume_degraded_to_full(3, true));
+        // A resumed round that actually resumed (no fresh restart) is healthy.
+        assert!(!ClaudeAgent::resume_degraded_to_full(3, false));
     }
 
     #[test]
