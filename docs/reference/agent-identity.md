@@ -47,9 +47,14 @@ A reference that resolves to nothing, or to something that is not 32 bytes, yiel
 no identity rather than a different one: the agent announces no key instead of one
 nobody can check.
 
-A configured key is installed as the worker's signing hook at construction, so the
-agent signs with the key it announces. A caller that sets its own hook afterwards
-still wins — the builder runs after construction.
+### Configuring a key does not switch signing on
+
+A key in config is announced, not used. Signing stays an explicit
+`with_hook(signing_hook_from(...))`, because the signing hook replaces a proposal
+payload with an audit envelope and the receiving side parses that subject straight
+into a `Proposal` — an envelope does not satisfy it, so every proposal would be
+dropped. Nothing verifies these signatures yet either, so wrapping the wire would
+cost delivery and buy nothing until a reader exists on the far side.
 
 ### Adding a key backend
 

@@ -255,6 +255,42 @@ mod tests {
 
     // ---- AgentKeyPair ----
 
+    /// Signing rewrites a proposal into an envelope, and nothing on the receiving
+    /// side unwraps one — the orchestrator parses that subject straight into a
+    /// `Proposal`, which an envelope cannot satisfy. Installing this hook therefore
+    /// changes the wire contract, and must stay an explicit choice rather than
+    /// something a config key switches on. This test is the reason, kept executable.
+    #[tokio::test]
+    async fn signing_a_proposal_replaces_it_with_something_no_reader_parses() {
+        use crate::agents::Proposal;
+        use crate::workers::WorkerHook;
+
+        let hook = super::SigningHook::new(super::AgentKeyPair::generate(), "agent-a".into());
+        let proposal = serde_json::to_vec(&Proposal {
+            thought_process: "considered".into(),
+            content: "the answer".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut payload = proposal.clone();
+        hook.before_publish("nsed.job1.result.0.agent-a.propose", &mut payload)
+            .await
+            .unwrap();
+        assert_ne!(payload, proposal, "the payload is replaced by an envelope");
+        assert!(
+            serde_json::from_slice::<Proposal>(&payload).is_err(),
+            "an envelope does not parse as the Proposal the receiver expects"
+        );
+
+        // A control-plane subject is left alone, so this is scoped, not universal.
+        let mut heartbeat = proposal.clone();
+        hook.before_publish("sphera.agent.heartbeat.agent-a", &mut heartbeat)
+            .await
+            .unwrap();
+        assert_eq!(heartbeat, proposal, "non-audit subjects pass through");
+    }
+
     #[test]
     fn keypair_generate_produces_unique_keys() {
         let a = AgentKeyPair::generate();

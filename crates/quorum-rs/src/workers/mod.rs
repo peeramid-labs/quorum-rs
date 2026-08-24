@@ -585,8 +585,6 @@ impl NatsNsedWorker {
                 .map_err(|e| anyhow::anyhow!(e))?,
         );
 
-        let signing_hook = signing_hook_from(agent_config.signing_key.as_deref(), &agent_id);
-
         Ok(Self {
             agent,
             agent_config,
@@ -599,11 +597,12 @@ impl NatsNsedWorker {
             active_jobs: Arc::new(Mutex::new(HashSet::new())),
             start_time: Instant::now(),
             status: None,
-            // A configured key signs from the start: announcing a derived identity
-            // on the heartbeat while leaving payloads unsigned would show a reader a
-            // key with nothing behind it. A caller's own `with_hook` still wins,
-            // since the builder runs after construction.
-            hook: signing_hook,
+            // NOT installed from config, deliberately. `SigningHook` replaces a
+            // proposal payload with an `AuditEnvelope`, and the receiver parses that
+            // subject straight into a `Proposal` — so switching signing on by config
+            // would drop every proposal the agent sends. Signing stays an explicit
+            // `with_signing` until something on the far side unwraps an envelope.
+            hook: None,
             user_tool_factory: None,
             chat_agent: None,
             response_buffer: None,
@@ -2913,14 +2912,21 @@ async fn run_stage_pipeline(
     }
 }
 
-/// The signing hook a configured `signing_key` implies, if any.
+/// Build the signing hook a configured `signing_key` names, if any.
 ///
-/// Installed as the worker's default hook at construction so an agent given a key
-/// in config actually signs with it — declaring a key it never used would put an
-/// identity on the heartbeat that nothing behind it honours. A caller that sets
-/// its own hook afterwards still wins, since the builder runs after construction.
+/// **Opt-in.** This is not installed from config, because [`crate::crypto::SigningHook`]
+/// replaces a proposal payload with an `AuditEnvelope` and the receiving side parses
+/// that subject straight into a `Proposal` — switching signing on by configuration
+/// would drop every proposal the agent sends. Pass the result to
+/// [`NatsNsedWorker::with_hook`] once something on the far side unwraps an envelope.
+///
+/// ```ignore
+/// if let Some(hook) = signing_hook_from(cfg.signing_key.as_deref(), &agent_id) {
+///     worker = worker.with_hook(hook);
+/// }
+/// ```
 #[cfg(feature = "audit")]
-fn signing_hook_from(signing_key: Option<&str>, agent_id: &str) -> Option<Arc<dyn WorkerHook>> {
+pub fn signing_hook_from(signing_key: Option<&str>, agent_id: &str) -> Option<Arc<dyn WorkerHook>> {
     let signer = crate::crypto::signer_from_config_ref(signing_key?)?;
     Some(Arc::new(crate::crypto::SigningHook::with_signer(
         signer,
@@ -2928,9 +2934,12 @@ fn signing_hook_from(signing_key: Option<&str>, agent_id: &str) -> Option<Arc<dy
     )))
 }
 
-/// Without the signing machinery a configured key installs nothing.
+/// Without the signing machinery a configured key names no hook.
 #[cfg(not(feature = "audit"))]
-fn signing_hook_from(_signing_key: Option<&str>, _agent_id: &str) -> Option<Arc<dyn WorkerHook>> {
+pub fn signing_hook_from(
+    _signing_key: Option<&str>,
+    _agent_id: &str,
+) -> Option<Arc<dyn WorkerHook>> {
     None
 }
 
