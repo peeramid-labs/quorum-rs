@@ -15,7 +15,7 @@ Set `NSED_DUMP_PROMPTS_DIR` to a writable directory when you launch the agents
 (or the orchestrator/`serve` process that spawns them):
 
 ```bash
-NSED_DUMP_PROMPTS_DIR=/Users/tim/SpheRa/prompt-dumps \
+NSED_DUMP_PROMPTS_DIR=/var/tmp/prompt-dumps \
   nsed serve --config quorum.yml
 ```
 
@@ -33,7 +33,7 @@ One file per outgoing call, in the provider's **native** format:
 | `openai` / `ollama` / `openrouter` / … | `…-<engine>.json` | the final Chat Completions request JSON as sent (messages, tools, params) |
 
 Filenames are `{seq}-{agent}[-r{round}][-{phase}]-{provider}.{ext}`, e.g.
-`000042-EngineerBot-Fast-r2-propose-claude.txt`. `{seq}` is a per-process counter,
+`000042-ReviewerBot-Fast-r2-propose-claude.txt`. `{seq}` is a per-process counter,
 so files sort in call order.
 
 ## Analyze
@@ -42,7 +42,7 @@ The claude dump shows every `--append-system-prompt` block — the usual home of
 prompt bloat. Rank system-prompt sizes:
 
 ```bash
-cd /Users/tim/SpheRa/prompt-dumps
+cd /var/tmp/prompt-dumps
 # biggest claude invocations (bytes)
 ls -S *-claude.txt | head
 

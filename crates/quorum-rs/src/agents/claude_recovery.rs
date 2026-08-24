@@ -84,7 +84,7 @@ fn normalize_lexical(p: &Path) -> PathBuf {
 ///
 /// claude's convention is to take the absolute working-dir path and
 /// replace every path separator (`/`) with `-`. So
-/// `/Users/tim/github/nsed` becomes `-Users-tim-github-nsed`. The
+/// `/home/dev/project` becomes `-home-dev-project`. The
 /// leading `-` is preserved because the original starts with `/`.
 ///
 /// We don't try to canonicalize symlinks here — claude doesn't
@@ -502,16 +502,16 @@ mod tests {
     #[test]
     fn project_dir_name_replaces_separators() {
         assert_eq!(
-            claude_project_dir_name(&PathBuf::from("/Users/tim/github/nsed")),
-            "-Users-tim-github-nsed"
+            claude_project_dir_name(&PathBuf::from("/home/dev/project")),
+            "-home-dev-project"
         );
         assert_eq!(claude_project_dir_name(&PathBuf::from("/work")), "-work");
         // Backslash form (Windows-y path passed through to_string_lossy).
         let mut p = PathBuf::from("");
         p.push("C:");
         p.push("Users");
-        p.push("tim");
-        // On unix this becomes `C:/Users/tim` — replacement still
+        p.push("dev");
+        // On unix this becomes `C:/Users/dev` — replacement still
         // strips both kinds of separator.
         let mapped = claude_project_dir_name(&p);
         assert!(!mapped.contains('/'));
@@ -532,11 +532,11 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", "/tmp/nsed-test-home");
         }
-        let p = session_jsonl_path(&PathBuf::from("/Users/tim/github/nsed"), "abc-123-uuid")
+        let p = session_jsonl_path(&PathBuf::from("/home/dev/project"), "abc-123-uuid")
             .expect("HOME set");
         assert!(
             p.ends_with(PathBuf::from(
-                ".claude/projects/-Users-tim-github-nsed/abc-123-uuid.jsonl"
+                ".claude/projects/-home-dev-project/abc-123-uuid.jsonl"
             )),
             "got {}",
             p.display()
