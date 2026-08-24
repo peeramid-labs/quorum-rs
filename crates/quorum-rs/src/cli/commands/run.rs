@@ -198,6 +198,23 @@ pub async fn run(
                 "\nResult ({} rounds, score {:.2}, by {}):",
                 payload.rounds_completed, payload.best_proposal_score, payload.best_proposal_author
             );
+            // Where the agreed answer lives, when the deliberation kept one. What is
+            // printed below is a copy; this is the thing itself, and the only form
+            // that can be fetched again or checked later.
+            if let Some(at) = &payload.consensus {
+                if at.hosted {
+                    eprintln!(
+                        "Answer: {} in {} ({} @ {})",
+                        at.file, at.repo, at.branch, at.commit
+                    );
+                    eprintln!("  git clone {} && git checkout {}", at.repo, at.commit);
+                } else {
+                    eprintln!(
+                        "Answer: {} at {} ({} @ {}) — local to the agent host, not fetchable from here",
+                        at.file, at.repo, at.branch, at.commit
+                    );
+                }
+            }
             if let Some(dir) = output_dir {
                 let dispatch = serde_json::json!({
                     "job_id": job_id,
