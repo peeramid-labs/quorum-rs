@@ -15,6 +15,7 @@ pub use user_tools::{NatsUserToolHandlerFactory, UserToolHandler, toolcalls_buck
 
 use anyhow::Result;
 use async_trait::async_trait;
+use quorum_crypto_core::envelope::EnvelopeSignature;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -283,6 +284,16 @@ pub struct OperatorAnnotation {
     /// **Required** for `Edit` annotations — enforced by [`Self::validate()`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_content_hash: Option<String>,
+    /// Signatures over the annotated content. A list, not a single signature,
+    /// because the audit envelope this feeds is already multi-signature: a classical
+    /// and a post-quantum signature over the same edit are separate entries, so a
+    /// reader can see which algorithms actually covered it. Each entry names its own
+    /// algorithm, which is what [`quorum_crypto_core::VerifierRegistry`] dispatches
+    /// on, and its [`SignerRole`] — `Operator` for a human approving a buffer
+    /// release. Empty means unsigned; whether unsigned is *acceptable* is the
+    /// release path's decision, not this type's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signatures: Vec<EnvelopeSignature>,
 }
 
 impl OperatorAnnotation {
@@ -290,10 +301,24 @@ impl OperatorAnnotation {
     ///
     /// - `Edit` annotations **must** carry a non-empty `original_content_hash`.
     /// - `Comment` annotations have no additional requirements.
+    /// - every signature names its algorithm, key and signature bytes.
     ///
     /// This is enforced at API boundaries (HITL buffer edit handler), not on
     /// deserialization, to preserve backward compat with `#[serde(default)]`.
     pub fn validate(&self) -> Result<(), String> {
+        // Blank counts as absent: an empty string satisfies a presence check while
+        // carrying nothing, which is what turns a fail-closed check fail-open.
+        for (i, sig) in self.signatures.iter().enumerate() {
+            for (field, value) in [
+                ("algorithm", &sig.algorithm),
+                ("public_key", &sig.public_key),
+                ("signature", &sig.signature),
+            ] {
+                if value.is_empty() {
+                    return Err(format!("signature {i} has no {field}"));
+                }
+            }
+        }
         if self.annotation_type == AnnotationType::Edit {
             match &self.original_content_hash {
                 Some(hash) if !hash.is_empty() => Ok(()),
@@ -1119,6 +1144,14 @@ pub struct AgentHeartbeat {
     /// knows what it pinned.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_endpoints: Vec<String>,
+    /// This agent's public key, hex-encoded, as declared in its config.
+    ///
+    /// Reported here because the orchestrator holds no copy of an agent's config:
+    /// the heartbeat is how the key reaches the registry that later has to decide
+    /// whether a signature came from the agent it names. Absent means the agent
+    /// declared none, which is not the same as one that failed to load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_pubkey: Option<String>,
     /// Job ID if currently processing, else None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_job: Option<String>,
@@ -1301,6 +1334,26 @@ mod tests {
         assert!(bare.get("pinned_endpoints").is_none());
         let back: AgentHeartbeat = serde_json::from_value(bare).unwrap();
         assert!(back.pinned_endpoints.is_empty());
+    }
+
+    /// The heartbeat is how a key reaches the orchestrator's registry — an agent's
+    /// config is not something the orchestrator holds a copy of. An agent that
+    /// declares no key must stay absent from the wire rather than announce a null
+    /// one, which reads as a key that failed to load.
+    #[test]
+    fn an_agent_pubkey_survives_the_wire_and_stays_absent_when_unset() {
+        let json = serde_json::to_string(&AgentHeartbeat {
+            agent_pubkey: Some("0x02aa".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let back: AgentHeartbeat = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.agent_pubkey.as_deref(), Some("0x02aa"));
+
+        let bare = serde_json::to_value(AgentHeartbeat::default()).unwrap();
+        assert!(bare.get("agent_pubkey").is_none());
+        let back: AgentHeartbeat = serde_json::from_value(bare).unwrap();
+        assert!(back.agent_pubkey.is_none());
     }
 
     #[test]
@@ -2950,6 +3003,7 @@ mod tests {
             model_name: "gpt-4".to_string(),
             provider_id: "openai".to_string(),
             pinned_endpoints: Vec::new(),
+            agent_pubkey: Some("0x02aa".to_string()),
             current_job: Some("job-42".to_string()),
             uptime_secs: 3600,
             timestamp: "2025-01-01T00:00:00Z".to_string(),
@@ -2984,6 +3038,7 @@ mod tests {
         assert_eq!(deserialized.model_name, "gpt-4");
         assert_eq!(deserialized.provider_id, "openai");
         assert_eq!(deserialized.current_job, Some("job-42".to_string()));
+        assert_eq!(deserialized.agent_pubkey.as_deref(), Some("0x02aa"));
         assert_eq!(deserialized.uptime_secs, 3600);
         assert!((deserialized.input_price_per_mtok.unwrap() - 10.0).abs() < f64::EPSILON);
         assert!((deserialized.output_price_per_mtok.unwrap() - 30.0).abs() < f64::EPSILON);
@@ -3259,6 +3314,7 @@ mod tests {
             comment: "Fixed factual error in claim 3".to_string(),
             timestamp: "2026-03-07T12:00:00Z".to_string(),
             original_content_hash: Some("abc123def456".to_string()),
+            signatures: Vec::new(),
         };
         let json = serde_json::to_value(&annotation).unwrap();
         let roundtripped: OperatorAnnotation = serde_json::from_value(json).unwrap();
@@ -3272,6 +3328,7 @@ mod tests {
             comment: "Looks good".to_string(),
             timestamp: "2026-03-07T12:00:00Z".to_string(),
             original_content_hash: None,
+            signatures: Vec::new(),
         };
         let json = serde_json::to_value(&annotation).unwrap();
         assert!(
@@ -3294,12 +3351,14 @@ mod tests {
                     comment: "Rewrote conclusion".to_string(),
                     timestamp: "2026-03-07T12:00:00Z".to_string(),
                     original_content_hash: Some("deadbeef".to_string()),
+                    signatures: Vec::new(),
                 },
                 OperatorAnnotation {
                     annotation_type: AnnotationType::Comment,
                     comment: "Approved after edit".to_string(),
                     timestamp: "2026-03-07T12:01:00Z".to_string(),
                     original_content_hash: None,
+                    signatures: Vec::new(),
                 },
             ],
             ..Default::default()
@@ -3343,6 +3402,7 @@ mod tests {
                 comment: "Score adjusted after review".to_string(),
                 timestamp: "2026-03-07T14:00:00Z".to_string(),
                 original_content_hash: None,
+                signatures: Vec::new(),
             }],
             ..Default::default()
         };
@@ -3366,6 +3426,7 @@ mod tests {
             comment: "Fixed error".to_string(),
             timestamp: "2026-03-11T00:00:00Z".to_string(),
             original_content_hash: Some("abc123".to_string()),
+            signatures: Vec::new(),
         };
         assert!(annotation.validate().is_ok());
     }
@@ -3377,6 +3438,7 @@ mod tests {
             comment: "Fixed error".to_string(),
             timestamp: "2026-03-11T00:00:00Z".to_string(),
             original_content_hash: None,
+            signatures: Vec::new(),
         };
         let err = annotation.validate().unwrap_err();
         assert!(err.contains("original_content_hash"));
@@ -3389,6 +3451,7 @@ mod tests {
             comment: "Fixed error".to_string(),
             timestamp: "2026-03-11T00:00:00Z".to_string(),
             original_content_hash: Some(String::new()),
+            signatures: Vec::new(),
         };
         assert!(annotation.validate().is_err());
     }
@@ -3400,8 +3463,86 @@ mod tests {
             comment: "Looks good".to_string(),
             timestamp: "2026-03-11T00:00:00Z".to_string(),
             original_content_hash: None,
+            signatures: Vec::new(),
         };
         assert!(annotation.validate().is_ok());
+    }
+
+    fn operator_sig(algorithm: &str, key: &str, sig: &str) -> EnvelopeSignature {
+        use quorum_crypto_core::envelope::SignerRole;
+        EnvelopeSignature {
+            algorithm: algorithm.to_string(),
+            public_key: key.to_string(),
+            signature: sig.to_string(),
+            role: SignerRole::Operator,
+            signer_id: "op-alice".to_string(),
+        }
+    }
+
+    fn annotated(signatures: Vec<EnvelopeSignature>) -> OperatorAnnotation {
+        OperatorAnnotation {
+            signatures,
+            ..Default::default()
+        }
+    }
+
+    /// An annotation may be unsigned, but each signature it does carry must be
+    /// checkable. `VerifierRegistry::verify` dispatches on the algorithm string, so
+    /// an entry missing one of algorithm, key or signature names nothing a verifier
+    /// could route to — it would read as provenance to anyone counting entries
+    /// rather than checking them.
+    #[test]
+    fn every_signature_on_an_annotation_is_checkable_or_rejected() {
+        assert!(annotated(vec![]).validate().is_ok(), "unsigned is allowed");
+        assert!(
+            annotated(vec![operator_sig("ed25519", "0x02aa", "0xdead")])
+                .validate()
+                .is_ok()
+        );
+
+        for (algorithm, key, sig, missing) in [
+            ("", "0x02aa", "0xdead", "algorithm"),
+            ("ed25519", "", "0xdead", "public_key"),
+            ("ed25519", "0x02aa", "", "signature"),
+        ] {
+            let err = annotated(vec![operator_sig(algorithm, key, sig)])
+                .validate()
+                .unwrap_err();
+            assert!(
+                err.contains(missing),
+                "a signature with no {missing} must say so; got: {err}"
+            );
+        }
+    }
+
+    /// Classical and post-quantum signatures over the same annotation are separate
+    /// entries, so a reader can tell which algorithms actually covered it rather
+    /// than inferring it from a single opaque blob.
+    #[test]
+    fn an_annotation_carries_a_classical_and_a_post_quantum_signature_side_by_side() {
+        let annotation = annotated(vec![
+            operator_sig("ed25519", "0x02aa", "0xdead"),
+            operator_sig("ml-dsa-65", "0x03bb", "0xbeef"),
+        ]);
+        assert!(annotation.validate().is_ok());
+        let algorithms: Vec<&str> = annotation
+            .signatures
+            .iter()
+            .map(|s| s.algorithm.as_str())
+            .collect();
+        assert_eq!(algorithms, vec!["ed25519", "ml-dsa-65"]);
+    }
+
+    /// An unsigned annotation must not serialize an empty signature list: a reader
+    /// distinguishes "no signatures" from "signatures that failed to load", and an
+    /// empty array asserts the first where the field's absence asserts nothing.
+    #[test]
+    fn an_unsigned_annotation_does_not_serialize_an_empty_signature_list() {
+        let json = serde_json::to_value(annotated(vec![])).unwrap();
+        assert!(
+            json.get("signatures").is_none(),
+            "empty signatures must not serialize: {json}"
+        );
     }
 
     #[test]

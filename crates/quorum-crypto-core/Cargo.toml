@@ -18,11 +18,13 @@ hex = "0.4"
 k256 = { version = "0.13", features = ["ecdsa", "sha256", "ecdsa-core"] }
 nkeys = { version = "0.4", optional = true }
 rand = "0.8"
+schemars = { version = "1", features = ["derive"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sha3 = "0.10"
 thiserror = "2"
+utoipa = { version = "5.4.0", optional = true }
 
 # On wasm32-unknown-unknown, `getrandom` (pulled via rand/ed25519-dalek/k256)
 # needs its `js` backend or it refuses to compile. Target-scoped so native
@@ -36,6 +38,10 @@ default = ["device"]
 # Device identity (NATS user nkey) for self-serve register. Pulls `nkeys`.
 # wasm consumers that don't register can `default-features = false` to drop it.
 device = ["dep:nkeys"]
+# JSON-schema / OpenAPI derives on the wire types, for consumers that expose
+# them in an HTTP API. Off by default so a lean or wasm build does not carry
+# schema machinery it never serves.
+schema = ["dep:schemars", "dep:utoipa"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

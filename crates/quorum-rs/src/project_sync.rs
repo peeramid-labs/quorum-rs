@@ -17,6 +17,12 @@ pub struct ProjectAdvanced {
     pub project_id: String,
     #[serde(default)]
     pub head: Option<String>,
+    /// Where the consensus can be fetched, when the deliberation worked it out:
+    /// `{repo, hosted, commit, file, branch}`. A holder syncing an epic it already
+    /// has does not need this; a caller meeting a fresh answer thread has nothing
+    /// else to go on. Absent when the job produced no fetchable answer.
+    #[serde(default)]
+    pub consensus: Option<serde_json::Value>,
 }
 
 /// A client's local replica of one epic, kept fresh by pulling on advanced events.
@@ -168,6 +174,7 @@ mod tests {
         ProjectAdvanced {
             project_id: project.to_string(),
             head: head.map(str::to_string),
+            consensus: None,
         }
     }
 
@@ -289,5 +296,34 @@ mod tests {
             "same head → skip"
         );
         let _ = std::fs::remove_dir_all(&sbx);
+    }
+}
+
+#[cfg(test)]
+mod consensus_tests {
+    use super::*;
+
+    /// The publisher now sends coordinates; a reader that silently dropped them is
+    /// the drift this type exists to prevent.
+    #[test]
+    fn a_reader_sees_the_coordinates_the_publisher_sends() {
+        let event: ProjectAdvanced = serde_json::from_value(serde_json::json!({
+            "project_id": "root-sha",
+            "head": "head-sha",
+            "consensus": {"repo": "https://seed.example/t.git", "file": "ANSWER.md"},
+        }))
+        .unwrap();
+        assert_eq!(
+            event.consensus.as_ref().and_then(|c| c["repo"].as_str()),
+            Some("https://seed.example/t.git")
+        );
+    }
+
+    /// An older publisher sends no coordinates; that must still parse.
+    #[test]
+    fn an_event_without_coordinates_still_parses() {
+        let event: ProjectAdvanced =
+            serde_json::from_value(serde_json::json!({"project_id": "root-sha"})).unwrap();
+        assert!(event.consensus.is_none());
     }
 }

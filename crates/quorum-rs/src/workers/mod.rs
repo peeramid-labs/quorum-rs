@@ -585,6 +585,8 @@ impl NatsNsedWorker {
                 .map_err(|e| anyhow::anyhow!(e))?,
         );
 
+        let signing_hook = signing_hook_from(agent_config.signing_key.as_deref(), &agent_id);
+
         Ok(Self {
             agent,
             agent_config,
@@ -597,7 +599,11 @@ impl NatsNsedWorker {
             active_jobs: Arc::new(Mutex::new(HashSet::new())),
             start_time: Instant::now(),
             status: None,
-            hook: None,
+            // A configured key signs from the start: announcing a derived identity
+            // on the heartbeat while leaving payloads unsigned would show a reader a
+            // key with nothing behind it. A caller's own `with_hook` still wins,
+            // since the builder runs after construction.
+            hook: signing_hook,
             user_tool_factory: None,
             chat_agent: None,
             response_buffer: None,
@@ -1342,8 +1348,10 @@ impl NatsNsedWorker {
             // in the verdict content — republish it as the "epic advanced, pull now"
             // notification so clients holding the project sync.
             Ok(Some(verdict_content)) => {
+                let (verdict_content, hook_state) = verdict_content;
                 if let Some((subject, payload)) = crate::project_registry::advanced_notification(
                     &verdict_content,
+                    &hook_state,
                     &self.config.subject_prefix,
                 ) {
                     match self.nats.publish(subject.clone(), payload.into()).await {
@@ -1561,7 +1569,12 @@ impl NatsNsedWorker {
         stage: crate::middleware::MiddlewareStage,
         content: serde_json::Value,
         metadata: serde_json::Value,
-    ) -> Result<Option<serde_json::Value>> {
+    ) -> Result<
+        Option<(
+            serde_json::Value,
+            std::collections::HashMap<String, serde_json::Value>,
+        )>,
+    > {
         match pipeline {
             Some(p) => run_stage_pipeline(
                 p,
@@ -1824,6 +1837,7 @@ impl NatsNsedWorker {
                 )
                 .await?
             {
+                let (new, _hook_state) = new;
                 if let Some(td) = new.get("task_description").and_then(|v| v.as_str()) {
                     context.task_description = td.to_string();
                 } else {
@@ -1975,7 +1989,7 @@ impl NatsNsedWorker {
                                     )
                                     .await?
                                 {
-                                    if let Some(c) = new.as_str() {
+                                    if let Some(c) = new.0.as_str() {
                                         proposal.content = c.to_string();
                                     }
                                 }
@@ -2400,6 +2414,16 @@ impl NatsNsedWorker {
         Ok(())
     }
 
+    /// The public half of this agent's configured signing key, hex-encoded.
+    ///
+    /// Derived on demand from the key reference rather than cached, so an agent
+    /// whose reference resolves to nothing reports no key instead of a stale one.
+    /// `None` when no `signing_key` is configured, or when its reference does not
+    /// resolve to a usable seed.
+    fn signing_pubkey(&self) -> Option<String> {
+        signing_pubkey_from(self.agent_config.signing_key.as_deref())
+    }
+
     /// Publishes an agent heartbeat via core NATS pub/sub.
     async fn publish_heartbeat(&self) {
         let active_job = {
@@ -2445,6 +2469,10 @@ impl NatsNsedWorker {
                 .as_ref()
                 .map(|o| o.only.clone())
                 .unwrap_or_default(),
+            // Derived from the configured signing key, never declared: what a peer
+            // needs is the key that actually signs, and a separately-stated one
+            // could disagree with it silently.
+            agent_pubkey: self.signing_pubkey(),
             current_job: active_job.clone(),
             uptime_secs: uptime,
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -2859,7 +2887,10 @@ async fn run_stage_pipeline(
     stage: crate::middleware::MiddlewareStage,
     content: serde_json::Value,
     metadata: serde_json::Value,
-) -> Result<serde_json::Value> {
+) -> Result<(
+    serde_json::Value,
+    std::collections::HashMap<String, serde_json::Value>,
+)> {
     let mut ctx = crate::middleware::MiddlewareContext {
         content,
         action: action.to_string(),
@@ -2874,8 +2905,48 @@ async fn run_stage_pipeline(
         crate::middleware::pipeline::PipelineResult::Blocked {
             category, reason, ..
         } => Err(anyhow::Error::new(MiddlewareBlocked { category, reason })),
-        _ => Ok(ctx.content),
+        // `hook_state` travels with the content: a middleware writes there what does
+        // not belong in the answer itself — where the consensus can be fetched, for
+        // one — and returning only the content leaves the caller holding a result
+        // whose location the pipeline had already worked out and discarded.
+        _ => Ok((ctx.content, ctx.hook_state)),
     }
+}
+
+/// The signing hook a configured `signing_key` implies, if any.
+///
+/// Installed as the worker's default hook at construction so an agent given a key
+/// in config actually signs with it — declaring a key it never used would put an
+/// identity on the heartbeat that nothing behind it honours. A caller that sets
+/// its own hook afterwards still wins, since the builder runs after construction.
+#[cfg(feature = "audit")]
+fn signing_hook_from(signing_key: Option<&str>, agent_id: &str) -> Option<Arc<dyn WorkerHook>> {
+    let signer = crate::crypto::signer_from_config_ref(signing_key?)?;
+    Some(Arc::new(crate::crypto::SigningHook::with_signer(
+        signer,
+        agent_id.to_string(),
+    )))
+}
+
+/// Without the signing machinery a configured key installs nothing.
+#[cfg(not(feature = "audit"))]
+fn signing_hook_from(_signing_key: Option<&str>, _agent_id: &str) -> Option<Arc<dyn WorkerHook>> {
+    None
+}
+
+/// Derive the public half of a configured signing-key reference, hex-encoded.
+///
+/// `None` when no key is configured, or when the reference does not resolve to a
+/// usable seed — an agent then reports no key rather than a stale or invented one.
+#[cfg(feature = "audit")]
+fn signing_pubkey_from(signing_key: Option<&str>) -> Option<String> {
+    crate::crypto::signer_from_config_ref(signing_key?).map(|s| hex::encode(s.public_key_bytes()))
+}
+
+/// Without the signing machinery there is no key to derive one from.
+#[cfg(not(feature = "audit"))]
+fn signing_pubkey_from(_signing_key: Option<&str>) -> Option<String> {
+    None
 }
 
 /// Adapts the `provider_response` middleware into a [`SubmissionValidator`] the
@@ -3419,7 +3490,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(out, serde_json::json!("changed"));
+        assert_eq!(out.0, serde_json::json!("changed"));
     }
 
     #[tokio::test]
@@ -3454,6 +3525,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let out = out.0;
         assert_eq!(out["agent"], "AgentA");
         assert_eq!(out["job"], "sess9");
         assert_eq!(out["round"], 3);
@@ -3969,6 +4041,7 @@ mod tests {
             comment: "Fixed wording".into(),
             timestamp: "2026-03-04T00:00:00Z".into(),
             original_content_hash: None,
+            signatures: Vec::new(),
         };
         let entry = make_entry(payload, true, vec![annotation]);
 
@@ -4011,6 +4084,7 @@ mod tests {
             comment: "Adjusted scores".into(),
             timestamp: "2026-03-04T00:00:00Z".into(),
             original_content_hash: None,
+            signatures: Vec::new(),
         };
         let entry = make_entry(payload, true, vec![annotation]);
 
@@ -4052,6 +4126,7 @@ mod tests {
             comment: "Reviewed".into(),
             timestamp: "2026-03-04T00:00:00Z".into(),
             original_content_hash: None,
+            signatures: Vec::new(),
         };
         let entry = make_entry(payload, false, vec![annotation]);
 
@@ -4720,6 +4795,7 @@ mod tests {
             comment: "Fixed".into(),
             timestamp: "t".into(),
             original_content_hash: None,
+            signatures: Vec::new(),
         };
         let entry = make_entry(payload, true, vec![annotation]);
 
@@ -5267,6 +5343,7 @@ mod tests {
             comment: "Reviewed".into(),
             timestamp: "t".into(),
             original_content_hash: None,
+            signatures: Vec::new(),
         };
         let entry = make_entry(payload, false, vec![annotation]);
 
@@ -5292,18 +5369,21 @@ mod tests {
                 comment: "First comment".into(),
                 timestamp: "t1".into(),
                 original_content_hash: None,
+                signatures: Vec::new(),
             },
             OperatorAnnotation {
                 annotation_type: AnnotationType::Edit,
                 comment: "Edited".into(),
                 timestamp: "t2".into(),
                 original_content_hash: Some("hash123".into()),
+                signatures: Vec::new(),
             },
             OperatorAnnotation {
                 annotation_type: AnnotationType::Comment,
                 comment: "Final LGTM".into(),
                 timestamp: "t3".into(),
                 original_content_hash: None,
+                signatures: Vec::new(),
             },
         ];
         let entry = make_entry(payload, true, annotations);
@@ -5352,6 +5432,7 @@ mod tests {
             comment: "test".into(),
             timestamp: "t".into(),
             original_content_hash: None,
+            signatures: Vec::new(),
         };
         let entry = make_entry(payload, true, vec![annotation]);
 
@@ -5467,6 +5548,53 @@ mod tests {
     // ===================================================================
     // Heartbeat status determination (pure logic)
     // ===================================================================
+
+    /// A configured key must actually sign. Announcing a derived identity while
+    /// leaving the payloads unsigned is the worse failure of the two: a reader sees
+    /// a key and reasonably infers something stands behind it.
+    #[test]
+    fn a_configured_signing_key_installs_the_hook_that_uses_it() {
+        let seed_hex = "33".repeat(32);
+        unsafe { std::env::set_var("SDK_TEST_HOOK_SEED", &seed_hex) };
+
+        assert!(
+            super::signing_hook_from(Some("${SDK_TEST_HOOK_SEED}"), "agent-a").is_some(),
+            "a resolvable key installs a signing hook"
+        );
+        assert!(
+            super::signing_hook_from(None, "agent-a").is_none(),
+            "no key configured installs nothing"
+        );
+        assert!(
+            super::signing_hook_from(Some("${SDK_TEST_HOOK_SEED_ABSENT}"), "agent-a").is_none(),
+            "an unresolvable reference installs nothing rather than a random identity"
+        );
+    }
+
+    /// The key a heartbeat announces is derived from the configured reference, so
+    /// what peers see follows the key that actually signs. An agent with no usable
+    /// reference announces nothing rather than an identity nobody can check.
+    #[test]
+    fn the_announced_key_is_derived_from_the_configured_reference() {
+        let seed_hex = "22".repeat(32);
+        unsafe { std::env::set_var("SDK_TEST_HB_SEED", &seed_hex) };
+
+        let announced = super::signing_pubkey_from(Some("${SDK_TEST_HB_SEED}"))
+            .expect("a resolvable reference yields a key");
+        let expected = crate::crypto::AgentKeyPair::from_config_ref(&seed_hex)
+            .unwrap()
+            .public_key_hex();
+        assert_eq!(announced, expected, "announced key follows the seed");
+
+        assert!(
+            super::signing_pubkey_from(None).is_none(),
+            "no key configured"
+        );
+        assert!(
+            super::signing_pubkey_from(Some("${SDK_TEST_HB_SEED_ABSENT}")).is_none(),
+            "an unresolvable reference announces nothing"
+        );
+    }
 
     #[test]
     fn test_heartbeat_status_idle_when_no_active_jobs() {
@@ -7274,6 +7402,7 @@ mod tests {
             comment: "test".into(),
             timestamp: "t".into(),
             original_content_hash: None,
+            signatures: Vec::new(),
         };
         let entry = make_entry(payload, true, vec![annotation]);
 
@@ -7534,6 +7663,7 @@ mod tests {
             comment: "edit".into(),
             timestamp: "t".into(),
             original_content_hash: None,
+            signatures: Vec::new(),
         };
 
         let result = buf

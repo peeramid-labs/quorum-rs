@@ -18,7 +18,11 @@ required-features = ["cli"]
 
 [features]
 default = ["audit", "cli", "tui", "status-server"]
-audit = ["dep:quorum-crypto-core", "dep:hex"]
+# Signing + verification. The crypto-core *types* (envelope, signature,
+# signer role) are always available — a provenance field that disappears
+# under a feature flag drops signatures on deserialize, silently. This
+# gates the machinery that produces and checks them.
+audit = ["dep:hex"]
 status-server = ["dep:open", "dep:utoipa-swagger-ui"]
 # CLI runtime — pulls in clap/inquire/dotenvy/comfy-table/owo-colors
 # so library-only users don't pay for them. Required to build the
@@ -53,7 +57,7 @@ fs4 = "0.13"
 futures = "0.3.31"
 hex = { version = "0.4", optional = true }
 nkeys = "0.4"
-quorum-crypto-core = { version = "0.7.1", path = "../quorum-crypto-core", optional = true }
+quorum-crypto-core = { version = "0.7.1", path = "../quorum-crypto-core", features = ["schema"] }
 llm-repair = { version = "0.7.1", path = "../llm-repair" }
 regex = "1.12.2"
 openai-harmony = "0.0.8"

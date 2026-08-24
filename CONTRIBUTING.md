@@ -168,3 +168,34 @@ stable flow exclusive to `Publish Release`.
 A preview workflow renders what `Prepare Release` would do
 (version bump + changelog) into the run's step summary, without
 touching `Cargo.toml` or opening a PR.
+
+## A Dependency Is Too Fresh
+
+CI refuses a lockfile that resolves a crate published inside the last seven days
+(`scripts/check-dep-age.py`), because a compromised release is most dangerous in
+the window before anyone has looked at it. The failure names the crate and its age:
+
+```
+❌ 1 package(s) published less than 7 days ago:
+   • quinn-proto@0.11.17 (6.8d old)
+```
+
+Downgrade it. The version you land on is a **deferral, not a pin** — nothing needs
+to defend it later, and a `cargo update` that picks the newer release up once it
+has aged out is correct rather than a regression:
+
+```
+cargo update -p <crate> --precise <older-version>
+```
+
+Prefer a version already resolved elsewhere in the repository over guessing which
+older release has cleared the window; publish dates are not visible offline, and
+one already in use is known to pass.
+
+Reach for `scripts/supply-chain-fasttrack.toml` only when waiting is the worse
+risk — a security patch where the cooldown would keep a known advisory open
+longer than a fresh release endangers us. That file documents its own schema; an
+entry needs a reason and an expiry, and CI warns when one goes stale or unused.
+
+A lockfile churns like this whenever a manifest changes, so re-run the check
+after touching dependencies rather than at review time.
