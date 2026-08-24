@@ -3969,6 +3969,7 @@ mod tests {
             comment: "Fixed wording".into(),
             timestamp: "2026-03-04T00:00:00Z".into(),
             original_content_hash: None,
+            signatures: Vec::new(),
         };
         let entry = make_entry(payload, true, vec![annotation]);
 
@@ -4011,6 +4012,7 @@ mod tests {
             comment: "Adjusted scores".into(),
             timestamp: "2026-03-04T00:00:00Z".into(),
             original_content_hash: None,
+            signatures: Vec::new(),
         };
         let entry = make_entry(payload, true, vec![annotation]);
 
@@ -4052,6 +4054,7 @@ mod tests {
             comment: "Reviewed".into(),
             timestamp: "2026-03-04T00:00:00Z".into(),
             original_content_hash: None,
+            signatures: Vec::new(),
         };
         let entry = make_entry(payload, false, vec![annotation]);
 
@@ -4720,6 +4723,7 @@ mod tests {
             comment: "Fixed".into(),
             timestamp: "t".into(),
             original_content_hash: None,
+            signatures: Vec::new(),
         };
         let entry = make_entry(payload, true, vec![annotation]);
 
@@ -5267,6 +5271,7 @@ mod tests {
             comment: "Reviewed".into(),
             timestamp: "t".into(),
             original_content_hash: None,
+            signatures: Vec::new(),
         };
         let entry = make_entry(payload, false, vec![annotation]);
 
@@ -5292,18 +5297,21 @@ mod tests {
                 comment: "First comment".into(),
                 timestamp: "t1".into(),
                 original_content_hash: None,
+                signatures: Vec::new(),
             },
             OperatorAnnotation {
                 annotation_type: AnnotationType::Edit,
                 comment: "Edited".into(),
                 timestamp: "t2".into(),
                 original_content_hash: Some("hash123".into()),
+                signatures: Vec::new(),
             },
             OperatorAnnotation {
                 annotation_type: AnnotationType::Comment,
                 comment: "Final LGTM".into(),
                 timestamp: "t3".into(),
                 original_content_hash: None,
+                signatures: Vec::new(),
             },
         ];
         let entry = make_entry(payload, true, annotations);
@@ -5352,6 +5360,7 @@ mod tests {
             comment: "test".into(),
             timestamp: "t".into(),
             original_content_hash: None,
+            signatures: Vec::new(),
         };
         let entry = make_entry(payload, true, vec![annotation]);
 
@@ -7274,6 +7283,7 @@ mod tests {
             comment: "test".into(),
             timestamp: "t".into(),
             original_content_hash: None,
+            signatures: Vec::new(),
         };
         let entry = make_entry(payload, true, vec![annotation]);
 
@@ -7534,6 +7544,7 @@ mod tests {
             comment: "edit".into(),
             timestamp: "t".into(),
             original_content_hash: None,
+            signatures: Vec::new(),
         };
 
         let result = buf

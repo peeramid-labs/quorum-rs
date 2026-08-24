@@ -22,6 +22,7 @@ pub enum SignatureStatus {
 
 /// Role of a signer in the signature chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema, utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SignerRole {
     /// Agent that produced the content.
@@ -37,7 +38,8 @@ pub enum SignerRole {
 }
 
 /// A single signature in the envelope's signature chain.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema, utoipa::ToSchema))]
 pub struct EnvelopeSignature {
     /// Algorithm used (e.g., "ed25519", "secp256k1", "ml-dsa-65").
     pub algorithm: String,

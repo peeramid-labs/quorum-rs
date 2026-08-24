@@ -622,6 +622,7 @@ pub(super) async fn agent_buffer_edit(
             comment: comment.clone(),
             timestamp,
             original_content_hash: original_hash,
+            signatures: Vec::new(),
         };
 
         // Enforce: Edit annotations must carry a non-empty original_content_hash.
@@ -701,6 +702,7 @@ pub(super) async fn agent_buffer_edit(
             comment: comment.clone(),
             timestamp,
             original_content_hash: None,
+            signatures: Vec::new(),
         };
         buf.add_comment(&path.id, annotation).await
     } else {
