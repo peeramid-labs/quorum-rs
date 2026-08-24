@@ -1144,6 +1144,14 @@ pub struct AgentHeartbeat {
     /// knows what it pinned.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_endpoints: Vec<String>,
+    /// This agent's public key, hex-encoded, as declared in its config.
+    ///
+    /// Reported here because the orchestrator holds no copy of an agent's config:
+    /// the heartbeat is how the key reaches the registry that later has to decide
+    /// whether a signature came from the agent it names. Absent means the agent
+    /// declared none, which is not the same as one that failed to load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_pubkey: Option<String>,
     /// Job ID if currently processing, else None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_job: Option<String>,
@@ -1326,6 +1334,26 @@ mod tests {
         assert!(bare.get("pinned_endpoints").is_none());
         let back: AgentHeartbeat = serde_json::from_value(bare).unwrap();
         assert!(back.pinned_endpoints.is_empty());
+    }
+
+    /// The heartbeat is how a key reaches the orchestrator's registry — an agent's
+    /// config is not something the orchestrator holds a copy of. An agent that
+    /// declares no key must stay absent from the wire rather than announce a null
+    /// one, which reads as a key that failed to load.
+    #[test]
+    fn an_agent_pubkey_survives_the_wire_and_stays_absent_when_unset() {
+        let json = serde_json::to_string(&AgentHeartbeat {
+            agent_pubkey: Some("0x02aa".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let back: AgentHeartbeat = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.agent_pubkey.as_deref(), Some("0x02aa"));
+
+        let bare = serde_json::to_value(AgentHeartbeat::default()).unwrap();
+        assert!(bare.get("agent_pubkey").is_none());
+        let back: AgentHeartbeat = serde_json::from_value(bare).unwrap();
+        assert!(back.agent_pubkey.is_none());
     }
 
     #[test]
@@ -2975,6 +3003,7 @@ mod tests {
             model_name: "gpt-4".to_string(),
             provider_id: "openai".to_string(),
             pinned_endpoints: Vec::new(),
+            agent_pubkey: Some("0x02aa".to_string()),
             current_job: Some("job-42".to_string()),
             uptime_secs: 3600,
             timestamp: "2025-01-01T00:00:00Z".to_string(),
@@ -3009,6 +3038,7 @@ mod tests {
         assert_eq!(deserialized.model_name, "gpt-4");
         assert_eq!(deserialized.provider_id, "openai");
         assert_eq!(deserialized.current_job, Some("job-42".to_string()));
+        assert_eq!(deserialized.agent_pubkey.as_deref(), Some("0x02aa"));
         assert_eq!(deserialized.uptime_secs, 3600);
         assert!((deserialized.input_price_per_mtok.unwrap() - 10.0).abs() < f64::EPSILON);
         assert!((deserialized.output_price_per_mtok.unwrap() - 30.0).abs() < f64::EPSILON);

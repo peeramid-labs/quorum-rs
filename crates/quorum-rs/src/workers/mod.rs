@@ -2445,6 +2445,7 @@ impl NatsNsedWorker {
                 .as_ref()
                 .map(|o| o.only.clone())
                 .unwrap_or_default(),
+            agent_pubkey: self.agent_config.agent_pubkey.clone(),
             current_job: active_job.clone(),
             uptime_secs: uptime,
             timestamp: chrono::Utc::now().to_rfc3339(),
