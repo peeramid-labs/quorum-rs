@@ -2213,6 +2213,7 @@ where
                 if attempts > max_retries {
                     anyhow::bail!(describe_parse_failure(ParseFailure {
                         attempts,
+                        model: &agent_config.model_name,
                         last_error: &e.to_string(),
                         finish_reason,
                         raw: &agent_response.content,
@@ -4133,6 +4134,11 @@ fn resolve_finalize_window(raw: Option<&str>) -> usize {
 /// to act on it.
 pub(crate) struct ParseFailure<'a> {
     pub attempts: usize,
+    /// The model that produced the unparseable output. A roster is a list of
+    /// models, and a seat that exhausts its retries is out of the deliberation —
+    /// without this the log says a parse failed but not whose, so a council
+    /// running at half strength reads as one that simply had less to say.
+    pub model: &'a str,
     /// The parser's own complaint.
     pub last_error: &'a str,
     pub finish_reason: &'a str,
@@ -4157,8 +4163,8 @@ const PARSE_FAILURE_EXCERPT: usize = 1_000;
 /// content field — while zero tokens means the provider returned nothing at all.
 pub(crate) fn describe_parse_failure(f: ParseFailure<'_>) -> String {
     let head = format!(
-        "Failed to parse structured output after {} attempts. Last error: {}. FinishReason: {}.",
-        f.attempts, f.last_error, f.finish_reason
+        "Failed to parse structured output from {} after {} attempts. Last error: {}. FinishReason: {}.",
+        f.model, f.attempts, f.last_error, f.finish_reason
     );
     if !f.cleaned.is_empty() {
         let total = f.cleaned.chars().count();
@@ -4376,12 +4382,26 @@ mod tests {
     fn failure<'a>(raw: &'a str, cleaned: &'a str, output_tokens: u32) -> ParseFailure<'a> {
         ParseFailure {
             attempts: 6,
+            model: "some-vendor/some-model",
             last_error: "EOF while parsing a value at line 1 column 0",
             finish_reason: "Stop",
             raw,
             cleaned,
             output_tokens,
         }
+    }
+
+    /// A seat that exhausts its retries is out of the deliberation, and the roster
+    /// it came from is a list of models. Without the model in the message the log
+    /// says a parse failed but not whose, so a council quietly running at half
+    /// strength reads as a council that simply had less to say.
+    #[test]
+    fn a_failure_names_the_model_that_produced_it() {
+        let msg = describe_parse_failure(failure("{oops", "{oops", 40));
+        assert!(
+            msg.contains("some-vendor/some-model"),
+            "the failing model must be named: {msg}"
+        );
     }
 
     #[test]
