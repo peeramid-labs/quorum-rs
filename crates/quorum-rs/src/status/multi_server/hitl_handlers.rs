@@ -1207,6 +1207,28 @@ mod tests {
         assert_eq!(algorithms, vec!["ed25519", "ml-dsa-65"]);
     }
 
+    /// The request body documented in `docs/reference/agent-identity.md` must
+    /// actually parse — an example a reader copies is a contract, and a field
+    /// renamed underneath it fails silently at the boundary rather than loudly here.
+    #[test]
+    fn the_documented_request_body_parses() {
+        let req: BufferEditRequest = serde_json::from_value(serde_json::json!({
+            "content": {"answer": "revised"},
+            "operator_comment": "tightened the second claim",
+            "signatures": [{
+                "algorithm": "ed25519",
+                "public_key": "0x03bb",
+                "signature": "3q2+7w==",
+                "role": "operator",
+                "signer_id": "alice",
+            }],
+        }))
+        .expect("the documented body deserializes");
+        assert_eq!(req.signatures.len(), 1);
+        assert_eq!(req.signatures[0].role, SignerRole::Operator);
+        assert!(req.content.is_some());
+    }
+
     /// An edit still cannot claim to revise content it does not name.
     #[test]
     fn an_edit_without_the_original_hash_is_still_refused() {

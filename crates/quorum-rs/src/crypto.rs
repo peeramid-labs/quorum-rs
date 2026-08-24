@@ -53,6 +53,24 @@ impl AgentKeyPair {
         Some(Self::from_seed(&seed))
     }
 
+    /// Load from a config reference — `${VAR}`, `file:<path>`, or a literal —
+    /// resolved by [`crate::config::resolve_env_token`], then read as a
+    /// hex-encoded 32-byte seed.
+    ///
+    /// The config holds the *reference*; the seed itself stays in an env var or a
+    /// key file so it never lands in a config that gets committed, copied, or
+    /// serialized back out. A literal is accepted because the resolver allows one,
+    /// but writing a seed inline puts a private key wherever that file goes.
+    ///
+    /// `None` when the reference resolves to nothing or does not decode to 32
+    /// bytes — the caller decides whether an agent without a key may run.
+    pub fn from_config_ref(raw: &str) -> Option<Self> {
+        let resolved = crate::config::resolve_env_token("signing_key", raw);
+        let bytes = hex::decode(resolved.trim()).ok()?;
+        let seed: [u8; 32] = bytes.try_into().ok()?;
+        Some(Self::from_seed(&seed))
+    }
+
     /// Get the public key as hex string for display/logging.
     pub fn public_key_hex(&self) -> String {
         hex::encode(self.signer.public_key_bytes())
@@ -175,6 +193,39 @@ impl WorkerHook for SigningHook {
 
 #[cfg(test)]
 mod tests {
+    /// A signing key is configured by reference so the seed lives in an env var or
+    /// a key file, never in the config itself. The derived public key is what other
+    /// parties see, and it must follow the seed rather than be declared beside it.
+    #[test]
+    fn a_signing_key_reference_resolves_to_a_stable_derived_identity() {
+        let seed_hex = "11".repeat(32);
+        unsafe { std::env::set_var("SDK_TEST_SIGNING_SEED", &seed_hex) };
+
+        let from_ref = super::AgentKeyPair::from_config_ref("${SDK_TEST_SIGNING_SEED}")
+            .expect("an env reference resolves");
+        let from_literal =
+            super::AgentKeyPair::from_config_ref(&seed_hex).expect("a literal resolves");
+        assert_eq!(
+            from_ref.public_key_hex(),
+            from_literal.public_key_hex(),
+            "the same seed derives the same identity however it was referenced"
+        );
+        assert_eq!(from_ref.public_key_hex().len(), 64);
+    }
+
+    /// A reference that resolves to nothing, or to something that is not a 32-byte
+    /// seed, must not silently become a different identity — an agent signing with
+    /// a key nobody expects is worse than one that fails to start.
+    #[test]
+    fn an_unusable_signing_key_reference_yields_no_identity() {
+        assert!(super::AgentKeyPair::from_config_ref("${SDK_TEST_SIGNING_SEED_ABSENT}").is_none());
+        assert!(super::AgentKeyPair::from_config_ref("not-hex").is_none());
+        assert!(
+            super::AgentKeyPair::from_config_ref(&"aa".repeat(16)).is_none(),
+            "a 16-byte value is not a seed"
+        );
+    }
+
     use super::*;
 
     // ---- AgentKeyPair ----

@@ -2408,6 +2408,16 @@ impl NatsNsedWorker {
         Ok(())
     }
 
+    /// The public half of this agent's configured signing key, hex-encoded.
+    ///
+    /// Derived on demand from the key reference rather than cached, so an agent
+    /// whose reference resolves to nothing reports no key instead of a stale one.
+    /// `None` when no `signing_key` is configured, or when its reference does not
+    /// resolve to a usable seed.
+    fn signing_pubkey(&self) -> Option<String> {
+        signing_pubkey_from(self.agent_config.signing_key.as_deref())
+    }
+
     /// Publishes an agent heartbeat via core NATS pub/sub.
     async fn publish_heartbeat(&self) {
         let active_job = {
@@ -2453,7 +2463,10 @@ impl NatsNsedWorker {
                 .as_ref()
                 .map(|o| o.only.clone())
                 .unwrap_or_default(),
-            agent_pubkey: self.agent_config.agent_pubkey.clone(),
+            // Derived from the configured signing key, never declared: what a peer
+            // needs is the key that actually signs, and a separately-stated one
+            // could disagree with it silently.
+            agent_pubkey: self.signing_pubkey(),
             current_job: active_job.clone(),
             uptime_secs: uptime,
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -2892,6 +2905,21 @@ async fn run_stage_pipeline(
         // whose location the pipeline had already worked out and discarded.
         _ => Ok((ctx.content, ctx.hook_state)),
     }
+}
+
+/// Derive the public half of a configured signing-key reference, hex-encoded.
+///
+/// `None` when no key is configured, or when the reference does not resolve to a
+/// usable seed — an agent then reports no key rather than a stale or invented one.
+#[cfg(feature = "audit")]
+fn signing_pubkey_from(signing_key: Option<&str>) -> Option<String> {
+    crate::crypto::AgentKeyPair::from_config_ref(signing_key?).map(|kp| kp.public_key_hex())
+}
+
+/// Without the signing machinery there is no key to derive one from.
+#[cfg(not(feature = "audit"))]
+fn signing_pubkey_from(_signing_key: Option<&str>) -> Option<String> {
+    None
 }
 
 /// Adapts the `provider_response` middleware into a [`SubmissionValidator`] the
@@ -5493,6 +5521,31 @@ mod tests {
     // ===================================================================
     // Heartbeat status determination (pure logic)
     // ===================================================================
+
+    /// The key a heartbeat announces is derived from the configured reference, so
+    /// what peers see follows the key that actually signs. An agent with no usable
+    /// reference announces nothing rather than an identity nobody can check.
+    #[test]
+    fn the_announced_key_is_derived_from_the_configured_reference() {
+        let seed_hex = "22".repeat(32);
+        unsafe { std::env::set_var("SDK_TEST_HB_SEED", &seed_hex) };
+
+        let announced = super::signing_pubkey_from(Some("${SDK_TEST_HB_SEED}"))
+            .expect("a resolvable reference yields a key");
+        let expected = crate::crypto::AgentKeyPair::from_config_ref(&seed_hex)
+            .unwrap()
+            .public_key_hex();
+        assert_eq!(announced, expected, "announced key follows the seed");
+
+        assert!(
+            super::signing_pubkey_from(None).is_none(),
+            "no key configured"
+        );
+        assert!(
+            super::signing_pubkey_from(Some("${SDK_TEST_HB_SEED_ABSENT}")).is_none(),
+            "an unresolvable reference announces nothing"
+        );
+    }
 
     #[test]
     fn test_heartbeat_status_idle_when_no_active_jobs() {
