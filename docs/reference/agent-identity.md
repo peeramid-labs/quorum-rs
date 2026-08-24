@@ -9,10 +9,12 @@ An agent is addressed by its `name` everywhere — subjects, rosters, config. Th
 fields add the keys that name binds to, so a reader holding both can tell whether
 a signature came from the agent it claims to.
 
-> **Carried, not checked.** Nothing in the SDK verifies these signatures yet. A
-> well-formed signature is accepted and stored; a malformed one is refused. Treat
-> what follows as provenance that travels with a response, not as proof of it,
-> until a verifier rejects a tampered message.
+> **Written and checkable; not yet checked for you.** `read_audit_record` verifies
+> a record off the trail and reports an altered one as tampered — proven against a
+> real signed record, not a fixture. But nothing subscribes to the trail
+> automatically, so provenance is something a consumer must go and verify, not a
+> guarantee the pipeline enforces on your behalf. Operator signatures on a held
+> response (below) are stored and shape-checked only; nothing verifies those.
 
 ## Agent config
 
@@ -64,6 +66,22 @@ rather than failing the task.
 
 This is the shape the orchestrator already uses for its own trail, so one consumer
 pattern reads both.
+
+### Reading the trail
+
+`read_audit_record(bytes, &registry)` verifies one record and reports:
+
+| outcome | meaning |
+| --- | --- |
+| `Verified` | every signature in the chain covers the payload it claims to |
+| `Tampered` | the record parsed but its chain did not verify — altered after signing, or a key that does not match |
+| `Unsigned` | the record carried no signature at all |
+
+A failing chain is a *verdict*, not an error: an error is reserved for bytes that
+are not a record. A reader that discarded a failed verification as a parse problem
+would lose the one event the trail exists to catch. A verifier that errors — an
+unknown algorithm, a malformed key — reads as `Tampered` too, since not being able
+to check a record is not a reason to trust it.
 
 **What a key does *not* switch on** is `SigningHook`, which replaces the payload
 with the envelope rather than copying it. That ties signing to delivery: a receiver

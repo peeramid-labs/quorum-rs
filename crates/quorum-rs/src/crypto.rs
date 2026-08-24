@@ -102,6 +102,59 @@ pub fn signer_from_config_ref(raw: &str) -> Option<Arc<dyn AuditSigner>> {
     AgentKeyPair::from_config_ref(raw).map(|kp| kp.as_audit_signer())
 }
 
+/// What reading one record off the audit trail produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditRecord {
+    /// Every signature in the chain verified against the payload it covers.
+    Verified {
+        /// The agent that signed it.
+        agent_id: String,
+        /// How many signatures the chain carried.
+        signatures: usize,
+    },
+    /// The record parsed, but its chain did not verify — the payload or a
+    /// signature was altered after signing, or a key does not match.
+    Tampered {
+        /// The agent the record claims to come from.
+        agent_id: String,
+    },
+    /// The record carried no signature at all.
+    Unsigned {
+        /// The agent the record claims to come from.
+        agent_id: String,
+    },
+}
+
+/// Read and verify one record from the audit trail.
+///
+/// The payload is treated as opaque JSON: a reader checks provenance, and does not
+/// need to know the shape of what was signed to do that.
+///
+/// A record whose chain fails is reported as [`AuditRecord::Tampered`] rather than
+/// as an error, because failing to verify IS the finding — an audit reader that
+/// discarded it as a parse problem would lose the one event it exists to catch.
+/// `Err` is reserved for bytes that are not a record at all.
+pub fn read_audit_record(
+    bytes: &[u8],
+    registry: &quorum_crypto_core::VerifierRegistry,
+) -> Result<AuditRecord, serde_json::Error> {
+    let mut envelope: AuditEnvelope<serde_json::Value> = serde_json::from_slice(bytes)?;
+    let agent_id = envelope.agent_id().to_string();
+    if envelope.signatures().is_empty() {
+        return Ok(AuditRecord::Unsigned { agent_id });
+    }
+    let signatures = envelope.signatures().len();
+    match envelope.verify_chain(registry) {
+        Ok(true) => Ok(AuditRecord::Verified {
+            agent_id,
+            signatures,
+        }),
+        // A verifier error (unknown algorithm, malformed key) is not a reason to
+        // call a record sound; it is a reason to not trust it.
+        Ok(false) | Err(_) => Ok(AuditRecord::Tampered { agent_id }),
+    }
+}
+
 /// The audit subject that mirrors a working result subject.
 ///
 /// An agent publishes results on `{prefix}.{job}.result.{round}.{agent}.{action}`.
@@ -347,6 +400,72 @@ mod tests {
                 "{not_a_result} must not derive an audit subject"
             );
         }
+    }
+
+    /// The bar the claim discipline sets: a verifier must reject a tampered
+    /// message. This drives the real path — the hook signs a result, the reader
+    /// verifies it, and the same record with one byte of payload changed is
+    /// reported as tampered rather than passing or being discarded as unparseable.
+    #[tokio::test]
+    async fn a_reader_verifies_a_recorded_result_and_rejects_a_tampered_one() {
+        use crate::agents::Proposal;
+        use crate::workers::WorkerHook;
+        use quorum_crypto_core::VerifierRegistry;
+
+        let hook = super::AuditTrailHook::new(
+            super::AgentKeyPair::generate().as_audit_signer(),
+            "agent-a".into(),
+        );
+        let proposal = serde_json::to_vec(&Proposal {
+            thought_process: "considered".into(),
+            content: "the answer".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let copies = hook
+            .audit_copies("nsed.job1.result.0.agent-a.propose", &proposal)
+            .await;
+        let record = &copies[0].1;
+        let registry = VerifierRegistry::with_defaults();
+
+        assert_eq!(
+            super::read_audit_record(record, &registry).unwrap(),
+            super::AuditRecord::Verified {
+                agent_id: "agent-a".to_string(),
+                signatures: 1,
+            },
+            "a record straight off the trail verifies"
+        );
+
+        // Alter the payload after signing — the case the trail exists to catch.
+        let mut tampered: serde_json::Value = serde_json::from_slice(record).unwrap();
+        tampered["payload"]["content"] = serde_json::json!("a different answer");
+        let tampered = serde_json::to_vec(&tampered).unwrap();
+        assert_eq!(
+            super::read_audit_record(&tampered, &registry).unwrap(),
+            super::AuditRecord::Tampered {
+                agent_id: "agent-a".to_string(),
+            },
+            "an altered payload does not verify"
+        );
+
+        // Stripping the signatures is not a way to look clean either.
+        let mut stripped: serde_json::Value = serde_json::from_slice(record).unwrap();
+        stripped["signatures"] = serde_json::json!([]);
+        stripped["signature"] = serde_json::json!("");
+        let stripped = serde_json::to_vec(&stripped).unwrap();
+        assert_eq!(
+            super::read_audit_record(&stripped, &registry).unwrap(),
+            super::AuditRecord::Unsigned {
+                agent_id: "agent-a".to_string(),
+            },
+            "a record with its signatures removed reads as unsigned, not as sound"
+        );
+
+        assert!(
+            super::read_audit_record(b"not a record", &registry).is_err(),
+            "bytes that are not a record are an error, not a verdict"
+        );
     }
 
     /// The audit hook records a signed copy and leaves the working payload alone,
