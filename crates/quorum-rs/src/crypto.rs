@@ -402,6 +402,43 @@ mod tests {
         }
     }
 
+    /// A signature covers bytes, not meaning. A signer that serializes a typed
+    /// struct writes fields in declaration order; a reader that verifies through
+    /// `serde_json::Value` re-serializes them in sorted order. Same content, other
+    /// bytes — so a record nobody touched can fail to verify.
+    #[tokio::test]
+    async fn a_record_signed_as_a_struct_still_verifies_when_read_as_json() {
+        use quorum_crypto_core::{AuditEnvelope, VerifierRegistry};
+        #[derive(serde::Serialize)]
+        struct Typed {
+            zeta: String,
+            alpha: String,
+        }
+        let signer = super::AgentKeyPair::generate().as_audit_signer();
+        let envelope = AuditEnvelope::signed(
+            Typed {
+                zeta: "z".into(),
+                alpha: "a".into(),
+            },
+            "proposal",
+            "agent-a",
+            &*signer,
+        )
+        .await
+        .unwrap();
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+
+        let registry = VerifierRegistry::with_defaults();
+        assert_eq!(
+            super::read_audit_record(&bytes, &registry).unwrap(),
+            super::AuditRecord::Verified {
+                agent_id: "agent-a".into(),
+                signatures: 1
+            },
+            "a reader must not report an untouched record as tampered"
+        );
+    }
+
     /// The bar the claim discipline sets: a verifier must reject a tampered
     /// message. This drives the real path — the hook signs a result, the reader
     /// verifies it, and the same record with one byte of payload changed is
