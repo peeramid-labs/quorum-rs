@@ -1,4 +1,5 @@
 use super::MultiAppState;
+use crate::agents::{AnnotationType, OperatorAnnotation};
 use crate::control_plane::ConfigPatch;
 use crate::workers::buffer::compute_divergence;
 use axum::{
@@ -6,6 +7,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Json},
 };
+use quorum_crypto_core::envelope::EnvelopeSignature;
 use serde::Deserialize;
 use std::sync::atomic::Ordering;
 use tracing::{info, warn};
@@ -541,6 +543,33 @@ pub(super) struct BufferEditRequest {
     /// Optional operator commentary.
     #[serde(default)]
     operator_comment: Option<String>,
+    /// Operator signatures over this edit. Optional — an unsigned edit is still
+    /// accepted here; whether the release path *requires* one is its decision.
+    #[serde(default)]
+    signatures: Vec<EnvelopeSignature>,
+}
+
+/// Build the annotation for an operator edit and enforce its invariants.
+///
+/// Both edit shapes go through here so the boundary check cannot be wired to one
+/// branch and forgotten on the other — which is what happened while the only
+/// invariant was `Edit`-specific and the `Comment` branch had nothing to check.
+fn annotation_for(
+    annotation_type: AnnotationType,
+    comment: String,
+    timestamp: String,
+    original_content_hash: Option<String>,
+    signatures: Vec<EnvelopeSignature>,
+) -> Result<OperatorAnnotation, String> {
+    let annotation = OperatorAnnotation {
+        annotation_type,
+        comment,
+        timestamp,
+        original_content_hash,
+        signatures,
+    };
+    annotation.validate()?;
+    Ok(annotation)
 }
 
 /// `PUT /api/agents/{name}/buffer/{id}` — edit a buffered response's content.
@@ -572,8 +601,6 @@ pub(super) async fn agent_buffer_edit(
     Path(path): Path<BufferEntryPath>,
     Json(req): Json<BufferEditRequest>,
 ) -> impl IntoResponse {
-    use crate::agents::{AnnotationType, OperatorAnnotation};
-
     let Some(buf) = state.buffers.get(&path.name) else {
         if !state.configs.contains_key(&path.name) {
             return (
@@ -617,22 +644,22 @@ pub(super) async fn agent_buffer_edit(
             }
         };
 
-        let annotation = OperatorAnnotation {
-            annotation_type: AnnotationType::Edit,
-            comment: comment.clone(),
+        let annotation = match annotation_for(
+            AnnotationType::Edit,
+            comment.clone(),
             timestamp,
-            original_content_hash: original_hash,
-            signatures: Vec::new(),
+            original_hash,
+            req.signatures,
+        ) {
+            Ok(a) => a,
+            Err(msg) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": msg})),
+                )
+                    .into_response();
+            }
         };
-
-        // Enforce: Edit annotations must carry a non-empty original_content_hash.
-        if let Err(msg) = annotation.validate() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": msg})),
-            )
-                .into_response();
-        }
 
         // Run before_release middleware at Edit stage (if configured)
         let mut new_payload = new_payload;
@@ -697,12 +724,21 @@ pub(super) async fn agent_buffer_edit(
             .await
     } else if !comment.is_empty() {
         // Comment only — no content change
-        let annotation = OperatorAnnotation {
-            annotation_type: AnnotationType::Comment,
-            comment: comment.clone(),
+        let annotation = match annotation_for(
+            AnnotationType::Comment,
+            comment.clone(),
             timestamp,
-            original_content_hash: None,
-            signatures: Vec::new(),
+            None,
+            req.signatures,
+        ) {
+            Ok(a) => a,
+            Err(msg) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": msg})),
+                )
+                    .into_response();
+            }
         };
         buf.add_comment(&path.id, annotation).await
     } else {
@@ -1104,4 +1140,85 @@ pub(super) async fn agent_buffer_unstop(
         Json(serde_json::json!({"status": "unstopped", "id": path.id})),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quorum_crypto_core::envelope::SignerRole;
+
+    fn sig(algorithm: &str) -> EnvelopeSignature {
+        EnvelopeSignature {
+            algorithm: algorithm.to_string(),
+            public_key: "0x02aa".to_string(),
+            signature: "0xdead".to_string(),
+            role: SignerRole::Operator,
+            signer_id: "op-alice".to_string(),
+        }
+    }
+
+    /// Both edit shapes go through one builder, so the boundary check cannot be
+    /// wired to one branch and forgotten on the other — a comment carrying a
+    /// malformed signature is refused exactly like an edit carrying one.
+    #[test]
+    fn a_comment_is_checked_at_the_boundary_just_like_an_edit() {
+        let bad = vec![sig("")];
+        assert!(
+            annotation_for(
+                AnnotationType::Comment,
+                "looks good".into(),
+                "2026-03-11T00:00:00Z".into(),
+                None,
+                bad.clone(),
+            )
+            .is_err(),
+            "a comment with an unroutable signature must be refused"
+        );
+        assert!(
+            annotation_for(
+                AnnotationType::Edit,
+                "fixed".into(),
+                "2026-03-11T00:00:00Z".into(),
+                Some("abc123".into()),
+                bad,
+            )
+            .is_err(),
+            "an edit with an unroutable signature must be refused"
+        );
+    }
+
+    /// The operator's signatures reach the annotation that gets stored; dropping
+    /// them would leave an edit that looks unsigned in the audit trail.
+    #[test]
+    fn the_operators_signatures_reach_the_stored_annotation() {
+        let annotation = annotation_for(
+            AnnotationType::Edit,
+            "fixed".into(),
+            "2026-03-11T00:00:00Z".into(),
+            Some("abc123".into()),
+            vec![sig("ed25519"), sig("ml-dsa-65")],
+        )
+        .expect("a well-formed signed edit is accepted");
+        let algorithms: Vec<&str> = annotation
+            .signatures
+            .iter()
+            .map(|s| s.algorithm.as_str())
+            .collect();
+        assert_eq!(algorithms, vec!["ed25519", "ml-dsa-65"]);
+    }
+
+    /// An edit still cannot claim to revise content it does not name.
+    #[test]
+    fn an_edit_without_the_original_hash_is_still_refused() {
+        assert!(
+            annotation_for(
+                AnnotationType::Edit,
+                "fixed".into(),
+                "2026-03-11T00:00:00Z".into(),
+                None,
+                vec![],
+            )
+            .is_err()
+        );
+    }
 }
