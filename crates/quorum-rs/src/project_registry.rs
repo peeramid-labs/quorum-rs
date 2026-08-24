@@ -67,6 +67,7 @@ pub fn advert_subject(subject_prefix: &str) -> String {
 /// `None` when the content carries no `project_advanced` (an ordinary completion).
 pub fn advanced_notification(
     content: &serde_json::Value,
+    hook_state: &HashMap<String, serde_json::Value>,
     subject_prefix: &str,
 ) -> Option<(String, Vec<u8>)> {
     let adv = content.get("project_advanced")?;
@@ -75,7 +76,15 @@ pub fn advanced_notification(
         return None;
     }
     let subject = format!("{subject_prefix}.project.{project_id}.advanced");
-    let payload = serde_json::to_vec(adv).ok()?;
+    let mut payload = adv.clone();
+    // `{project_id, head}` names a commit but no repository, which is enough for a
+    // holder pulling an update and useless to a caller meeting this thread for the
+    // first time. When the deliberation worked out where its answer can be fetched,
+    // carry that here — otherwise the answer is addressable only in principle.
+    if let (Some(obj), Some(coords)) = (payload.as_object_mut(), hook_state.get("pd_consensus")) {
+        obj.insert("consensus".to_string(), coords.clone());
+    }
+    let payload = serde_json::to_vec(&payload).ok()?;
     Some((subject, payload))
 }
 
@@ -260,20 +269,64 @@ mod tests {
         let content = serde_json::json!({
             "project_advanced": { "project_id": "root-sha", "head": "head-sha" }
         });
-        let (subject, payload) = advanced_notification(&content, "nsed").unwrap();
+        let (subject, payload) = advanced_notification(&content, &HashMap::new(), "nsed").unwrap();
         assert_eq!(subject, "nsed.project.root-sha.advanced");
         let back: serde_json::Value = serde_json::from_slice(&payload).unwrap();
         assert_eq!(back["head"], "head-sha");
         assert_eq!(back["project_id"], "root-sha");
         // Ordinary completion (no signal) / empty id → nothing to publish.
-        assert!(advanced_notification(&serde_json::json!({"note": "ok"}), "nsed").is_none());
+        assert!(
+            advanced_notification(&serde_json::json!({"note": "ok"}), &HashMap::new(), "nsed")
+                .is_none()
+        );
         assert!(
             advanced_notification(
                 &serde_json::json!({"project_advanced": {"project_id": ""}}),
+                &HashMap::new(),
                 "nsed"
             )
             .is_none()
         );
+    }
+
+    /// A caller who does not already hold the thread cannot act on `{project_id,
+    /// head}` alone — it names a commit but no repository to fetch it from. The
+    /// middleware works those coordinates out at consensus and puts them in
+    /// `hook_state`; if the notification drops them, the answer is addressable in
+    /// principle and unreachable in practice.
+    #[test]
+    fn the_notification_carries_where_the_answer_can_be_fetched() {
+        let content = serde_json::json!({
+            "project_advanced": { "project_id": "root-sha", "head": "head-sha" }
+        });
+        let hook_state = HashMap::from([(
+            "pd_consensus".to_string(),
+            serde_json::json!({
+                "repo": "https://seed.example/thread.git",
+                "hosted": true,
+                "commit": "head-sha",
+                "file": "ANSWER.md",
+                "branch": "main",
+            }),
+        )]);
+        let (_subject, payload) = advanced_notification(&content, &hook_state, "nsed").unwrap();
+        let back: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(back["consensus"]["repo"], "https://seed.example/thread.git");
+        assert_eq!(back["consensus"]["file"], "ANSWER.md");
+        assert_eq!(back["consensus"]["branch"], "main");
+        assert_eq!(back["project_id"], "root-sha", "the existing fields remain");
+    }
+
+    /// A deliberation that produced no fetchable answer publishes no coordinates,
+    /// rather than an empty object a reader would try to fetch from.
+    #[test]
+    fn a_notification_without_coordinates_omits_them() {
+        let content = serde_json::json!({
+            "project_advanced": { "project_id": "root-sha", "head": "head-sha" }
+        });
+        let (_s, payload) = advanced_notification(&content, &HashMap::new(), "nsed").unwrap();
+        let back: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert!(back.get("consensus").is_none(), "no coordinates: {back}");
     }
 
     #[test]

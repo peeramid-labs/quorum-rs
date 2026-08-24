@@ -1342,8 +1342,10 @@ impl NatsNsedWorker {
             // in the verdict content — republish it as the "epic advanced, pull now"
             // notification so clients holding the project sync.
             Ok(Some(verdict_content)) => {
+                let (verdict_content, hook_state) = verdict_content;
                 if let Some((subject, payload)) = crate::project_registry::advanced_notification(
                     &verdict_content,
+                    &hook_state,
                     &self.config.subject_prefix,
                 ) {
                     match self.nats.publish(subject.clone(), payload.into()).await {
@@ -1561,7 +1563,12 @@ impl NatsNsedWorker {
         stage: crate::middleware::MiddlewareStage,
         content: serde_json::Value,
         metadata: serde_json::Value,
-    ) -> Result<Option<serde_json::Value>> {
+    ) -> Result<
+        Option<(
+            serde_json::Value,
+            std::collections::HashMap<String, serde_json::Value>,
+        )>,
+    > {
         match pipeline {
             Some(p) => run_stage_pipeline(
                 p,
@@ -1824,6 +1831,7 @@ impl NatsNsedWorker {
                 )
                 .await?
             {
+                let (new, _hook_state) = new;
                 if let Some(td) = new.get("task_description").and_then(|v| v.as_str()) {
                     context.task_description = td.to_string();
                 } else {
@@ -1975,7 +1983,7 @@ impl NatsNsedWorker {
                                     )
                                     .await?
                                 {
-                                    if let Some(c) = new.as_str() {
+                                    if let Some(c) = new.0.as_str() {
                                         proposal.content = c.to_string();
                                     }
                                 }
@@ -2860,7 +2868,10 @@ async fn run_stage_pipeline(
     stage: crate::middleware::MiddlewareStage,
     content: serde_json::Value,
     metadata: serde_json::Value,
-) -> Result<serde_json::Value> {
+) -> Result<(
+    serde_json::Value,
+    std::collections::HashMap<String, serde_json::Value>,
+)> {
     let mut ctx = crate::middleware::MiddlewareContext {
         content,
         action: action.to_string(),
@@ -2875,7 +2886,11 @@ async fn run_stage_pipeline(
         crate::middleware::pipeline::PipelineResult::Blocked {
             category, reason, ..
         } => Err(anyhow::Error::new(MiddlewareBlocked { category, reason })),
-        _ => Ok(ctx.content),
+        // `hook_state` travels with the content: a middleware writes there what does
+        // not belong in the answer itself — where the consensus can be fetched, for
+        // one — and returning only the content leaves the caller holding a result
+        // whose location the pipeline had already worked out and discarded.
+        _ => Ok((ctx.content, ctx.hook_state)),
     }
 }
 
@@ -3420,7 +3435,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(out, serde_json::json!("changed"));
+        assert_eq!(out.0, serde_json::json!("changed"));
     }
 
     #[tokio::test]
@@ -3455,6 +3470,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let out = out.0;
         assert_eq!(out["agent"], "AgentA");
         assert_eq!(out["job"], "sess9");
         assert_eq!(out["round"], 3);
