@@ -1655,6 +1655,48 @@ fn relaxed_without_forced_choice(config: &RequestConfig) -> Option<RequestConfig
     Some(relaxed)
 }
 
+/// The tool choice for a request: forced when the schema needs it, unless this
+/// model is already known to refuse a forced choice.
+///
+/// The whole decision lives here so it can be tested as one. Split across the
+/// call site, a test can wire the pieces itself and pass while the wiring is
+/// gone.
+fn tool_choice_for(
+    model: &str,
+    schema_declared: bool,
+    has_tools: bool,
+    disable_native_tools: bool,
+) -> Option<async_openai::types::ChatCompletionToolChoiceOption> {
+    force_tool_choice(
+        schema_declared,
+        has_tools,
+        disable_native_tools || refuses_forced_choice_already(model),
+    )
+}
+
+/// Models already seen refusing a forced tool choice, so the next request skips
+/// the choice instead of paying a refusal to rediscover it.
+///
+/// Measured live: the refusal costs a full round trip, and with reasoning models
+/// the round it happens in used 922 of its 930-second budget. The refusal is a
+/// property of the model, not of the request, so learning it once is enough.
+/// Process-local and never evicted — the set is bounded by the roster.
+fn refuses_forced_choice_already(model: &str) -> bool {
+    known_refusers().lock().is_ok_and(|s| s.contains(model))
+}
+
+fn remember_refusal(model: &str) {
+    if let Ok(mut s) = known_refusers().lock() {
+        s.insert(model.to_string());
+    }
+}
+
+fn known_refusers() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
 /// The text to judge a refusal on: the provider's response body when the error
 /// carries one, else the error itself.
 ///
@@ -3232,7 +3274,8 @@ async fn react_loop(
             // turn (`required`) so the model can't end with prose instead of the
             // structured submission. The terminal tool's schema enforces the
             // shape; `required` guarantees the call happens.
-            tool_choice: force_tool_choice(
+            tool_choice: tool_choice_for(
+                &agent_config.model_name,
                 context.forced_proposal_schema.is_some(),
                 !active_tool_schemas.is_empty(),
                 agent_config.disable_native_tools,
@@ -3313,6 +3356,7 @@ async fn react_loop(
                     error = %e,
                     "backend refused the forced tool choice; retrying without it"
                 );
+                remember_refusal(&agent_config.model_name);
                 llm_client.chat_completion(agent_config, relaxed).await
             }
             (completed, _) => completed,
@@ -4589,6 +4633,43 @@ mod tests {
             .is_none(),
             "a request we never forced has nothing to retry"
         );
+    }
+
+    /// Covers the DECISION, not the recording call site: this test remembers the
+    /// refusal itself, so deleting `remember_refusal` from the retry arm still
+    /// passes here. Reaching that line needs the async request path. What is
+    /// pinned is that a remembered refusal changes the next request.
+    #[test]
+    #[serial]
+    fn a_model_that_refused_once_is_not_asked_to_refuse_again() {
+        use super::{refuses_forced_choice_already, remember_refusal, tool_choice_for};
+        use async_openai::types::ChatCompletionToolChoiceOption;
+
+        let model = "test-model-that-refuses-forced-choice";
+        assert!(
+            !refuses_forced_choice_already(model),
+            "a model is only known to refuse after it has"
+        );
+        // Before: the choice is forced, so this model pays a refusal to learn.
+        assert!(matches!(
+            tool_choice_for(model, true, true, false),
+            Some(ChatCompletionToolChoiceOption::Required)
+        ));
+
+        remember_refusal(model);
+
+        // After: the refusal is a property of the model, so the next request
+        // skips the choice rather than spending a round trip rediscovering it.
+        assert!(refuses_forced_choice_already(model));
+        assert!(
+            tool_choice_for(model, true, true, false).is_none(),
+            "a model known to refuse must not be asked again"
+        );
+        // A model that never refused is unaffected.
+        assert!(matches!(
+            tool_choice_for("some-other-model", true, true, false),
+            Some(ChatCompletionToolChoiceOption::Required)
+        ));
     }
 
     #[test]
