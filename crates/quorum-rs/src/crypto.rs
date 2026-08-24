@@ -102,6 +102,80 @@ pub fn signer_from_config_ref(raw: &str) -> Option<Arc<dyn AuditSigner>> {
     AgentKeyPair::from_config_ref(raw).map(|kp| kp.as_audit_signer())
 }
 
+/// What reading one record off the audit trail produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditRecord {
+    /// Every signature in the chain verified against the payload it covers.
+    Verified {
+        /// The agent that signed it.
+        agent_id: String,
+        /// How many signatures the chain carried.
+        signatures: usize,
+    },
+    /// The record parsed, but its chain did not verify — the payload or a
+    /// signature was altered after signing, or a key does not match.
+    Tampered {
+        /// The agent the record claims to come from.
+        agent_id: String,
+    },
+    /// The record carried no signature at all.
+    Unsigned {
+        /// The agent the record claims to come from.
+        agent_id: String,
+    },
+}
+
+/// Read and verify one record from the audit trail.
+///
+/// The payload is treated as opaque JSON: a reader checks provenance, and does not
+/// need to know the shape of what was signed to do that.
+///
+/// A record whose chain fails is reported as [`AuditRecord::Tampered`] rather than
+/// as an error, because failing to verify IS the finding — an audit reader that
+/// discarded it as a parse problem would lose the one event it exists to catch.
+/// `Err` is reserved for bytes that are not a record at all.
+pub fn read_audit_record(
+    bytes: &[u8],
+    registry: &quorum_crypto_core::VerifierRegistry,
+) -> Result<AuditRecord, serde_json::Error> {
+    let mut envelope: AuditEnvelope<serde_json::Value> = serde_json::from_slice(bytes)?;
+    let agent_id = envelope.agent_id().to_string();
+    if envelope.signatures().is_empty() {
+        return Ok(AuditRecord::Unsigned { agent_id });
+    }
+    let signatures = envelope.signatures().len();
+    match envelope.verify_chain(registry) {
+        Ok(true) => Ok(AuditRecord::Verified {
+            agent_id,
+            signatures,
+        }),
+        // A verifier error (unknown algorithm, malformed key) is not a reason to
+        // call a record sound; it is a reason to not trust it.
+        Ok(false) | Err(_) => Ok(AuditRecord::Tampered { agent_id }),
+    }
+}
+
+/// The audit subject that mirrors a working result subject.
+///
+/// An agent publishes results on `{prefix}.{job}.result.{round}.{agent}.{action}`.
+/// The signed copy goes to `{prefix}.{job}.audit.{action}`, matching the shape the
+/// orchestrator already uses for its own trail, so one consumer pattern reads both.
+///
+/// `None` for anything that is not a result subject — control-plane traffic has no
+/// audit counterpart, and inventing one would put heartbeats in the trail.
+pub fn audit_subject_for(working: &str) -> Option<String> {
+    let parts: Vec<&str> = working.split('.').collect();
+    // prefix . job . "result" . round . agent . action
+    if parts.len() != 6 || parts[2] != "result" {
+        return None;
+    }
+    let action = parts[5];
+    if action == "event" || action.is_empty() {
+        return None;
+    }
+    Some(format!("{}.{}.audit.{}", parts[0], parts[1], action))
+}
+
 // ---------------------------------------------------------------------------
 // SigningHook
 // ---------------------------------------------------------------------------
@@ -149,12 +223,61 @@ impl SigningHook {
     /// - Everything else (heartbeats, manifest ACKs, control messages) → `None`
     ///
     /// Returns `None` for subjects that should pass through unsigned.
-    fn audit_subject_type(subject: &str) -> Option<&'static str> {
+    pub(crate) fn audit_subject_type(subject: &str) -> Option<&'static str> {
         let last = subject.rsplit('.').next().unwrap_or("");
         match last {
             "propose" => Some("proposal"),
             "evaluate" => Some("evaluation"),
             _ => None,
+        }
+    }
+}
+
+/// [`WorkerHook`] that publishes a *signed copy* of each result to an audit
+/// subject, leaving the working payload exactly as the receiver expects it.
+///
+/// The counterpart to [`SigningHook`], and the one to prefer: that hook replaces
+/// the payload with an envelope, which ties signing to delivery — a receiver that
+/// parses the subject into a `Proposal` cannot read an envelope, so the message is
+/// lost. Copying to a parallel subject is the shape the orchestrator's own audit
+/// trail already uses, so signing can be switched on without a reader on the far
+/// side agreeing first.
+#[derive(Debug)]
+pub struct AuditTrailHook {
+    signer: Arc<dyn AuditSigner>,
+    agent_id: String,
+}
+
+impl AuditTrailHook {
+    /// Create a hook that signs a copy of every result under `agent_id`.
+    pub fn new(signer: Arc<dyn AuditSigner>, agent_id: String) -> Self {
+        Self { signer, agent_id }
+    }
+}
+
+#[async_trait::async_trait]
+impl WorkerHook for AuditTrailHook {
+    async fn audit_copies(&self, subject: &str, payload: &[u8]) -> Vec<(String, Vec<u8>)> {
+        let Some(audit_subject) = audit_subject_for(subject) else {
+            return Vec::new();
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
+            tracing::warn!(agent_id = %self.agent_id, "audit trail: payload is not JSON, not recorded");
+            return Vec::new();
+        };
+        let subject_type = SigningHook::audit_subject_type(subject).unwrap_or("result");
+        match AuditEnvelope::signed(value, subject_type, &self.agent_id, &*self.signer).await {
+            Ok(envelope) => match serde_json::to_vec(&envelope) {
+                Ok(bytes) => vec![(audit_subject, bytes)],
+                Err(e) => {
+                    tracing::warn!(agent_id = %self.agent_id, error = %e, "audit trail: envelope did not serialize");
+                    Vec::new()
+                }
+            },
+            Err(e) => {
+                tracing::warn!(agent_id = %self.agent_id, error = %e, "audit trail: signing failed");
+                Vec::new()
+            }
         }
     }
 }
@@ -254,6 +377,180 @@ mod tests {
     use super::*;
 
     // ---- AgentKeyPair ----
+
+    #[test]
+    fn an_audit_subject_mirrors_the_result_it_copies() {
+        assert_eq!(
+            super::audit_subject_for("nsed.job1.result.0.agent-a.propose").as_deref(),
+            Some("nsed.job1.audit.propose")
+        );
+        assert_eq!(
+            super::audit_subject_for("nsed.job1.result.2.agent-b.evaluate").as_deref(),
+            Some("nsed.job1.audit.evaluate")
+        );
+        // Control-plane traffic has no audit counterpart.
+        for not_a_result in [
+            "sphera.agent.heartbeat.agent-a",
+            "nsed.job1.result.event.round_complete",
+            "nsed.job1.task.agent-a.propose",
+            "nsed.job1.result.0.agent-a",
+        ] {
+            assert!(
+                super::audit_subject_for(not_a_result).is_none(),
+                "{not_a_result} must not derive an audit subject"
+            );
+        }
+    }
+
+    /// The bar the claim discipline sets: a verifier must reject a tampered
+    /// message. This drives the real path — the hook signs a result, the reader
+    /// verifies it, and the same record with one byte of payload changed is
+    /// reported as tampered rather than passing or being discarded as unparseable.
+    #[tokio::test]
+    async fn a_reader_verifies_a_recorded_result_and_rejects_a_tampered_one() {
+        use crate::agents::Proposal;
+        use crate::workers::WorkerHook;
+        use quorum_crypto_core::VerifierRegistry;
+
+        let hook = super::AuditTrailHook::new(
+            super::AgentKeyPair::generate().as_audit_signer(),
+            "agent-a".into(),
+        );
+        let proposal = serde_json::to_vec(&Proposal {
+            thought_process: "considered".into(),
+            content: "the answer".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let copies = hook
+            .audit_copies("nsed.job1.result.0.agent-a.propose", &proposal)
+            .await;
+        let record = &copies[0].1;
+        let registry = VerifierRegistry::with_defaults();
+
+        assert_eq!(
+            super::read_audit_record(record, &registry).unwrap(),
+            super::AuditRecord::Verified {
+                agent_id: "agent-a".to_string(),
+                signatures: 1,
+            },
+            "a record straight off the trail verifies"
+        );
+
+        // Alter the payload after signing — the case the trail exists to catch.
+        let mut tampered: serde_json::Value = serde_json::from_slice(record).unwrap();
+        tampered["payload"]["content"] = serde_json::json!("a different answer");
+        let tampered = serde_json::to_vec(&tampered).unwrap();
+        assert_eq!(
+            super::read_audit_record(&tampered, &registry).unwrap(),
+            super::AuditRecord::Tampered {
+                agent_id: "agent-a".to_string(),
+            },
+            "an altered payload does not verify"
+        );
+
+        // Stripping the signatures is not a way to look clean either.
+        let mut stripped: serde_json::Value = serde_json::from_slice(record).unwrap();
+        stripped["signatures"] = serde_json::json!([]);
+        stripped["signature"] = serde_json::json!("");
+        let stripped = serde_json::to_vec(&stripped).unwrap();
+        assert_eq!(
+            super::read_audit_record(&stripped, &registry).unwrap(),
+            super::AuditRecord::Unsigned {
+                agent_id: "agent-a".to_string(),
+            },
+            "a record with its signatures removed reads as unsigned, not as sound"
+        );
+
+        assert!(
+            super::read_audit_record(b"not a record", &registry).is_err(),
+            "bytes that are not a record are an error, not a verdict"
+        );
+    }
+
+    /// The audit hook records a signed copy and leaves the working payload alone,
+    /// so the receiver still parses the `Proposal` it expects. This is the property
+    /// that lets signing be switched on without a reader agreeing first.
+    #[tokio::test]
+    async fn an_audit_copy_is_signed_while_the_working_payload_is_untouched() {
+        use crate::agents::Proposal;
+        use crate::workers::WorkerHook;
+
+        let hook = super::AuditTrailHook::new(
+            super::AgentKeyPair::generate().as_audit_signer(),
+            "agent-a".into(),
+        );
+        let proposal = serde_json::to_vec(&Proposal {
+            thought_process: "considered".into(),
+            content: "the answer".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let subject = "nsed.job1.result.0.agent-a.propose";
+
+        let mut working = proposal.clone();
+        hook.before_publish(subject, &mut working).await.unwrap();
+        assert_eq!(working, proposal, "the working payload is not rewritten");
+        assert!(
+            serde_json::from_slice::<Proposal>(&working).is_ok(),
+            "the receiver still parses what it expects"
+        );
+
+        let copies = hook.audit_copies(subject, &proposal).await;
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].0, "nsed.job1.audit.propose");
+        let envelope: serde_json::Value = serde_json::from_slice(&copies[0].1).unwrap();
+        assert_eq!(envelope["agent_id"], "agent-a");
+        assert!(
+            envelope["signatures"]
+                .as_array()
+                .is_some_and(|s| !s.is_empty()),
+            "the copy carries a signature: {envelope}"
+        );
+
+        assert!(
+            hook.audit_copies("sphera.agent.heartbeat.agent-a", &proposal)
+                .await
+                .is_empty(),
+            "control-plane traffic is not recorded"
+        );
+    }
+
+    /// Signing rewrites a proposal into an envelope, and nothing on the receiving
+    /// side unwraps one — the orchestrator parses that subject straight into a
+    /// `Proposal`, which an envelope cannot satisfy. Installing this hook therefore
+    /// changes the wire contract, and must stay an explicit choice rather than
+    /// something a config key switches on. This test is the reason, kept executable.
+    #[tokio::test]
+    async fn signing_a_proposal_replaces_it_with_something_no_reader_parses() {
+        use crate::agents::Proposal;
+        use crate::workers::WorkerHook;
+
+        let hook = super::SigningHook::new(super::AgentKeyPair::generate(), "agent-a".into());
+        let proposal = serde_json::to_vec(&Proposal {
+            thought_process: "considered".into(),
+            content: "the answer".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut payload = proposal.clone();
+        hook.before_publish("nsed.job1.result.0.agent-a.propose", &mut payload)
+            .await
+            .unwrap();
+        assert_ne!(payload, proposal, "the payload is replaced by an envelope");
+        assert!(
+            serde_json::from_slice::<Proposal>(&payload).is_err(),
+            "an envelope does not parse as the Proposal the receiver expects"
+        );
+
+        // A control-plane subject is left alone, so this is scoped, not universal.
+        let mut heartbeat = proposal.clone();
+        hook.before_publish("sphera.agent.heartbeat.agent-a", &mut heartbeat)
+            .await
+            .unwrap();
+        assert_eq!(heartbeat, proposal, "non-audit subjects pass through");
+    }
 
     #[test]
     fn keypair_generate_produces_unique_keys() {
