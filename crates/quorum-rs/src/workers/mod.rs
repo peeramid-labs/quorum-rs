@@ -102,6 +102,16 @@ pub trait WorkerHook: Send + Sync + Debug {
     async fn before_publish(&self, _subject: &str, _payload: &mut Vec<u8>) -> Result<()> {
         Ok(())
     }
+
+    /// Extra messages to publish alongside the working payload, left untouched.
+    ///
+    /// This is how a signed copy reaches an audit subject without altering what the
+    /// receiver parses. Rewriting the working payload instead makes signing and
+    /// delivery the same decision, and a reader that cannot unwrap the wrapper loses
+    /// the message entirely. Default: none.
+    async fn audit_copies(&self, _subject: &str, _payload: &[u8]) -> Vec<(String, Vec<u8>)> {
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -585,6 +595,8 @@ impl NatsNsedWorker {
                 .map_err(|e| anyhow::anyhow!(e))?,
         );
 
+        let audit_hook = audit_hook_from(agent_config.signing_key.as_deref(), &agent_id);
+
         Ok(Self {
             agent,
             agent_config,
@@ -597,12 +609,11 @@ impl NatsNsedWorker {
             active_jobs: Arc::new(Mutex::new(HashSet::new())),
             start_time: Instant::now(),
             status: None,
-            // NOT installed from config, deliberately. `SigningHook` replaces a
-            // proposal payload with an `AuditEnvelope`, and the receiver parses that
-            // subject straight into a `Proposal` — so switching signing on by config
-            // would drop every proposal the agent sends. Signing stays an explicit
-            // `with_signing` until something on the far side unwraps an envelope.
-            hook: None,
+            // A configured key records a signed COPY on the audit subject and
+            // leaves the working payload alone, so switching this on cannot cost a
+            // delivery. `SigningHook`, which rewrites the payload, stays an explicit
+            // `with_signing` — that one needs a reader on the far side first.
+            hook: audit_hook,
             user_tool_factory: None,
             chat_agent: None,
             response_buffer: None,
@@ -2147,9 +2158,23 @@ impl NatsNsedWorker {
                         hook.before_publish(&reply_subject, &mut response_payload)
                             .await?;
                     }
+                    let audit_copies = match self.hook {
+                        Some(ref hook) => {
+                            hook.audit_copies(&reply_subject, &response_payload).await
+                        }
+                        None => Vec::new(),
+                    };
                     self.nats
                         .publish(reply_subject, response_payload.into())
                         .await?;
+                    // After the result, and never instead of it: a trail that cannot
+                    // be written is worth less than the answer it describes, so a
+                    // failure here is logged rather than failing the task.
+                    for (subject, payload) in audit_copies {
+                        if let Err(e) = self.nats.publish(subject.clone(), payload.into()).await {
+                            warn!(agent_id = %self.agent_id, subject = %subject, error = %e, "failed to publish audit copy");
+                        }
+                    }
                     self.mark_processed(&msg_id).await?;
                     msg.ack().await.map_err(|e| anyhow::anyhow!(e))?;
                     info!("✅ Task Complete: {}", msg_id);
@@ -2910,6 +2935,25 @@ async fn run_stage_pipeline(
         // whose location the pipeline had already worked out and discarded.
         _ => Ok((ctx.content, ctx.hook_state)),
     }
+}
+
+/// Build the audit-trail hook a configured `signing_key` names, if any.
+///
+/// Safe to install from configuration: it records a signed copy on the audit
+/// subject and never alters the payload a receiver parses.
+#[cfg(feature = "audit")]
+fn audit_hook_from(signing_key: Option<&str>, agent_id: &str) -> Option<Arc<dyn WorkerHook>> {
+    let signer = crate::crypto::signer_from_config_ref(signing_key?)?;
+    Some(Arc::new(crate::crypto::AuditTrailHook::new(
+        signer,
+        agent_id.to_string(),
+    )))
+}
+
+/// Without the signing machinery a configured key names no hook.
+#[cfg(not(feature = "audit"))]
+fn audit_hook_from(_signing_key: Option<&str>, _agent_id: &str) -> Option<Arc<dyn WorkerHook>> {
+    None
 }
 
 /// Build the signing hook a configured `signing_key` names, if any.
@@ -5557,6 +5601,25 @@ mod tests {
     // ===================================================================
     // Heartbeat status determination (pure logic)
     // ===================================================================
+
+    /// A configured key installs the hook that records the trail — the safe one,
+    /// which copies rather than rewrites. An unresolvable reference installs
+    /// nothing rather than falling back to a generated identity.
+    #[test]
+    fn a_configured_signing_key_installs_the_audit_hook() {
+        let seed_hex = "44".repeat(32);
+        unsafe { std::env::set_var("SDK_TEST_AUDIT_SEED", &seed_hex) };
+
+        assert!(
+            super::audit_hook_from(Some("${SDK_TEST_AUDIT_SEED}"), "agent-a").is_some(),
+            "a resolvable key records a trail"
+        );
+        assert!(super::audit_hook_from(None, "agent-a").is_none());
+        assert!(
+            super::audit_hook_from(Some("${SDK_TEST_AUDIT_SEED_ABSENT}"), "agent-a").is_none(),
+            "an unresolvable reference installs nothing"
+        );
+    }
 
     /// A configured key must actually sign. Announcing a derived identity while
     /// leaving the payloads unsigned is the worse failure of the two: a reader sees

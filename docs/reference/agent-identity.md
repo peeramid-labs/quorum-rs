@@ -47,14 +47,29 @@ A reference that resolves to nothing, or to something that is not 32 bytes, yiel
 no identity rather than a different one: the agent announces no key instead of one
 nobody can check.
 
-### Configuring a key does not switch signing on
+### What a configured key switches on
 
-A key in config is announced, not used. Signing stays an explicit
-`with_hook(signing_hook_from(...))`, because the signing hook replaces a proposal
-payload with an audit envelope and the receiving side parses that subject straight
-into a `Proposal` — an envelope does not satisfy it, so every proposal would be
-dropped. Nothing verifies these signatures yet either, so wrapping the wire would
-cost delivery and buy nothing until a reader exists on the far side.
+A configured key installs the **audit trail**: every result is published as normal,
+and a signed copy of it goes to a parallel subject.
+
+| working subject | audit copy |
+| --- | --- |
+| `{prefix}.{job}.result.{round}.{agent}.propose` | `{prefix}.{job}.audit.propose` |
+| `{prefix}.{job}.result.{round}.{agent}.evaluate` | `{prefix}.{job}.audit.evaluate` |
+
+Control-plane traffic — heartbeats, ACKs, lifecycle events — is not copied. The
+copy is published after the result and never instead of it: a trail that cannot be
+written is worth less than the answer it describes, so a failure there is logged
+rather than failing the task.
+
+This is the shape the orchestrator already uses for its own trail, so one consumer
+pattern reads both.
+
+**What a key does *not* switch on** is `SigningHook`, which replaces the payload
+with the envelope rather than copying it. That ties signing to delivery: a receiver
+parsing the subject into a `Proposal` cannot read an envelope, so the result is
+lost. It stays an explicit `with_hook(signing_hook_from(...))` for a deployment
+whose far side unwraps envelopes.
 
 ### Adding a key backend
 
