@@ -27,7 +27,7 @@ a signature came from the agent it claims to.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `signing_key` | unset | Reference to the agent's own signing key: `${VAR}`, `file:<path>`, or a literal. Resolves to a hex-encoded 32-byte Ed25519 seed. Unset means the agent signs nothing. |
+| `signing_key` | unset | Reference to the agent's own signing key: `${VAR}`, `file:<path>`, or a literal, each naming a hex-encoded 32-byte Ed25519 seed. Unset means the agent signs nothing. |
 | `operator_pubkeys` | empty | Public keys authorised to act for this agent, i.e. an operator editing a held response. A list, because an agent may have more than one operator and because a key must be rotatable without a window where neither the old nor the new one works. |
 
 **Put the reference in config, not the key.** `signing_key` names where the seed
@@ -46,6 +46,18 @@ which public keys may act for the agent is the only way to state it.
 A reference that resolves to nothing, or to something that is not 32 bytes, yields
 no identity rather than a different one: the agent announces no key instead of one
 nobody can check.
+
+A configured key is installed as the worker's signing hook at construction, so the
+agent signs with the key it announces. A caller that sets its own hook afterwards
+still wins — the builder runs after construction.
+
+### Adding a key backend
+
+The reference resolves to an `AuditSigner`, not to key material. The schemes above
+name a *stored secret*, which is read into a software Ed25519 signer, but a token,
+a TPM or a secure enclave never surrenders its private key — it signs on request.
+Those are added as further arms of the same resolver and need no change at any
+call site, because nothing downstream ever sees a seed.
 
 ## Heartbeat
 

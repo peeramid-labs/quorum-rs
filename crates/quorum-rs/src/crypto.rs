@@ -87,6 +87,21 @@ impl AgentKeyPair {
     }
 }
 
+/// Resolve a configured `signing_key` reference to the signer it names.
+///
+/// Returns a signer rather than key material on purpose. `${VAR}`, `file:<path>`
+/// and a literal all name a *stored secret*, which this reads into a software
+/// Ed25519 signer — but a token, a TPM or a secure enclave never surrenders its
+/// private key, it signs on request. Handing back an [`AuditSigner`] is what lets
+/// such a backend be added as another arm here without changing any caller.
+///
+/// `None` when the reference resolves to nothing usable. The caller decides
+/// whether an agent without a signer may run; this does not invent one, because an
+/// agent signing under a key nobody expects is worse than one that will not start.
+pub fn signer_from_config_ref(raw: &str) -> Option<Arc<dyn AuditSigner>> {
+    AgentKeyPair::from_config_ref(raw).map(|kp| kp.as_audit_signer())
+}
+
 // ---------------------------------------------------------------------------
 // SigningHook
 // ---------------------------------------------------------------------------
@@ -106,14 +121,24 @@ impl AgentKeyPair {
 /// is passed through unchanged with a warning log.
 #[derive(Debug)]
 pub struct SigningHook {
-    keypair: AgentKeyPair,
+    signer: Arc<dyn AuditSigner>,
     agent_id: String,
 }
 
 impl SigningHook {
     /// Create a new signing hook for the given agent.
     pub fn new(keypair: AgentKeyPair, agent_id: String) -> Self {
-        Self { keypair, agent_id }
+        Self::with_signer(keypair.as_audit_signer(), agent_id)
+    }
+
+    /// Create a hook over any [`AuditSigner`].
+    ///
+    /// The hook needs a thing that signs, not a key it can read. A token, a TPM or
+    /// a secure enclave never surrenders its private key — it signs on request —
+    /// so taking the signer rather than the keypair is what lets those back the
+    /// same hook later without changing anything around it.
+    pub fn with_signer(signer: Arc<dyn AuditSigner>, agent_id: String) -> Self {
+        Self { signer, agent_id }
     }
 
     /// Extract the audit-relevant subject type from a NATS subject.
@@ -157,7 +182,7 @@ impl WorkerHook for SigningHook {
         };
 
         // Sign into an AuditEnvelope
-        let signer = self.keypair.as_audit_signer();
+        let signer = self.signer.clone();
         match AuditEnvelope::signed(value, subject_type, &self.agent_id, &*signer).await {
             Ok(envelope) => {
                 // Replace payload with the serialized envelope

@@ -585,6 +585,8 @@ impl NatsNsedWorker {
                 .map_err(|e| anyhow::anyhow!(e))?,
         );
 
+        let signing_hook = signing_hook_from(agent_config.signing_key.as_deref(), &agent_id);
+
         Ok(Self {
             agent,
             agent_config,
@@ -597,7 +599,11 @@ impl NatsNsedWorker {
             active_jobs: Arc::new(Mutex::new(HashSet::new())),
             start_time: Instant::now(),
             status: None,
-            hook: None,
+            // A configured key signs from the start: announcing a derived identity
+            // on the heartbeat while leaving payloads unsigned would show a reader a
+            // key with nothing behind it. A caller's own `with_hook` still wins,
+            // since the builder runs after construction.
+            hook: signing_hook,
             user_tool_factory: None,
             chat_agent: None,
             response_buffer: None,
@@ -2907,13 +2913,34 @@ async fn run_stage_pipeline(
     }
 }
 
+/// The signing hook a configured `signing_key` implies, if any.
+///
+/// Installed as the worker's default hook at construction so an agent given a key
+/// in config actually signs with it — declaring a key it never used would put an
+/// identity on the heartbeat that nothing behind it honours. A caller that sets
+/// its own hook afterwards still wins, since the builder runs after construction.
+#[cfg(feature = "audit")]
+fn signing_hook_from(signing_key: Option<&str>, agent_id: &str) -> Option<Arc<dyn WorkerHook>> {
+    let signer = crate::crypto::signer_from_config_ref(signing_key?)?;
+    Some(Arc::new(crate::crypto::SigningHook::with_signer(
+        signer,
+        agent_id.to_string(),
+    )))
+}
+
+/// Without the signing machinery a configured key installs nothing.
+#[cfg(not(feature = "audit"))]
+fn signing_hook_from(_signing_key: Option<&str>, _agent_id: &str) -> Option<Arc<dyn WorkerHook>> {
+    None
+}
+
 /// Derive the public half of a configured signing-key reference, hex-encoded.
 ///
 /// `None` when no key is configured, or when the reference does not resolve to a
 /// usable seed — an agent then reports no key rather than a stale or invented one.
 #[cfg(feature = "audit")]
 fn signing_pubkey_from(signing_key: Option<&str>) -> Option<String> {
-    crate::crypto::AgentKeyPair::from_config_ref(signing_key?).map(|kp| kp.public_key_hex())
+    crate::crypto::signer_from_config_ref(signing_key?).map(|s| hex::encode(s.public_key_bytes()))
 }
 
 /// Without the signing machinery there is no key to derive one from.
@@ -5521,6 +5548,28 @@ mod tests {
     // ===================================================================
     // Heartbeat status determination (pure logic)
     // ===================================================================
+
+    /// A configured key must actually sign. Announcing a derived identity while
+    /// leaving the payloads unsigned is the worse failure of the two: a reader sees
+    /// a key and reasonably infers something stands behind it.
+    #[test]
+    fn a_configured_signing_key_installs_the_hook_that_uses_it() {
+        let seed_hex = "33".repeat(32);
+        unsafe { std::env::set_var("SDK_TEST_HOOK_SEED", &seed_hex) };
+
+        assert!(
+            super::signing_hook_from(Some("${SDK_TEST_HOOK_SEED}"), "agent-a").is_some(),
+            "a resolvable key installs a signing hook"
+        );
+        assert!(
+            super::signing_hook_from(None, "agent-a").is_none(),
+            "no key configured installs nothing"
+        );
+        assert!(
+            super::signing_hook_from(Some("${SDK_TEST_HOOK_SEED_ABSENT}"), "agent-a").is_none(),
+            "an unresolvable reference installs nothing rather than a random identity"
+        );
+    }
 
     /// The key a heartbeat announces is derived from the configured reference, so
     /// what peers see follows the key that actually signs. An agent with no usable
