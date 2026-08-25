@@ -407,7 +407,7 @@ impl WorkerHook for AuditTrailHook {
         }
         let claim_subject = format!("{}.{}.audit.candidate", parts[0], parts[1]);
 
-        // Bound to what was published, so a promoter can tell the commit was put
+        // Bound to what was published, so the orchestrator can tell the commit was put
         // forward for the proposal the evaluators were shown.
         let about = About::this(candidate, published);
         match AuditEnvelope::signed(about, "candidate", &self.agent_id, &*self.signer).await {
@@ -1262,10 +1262,10 @@ mod tests {
         );
     }
 
-    /// The claim a promoter reads: signed, bound, and on the trail it already
+    /// The claim the orchestrator reads: signed, bound, and on the trail it already
     /// follows.
     ///
-    /// This is the seam between the dylib reporting a commit and a promoter being
+    /// This is the seam between the dylib reporting a commit and the orchestrator being
     /// able to act on it. Unsigned, the commit is only as trustworthy as the
     /// transport; unbound, it says nothing about which proposal it belongs to.
     #[tokio::test]
@@ -1292,7 +1292,7 @@ mod tests {
             "the claim rides the job's existing audit tree, not a subject of its own"
         );
 
-        // A promoter holds bytes and a registry, nothing else.
+        // The orchestrator holds bytes and a registry, nothing else.
         let registry = VerifierRegistry::with_defaults();
         assert_eq!(
             super::read_audit_record(&bytes, &registry).unwrap(),
@@ -1304,7 +1304,7 @@ mod tests {
         );
 
         let envelope: quorum_crypto_core::AuditEnvelope<super::About<super::Candidate>> =
-            serde_json::from_slice(&bytes).expect("a promoter reads the claim");
+            serde_json::from_slice(&bytes).expect("the orchestrator reads the claim");
         assert_eq!(
             envelope.payload().claim.commit,
             "9f2c1b7e4d5a6083c1e2f3a4b5c6d7e8f9a0b1c2"
