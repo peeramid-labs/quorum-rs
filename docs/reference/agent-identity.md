@@ -83,6 +83,34 @@ would lose the one event the trail exists to catch. A verifier that errors — a
 unknown algorithm, a malformed key — reads as `Tampered` too, since not being able
 to check a record is not a reason to trust it.
 
+### Reading a whole job's trail
+
+`verify_job_trail(&nats, prefix, job_id, &registry, idle)` subscribes to
+`{prefix}.{job}.audit.>`, reads until `idle` passes with no message, and tallies
+what it saw:
+
+| field | meaning |
+| --- | --- |
+| `verified` | records whose chain covered their payload |
+| `tampered` | the **agent ids** whose records did not verify — named, not counted, because the next question is always *whose* |
+| `unsigned` | records carrying no signature |
+| `unreadable` | bytes that were not a record at all |
+
+`summary.is_sound()` requires `verified > 0` alongside empty failures. **An empty
+trail is not sound**: nothing was recorded, so nothing was shown, and a reader
+asking this question wants evidence — absence is not evidence. The same reasoning
+makes one bad record cost only itself: a trail is still readable, and still worth
+tallying, when part of it fails.
+
+Two properties of the transport shape how a caller uses this:
+
+- **The trail is a live stream, not a store.** Subscribe before the records are
+  published or they are simply missed. The audit subtree is not captured by the
+  per-job result stream, so there is no replay.
+- **`idle` is the only terminator.** There is no end-of-trail marker, so the call
+  returns once nothing has arrived for that long. Too short a value on a slow
+  broker reports a short trail rather than an error.
+
 **What a key does *not* switch on** is `SigningHook`, which replaces the payload
 with the envelope rather than copying it. That ties signing to delivery: a receiver
 parsing the subject into a `Proposal` cannot read an envelope, so the result is
