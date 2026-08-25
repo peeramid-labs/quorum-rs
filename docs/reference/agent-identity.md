@@ -183,25 +183,7 @@ artifact are comparable, and ones that do not are not — regardless of what eit
 says. That is what stops a seat being scored on one proposal and promoting a commit
 built from another.
 
-### Where the claim is published
-
-A seat that reports a candidate publishes a signed claim beside its result:
-
-| working subject | claim |
-| --- | --- |
-| `{prefix}.{job}.result.{round}.{agent}.propose` | `{prefix}.{job}.audit.candidate` |
-
-It rides the job's existing audit tree rather than a subject of its own — it is
-another thing this seat said about this job, and a reader already following the
-trail receives it with no second subscription. `verify_job_trail` tallies it like
-any other record.
-
-Published **after** the result and never instead of it, for the same reason as the
-audit copy: a claim that cannot be written is worth less than the answer it
-describes, so a failure there is logged rather than failing the task. A seat that
-reported no candidate, or holds no key, publishes nothing.
-
-**Not yet enforced.** Two things the orchestrator must do, neither of which exists yet:
+**Not yet enforced.** Two things a promoter must do, neither of which exists yet:
 reject a claim whose `job` is not the job being settled, and refuse a slot where one
 seat attested two different commits for the same `{job, round}` — an equivocation
 the signature makes attributable. The envelope's timestamp is signed but no code
