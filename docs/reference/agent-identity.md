@@ -189,14 +189,12 @@ A seat that reports a candidate publishes a signed claim beside its result:
 
 | working subject | claim |
 | --- | --- |
-| `{prefix}.{job}.result.{round}.{agent}.propose` | `{prefix}.{job}.result.event.candidate` |
+| `{prefix}.{job}.result.{round}.{agent}.propose` | `{prefix}.{job}.audit.candidate` |
 
-It rides the job's **event tree**, not the audit subtree, because only the former
-is captured by the per-job stream. The claim is published during a round and read
-after the rounds end: on an uncaptured subject a reader that subscribes at
-finalisation receives nothing, and the deliberation would settle as if no seat had
-spoken. A candidate claim is a fact about this job's round, so it belongs with the
-job's other events.
+It rides the job's existing audit tree rather than a subject of its own — it is
+another thing this seat said about this job, and a reader already following the
+trail receives it with no second subscription. `verify_job_trail` tallies it like
+any other record.
 
 Published **after** the result and never instead of it, for the same reason as the
 audit copy: a claim that cannot be written is worth less than the answer it
