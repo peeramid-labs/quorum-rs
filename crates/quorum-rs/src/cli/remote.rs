@@ -1089,6 +1089,12 @@ impl RemoteOrchestrator {
                                 continue;
                             }
                         }
+                        // NOTE: `consensus` — where the agreed answer can be fetched — is
+                        // handled in `stream_events` below, not here. This stream feeds the
+                        // TUI, whose thread model stores a reply's text and has nowhere to
+                        // put a repository address; surfacing it needs a model change and a
+                        // placement decision, so the event is deliberately not parsed into a
+                        // variant nothing would render.
                         "timeout" => SseEvent::Timeout(data),
                         "tool_call_pending" => {
                             let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
