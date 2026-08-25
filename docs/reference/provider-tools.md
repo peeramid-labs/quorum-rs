@@ -95,3 +95,20 @@ Which of the two a model needs is measured against the endpoint, not inferred
 from the vendor: of the models on one EU router, some accept the mix, one
 accepts search only when alone, and others reject the search tool in any shape
 and should carry neither field.
+
+### How it shows up in the logs
+
+A seat misconfigured this way produces nothing — every task fails identically,
+which reads like a dead model rather than a config error. The refusal is now
+recognised and logged with the seat, the model, and the declared
+`provider_executed_tools`:
+
+```
+backend refuses our tools declared beside a provider-executed one — every tool
+call from this seat will fail. Use the nested search-only call instead of
+declaring the tool alongside.
+```
+
+Parse failures name the model too, for the same reason: a seat that never
+produces a usable proposal is a property of the model behind it, and a log line
+that omits which one leaves the roster to be bisected by hand.
