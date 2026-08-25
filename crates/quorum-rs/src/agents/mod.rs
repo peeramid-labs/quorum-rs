@@ -332,10 +332,54 @@ impl OperatorAnnotation {
     }
 }
 
+/// What a proposal's `content` is.
+///
+/// A deliberation can carry its answer as text, or carry an address and leave the
+/// answer where it already lives. The second is what lets a party settle a job
+/// without reading it — and what stops a copy drifting from the thing it copied.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalType {
+    /// `content` is the answer itself. The default, and what every existing
+    /// producer means, so an older payload keeps its meaning.
+    #[default]
+    Text,
+    /// `content` is a URI naming where the answer is, not the answer.
+    ///
+    /// The proposal is already signed on the audit trail, so an address carried
+    /// this way is an attested claim about where a seat's answer lives — no
+    /// separate claim channel, and nothing to reconcile, because the thing judged
+    /// and the thing named are one object.
+    ///
+    /// **A reader that scores `content` must resolve it first.** Evaluator context
+    /// is built from `content` today (`tools::context`, `agents::mcp_agent`), so a
+    /// URI reaches an evaluator as a string unless the substrate injects the
+    /// resolved answer for judging. Producing this type without that in place
+    /// scores the address instead of the answer.
+    ///
+    /// **Resolution must not reveal authorship.** Evaluators score anonymised
+    /// candidates on purpose: a seat that can tell whose work it is judging can
+    /// favour an ally or bury a rival, and the scores stop measuring the answer.
+    /// An address into a shared repository leaks that by default — the branch is
+    /// `job/{job}/{agent}`, the commit carries an author, and a collaborator can
+    /// read both. So a URI is an **opaque handle to be resolved**, never a hint to
+    /// dereference directly: whatever resolves it owes the caller the answer
+    /// without the author. Until a resolver enforces that, this type is sound for
+    /// settling a winner — where authorship is already public — and unsound for
+    /// evaluation.
+    Uri,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ToSchema, Default)]
 pub struct Proposal {
     pub thought_process: String,
     pub content: String,
+    /// Whether `content` is the answer or an address for it. Defaults to
+    /// [`ProposalType::Text`], so a payload that predates this field is unchanged.
+    #[serde(default)]
+    pub proposal_type: ProposalType,
     /// Explicit SKIP answer — see `docs/reference/skip.md`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skipped: bool,
@@ -1299,6 +1343,29 @@ pub fn calculate_qv_score(raw_weight: f32, total_weight: f32) -> (f32, f32) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A payload written before proposals had a type still means what it meant.
+    ///
+    /// The type decides whether `content` is the answer or an address for it, so a
+    /// missing field defaulting to anything but `Text` would silently reinterpret
+    /// every stored proposal as a URI.
+    #[test]
+    fn a_proposal_without_a_type_is_still_text() {
+        let older = r#"{"thought_process":"why","content":"the answer itself"}"#;
+        let p: Proposal = serde_json::from_str(older).expect("an older payload parses");
+        assert_eq!(p.proposal_type, ProposalType::Text);
+        assert_eq!(p.content, "the answer itself");
+
+        // And a proposal that names where its answer lives says so explicitly.
+        let addressed = r#"{"thought_process":"why","content":"rad://x/answer.md@9f2c1b","proposal_type":"uri"}"#;
+        let p: Proposal = serde_json::from_str(addressed).expect("an addressed payload parses");
+        assert_eq!(p.proposal_type, ProposalType::Uri);
+
+        // Round-trips, so a relay cannot quietly turn an address back into text.
+        let back: Proposal = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back.proposal_type, ProposalType::Uri);
+        assert_eq!(back.content, "rad://x/answer.md@9f2c1b");
+    }
     #[test]
     fn a_proposal_records_which_backend_served_it() {
         // An allowlist states where a request was permitted to go; this
