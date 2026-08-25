@@ -112,6 +112,22 @@ pub trait WorkerHook: Send + Sync + Debug {
     async fn audit_copies(&self, _subject: &str, _payload: &[u8]) -> Vec<(String, Vec<u8>)> {
         Vec::new()
     }
+
+    /// A signed claim naming the commit this seat is putting forward, bound to the
+    /// payload it published.
+    ///
+    /// Separate from [`WorkerHook::audit_copies`] because it is not a copy of the
+    /// result: it is a different claim, about the same artifact. A promoter reads
+    /// it to settle a deliberation without opening the repository. Default: none,
+    /// for a seat that reported no candidate or holds no key.
+    async fn candidate_copy(
+        &self,
+        _subject: &str,
+        _reported: &serde_json::Value,
+        _published: &[u8],
+    ) -> Option<(String, Vec<u8>)> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1984,6 +2000,10 @@ impl NatsNsedWorker {
         // Wraps the full propose/evaluate call because the SDK cannot pinpoint where inside
         // the agent's implementation the transport failure occurred. Only errors matching
         // `is_transient_error()` are retried; LLM-level or logic errors break immediately.
+        // Set by the propose stage, read at publish. Declared outside the retry
+        // block because the claim is published with the result, after it closes;
+        // the last attempt's candidate is the one whose payload actually ships.
+        let mut reported_candidate: Option<serde_json::Value> = None;
         let execution_result = {
             const MAX_TASK_RETRIES: u32 = 2;
             let mut last_err = None;
@@ -2015,6 +2035,11 @@ impl NatsNsedWorker {
                                     if let Some(c) = new.0.as_str() {
                                         proposal.content = c.to_string();
                                     }
+                                    // The commit this seat is putting forward. Kept
+                                    // for the signed claim published beside the
+                                    // result; a promoter settles on it without
+                                    // reading the repository.
+                                    reported_candidate = new.1.get("pd_candidate").cloned();
                                 }
                             }
                             proposal.published_at_ms = chrono::Utc::now().timestamp_millis();
@@ -2171,12 +2196,20 @@ impl NatsNsedWorker {
                         hook.before_publish(&reply_subject, &mut response_payload)
                             .await?;
                     }
-                    let audit_copies = match self.hook {
+                    let mut audit_copies = match self.hook {
                         Some(ref hook) => {
                             hook.audit_copies(&reply_subject, &response_payload).await
                         }
                         None => Vec::new(),
                     };
+                    if let (Some(hook), Some(reported)) = (&self.hook, &reported_candidate) {
+                        if let Some(claim) = hook
+                            .candidate_copy(&reply_subject, reported, &response_payload)
+                            .await
+                        {
+                            audit_copies.push(claim);
+                        }
+                    }
                     self.nats
                         .publish(reply_subject, response_payload.into())
                         .await?;
