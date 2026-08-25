@@ -182,14 +182,14 @@ pub fn artifact_digest(published: &[u8]) -> String {
 
 /// A claim about a specific artifact.
 ///
-/// A deliberation is settled by parties who did not read it: a promoter ranks on
+/// A deliberation is settled by parties who did not read it: the orchestrator ranks on
 /// scores and promotes on ids. That only holds together if every claim names the
 /// artifact it is about — otherwise a seat can be scored on one proposal and
 /// attest a commit derived from another, and nothing in the chain notices.
 ///
 /// Generic because the shape recurs: a [`Candidate`] is a claim about the proposal
 /// it was judged on, an evaluation is a claim about the proposal it scored. Both
-/// need the same binding, and a promoter checks it the same way for both — the
+/// need the same binding, and the orchestrator checks it the same way for both — the
 /// artifact digest is what joins separate claims into one chain.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct About<T> {
@@ -218,7 +218,7 @@ impl<T> About<T> {
     /// This is what separates a declared skip from silence. A seat that signs this
     /// has said "nothing, for this slot" and can be held to it; a seat that
     /// publishes nothing has said nothing at all, and no signature exists to
-    /// distinguish it from one that was never asked. A promoter needs both, and
+    /// distinguish it from one that was never asked. The orchestrator needs both, and
     /// they are not the same fact.
     pub fn nothing(claim: T) -> Self {
         Self::this(claim, b"")
@@ -226,7 +226,7 @@ impl<T> About<T> {
 
     /// Whether this claim is about the given artifact bytes.
     ///
-    /// The check a promoter runs to join claims: an evaluation and a candidate
+    /// The check the orchestrator runs to join claims: an evaluation and a candidate
     /// that agree here are about the same thing, and ones that do not are not
     /// comparable — regardless of what either says.
     pub fn is_about(&self, artifact: &[u8]) -> bool {
@@ -244,7 +244,7 @@ impl<T> About<T> {
 ///
 /// This is what lets a deliberation be settled by a party that never reads it.
 /// Ranking is a function of scores, and promotion is a function of ids, so a
-/// promoter holding candidates can name the winning commit without opening the
+/// orchestrator holding candidates can name the winning commit without opening the
 /// repository — the signature binds a commit to the seat that produced it, and
 /// that is the whole of what promotion needs to be checkable.
 ///
@@ -938,11 +938,11 @@ mod tests {
         );
     }
 
-    /// A promoter must be able to settle a deliberation from ids alone.
+    /// The orchestrator must be able to settle a deliberation from ids alone.
     ///
-    /// The attestation binds a commit to the seat that produced it, so a promoter
+    /// The attestation binds a commit to the seat that produced it, so the orchestrator
     /// that never opens the repository can still tell whose candidate it is
-    /// promoting. This asserts the whole path a promoter sees — sign, wire,
+    /// promoting. This asserts the whole path the orchestrator sees — sign, wire,
     /// untyped parse, verify — because verification re-serializes an untyped
     /// parse, and a payload that does not survive that reads as tampered.
     #[tokio::test]
@@ -968,9 +968,9 @@ mod tests {
             .expect("a seat signs its candidate");
         let wire = serde_json::to_vec(&env).expect("the attestation serializes");
 
-        // What a promoter actually holds: bytes, parsed without the author's types.
+        // What the orchestrator actually holds: bytes, parsed without the author's types.
         let mut read: AuditEnvelope<serde_json::Value> =
-            serde_json::from_slice(&wire).expect("a promoter parses it untyped");
+            serde_json::from_slice(&wire).expect("the orchestrator parses it untyped");
         assert!(
             read.verify_chain(&registry).expect("verification runs"),
             "an untouched attestation verifies"
@@ -1005,7 +1005,7 @@ mod tests {
             );
         }
 
-        // Tampering with the commit is the attack this exists to catch: a promoter
+        // Tampering with the commit is the attack this exists to catch: the orchestrator
         // pointed at a commit its signer never claimed.
         let mut forged: serde_json::Value = serde_json::from_slice(&wire).unwrap();
         forged["payload"]["commit"] = serde_json::json!("0000000000000000000000000000000000000000");
@@ -1080,17 +1080,17 @@ mod tests {
         }
     }
 
-    /// The chain a promoter walks: a score and a commit are comparable only when
+    /// The chain the orchestrator walks: a score and a commit are comparable only when
     /// they are about the same artifact.
     ///
     /// This is the half that makes the candidate binding worth anything. Ranking
     /// is per seat, so without a binding on the evaluation too, a seat could be
     /// scored on one proposal and attest a commit derived from another, and a
-    /// promoter that ranks on scores and promotes on ids would have no way to see
+    /// orchestrator that ranks on scores and promotes on ids would have no way to see
     /// it. Both claims naming the same artifact is what closes that.
     ///
     /// `About` is generic precisely so this needs no evaluation-specific type: the
-    /// promoter runs the same check for both.
+    /// orchestrator runs the same check for both.
     #[test]
     fn a_score_and_a_commit_are_comparable_only_about_the_same_artifact() {
         use crate::agents::Evaluation;
@@ -1144,7 +1144,7 @@ mod tests {
 
     /// A skip is a claim about the empty artifact, not a claim about no artifact.
     ///
-    /// Keeping one shape matters for what a promoter can conclude. A signed skip
+    /// Keeping one shape matters for what the orchestrator can conclude. A signed skip
     /// says "nothing, for this slot" and is attributable; silence says nothing at
     /// all and is indistinguishable from a seat that was never asked, or whose
     /// message was lost. Collapsing the two would let a dropped message read as a
@@ -1219,7 +1219,7 @@ mod tests {
             "an empty commit is not a candidate"
         );
 
-        // Bound, it answers the question a promoter actually asks: is this claim
+        // Bound, it answers the question the orchestrator actually asks: is this claim
         // about the artifact I hold?
         let bound = super::About::this(candidate, published);
         assert!(bound.is_about(published), "bound to what it was judged on");
