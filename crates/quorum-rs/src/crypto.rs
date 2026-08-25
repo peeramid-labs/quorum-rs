@@ -207,6 +207,63 @@ pub struct CandidateAttestation {
     /// untyped parse, and a 40-hex-digit value has no exact numeric form there:
     /// as an integer it would come back as a float and read as tampered.
     pub commit: String,
+    /// Hex SHA-256 of the proposal payload this seat published for the round.
+    ///
+    /// Without it the attestation says which commit a seat *claims*, and nothing
+    /// ties that to what the evaluators actually read. Scores are per seat, not
+    /// per commit, so a seat could be scored on one proposal and attest an
+    /// unrelated commit — and a promoter that ranks on scores and promotes on ids
+    /// has no way to notice. This is the link that makes the promoted commit the
+    /// judged one.
+    ///
+    /// Over the **published bytes**, so a party that cannot read the proposal can
+    /// still check the binding: it hashes what it relayed. That keeps working if
+    /// the payload is later encrypted.
+    pub proposal_digest: String,
+}
+
+/// Hex SHA-256 of a published proposal payload.
+///
+/// Deliberately not the dylib's FNV hunk id: that is content addressing among
+/// cooperating parties and is trivially collidable, so it cannot carry a claim
+/// about *which* proposal was judged.
+pub fn proposal_digest(published: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(published))
+}
+
+impl CandidateAttestation {
+    /// Bind the candidate a seat reported to the proposal bytes it published.
+    ///
+    /// `reported` is the dylib's `hook_state.pd_candidate` — the commit, the seat
+    /// and the slot. The digest is added here rather than there because the bytes
+    /// that matter are the ones that go on the wire, which the publisher holds and
+    /// the dylib does not.
+    ///
+    /// `None` when the reported value is not a candidate, so a missing or
+    /// malformed one yields no attestation rather than one bound to nothing.
+    pub fn bind(reported: &serde_json::Value, published_proposal: &[u8]) -> Option<Self> {
+        /// The dylib's half, deserialized as a whole so a missing or wrong-typed
+        /// field refuses the lot rather than being read one accessor at a time.
+        #[derive(serde::Deserialize)]
+        struct Reported {
+            job: String,
+            round: u32,
+            agent: String,
+            commit: String,
+        }
+        let r: Reported = serde_json::from_value(reported.clone()).ok()?;
+        if r.commit.is_empty() {
+            return None;
+        }
+        Some(Self {
+            job: r.job,
+            round: r.round,
+            agent: r.agent,
+            commit: r.commit,
+            proposal_digest: proposal_digest(published_proposal),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -843,6 +900,7 @@ mod tests {
             round: 2,
             agent: "Reviewer".into(),
             commit: "9f2c1b7e4d5a6083c1e2f3a4b5c6d7e8f9a0b1c2".into(),
+            proposal_digest: super::proposal_digest(b"{\"rationale\":\"why\",\"ops\":[]}"),
         };
 
         let env = AuditEnvelope::signed(&candidate, "candidate", "Reviewer", signer.as_ref())
@@ -868,8 +926,8 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["agent", "commit", "job", "round"],
-            "an attestation names a commit and its seat, nothing else: {payload}"
+            ["agent", "commit", "job", "proposal_digest", "round"],
+            "an attestation names a commit, its seat and the proposal it was judged on: {payload}"
         );
 
         // The repository and branch are derived, not carried: `job/{job}/{agent}`
@@ -895,37 +953,115 @@ mod tests {
         );
     }
 
-    /// The dylib emits the candidate; this crate parses it. They live in separate
+    /// Every way a reported candidate can be malformed yields no attestation.
+    ///
+    /// `bind` is the boundary between a payload this crate did not produce and a
+    /// claim it will sign. A partial parse here would mean signing an attestation
+    /// whose slot or seat came from somewhere other than the seat that reported
+    /// it, so each missing or wrong-typed field must refuse rather than default.
+    #[test]
+    fn a_malformed_candidate_binds_to_nothing() {
+        let published = b"proposal bytes";
+        let full = serde_json::json!({
+            "job": "j", "round": 1, "agent": "a", "commit": "abc"
+        });
+        assert!(
+            super::CandidateAttestation::bind(&full, published).is_some(),
+            "precondition: the complete shape binds"
+        );
+
+        for (why, value) in [
+            ("not an object", serde_json::json!("candidate")),
+            (
+                "no job",
+                serde_json::json!({"round": 1, "agent": "a", "commit": "abc"}),
+            ),
+            (
+                "no round",
+                serde_json::json!({"job": "j", "agent": "a", "commit": "abc"}),
+            ),
+            (
+                "no agent",
+                serde_json::json!({"job": "j", "round": 1, "commit": "abc"}),
+            ),
+            (
+                "no commit",
+                serde_json::json!({"job": "j", "round": 1, "agent": "a"}),
+            ),
+            (
+                "round is not a number",
+                serde_json::json!({"job": "j", "round": "1", "agent": "a", "commit": "abc"}),
+            ),
+            (
+                "round exceeds u32",
+                serde_json::json!({"job": "j", "round": 4_294_967_296u64, "agent": "a", "commit": "abc"}),
+            ),
+            (
+                "job is not a string",
+                serde_json::json!({"job": 1, "round": 1, "agent": "a", "commit": "abc"}),
+            ),
+            (
+                "agent is not a string",
+                serde_json::json!({"job": "j", "round": 1, "agent": 1, "commit": "abc"}),
+            ),
+            (
+                "commit is not a string",
+                serde_json::json!({"job": "j", "round": 1, "agent": "a", "commit": 1}),
+            ),
+        ] {
+            assert!(
+                super::CandidateAttestation::bind(&value, published).is_none(),
+                "a candidate with {why} must not bind: {value}"
+            );
+        }
+    }
+
+    /// The dylib emits the candidate; this crate binds it. They live in separate
     /// repositories, so nothing but a fixture keeps the two halves agreeing —
     /// rename a field on either side and the seat's commit silently stops being
     /// readable, with no compiler and no test to say so.
     ///
     /// The literal below is the shape `provider_response` returns under
     /// `hook_state.pd_candidate` (patch-deliberation, documented in
-    /// `docs/reference/hooks-and-config.md`). If it stops parsing here, the wire
+    /// `docs/reference/hooks-and-config.md`). If it stops binding here, the wire
     /// contract broke.
     #[test]
-    fn the_candidate_the_dylib_emits_parses_as_an_attestation() {
+    fn the_candidate_the_dylib_emits_binds_to_the_proposal_it_was_judged_on() {
         let from_hook_state = serde_json::json!({
             "job": "thread-t1_jobAAAA",
             "round": 0,
             "agent": "AgentA",
             "commit": "9f2c1b7e4d5a6083c1e2f3a4b5c6d7e8f9a0b1c2"
         });
+        let published = br#"{"rationale":"tightened the estimate","ops":[]}"#;
 
-        let parsed: super::CandidateAttestation =
-            serde_json::from_value(from_hook_state.clone()).expect("the dylib's shape parses");
-        assert_eq!(parsed.job, "thread-t1_jobAAAA");
-        assert_eq!(parsed.round, 0);
-        assert_eq!(parsed.agent, "AgentA");
-        assert_eq!(parsed.commit, "9f2c1b7e4d5a6083c1e2f3a4b5c6d7e8f9a0b1c2");
+        let bound = super::CandidateAttestation::bind(&from_hook_state, published)
+            .expect("the dylib's shape binds");
+        assert_eq!(bound.job, "thread-t1_jobAAAA");
+        assert_eq!(bound.round, 0);
+        assert_eq!(bound.agent, "AgentA");
+        assert_eq!(bound.commit, "9f2c1b7e4d5a6083c1e2f3a4b5c6d7e8f9a0b1c2");
+        assert_eq!(bound.proposal_digest, super::proposal_digest(published));
 
-        // And back out unchanged: a promoter re-signs or forwards what it read, so
-        // a field this side adds or drops would not survive the round trip.
-        assert_eq!(
-            serde_json::to_value(&parsed).unwrap(),
-            from_hook_state,
-            "the attestation round-trips the dylib's payload exactly"
+        // The binding is what stops a seat being scored on one proposal and
+        // promoting another: a different payload cannot reuse this attestation.
+        let swapped = super::CandidateAttestation::bind(&from_hook_state, b"a different proposal")
+            .expect("binds");
+        assert_ne!(
+            swapped.proposal_digest, bound.proposal_digest,
+            "swapping the judged proposal must change the binding"
+        );
+
+        // A candidate that is not one yields nothing, rather than an attestation
+        // bound to whatever happened to be published.
+        assert!(super::CandidateAttestation::bind(&serde_json::json!({}), published).is_none());
+        assert!(
+            super::CandidateAttestation::bind(
+                &serde_json::json!({"job": "j", "round": 0, "agent": "a", "commit": ""}),
+                published
+            )
+            .is_none(),
+            "an empty commit is not a candidate"
         );
     }
 }

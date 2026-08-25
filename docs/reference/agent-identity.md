@@ -100,6 +100,7 @@ a round:
 | `round` | the round within it |
 | `agent` | the seat that produced it — the `{agent}` of its branch |
 | `commit` | hex commit sha, as a **string** |
+| `proposal_digest` | hex SHA-256 of the proposal payload the seat published for that round |
 
 Signed with the seat's key and read back through the same envelope as any other
 record, so it needs no separate verification path.
@@ -109,6 +110,22 @@ it. Ranking is a function of scores and promotion is a function of ids, so a
 promoter holding attestations can name the winning commit without opening the
 repository — the signature binds the commit to the seat that produced it, which is
 the whole of what makes a promotion checkable.
+
+**Why the digest.** Scores are per seat, not per commit. Without a binding to what
+was judged, a seat could be scored on one proposal and attest an unrelated commit,
+and a promoter ranking on scores and promoting on ids would have no way to notice.
+The digest is over the *published bytes*, so a party that cannot read the proposal
+can still check the binding by hashing what it relayed — which keeps working if the
+payload is later encrypted. `CandidateAttestation::bind` adds it at publish time,
+because the bytes that matter are the ones that go on the wire and the dylib does
+not hold them.
+
+**Not yet enforced.** Two things a promoter must do, neither of which exists yet:
+reject an attestation whose `job` is not the job being settled, and refuse a slot
+where one seat attested two different commits for the same `{job, round}` — an
+equivocation the signature makes attributable. The envelope's timestamp is signed
+but no code checks freshness; scoping by `{job, round}` is the load-bearing
+defence, not time.
 
 **Only the commit travels.** The repository follows from the thread and the branch
 from the job and the seat (`job/{job}/{agent}`), so anyone already routing the job
