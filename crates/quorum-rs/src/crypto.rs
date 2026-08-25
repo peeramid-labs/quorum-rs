@@ -399,13 +399,16 @@ impl WorkerHook for AuditTrailHook {
         published: &[u8],
     ) -> Option<(String, Vec<u8>)> {
         let candidate = Candidate::reported(reported)?;
-        // The claim rides the audit tree a reader already follows, rather than a
-        // subject of its own: it is another thing this seat said about this job.
+        // On the job's event tree, not the audit subtree. Only the former is
+        // captured by the per-job stream, and the claim is published during a round
+        // but read after the rounds end: on an uncaptured subject a reader that
+        // subscribes at finalisation receives nothing, and the deliberation settles
+        // as if no seat had spoken.
         let parts: Vec<&str> = subject.split('.').collect();
         if parts.len() != 6 || parts[2] != "result" {
             return None;
         }
-        let claim_subject = format!("{}.{}.audit.candidate", parts[0], parts[1]);
+        let claim_subject = format!("{}.{}.result.event.candidate", parts[0], parts[1]);
 
         // Bound to what was published, so the orchestrator can tell the commit was put
         // forward for the proposal the evaluators were shown.
@@ -1288,8 +1291,8 @@ mod tests {
             .await
             .expect("a reported candidate becomes a claim");
         assert_eq!(
-            subject, "nsed.job1.audit.candidate",
-            "the claim rides the job's existing audit tree, not a subject of its own"
+            subject, "nsed.job1.result.event.candidate",
+            "the claim rides the job's retained event tree, so a reader at finalisation still finds it"
         );
 
         // The orchestrator holds bytes and a registry, nothing else.
