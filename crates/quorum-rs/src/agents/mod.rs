@@ -380,13 +380,29 @@ pub enum ProposalType {
     Uri,
 }
 
+impl ProposalType {
+    /// Whether this is the default, and so may be left off the wire.
+    ///
+    /// Serialization asks this: a record that omits the field is byte-identical to
+    /// one written before the field existed, which is what keeps historical
+    /// commitments verifiable.
+    pub fn is_text(&self) -> bool {
+        matches!(self, Self::Text)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ToSchema, Default)]
 pub struct Proposal {
     pub thought_process: String,
     pub content: String,
     /// Whether `content` is the answer or an address for it. Defaults to
     /// [`ProposalType::Text`], so a payload that predates this field is unchanged.
-    #[serde(default)]
+    ///
+    /// Omitted when it is `Text`, which is not cosmetic: a proposal's serialized
+    /// bytes are what commitments are computed over, so emitting a field every
+    /// existing record lacks would move every historical digest and stop already
+    /// issued commitments verifying.
+    #[serde(default, skip_serializing_if = "ProposalType::is_text")]
     pub proposal_type: ProposalType,
     /// Explicit SKIP answer — see `docs/reference/skip.md`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1373,6 +1389,21 @@ mod tests {
         let back: Proposal = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
         assert_eq!(back.proposal_type, ProposalType::Uri);
         assert_eq!(back.content, "rad://x/answer.md@9f2c1b");
+
+        // A text proposal serializes without the field at all. Commitments are
+        // computed over these bytes, so emitting a field every historical record
+        // lacks would move every past digest and break verification of
+        // commitments already issued.
+        let text = Proposal {
+            thought_process: "why".into(),
+            content: "the answer itself".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&text).unwrap();
+        assert!(
+            !json.contains("proposal_type"),
+            "a text proposal is byte-identical to one written before the field existed: {json}"
+        );
     }
     #[test]
     fn a_proposal_records_which_backend_served_it() {
