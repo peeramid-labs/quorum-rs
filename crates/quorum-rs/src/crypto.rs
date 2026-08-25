@@ -222,6 +222,22 @@ impl<T> About<T> {
         }
     }
 
+    /// Bind a claim to the absence of an artifact — a seat that skipped a round,
+    /// an evaluation that scored nothing.
+    ///
+    /// Not a special case. The empty artifact has a digest like any other, so a
+    /// skip is a claim *about* it rather than a claim about no artifact, and every
+    /// claim keeps one shape.
+    ///
+    /// This is what separates a declared skip from silence. A seat that signs this
+    /// has said "nothing, for this slot" and can be held to it; a seat that
+    /// publishes nothing has said nothing at all, and no signature exists to
+    /// distinguish it from one that was never asked. A promoter needs both, and
+    /// they are not the same fact.
+    pub fn nothing(claim: T) -> Self {
+        Self::this(claim, b"")
+    }
+
     /// Whether this claim is about the given artifact bytes.
     ///
     /// The check a promoter runs to join claims: an evaluation and a candidate
@@ -229,6 +245,12 @@ impl<T> About<T> {
     /// comparable — regardless of what either says.
     pub fn is_about(&self, artifact: &[u8]) -> bool {
         self.artifact == artifact_digest(artifact)
+    }
+
+    /// True for a declared skip — see [`About::nothing`] for why that is a claim
+    /// rather than an absence.
+    pub fn is_about_nothing(&self) -> bool {
+        self.is_about(b"")
     }
 }
 
@@ -1033,6 +1055,47 @@ mod tests {
                 "a candidate with {why} must not bind: {value}"
             );
         }
+    }
+
+    /// A skip is a claim about the empty artifact, not a claim about no artifact.
+    ///
+    /// Keeping one shape matters for what a promoter can conclude. A signed skip
+    /// says "nothing, for this slot" and is attributable; silence says nothing at
+    /// all and is indistinguishable from a seat that was never asked, or whose
+    /// message was lost. Collapsing the two would let a dropped message read as a
+    /// deliberate decline.
+    #[test]
+    fn a_skip_is_a_claim_about_the_empty_artifact() {
+        let skipped = super::About::nothing(super::Candidate {
+            job: "j".into(),
+            round: 1,
+            agent: "Reviewer".into(),
+            commit: "9f2c1b7e4d5a6083c1e2f3a4b5c6d7e8f9a0b1c2".into(),
+        });
+
+        assert!(skipped.is_about_nothing(), "a skip is about nothing");
+        assert!(
+            skipped.is_about(b""),
+            "which is the empty artifact, not a missing binding"
+        );
+        assert_eq!(
+            skipped.artifact, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "the well-known SHA-256 of the empty input — a reader can recognise a \
+             skip without being told which bytes produced it"
+        );
+
+        // A skip and a real claim are never confusable, in either direction.
+        let real = super::About::this(
+            super::Candidate {
+                job: "j".into(),
+                round: 1,
+                agent: "Reviewer".into(),
+                commit: "9f2c1b7e4d5a6083c1e2f3a4b5c6d7e8f9a0b1c2".into(),
+            },
+            br#"{"rationale":"a real proposal","ops":[]}"#,
+        );
+        assert!(!real.is_about_nothing(), "a real claim is not a skip");
+        assert_ne!(real.artifact, skipped.artifact);
     }
 
     /// The dylib emits the candidate; this crate reads and binds it. They live in
