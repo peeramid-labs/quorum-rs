@@ -89,6 +89,37 @@ parsing the subject into a `Proposal` cannot read an envelope, so the result is
 lost. It stays an explicit `with_hook(signing_hook_from(...))` for a deployment
 whose far side unwraps envelopes.
 
+### Attesting a candidate
+
+`CandidateAttestation` is a seat's signed claim that a commit is its candidate for
+a round:
+
+| field | meaning |
+| --- | --- |
+| `job` | the job the candidate was produced for |
+| `round` | the round within it |
+| `agent` | the seat that produced it — the `{agent}` of its branch |
+| `commit` | hex commit sha, as a **string** |
+
+Signed with the seat's key and read back through the same envelope as any other
+record, so it needs no separate verification path.
+
+**Why this exists.** It lets a deliberation be settled by a party that never reads
+it. Ranking is a function of scores and promotion is a function of ids, so a
+promoter holding attestations can name the winning commit without opening the
+repository — the signature binds the commit to the seat that produced it, which is
+the whole of what makes a promotion checkable.
+
+**Only the commit travels.** The repository follows from the thread and the branch
+from the job and the seat (`job/{job}/{agent}`), so anyone already routing the job
+reconstructs both, and anyone who cannot is not entitled to fetch it. Carrying a
+repo URL here would restate what the receiver already holds and turn a promotion
+record into a distribution channel.
+
+`commit` is a string rather than a number because verification re-serializes an
+untyped parse, and a 40-hex-digit value has no exact numeric form there: carried as
+an integer it would come back as a float and read as tampered.
+
 ### Adding a key backend
 
 The reference resolves to an `AuditSigner`, not to key material. The schemes above

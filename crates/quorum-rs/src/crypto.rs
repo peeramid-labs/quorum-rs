@@ -177,6 +177,39 @@ pub fn audit_subject_for(working: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Candidate attestation
+// ---------------------------------------------------------------------------
+
+/// A seat's signed claim that a commit is its candidate for a round.
+///
+/// This is what lets a deliberation be settled by a party that never reads it.
+/// Ranking is a function of scores, and promotion is a function of ids, so a
+/// promoter holding attestations can name the winning commit without opening the
+/// repository — the signature binds a commit to the seat that produced it, and
+/// that is the whole of what promotion needs to be checkable.
+///
+/// **Only the commit travels.** The repository follows from the thread and the
+/// branch from the job and the seat (`job/{job}/{agent}`), so anyone already
+/// routing the job reconstructs both; anyone who cannot is not entitled to fetch
+/// it. Carrying a repo url here would re-state a fact the receiver already holds
+/// and turn a promotion record into a distribution channel.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CandidateAttestation {
+    /// The job this candidate was produced for.
+    pub job: String,
+    /// The round within that job.
+    pub round: u32,
+    /// The seat that produced it — the `{agent}` of its branch.
+    pub agent: String,
+    /// Hex commit sha.
+    ///
+    /// A string, not a number. A signed payload is verified by re-serializing an
+    /// untyped parse, and a 40-hex-digit value has no exact numeric form there:
+    /// as an integer it would come back as a float and read as tampered.
+    pub commit: String,
+}
+
+// ---------------------------------------------------------------------------
 // SigningHook
 // ---------------------------------------------------------------------------
 
@@ -787,6 +820,78 @@ mod tests {
         assert_ne!(
             env1.signatures()[0].signature,
             env2.signatures()[0].signature
+        );
+    }
+
+    /// A promoter must be able to settle a deliberation from ids alone.
+    ///
+    /// The attestation binds a commit to the seat that produced it, so a promoter
+    /// that never opens the repository can still tell whose candidate it is
+    /// promoting. This asserts the whole path a promoter sees — sign, wire,
+    /// untyped parse, verify — because verification re-serializes an untyped
+    /// parse, and a payload that does not survive that reads as tampered.
+    #[tokio::test]
+    async fn a_candidate_attestation_binds_a_commit_to_its_seat_without_carrying_the_answer() {
+        use quorum_crypto_core::{AuditEnvelope, VerifierRegistry};
+
+        let kp = super::AgentKeyPair::generate();
+        let signer = kp.as_audit_signer();
+        let registry = VerifierRegistry::with_defaults();
+
+        let candidate = super::CandidateAttestation {
+            job: "thread-t1_jobAAAA".into(),
+            round: 2,
+            agent: "Reviewer".into(),
+            commit: "9f2c1b7e4d5a6083c1e2f3a4b5c6d7e8f9a0b1c2".into(),
+        };
+
+        let env = AuditEnvelope::signed(&candidate, "candidate", "Reviewer", signer.as_ref())
+            .await
+            .expect("a seat signs its candidate");
+        let wire = serde_json::to_vec(&env).expect("the attestation serializes");
+
+        // What a promoter actually holds: bytes, parsed without the author's types.
+        let mut read: AuditEnvelope<serde_json::Value> =
+            serde_json::from_slice(&wire).expect("a promoter parses it untyped");
+        assert!(
+            read.verify_chain(&registry).expect("verification runs"),
+            "an untouched attestation verifies"
+        );
+
+        let payload = read.payload().clone();
+        let mut keys: Vec<&str> = payload
+            .as_object()
+            .expect("the payload is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["agent", "commit", "job", "round"],
+            "an attestation names a commit and its seat, nothing else: {payload}"
+        );
+
+        // The repository and branch are derived, not carried: `job/{job}/{agent}`
+        // and the thread's repo. Adding them here would make a promotion record
+        // into a way to hand out the answer.
+        let as_text = serde_json::to_string(&payload).unwrap();
+        for leaked in ["repo", "://", "content", "thought_process"] {
+            assert!(
+                !as_text.contains(leaked),
+                "an attestation must not carry {leaked}: {as_text}"
+            );
+        }
+
+        // Tampering with the commit is the attack this exists to catch: a promoter
+        // pointed at a commit its signer never claimed.
+        let mut forged: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+        forged["payload"]["commit"] = serde_json::json!("0000000000000000000000000000000000000000");
+        let mut forged: AuditEnvelope<serde_json::Value> =
+            serde_json::from_value(forged).expect("the forgery still parses");
+        assert!(
+            !forged.verify_chain(&registry).unwrap_or(false),
+            "a rewritten commit does not verify"
         );
     }
 }
