@@ -736,4 +736,84 @@ mod tests {
         let registry = VerifierRegistry::with_defaults();
         assert!(!envelope.verify_chain(&registry).unwrap());
     }
+
+    /// The numeric range a signed payload can carry and still verify.
+    ///
+    /// A verifier does not hold the author's Rust types — it parses the record into
+    /// `AuditEnvelope<serde_json::Value>` and re-serializes the payload to rebuild
+    /// the bytes the signature covers. `Value` has `u64` and `i64` variants and
+    /// nothing wider, so a 128-bit field signs against its full decimal literal and
+    /// verifies against a float: an untouched record reads as tampered.
+    ///
+    /// Everything inside `u64`/`i64`, and every `f64` (Ryu prints the shortest
+    /// round-trip form, with no locale and no platform variance), survives exactly.
+    #[tokio::test]
+    async fn a_signed_payload_verifies_across_the_numeric_range_it_may_carry() {
+        let signer = Ed25519Signer::generate();
+        let registry = VerifierRegistry::with_defaults();
+
+        // Round-trips a payload the way a verifier does: sign the author's own type,
+        // put it on the wire, then read it back as an untyped record and verify.
+        async fn survives_the_wire<T: serde::Serialize>(
+            payload: T,
+            signer: &Ed25519Signer,
+            registry: &VerifierRegistry,
+        ) -> bool {
+            let env = AuditEnvelope::signed(payload, "subject", "agent-a", signer)
+                .await
+                .expect("signing a numeric payload");
+            let wire = serde_json::to_vec(&env).expect("envelope serializes");
+            let mut read: AuditEnvelope<serde_json::Value> =
+                serde_json::from_slice(&wire).expect("a record parses as untyped");
+            read.verify_chain(registry).unwrap_or(false)
+        }
+
+        for (what, value) in [
+            ("u64::MAX", serde_json::json!({ "n": u64::MAX })),
+            ("i64::MIN", serde_json::json!({ "n": i64::MIN })),
+            (
+                "i64::MAX + 1",
+                serde_json::json!({ "n": 9223372036854775808u64 }),
+            ),
+            ("zero", serde_json::json!({ "n": 0 })),
+        ] {
+            assert!(
+                survives_the_wire(&value, &signer, &registry).await,
+                "an integer inside u64/i64 must verify: {what}"
+            );
+        }
+
+        for (what, value) in [
+            ("f64::MAX", f64::MAX),
+            ("f64::MIN_POSITIVE", f64::MIN_POSITIVE),
+            ("subnormal 5e-324", 5e-324_f64),
+            ("0.1", 0.1_f64),
+        ] {
+            assert!(
+                survives_the_wire(&serde_json::json!({ "n": value }), &signer, &registry).await,
+                "a float must verify: {what}"
+            );
+        }
+
+        // The boundary itself. A 128-bit integer beyond u64 cannot survive the
+        // untyped round-trip, so it must not appear in a signed payload — this
+        // asserts the limit so that adding such a field fails here with the reason
+        // rather than in production as an unexplained tampered record.
+        #[derive(serde::Serialize)]
+        struct TooWide {
+            n: u128,
+        }
+        assert!(
+            !survives_the_wire(
+                TooWide {
+                    n: u128::from(u64::MAX) + 1
+                },
+                &signer,
+                &registry
+            )
+            .await,
+            "an integer wider than u64 does NOT survive verification — keep 128-bit \
+             integers out of signed payloads, or carry them as strings"
+        );
+    }
 }
