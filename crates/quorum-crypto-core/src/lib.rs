@@ -21,6 +21,7 @@ pub mod device;
 pub mod envelope;
 pub mod error;
 pub mod signer;
+pub mod trail;
 pub mod verifier;
 
 pub use canonical::canonical_bytes;
@@ -30,4 +31,5 @@ pub use device::DeviceIdentity;
 pub use envelope::{AuditEnvelope, SignatureStatus};
 pub use error::CryptoError;
 pub use signer::AuditSigner;
+pub use trail::{read_audit_record, AuditRecord, TrailSummary};
 pub use verifier::{AuditVerifier, VerifierRegistry};
