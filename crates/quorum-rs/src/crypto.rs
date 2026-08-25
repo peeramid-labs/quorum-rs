@@ -894,4 +894,38 @@ mod tests {
             "a rewritten commit does not verify"
         );
     }
+
+    /// The dylib emits the candidate; this crate parses it. They live in separate
+    /// repositories, so nothing but a fixture keeps the two halves agreeing —
+    /// rename a field on either side and the seat's commit silently stops being
+    /// readable, with no compiler and no test to say so.
+    ///
+    /// The literal below is the shape `provider_response` returns under
+    /// `hook_state.pd_candidate` (patch-deliberation, documented in
+    /// `docs/reference/hooks-and-config.md`). If it stops parsing here, the wire
+    /// contract broke.
+    #[test]
+    fn the_candidate_the_dylib_emits_parses_as_an_attestation() {
+        let from_hook_state = serde_json::json!({
+            "job": "thread-t1_jobAAAA",
+            "round": 0,
+            "agent": "AgentA",
+            "commit": "9f2c1b7e4d5a6083c1e2f3a4b5c6d7e8f9a0b1c2"
+        });
+
+        let parsed: super::CandidateAttestation =
+            serde_json::from_value(from_hook_state.clone()).expect("the dylib's shape parses");
+        assert_eq!(parsed.job, "thread-t1_jobAAAA");
+        assert_eq!(parsed.round, 0);
+        assert_eq!(parsed.agent, "AgentA");
+        assert_eq!(parsed.commit, "9f2c1b7e4d5a6083c1e2f3a4b5c6d7e8f9a0b1c2");
+
+        // And back out unchanged: a promoter re-signs or forwards what it read, so
+        // a field this side adds or drops would not survive the round trip.
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            from_hook_state,
+            "the attestation round-trips the dylib's payload exactly"
+        );
+    }
 }
