@@ -102,57 +102,39 @@ pub fn signer_from_config_ref(raw: &str) -> Option<Arc<dyn AuditSigner>> {
     AgentKeyPair::from_config_ref(raw).map(|kp| kp.as_audit_signer())
 }
 
-/// What reading one record off the audit trail produced.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AuditRecord {
-    /// Every signature in the chain verified against the payload it covers.
-    Verified {
-        /// The agent that signed it.
-        agent_id: String,
-        /// How many signatures the chain carried.
-        signatures: usize,
-    },
-    /// The record parsed, but its chain did not verify — the payload or a
-    /// signature was altered after signing, or a key does not match.
-    Tampered {
-        /// The agent the record claims to come from.
-        agent_id: String,
-    },
-    /// The record carried no signature at all.
-    Unsigned {
-        /// The agent the record claims to come from.
-        agent_id: String,
-    },
+pub use quorum_crypto_core::{AuditRecord, TrailSummary, read_audit_record};
+
+pub fn job_trail_subject(subject_prefix: &str, job_id: &str) -> String {
+    format!("{subject_prefix}.{job_id}.audit.>")
 }
 
-/// Read and verify one record from the audit trail.
+/// Read a job's audit trail until it falls quiet, verifying every record.
 ///
-/// The payload is treated as opaque JSON: a reader checks provenance, and does not
-/// need to know the shape of what was signed to do that.
+/// Returns when no record arrives for `idle`. A trail has no terminator — the
+/// agents that write it do not announce that they are finished — so a reader
+/// waits out a silence rather than looking for an end.
 ///
-/// A record whose chain fails is reported as [`AuditRecord::Tampered`] rather than
-/// as an error, because failing to verify IS the finding — an audit reader that
-/// discarded it as a parse problem would lose the one event it exists to catch.
-/// `Err` is reserved for bytes that are not a record at all.
-pub fn read_audit_record(
-    bytes: &[u8],
+/// Verification failures are counted, never returned as errors: one unsound
+/// record must not stop the reader from seeing the rest of the trail, which is
+/// the whole reason it is read.
+pub async fn verify_job_trail(
+    nats: &async_nats::Client,
+    subject_prefix: &str,
+    job_id: &str,
     registry: &quorum_crypto_core::VerifierRegistry,
-) -> Result<AuditRecord, serde_json::Error> {
-    let mut envelope: AuditEnvelope<serde_json::Value> = serde_json::from_slice(bytes)?;
-    let agent_id = envelope.agent_id().to_string();
-    if envelope.signatures().is_empty() {
-        return Ok(AuditRecord::Unsigned { agent_id });
+    idle: std::time::Duration,
+) -> anyhow::Result<TrailSummary> {
+    use futures::StreamExt;
+    let subject = job_trail_subject(subject_prefix, job_id);
+    let mut sub = nats
+        .subscribe(subject.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("subscribe {subject}: {e}"))?;
+    let mut summary = TrailSummary::default();
+    while let Ok(Some(msg)) = tokio::time::timeout(idle, sub.next()).await {
+        summary.record(read_audit_record(&msg.payload, registry));
     }
-    let signatures = envelope.signatures().len();
-    match envelope.verify_chain(registry) {
-        Ok(true) => Ok(AuditRecord::Verified {
-            agent_id,
-            signatures,
-        }),
-        // A verifier error (unknown algorithm, malformed key) is not a reason to
-        // call a record sound; it is a reason to not trust it.
-        Ok(false) | Err(_) => Ok(AuditRecord::Tampered { agent_id }),
-    }
+    Ok(summary)
 }
 
 /// The audit subject that mirrors a working result subject.
@@ -400,6 +382,43 @@ mod tests {
                 "{not_a_result} must not derive an audit subject"
             );
         }
+    }
+
+    /// A signature covers bytes, not meaning. A signer that serializes a typed
+    /// struct writes fields in declaration order; a reader that verifies through
+    /// `serde_json::Value` re-serializes them in sorted order. Same content, other
+    /// bytes — so a record nobody touched can fail to verify.
+    #[tokio::test]
+    async fn a_record_signed_as_a_struct_still_verifies_when_read_as_json() {
+        use quorum_crypto_core::{AuditEnvelope, VerifierRegistry};
+        #[derive(serde::Serialize)]
+        struct Typed {
+            zeta: String,
+            alpha: String,
+        }
+        let signer = super::AgentKeyPair::generate().as_audit_signer();
+        let envelope = AuditEnvelope::signed(
+            Typed {
+                zeta: "z".into(),
+                alpha: "a".into(),
+            },
+            "proposal",
+            "agent-a",
+            &*signer,
+        )
+        .await
+        .unwrap();
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+
+        let registry = VerifierRegistry::with_defaults();
+        assert_eq!(
+            super::read_audit_record(&bytes, &registry).unwrap(),
+            super::AuditRecord::Verified {
+                agent_id: "agent-a".into(),
+                signatures: 1
+            },
+            "a reader must not report an untouched record as tampered"
+        );
     }
 
     /// The bar the claim discipline sets: a verifier must reject a tampered
