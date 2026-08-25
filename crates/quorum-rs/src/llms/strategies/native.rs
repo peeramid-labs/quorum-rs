@@ -421,6 +421,31 @@ impl ChatStrategy for NativeStrategy {
             obj.remove("service_tier");
         }
 
+        // A provider-executed tool is declared as `builtin_function` — that is what
+        // tells the backend it owns execution. Some backends echo that type back on
+        // the tool call, and the response enum only knows `function`, so an
+        // otherwise good completion fails to parse and the seat produces nothing.
+        // Only the tag differs; the call is still a tool call, and the ReAct loop
+        // already routes it by name.
+        if let Some(choices) = value.get_mut("choices").and_then(|c| c.as_array_mut()) {
+            for choice in choices {
+                let Some(calls) = choice
+                    .get_mut("message")
+                    .and_then(|m| m.get_mut("tool_calls"))
+                    .and_then(|t| t.as_array_mut())
+                else {
+                    continue;
+                };
+                for call in calls {
+                    if call.get("type").and_then(|t| t.as_str()) == Some("builtin_function")
+                        && let Some(obj) = call.as_object_mut()
+                    {
+                        obj.insert("type".to_string(), serde_json::json!("function"));
+                    }
+                }
+            }
+        }
+
         // Patch missing usage fields (Cloudflare sometimes returns incomplete usage objects)
         if let Some(usage) = value.get_mut("usage").and_then(|u| u.as_object_mut()) {
             if !usage.contains_key("prompt_tokens") {
@@ -857,6 +882,51 @@ mod tests {
             tools: None,
             ..one_tool_config()
         }
+    }
+
+    /// A backend that echoes a provider-executed tool call back with the type we
+    /// declared it under.
+    ///
+    /// We send provider tools as `builtin_function` — that is what tells the
+    /// backend it owns execution. Some echo that type into the response, and the
+    /// strict response enum only knows `function`, so the whole completion fails to
+    /// parse and the seat produces nothing. The call is still a tool call; only the
+    /// tag differs, and dropping the response over a tag loses a turn that worked.
+    #[tokio::test]
+    async fn a_provider_tool_call_echoed_as_builtin_function_still_parses() {
+        let strategy = NativeStrategy::new("test-provider");
+        let body = serde_json::json!({
+            "id": "resp_builtin",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "some-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": serde_json::Value::Null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "builtin_function",
+                        "function": {"name": "$web_search", "arguments": "{\"query\":\"x\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })
+        .to_string();
+
+        let parsed = strategy
+            .parse_response(&body)
+            .await
+            .expect("a provider-executed tool call must not fail the whole completion");
+        let calls = parsed.choices[0]
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("the tool call survives");
+        assert_eq!(calls[0].function.name, "$web_search");
     }
 
     #[tokio::test]

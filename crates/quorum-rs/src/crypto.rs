@@ -391,6 +391,39 @@ impl WorkerHook for AuditTrailHook {
             }
         }
     }
+
+    async fn candidate_copy(
+        &self,
+        subject: &str,
+        reported: &serde_json::Value,
+        published: &[u8],
+    ) -> Option<(String, Vec<u8>)> {
+        let candidate = Candidate::reported(reported)?;
+        // The claim rides the audit tree a reader already follows, rather than a
+        // subject of its own: it is another thing this seat said about this job.
+        let parts: Vec<&str> = subject.split('.').collect();
+        if parts.len() != 6 || parts[2] != "result" {
+            return None;
+        }
+        let claim_subject = format!("{}.{}.audit.candidate", parts[0], parts[1]);
+
+        // Bound to what was published, so a promoter can tell the commit was put
+        // forward for the proposal the evaluators were shown.
+        let about = About::this(candidate, published);
+        match AuditEnvelope::signed(about, "candidate", &self.agent_id, &*self.signer).await {
+            Ok(envelope) => match serde_json::to_vec(&envelope) {
+                Ok(bytes) => Some((claim_subject, bytes)),
+                Err(e) => {
+                    tracing::warn!(agent_id = %self.agent_id, error = %e, "candidate claim did not serialize");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(agent_id = %self.agent_id, error = %e, "candidate claim signing failed");
+                None
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -1226,6 +1259,81 @@ mod tests {
         assert!(
             !bound.is_about(b"a different proposal"),
             "swapping the judged artifact must break the binding"
+        );
+    }
+
+    /// The claim a promoter reads: signed, bound, and on the trail it already
+    /// follows.
+    ///
+    /// This is the seam between the dylib reporting a commit and a promoter being
+    /// able to act on it. Unsigned, the commit is only as trustworthy as the
+    /// transport; unbound, it says nothing about which proposal it belongs to.
+    #[tokio::test]
+    async fn a_seats_candidate_is_published_as_a_signed_claim_bound_to_what_it_published() {
+        use crate::workers::WorkerHook;
+        use quorum_crypto_core::VerifierRegistry;
+
+        let hook = super::AuditTrailHook::new(
+            super::AgentKeyPair::generate().as_audit_signer(),
+            "agent-a".into(),
+        );
+        let published = br#"{"rationale":"the proposal as published","ops":[]}"#;
+        let reported = serde_json::json!({
+            "job": "job1", "round": 0, "agent": "agent-a",
+            "commit": "9f2c1b7e4d5a6083c1e2f3a4b5c6d7e8f9a0b1c2"
+        });
+
+        let (subject, bytes) = hook
+            .candidate_copy("nsed.job1.result.0.agent-a.propose", &reported, published)
+            .await
+            .expect("a reported candidate becomes a claim");
+        assert_eq!(
+            subject, "nsed.job1.audit.candidate",
+            "the claim rides the job's existing audit tree, not a subject of its own"
+        );
+
+        // A promoter holds bytes and a registry, nothing else.
+        let registry = VerifierRegistry::with_defaults();
+        assert_eq!(
+            super::read_audit_record(&bytes, &registry).unwrap(),
+            super::AuditRecord::Verified {
+                agent_id: "agent-a".to_string(),
+                signatures: 1,
+            },
+            "the claim verifies as any other record on the trail"
+        );
+
+        let envelope: quorum_crypto_core::AuditEnvelope<super::About<super::Candidate>> =
+            serde_json::from_slice(&bytes).expect("a promoter reads the claim");
+        assert_eq!(
+            envelope.payload().claim.commit,
+            "9f2c1b7e4d5a6083c1e2f3a4b5c6d7e8f9a0b1c2"
+        );
+        assert!(
+            envelope.payload().is_about(published),
+            "bound to the payload the evaluators were shown"
+        );
+        assert!(
+            !envelope.payload().is_about(b"some other proposal"),
+            "and not to anything else"
+        );
+
+        // Nothing to claim, or nowhere to claim it about.
+        assert!(
+            hook.candidate_copy(
+                "nsed.job1.result.0.agent-a.propose",
+                &serde_json::json!({}),
+                published
+            )
+            .await
+            .is_none(),
+            "no reported candidate, no claim"
+        );
+        assert!(
+            hook.candidate_copy("nsed.job1.task.agent-a.propose", &reported, published)
+                .await
+                .is_none(),
+            "control-plane traffic carries no candidate claim"
         );
     }
 }
