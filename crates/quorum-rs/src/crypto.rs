@@ -104,6 +104,10 @@ pub fn signer_from_config_ref(raw: &str) -> Option<Arc<dyn AuditSigner>> {
 
 pub use quorum_crypto_core::{AuditRecord, TrailSummary, read_audit_record};
 
+/// The subject family carrying one job's audit trail.
+///
+/// A wildcard, because the trail spans every action a seat published — a reader
+/// asks for the job, not for each action it happens to have taken.
 pub fn job_trail_subject(subject_prefix: &str, job_id: &str) -> String {
     format!("{subject_prefix}.{job_id}.audit.>")
 }
