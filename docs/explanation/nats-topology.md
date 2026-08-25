@@ -26,7 +26,18 @@ The system is built around a "Hub-and-Spoke" model where **NATS JetStream** acts
 | `telemetry.orch.{event_type}` | **Telemetry** | Orchestrator-side metrics-only events. Independent stream from the result/event tree above. | Orchestrator | Forwarder |
 | `telemetry.agent.{agent_id}.{event_type}` | **Telemetry** | Per-agent metrics-only events. The `agent_id` subtree is JWT-bound — the telemetry `Agent { agent_id }` role grants `publish("telemetry.agent.{agent_id}.>")` only, so an agent cannot forge events under a peer's id. Roles are minted by `<orchestrator>::credentials::issue_telemetry_jwt`. | NSED Worker (per agent) | Forwarder |
 
-**SSE Event Types**: `round_start`, `proposal_submitted`, `evaluation_submitted`, `round_complete`, `job_complete`, `agent_accepted`, `agent_working`, `agent_error`, `budget_update`, `budget_phase_complete`, `tool_call_pending`, `tool_call_responded`, `tool_call_expired`, `user_injection`.
+**SSE Event Types**: `round_start`, `proposal_submitted`, `evaluation_submitted`, `round_complete`, `job_complete`, `consensus`, `agent_accepted`, `agent_working`, `agent_error`, `budget_update`, `budget_phase_complete`, `tool_call_pending`, `tool_call_responded`, `tool_call_expired`, `user_injection`.
+
+**`consensus`** carries `{repo, hosted, commit, file, branch}` — where the agreed
+answer can be fetched, rather than a copy of it. It is published on the job's own
+event tree because the job id is the only key a first-time caller reliably holds.
+
+It arrives **before** `job_complete` and is a separate event because the location
+does not exist yet when `job_complete` is published: the winner's merge runs in a
+`job_complete` hook, i.e. in response to that event. A client therefore holds the
+`consensus` payload until `job_complete` arrives and joins the two. `hosted` is
+`false` when `repo` is a path local to the agent host, which is not fetchable from
+elsewhere — an answer addressable only in principle.
 
 **Telemetry Event Types** (see [the telemetry reference](../reference/telemetry.md) for the full contract): orch tree — `round_started`, `phase_complete`, `agent_responded`, `agent_timed_out`, `eval_injected_synthetic`, `convergence_sample`, `job_finalized`, `submission_received`, `phase_quorum_reached`, `phase_tail_closed`. Agent tree — `llm_request_start` / `_complete` / `_failed` / `_stalled`, `tool_call_executed`, `retry_loop_attempt`, `task_accepted` / `_completed` / `_failed`, `nats_connection_state`, `prompt_exposure_detected`. Telemetry events carry **no** prompt / proposal / `thought_process` / secret content; redaction is enforced at the type layer in `quorum-rs::telemetry`.
 

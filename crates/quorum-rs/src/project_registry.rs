@@ -88,6 +88,33 @@ pub fn advanced_notification(
     Some((subject, payload))
 }
 
+/// The subject + payload announcing where a job's agreed answer can be fetched.
+///
+/// Published on the job's own event tree — `{prefix}.{job}.result.event.consensus`
+/// — because that is what a caller already watches and the only key it reliably
+/// holds. The project-advanced notification carries the same coordinates, but it
+/// is keyed on a project id a first-time caller cannot know: in answer mode the
+/// thread's repository is created by the deliberation, so its id does not exist
+/// when the caller submits.
+///
+/// The answer itself does not travel. A copy in an event can drift from what was
+/// agreed and cannot be verified against anything; an address stays true.
+///
+/// `None` when the deliberation produced no fetchable answer.
+pub fn consensus_located_event(
+    hook_state: &HashMap<String, serde_json::Value>,
+    subject_prefix: &str,
+    job_id: &str,
+) -> Option<(String, Vec<u8>)> {
+    if job_id.is_empty() {
+        return None;
+    }
+    let coords = hook_state.get("pd_consensus")?;
+    let subject = format!("{subject_prefix}.{job_id}.result.event.consensus");
+    let payload = serde_json::to_vec(coords).ok()?;
+    Some((subject, payload))
+}
+
 /// A registered holder of a project, with the last time it was seen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectAgent {
@@ -315,6 +342,34 @@ mod tests {
         assert_eq!(back["consensus"]["file"], "ANSWER.md");
         assert_eq!(back["consensus"]["branch"], "main");
         assert_eq!(back["project_id"], "root-sha", "the existing fields remain");
+    }
+
+    /// A caller knows its job id and nothing else, so the coordinates must arrive
+    /// on the job's own event tree. Without this the answer is addressable only to
+    /// someone who already knows the project id — which, for a thread the
+    /// deliberation itself created, is nobody at submission time.
+    #[test]
+    fn the_caller_is_told_where_the_answer_is_on_the_subject_it_watches() {
+        let coords = serde_json::json!({
+            "repo": "https://seed.example/thread.git",
+            "hosted": true,
+            "commit": "head-sha",
+            "file": "ANSWER.md",
+            "branch": "main",
+        });
+        let hook_state = HashMap::from([("pd_consensus".to_string(), coords.clone())]);
+
+        let (subject, payload) = consensus_located_event(&hook_state, "nsed", "job-42").unwrap();
+        assert_eq!(subject, "nsed.job-42.result.event.consensus");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&payload).unwrap(),
+            coords,
+            "the address travels; the answer text does not"
+        );
+
+        // Nothing to announce, or nowhere to announce it to.
+        assert!(consensus_located_event(&HashMap::new(), "nsed", "job-42").is_none());
+        assert!(consensus_located_event(&hook_state, "nsed", "").is_none());
     }
 
     /// A deliberation that produced no fetchable answer publishes no coordinates,

@@ -1359,6 +1359,19 @@ impl NatsNsedWorker {
             // notification so clients holding the project sync.
             Ok(Some(verdict_content)) => {
                 let (verdict_content, hook_state) = verdict_content;
+                // Tell the caller where its answer is, on the subject it already
+                // watches. The project-advanced notification below carries the same
+                // coordinates but is keyed on a project id a first-time caller has
+                // no way to know, so on its own it reaches only existing holders.
+                if let Some((subject, payload)) = crate::project_registry::consensus_located_event(
+                    &hook_state,
+                    &self.config.subject_prefix,
+                    &session_id,
+                ) {
+                    if let Err(e) = self.nats.publish(subject.clone(), payload.into()).await {
+                        warn!(agent_id = %self.agent_id, subject = %subject, error = %e, "failed to publish consensus location");
+                    }
+                }
                 if let Some((subject, payload)) = crate::project_registry::advanced_notification(
                     &verdict_content,
                     &hook_state,

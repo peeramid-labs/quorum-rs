@@ -282,6 +282,23 @@ pub struct InjectResponse {
     pub injected_at_round: u32,
 }
 
+/// Where a deliberation's agreed answer can be fetched, from the `consensus` SSE
+/// event. Only the address travels: a copy of the answer in an event can drift
+/// from what was agreed and cannot be checked against anything.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConsensusLocation {
+    /// Where to fetch: the repository's remote, or a local path when it has none.
+    pub repo: String,
+    /// `false` when `repo` is that local path, i.e. unreachable from elsewhere.
+    pub hosted: bool,
+    /// The consensus commit.
+    pub commit: String,
+    /// The answer's path within the repository.
+    pub file: String,
+    /// The branch the consensus landed on.
+    pub branch: String,
+}
+
 /// Payload of the `job_complete` SSE event.
 #[derive(Debug, Clone, Deserialize)]
 pub struct JobCompletePayload {
@@ -291,6 +308,11 @@ pub struct JobCompletePayload {
     pub best_proposal_content: String,
     pub best_proposal_score: f32,
     pub best_proposal_author: String,
+    /// Where the agreed answer can be fetched, when the deliberation produced a
+    /// fetchable one. Carried from the earlier `consensus` event rather than sent
+    /// on this one, so a stream that ended before it simply has none.
+    #[serde(default, skip)]
+    pub consensus: Option<ConsensusLocation>,
 }
 
 /// Outcome of streaming a deliberation.
@@ -1067,6 +1089,12 @@ impl RemoteOrchestrator {
                                 continue;
                             }
                         }
+                        // NOTE: `consensus` — where the agreed answer can be fetched — is
+                        // handled in `stream_events` below, not here. This stream feeds the
+                        // TUI, whose thread model stores a reply's text and has nowhere to
+                        // put a repository address; surfacing it needs a model change and a
+                        // placement decision, so the event is deliberately not parsed into a
+                        // variant nothing would render.
                         "timeout" => SseEvent::Timeout(data),
                         "tool_call_pending" => {
                             let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
@@ -1126,6 +1154,9 @@ impl RemoteOrchestrator {
         let mut stream = resp.bytes_stream();
         let mut buffer = Vec::<u8>::new();
         let mut tracker = PhaseTracker::default();
+        // The location arrives on its own event, before completion, so it is held
+        // until there is a payload to attach it to.
+        let mut consensus: Option<ConsensusLocation> = None;
         while let Some(chunk) = stream.next().await {
             let bytes = chunk?;
             buffer.extend_from_slice(&bytes);
@@ -1244,9 +1275,14 @@ impl RemoteOrchestrator {
                         eprintln!("  !! Stream timeout: {data}");
                     }
                     "keepalive" => {} // server heartbeat — ignore
+                    "consensus" => match serde_json::from_str::<ConsensusLocation>(&data) {
+                        Ok(at) => consensus = Some(at),
+                        Err(e) => eprintln!("  !! consensus location unreadable: {e}"),
+                    },
                     "job_complete" => {
-                        let payload: JobCompletePayload = serde_json::from_str(&data)
+                        let mut payload: JobCompletePayload = serde_json::from_str(&data)
                             .map_err(|e| RemoteError::ParseError(format!("job_complete: {e}")))?;
+                        payload.consensus = consensus.take();
 
                         if payload.status == "Success" {
                             return Ok(JobOutcome::Success(payload));
@@ -1687,6 +1723,47 @@ mod tests {
 
         match outcome {
             JobOutcome::Success(p) => assert_eq!(p.best_proposal_content, "final answer"),
+            other => panic!("expected success, got: {other:?}"),
+        }
+    }
+
+    /// The deliberation says where its answer can be fetched; a caller that
+    /// discards that is left with a copy in an event and no way to reach the thing
+    /// itself, or to check it later. The event arrives before `job_complete`, so it
+    /// has to be held rather than read off the final payload.
+    #[tokio::test]
+    async fn stream_carries_where_the_answer_can_be_fetched() {
+        let server = MockServer::start().await;
+        let body = sse_body(&[
+            (
+                "consensus",
+                r#"{"repo":"https://seed.example/t.git","hosted":true,"commit":"abc1234","file":"ANSWER.md","branch":"main"}"#,
+            ),
+            (
+                "job_complete",
+                r#"{"status":"Success","job_id":"j9","rounds_completed":1,"best_proposal_content":"final answer","best_proposal_score":0.9,"best_proposal_author":"alpha"}"#,
+            ),
+        ]);
+
+        Mock::given(method("GET"))
+            .and(path("/job/j9/stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let client = RemoteOrchestrator::new(&server.uri(), "tok").unwrap();
+        match client.stream_events("j9").await.unwrap() {
+            JobOutcome::Success(p) => {
+                let at = p.consensus.expect("the location reaches the caller");
+                assert_eq!(at.repo, "https://seed.example/t.git");
+                assert!(at.hosted, "a hosted thread is reachable from elsewhere");
+                assert_eq!(at.file, "ANSWER.md");
+                assert_eq!(at.commit, "abc1234");
+            }
             other => panic!("expected success, got: {other:?}"),
         }
     }
