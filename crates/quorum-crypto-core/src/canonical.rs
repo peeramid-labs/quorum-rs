@@ -36,6 +36,23 @@ pub fn canonical_bytes(
 mod tests {
     use super::*;
 
+    /// Signing covers bytes, so a payload must survive a JSON round-trip unchanged.
+    /// `serde_json/preserve_order` is what makes that true: without it a `Value`
+    /// sorts object keys, and a record signed from a struct — whose fields
+    /// serialize in declaration order — verifies against different bytes than it
+    /// was signed over. If this fails, the feature was dropped and every
+    /// struct-signed record will read as tampered.
+    #[test]
+    fn a_json_round_trip_preserves_key_order_that_signatures_depend_on() {
+        let signed_bytes = br#"{"zeta":1,"alpha":2}"#;
+        let parsed: serde_json::Value = serde_json::from_slice(signed_bytes).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&parsed).unwrap(),
+            signed_bytes,
+            "a Value round-trip must reproduce the bytes a signature covers"
+        );
+    }
+
     #[test]
     fn canonical_bytes_deterministic() {
         let a = canonical_bytes(

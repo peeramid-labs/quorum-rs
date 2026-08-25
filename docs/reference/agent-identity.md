@@ -83,11 +83,59 @@ would lose the one event the trail exists to catch. A verifier that errors — a
 unknown algorithm, a malformed key — reads as `Tampered` too, since not being able
 to check a record is not a reason to trust it.
 
+### Reading a whole job's trail
+
+`verify_job_trail(&nats, prefix, job_id, &registry, idle)` subscribes to
+`{prefix}.{job}.audit.>`, reads until `idle` passes with no message, and tallies
+what it saw:
+
+| field | meaning |
+| --- | --- |
+| `verified` | records whose chain covered their payload |
+| `tampered` | the **agent ids** whose records did not verify — named, not counted, because the next question is always *whose* |
+| `unsigned` | records carrying no signature |
+| `unreadable` | bytes that were not a record at all |
+
+`summary.is_sound()` requires `verified > 0` alongside empty failures. **An empty
+trail is not sound**: nothing was recorded, so nothing was shown, and a reader
+asking this question wants evidence — absence is not evidence. The same reasoning
+makes one bad record cost only itself: a trail is still readable, and still worth
+tallying, when part of it fails.
+
+Two properties of the transport shape how a caller uses this:
+
+- **The trail is a live stream, not a store.** Subscribe before the records are
+  published or they are simply missed. The audit subtree is not captured by the
+  per-job result stream, so there is no replay.
+- **`idle` is the only terminator.** There is no end-of-trail marker, so the call
+  returns once nothing has arrived for that long. Too short a value on a slow
+  broker reports a short trail rather than an error.
+
 **What a key does *not* switch on** is `SigningHook`, which replaces the payload
 with the envelope rather than copying it. That ties signing to delivery: a receiver
 parsing the subject into a `Proposal` cannot read an envelope, so the result is
 lost. It stays an explicit `with_hook(signing_hook_from(...))` for a deployment
 whose far side unwraps envelopes.
+
+### What a signed payload may carry
+
+A signature covers bytes, and a verifier does not hold the author's Rust types: it
+parses the record into `AuditEnvelope<serde_json::Value>` and re-serializes the
+payload to rebuild the bytes the signature claims to cover. A payload must
+therefore survive that untyped round-trip byte-for-byte.
+
+| carried as | verifies | note |
+| --- | --- | --- |
+| any integer inside `u64` / `i64` | yes | exact; `Value` has variants for both |
+| `u128` / `i128` beyond `u64::MAX` | **no** | `Value` has no 128-bit variant, so the literal comes back as a float and an untouched record reads as `Tampered`. Carry a wide integer as a string. |
+| any `f64`, including subnormals | yes | shortest round-trip form, no locale, no platform variance |
+| `NaN` / `Infinity` | n/a | serialize to `null` — stable, but the value is gone |
+| object key order | yes | `serde_json/preserve_order` is a load-bearing dependency feature, not a preference; dropping it makes every struct-signed record read as tampered |
+
+The boundary is pinned by
+`a_signed_payload_verifies_across_the_numeric_range_it_may_carry`, so adding a
+128-bit field to a signed type fails there with the reason rather than in
+production as an unexplained tampered record.
 
 ### Adding a key backend
 
