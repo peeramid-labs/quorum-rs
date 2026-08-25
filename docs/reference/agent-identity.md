@@ -120,6 +120,26 @@ payload is later encrypted. `CandidateAttestation::bind` adds it at publish time
 because the bytes that matter are the ones that go on the wire and the dylib does
 not hold them.
 
+**One shape for every claim.** `About<T>` is a claim about a specific artifact,
+and the same check joins any two of them:
+
+| claim | about |
+| --- | --- |
+| `About<Candidate>` | the proposal it was judged on |
+| `About<Evaluation>` | the proposal it scored |
+| acceptance | the manifest it accepted |
+| a skipped round | **nothing** — `About::nothing`, the empty artifact |
+
+A skip is not a missing binding. The empty artifact has a digest like any other
+(`e3b0c442…`), so a declared skip stays a claim and stays attributable — which is
+what separates it from silence, where a seat that publishes nothing is
+indistinguishable from one never asked or whose message was lost.
+
+A promoter joins claims with `is_about`: a score and a commit that name the same
+artifact are comparable, and ones that do not are not — regardless of what either
+says. That is what stops a seat being scored on one proposal and promoting a
+commit built from another.
+
 **Not yet enforced.** Two things a promoter must do, neither of which exists yet:
 reject an attestation whose `job` is not the job being settled, and refuse a slot
 where one seat attested two different commits for the same `{job, round}` — an

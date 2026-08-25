@@ -1057,6 +1057,68 @@ mod tests {
         }
     }
 
+    /// The chain a promoter walks: a score and a commit are comparable only when
+    /// they are about the same artifact.
+    ///
+    /// This is the half that makes the candidate binding worth anything. Ranking
+    /// is per seat, so without a binding on the evaluation too, a seat could be
+    /// scored on one proposal and attest a commit derived from another, and a
+    /// promoter that ranks on scores and promotes on ids would have no way to see
+    /// it. Both claims naming the same artifact is what closes that.
+    ///
+    /// `About` is generic precisely so this needs no evaluation-specific type: the
+    /// promoter runs the same check for both.
+    #[test]
+    fn a_score_and_a_commit_are_comparable_only_about_the_same_artifact() {
+        use crate::agents::Evaluation;
+
+        let judged = br#"{"rationale":"the proposal that was read","ops":[]}"#;
+
+        let candidate = super::About::this(
+            super::Candidate {
+                job: "j".into(),
+                round: 1,
+                agent: "Reviewer".into(),
+                commit: "9f2c1b7e4d5a6083c1e2f3a4b5c6d7e8f9a0b1c2".into(),
+            },
+            judged,
+        );
+        let score = super::About::this(
+            Evaluation {
+                score: 0.75,
+                justification: "grounded".into(),
+                ..Default::default()
+            },
+            judged,
+        );
+
+        assert_eq!(
+            candidate.artifact, score.artifact,
+            "a score and a commit about the same proposal join"
+        );
+        assert!(candidate.is_about(judged) && score.is_about(judged));
+
+        // The attack the binding exists to stop: a seat scored on what it showed,
+        // promoting a commit built from something else.
+        let elsewhere = super::About::this(
+            super::Candidate {
+                job: "j".into(),
+                round: 1,
+                agent: "Reviewer".into(),
+                commit: "0badc0de0badc0de0badc0de0badc0de0badc0de".into(),
+            },
+            br#"{"rationale":"something nobody scored","ops":[]}"#,
+        );
+        assert_ne!(
+            elsewhere.artifact, score.artifact,
+            "a commit built from an unscored proposal does not join that score"
+        );
+        assert!(
+            !elsewhere.is_about(judged),
+            "and does not claim to be about the judged one"
+        );
+    }
+
     /// A skip is a claim about the empty artifact, not a claim about no artifact.
     ///
     /// Keeping one shape matters for what a promoter can conclude. A signed skip
