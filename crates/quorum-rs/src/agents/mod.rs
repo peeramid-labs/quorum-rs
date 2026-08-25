@@ -369,6 +369,14 @@ pub enum ProposalType {
     /// without the author. Until a resolver enforces that, this type is sound for
     /// settling a winner — where authorship is already public — and unsound for
     /// evaluation.
+    ///
+    /// **Carry a scheme.** The substrate a handle resolves through is expected to
+    /// change — a shared store serving opaque blobs is what makes anonymity and
+    /// confidentiality hold at once, with the repository kept as a merge target
+    /// rather than the thing evaluators read. Encoding the scheme in the handle
+    /// makes that a dispatch change rather than a format migration, so producers
+    /// should emit `<scheme>://…` and readers should refuse a bare path: a handle
+    /// with no scheme names a substrate nobody agreed on.
     Uri,
 }
 
