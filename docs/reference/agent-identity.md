@@ -153,7 +153,7 @@ separate verification path.
 
 **Why this exists.** It lets a deliberation be settled by a party that never reads
 it. Ranking is a function of scores and promotion is a function of ids, so a
-promoter holding candidates can name the winning commit without opening the
+orchestrator holding candidates can name the winning commit without opening the
 repository — the signature binds the commit to the seat that produced it, which is
 the whole of what makes a promotion checkable.
 
@@ -178,7 +178,7 @@ A skip is not a missing binding. The empty artifact has a digest like any other
 what separates it from silence, where a seat that publishes nothing is
 indistinguishable from one never asked or whose message was lost.
 
-A promoter joins claims with `is_about`: a score and a commit that name the same
+The orchestrator joins claims with `is_about`: a score and a commit that name the same
 artifact are comparable, and ones that do not are not — regardless of what either
 says. That is what stops a seat being scored on one proposal and promoting a commit
 built from another.
@@ -201,7 +201,7 @@ audit copy: a claim that cannot be written is worth less than the answer it
 describes, so a failure there is logged rather than failing the task. A seat that
 reported no candidate, or holds no key, publishes nothing.
 
-**Not yet enforced.** Two things a promoter must do, neither of which exists yet:
+**Not yet enforced.** Two things the orchestrator must do, neither of which exists yet:
 reject a claim whose `job` is not the job being settled, and refuse a slot where one
 seat attested two different commits for the same `{job, round}` — an equivocation
 the signature makes attributable. The envelope's timestamp is signed but no code
