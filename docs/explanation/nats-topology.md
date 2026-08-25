@@ -82,7 +82,7 @@ NATS JetStream streams are configured to capture specific subject patterns:
 | :---- | :---- | :---- |
 | `sphera_jobs` | `sphera.jobs.submit`, `sphera.jobs.complete.>`, `sphera.jobs.manifest.>`, `sphera.jobs.ack.>`, `nsed.*.task.>` | Global job queue for submission, manifests, ACKs, and task dispatch |
 | `nsed_results_{job_id}` | `nsed.{job_id}.result.>` | Per-job stream for results and events |
-| `NSED_TELEMETRY` | `telemetry.>` | Drain buffer for telemetry. Stream name matches the `nsed-telemetry-forwarder::config::DEFAULT_STREAM_NAME` constant. Configured separately on dedicated telemetry node(s) via NATS placement tags — MUST NOT share storage with `nsed_results_*` on orchestrator hosts (load isolation + tenancy). Defaults: file storage, 24h time cap / 2 GB size cap, `Discard: old`, drained by the `nsed-telemetry-forwarder` durable consumer. Stream + placement detail lives in `ops/nats/telemetry-placement.md`. |
+| `NSED_TELEMETRY` | `telemetry.>` | Drain buffer for telemetry. Stream name matches the `nsed-telemetry-forwarder::config::DEFAULT_STREAM_NAME` constant. Configured separately on dedicated telemetry node(s) via NATS placement tags — MUST NOT share storage with `nsed_results_*` on orchestrator hosts (load isolation + tenancy). Defaults: file storage, 24h time cap / 2 GB size cap, `Discard: old`, drained by the `nsed-telemetry-forwarder` durable consumer. The stream and its placement tags are not yet written up; the constraint above is the part that matters, and a deployment that ignores it puts telemetry retention on the same disk as job results. |
 
 **Important**: Two streams cannot have overlapping subject patterns. Tests use unique prefixed streams to avoid conflicts.
 
