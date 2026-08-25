@@ -137,68 +137,6 @@ The boundary is pinned by
 128-bit field to a signed type fails there with the reason rather than in
 production as an unexplained tampered record.
 
-### Attesting a candidate
-
-`Candidate` is a seat's claim that a commit is its candidate for a round:
-
-| field | meaning |
-| --- | --- |
-| `job` | the job the candidate was produced for |
-| `round` | the round within it |
-| `agent` | the seat that produced it — the `{agent}` of its branch |
-| `commit` | hex commit sha, as a **string** |
-
-Signed and read back through the same envelope as any other record, so it needs no
-separate verification path.
-
-**Why this exists.** It lets a deliberation be settled by a party that never reads
-it. Ranking is a function of scores and promotion is a function of ids, so a
-orchestrator holding candidates can name the winning commit without opening the
-repository — the signature binds the commit to the seat that produced it, which is
-the whole of what makes a promotion checkable.
-
-**One shape for every claim.** A claim on its own says what a seat asserts and
-nothing about *what it asserts it of*. `About<T>` binds a claim to a specific
-artifact, and the same check joins any two of them:
-
-| claim | about |
-| --- | --- |
-| `About<Candidate>` | the proposal it was judged on |
-| `About<Evaluation>` | the proposal it scored |
-| acceptance | the manifest it accepted |
-| a skipped round | **nothing** — `About::nothing`, the empty artifact |
-
-The digest is over the *published bytes*, so a party that cannot read the artifact
-can still check the binding by hashing what it relayed — which keeps working if the
-payload is later encrypted. `About::this` is applied at publish time, because the
-bytes that matter are the ones that go on the wire and the dylib does not hold them.
-
-A skip is not a missing binding. The empty artifact has a digest like any other
-(`e3b0c442…`), so a declared skip stays a claim and stays attributable — which is
-what separates it from silence, where a seat that publishes nothing is
-indistinguishable from one never asked or whose message was lost.
-
-The orchestrator joins claims with `is_about`: a score and a commit that name the same
-artifact are comparable, and ones that do not are not — regardless of what either
-says. That is what stops a seat being scored on one proposal and promoting a commit
-built from another.
-
-**Not yet enforced.** Two things a promoter must do, neither of which exists yet:
-reject a claim whose `job` is not the job being settled, and refuse a slot where one
-seat attested two different commits for the same `{job, round}` — an equivocation
-the signature makes attributable. The envelope's timestamp is signed but no code
-checks freshness; scoping by `{job, round}` is the load-bearing defence, not time.
-
-**Only the commit travels.** The repository follows from the thread and the branch
-from the job and the seat (`job/{job}/{agent}`), so anyone already routing the job
-reconstructs both, and anyone who cannot is not entitled to fetch it. Carrying a
-repo URL here would restate what the receiver already holds and turn a promotion
-record into a distribution channel.
-
-`commit` is a string rather than a number for the reason in [What a signed payload
-may carry](#what-a-signed-payload-may-carry): a 40-hex-digit value has no exact
-numeric form in an untyped parse.
-
 ### Adding a key backend
 
 The reference resolves to an `AuditSigner`, not to key material. The schemes above
