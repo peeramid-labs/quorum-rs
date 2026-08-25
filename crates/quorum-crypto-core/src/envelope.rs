@@ -385,6 +385,57 @@ mod tests {
     use crate::signer::{Ed25519Signer, Secp256k1Signer};
     use crate::verifier::VerifierRegistry;
 
+    /// A signature field that is not decodable is a verification failure, not a
+    /// crash and not a pass. These are the fields an attacker or a corrupt
+    /// transport controls, and a reader treats an error here as grounds to
+    /// distrust the record — so the error has to actually arrive.
+    #[tokio::test]
+    async fn a_signature_that_cannot_be_decoded_fails_verification() {
+        let registry = VerifierRegistry::with_defaults();
+        let signer = Ed25519Signer::generate();
+
+        let sound = || async {
+            AuditEnvelope::signed(
+                serde_json::json!({"content": "hello"}),
+                "proposal",
+                "agent-1",
+                &signer,
+            )
+            .await
+            .unwrap()
+        };
+
+        // Signature bytes that are not base64.
+        let mut bad_sig = sound().await;
+        bad_sig.signatures_mut()[0].signature = "not!base64!".to_string();
+        let err = bad_sig
+            .verify_chain(&registry)
+            .expect_err("undecodable signature bytes must not verify");
+        assert!(
+            format!("{err}").contains("base64"),
+            "and the reason names what could not be read: {err}"
+        );
+
+        // A public key that is not hex.
+        let mut bad_key = sound().await;
+        bad_key.signatures_mut()[0].public_key = "zznothex".to_string();
+        let err = bad_key
+            .verify_chain(&registry)
+            .expect_err("an unreadable public key must not verify");
+        assert!(
+            format!("{err}").contains("hex") || format!("{err}").contains("key"),
+            "and says the key was the problem: {err}"
+        );
+
+        // A key that decodes but is the wrong length is a verifier error, still not a pass.
+        let mut short_key = sound().await;
+        short_key.signatures_mut()[0].public_key = "0xaabb".to_string();
+        assert!(
+            !matches!(short_key.verify_chain(&registry), Ok(true)),
+            "a key too short to be one must never verify"
+        );
+    }
+
     #[tokio::test]
     async fn envelope_ed25519_sign_verify() {
         let signer = Ed25519Signer::generate();
