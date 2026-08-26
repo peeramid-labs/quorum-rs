@@ -60,34 +60,6 @@ pub fn advert_subject(subject_prefix: &str) -> String {
     format!("{subject_prefix}.project.advert")
 }
 
-/// The NATS subject + payload for a `project_advanced` signal carried in a
-/// `job_complete` verdict content — the "epic advanced, pull now" notification a
-/// worker republishes so clients holding the project sync. Subject:
-/// `<prefix>.project.<project_id>.advanced`, payload = the `{project_id, head}` object.
-/// `None` when the content carries no `project_advanced` (an ordinary completion).
-pub fn advanced_notification(
-    content: &serde_json::Value,
-    hook_state: &HashMap<String, serde_json::Value>,
-    subject_prefix: &str,
-) -> Option<(String, Vec<u8>)> {
-    let adv = content.get("project_advanced")?;
-    let project_id = adv.get("project_id").and_then(|v| v.as_str())?;
-    if project_id.is_empty() {
-        return None;
-    }
-    let subject = format!("{subject_prefix}.project.{project_id}.advanced");
-    let mut payload = adv.clone();
-    // `{project_id, head}` names a commit but no repository, which is enough for a
-    // holder pulling an update and useless to a caller meeting this thread for the
-    // first time. When the deliberation worked out where its answer can be fetched,
-    // carry that here — otherwise the answer is addressable only in principle.
-    if let (Some(obj), Some(coords)) = (payload.as_object_mut(), hook_state.get("pd_consensus")) {
-        obj.insert("consensus".to_string(), coords.clone());
-    }
-    let payload = serde_json::to_vec(&payload).ok()?;
-    Some((subject, payload))
-}
-
 /// The subject + payload announcing where a job's agreed answer can be fetched.
 ///
 /// Published on the job's own event tree — `{prefix}.{job}.result.event.consensus`
@@ -291,59 +263,6 @@ mod tests {
         assert_eq!(advert_subject("nsed"), "nsed.project.advert");
     }
 
-    #[test]
-    fn advanced_notification_builds_subject_and_payload() {
-        let content = serde_json::json!({
-            "project_advanced": { "project_id": "root-sha", "head": "head-sha" }
-        });
-        let (subject, payload) = advanced_notification(&content, &HashMap::new(), "nsed").unwrap();
-        assert_eq!(subject, "nsed.project.root-sha.advanced");
-        let back: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(back["head"], "head-sha");
-        assert_eq!(back["project_id"], "root-sha");
-        // Ordinary completion (no signal) / empty id → nothing to publish.
-        assert!(
-            advanced_notification(&serde_json::json!({"note": "ok"}), &HashMap::new(), "nsed")
-                .is_none()
-        );
-        assert!(
-            advanced_notification(
-                &serde_json::json!({"project_advanced": {"project_id": ""}}),
-                &HashMap::new(),
-                "nsed"
-            )
-            .is_none()
-        );
-    }
-
-    /// A caller who does not already hold the thread cannot act on `{project_id,
-    /// head}` alone — it names a commit but no repository to fetch it from. The
-    /// middleware works those coordinates out at consensus and puts them in
-    /// `hook_state`; if the notification drops them, the answer is addressable in
-    /// principle and unreachable in practice.
-    #[test]
-    fn the_notification_carries_where_the_answer_can_be_fetched() {
-        let content = serde_json::json!({
-            "project_advanced": { "project_id": "root-sha", "head": "head-sha" }
-        });
-        let hook_state = HashMap::from([(
-            "pd_consensus".to_string(),
-            serde_json::json!({
-                "repo": "https://seed.example/thread.git",
-                "hosted": true,
-                "commit": "head-sha",
-                "file": "ANSWER.md",
-                "branch": "main",
-            }),
-        )]);
-        let (_subject, payload) = advanced_notification(&content, &hook_state, "nsed").unwrap();
-        let back: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(back["consensus"]["repo"], "https://seed.example/thread.git");
-        assert_eq!(back["consensus"]["file"], "ANSWER.md");
-        assert_eq!(back["consensus"]["branch"], "main");
-        assert_eq!(back["project_id"], "root-sha", "the existing fields remain");
-    }
-
     /// A caller knows its job id and nothing else, so the coordinates must arrive
     /// on the job's own event tree. Without this the answer is addressable only to
     /// someone who already knows the project id — which, for a thread the
@@ -370,18 +289,6 @@ mod tests {
         // Nothing to announce, or nowhere to announce it to.
         assert!(consensus_located_event(&HashMap::new(), "nsed", "job-42").is_none());
         assert!(consensus_located_event(&hook_state, "nsed", "").is_none());
-    }
-
-    /// A deliberation that produced no fetchable answer publishes no coordinates,
-    /// rather than an empty object a reader would try to fetch from.
-    #[test]
-    fn a_notification_without_coordinates_omits_them() {
-        let content = serde_json::json!({
-            "project_advanced": { "project_id": "root-sha", "head": "head-sha" }
-        });
-        let (_s, payload) = advanced_notification(&content, &HashMap::new(), "nsed").unwrap();
-        let back: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert!(back.get("consensus").is_none(), "no coordinates: {back}");
     }
 
     #[test]
