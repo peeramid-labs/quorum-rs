@@ -1381,14 +1381,14 @@ mod tests {
         assert_eq!(p.content, "the answer itself");
 
         // And a proposal that names where its answer lives says so explicitly.
-        let addressed = r#"{"thought_process":"why","content":"rad://x/answer.md@9f2c1b","proposal_type":"uri"}"#;
+        let addressed = r#"{"thought_process":"why","content":"obj://thread-7/answer@9f2c1b","proposal_type":"uri"}"#;
         let p: Proposal = serde_json::from_str(addressed).expect("an addressed payload parses");
         assert_eq!(p.proposal_type, ProposalType::Uri);
 
         // Round-trips, so a relay cannot quietly turn an address back into text.
         let back: Proposal = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
         assert_eq!(back.proposal_type, ProposalType::Uri);
-        assert_eq!(back.content, "rad://x/answer.md@9f2c1b");
+        assert_eq!(back.content, "obj://thread-7/answer@9f2c1b");
 
         // A text proposal serializes without the field at all. Commitments are
         // computed over these bytes, so emitting a field every historical record
