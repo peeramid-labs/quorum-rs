@@ -1358,7 +1358,7 @@ impl NatsNsedWorker {
             // in the verdict content — republish it as the "epic advanced, pull now"
             // notification so clients holding the project sync.
             Ok(Some(verdict_content)) => {
-                let (verdict_content, hook_state) = verdict_content;
+                let (_verdict_content, hook_state) = verdict_content;
                 // Tell the caller where its answer is, on the subject it already
                 // watches. The project-advanced notification below carries the same
                 // coordinates but is keyed on a project id a first-time caller has
@@ -1370,20 +1370,6 @@ impl NatsNsedWorker {
                 ) {
                     if let Err(e) = self.nats.publish(subject.clone(), payload.into()).await {
                         warn!(agent_id = %self.agent_id, subject = %subject, error = %e, "failed to publish consensus location");
-                    }
-                }
-                if let Some((subject, payload)) = crate::project_registry::advanced_notification(
-                    &verdict_content,
-                    &hook_state,
-                    &self.config.subject_prefix,
-                ) {
-                    match self.nats.publish(subject.clone(), payload.into()).await {
-                        Ok(()) => {
-                            tracing::debug!(agent_id = %self.agent_id, subject = %subject, "published project_advanced")
-                        }
-                        Err(e) => {
-                            warn!(agent_id = %self.agent_id, subject = %subject, error = %e, "failed to publish project_advanced")
-                        }
                     }
                 }
             }
