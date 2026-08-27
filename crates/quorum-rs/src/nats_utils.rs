@@ -4,7 +4,7 @@
 //! These are pure utility functions with no dependency on orchestrator internals.
 
 use anyhow::{Context, Result};
-use async_nats::jetstream::{self, kv};
+use async_nats::jetstream::{self, kv, object_store};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -225,6 +225,106 @@ pub async fn ensure_kv_bucket(js: &jetstream::Context, config: kv::Config) -> Re
             }
         }
     }
+}
+
+/// Helper to ensure an object-store bucket exists, creating it if necessary.
+///
+/// Idempotent, like [`ensure_kv_bucket`] — an existing bucket is returned as-is.
+/// Bucket naming, retention and what the contents mean are the caller's: this
+/// knows only that objects are bytes.
+pub async fn ensure_object_bucket(
+    js: &jetstream::Context,
+    config: object_store::Config,
+) -> Result<object_store::ObjectStore> {
+    match js.create_object_store(config.clone()).await {
+        Ok(store) => Ok(store),
+        Err(e) => {
+            if e.to_string().contains("already in use") {
+                js.get_object_store(&config.bucket)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))
+                    .context(format!(
+                        "Failed to get existing object bucket {}",
+                        config.bucket
+                    ))
+            } else {
+                Err(anyhow::anyhow!(e).context("Failed to create object bucket"))
+            }
+        }
+    }
+}
+
+/// Store `content` under its own SHA-256 digest and return that digest as hex.
+///
+/// The name of an object *is* its digest, which makes storing the same bytes
+/// twice idempotent and makes the returned address a claim anyone can check by
+/// hashing what they read back. Callers that need a URI build one around this;
+/// no scheme or bucket convention is imposed here.
+pub async fn put_content_addressed(
+    store: &object_store::ObjectStore,
+    content: &[u8],
+) -> Result<String> {
+    let digest = sha256_hex_bytes(content);
+    let mut reader = content;
+    store
+        .put(digest.as_str(), &mut reader)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))
+        .context(format!("Failed to store object {digest}"))?;
+    Ok(digest)
+}
+
+/// Fetch the content previously stored under `digest`, verifying it still
+/// hashes to that digest.
+///
+/// The check is the point: an address is only worth carrying if reading it
+/// proves what came back. Storage that returned different bytes — corrupted,
+/// or substituted by whoever can write the bucket — fails here rather than
+/// being passed off as the answer.
+pub async fn get_content_addressed(
+    store: &object_store::ObjectStore,
+    digest: &str,
+) -> Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    if !is_sha256_hex(digest) {
+        anyhow::bail!("{digest:?} is not a SHA-256 hex digest");
+    }
+
+    let mut object = store
+        .get(digest)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))
+        .context(format!("Failed to read object {digest}"))?;
+
+    let mut content = Vec::new();
+    object
+        .read_to_end(&mut content)
+        .await
+        .context(format!("Failed to read object {digest} to end"))?;
+
+    let actual = sha256_hex_bytes(&content);
+    if actual != digest {
+        anyhow::bail!("object {digest} does not match its content, which hashes to {actual}");
+    }
+    Ok(content)
+}
+
+/// True when `s` is exactly 64 lowercase hex characters.
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Compute `hex(SHA-256(content))` over raw bytes.
+pub fn sha256_hex_bytes(content: &[u8]) -> String {
+    let hash = Sha256::digest(content);
+    hash.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write;
+        write!(s, "{b:02x}").unwrap();
+        s
+    })
 }
 
 /// Format a User JWT and NKey seed into the `.creds` file format that

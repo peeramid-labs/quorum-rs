@@ -6,6 +6,7 @@ mod g15_g17_g19_extensions;
 mod llm_stalled_heartbeat;
 mod multi_endpoint_emit;
 mod nats_connection;
+mod object_store;
 mod registration;
 mod scratchpad_store;
 mod telemetry_emit;
