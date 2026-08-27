@@ -27,6 +27,7 @@ pub mod brand;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod config;
+pub mod content_address;
 pub mod control_plane;
 pub mod conversation;
 #[cfg(feature = "audit")]
