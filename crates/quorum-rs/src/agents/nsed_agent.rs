@@ -1020,6 +1020,19 @@ impl ProposerEvaluatorAgent {
                 .map(|t| dyn_clone::clone_box(t.as_ref())),
         );
 
+        // Web search, where the backend refuses to take its search tool
+        // alongside ours. The tool is ordinary here; calling it issues a
+        // separate, search-only completion. Without this the setting parses and
+        // does nothing, which reads as "search configured" while the agent has
+        // no way to search at all.
+        if let Some(provider_tool) = self.config.delegated_search.as_deref() {
+            all_tools.push(Box::new(crate::tools::DelegatedSearchTool::new(
+                dyn_clone::clone_box(self.llm.as_ref()),
+                &self.config,
+                provider_tool,
+            )));
+        }
+
         // Automatically inject Context Tools if store is available.
         //
         // Only the ones that have something to read. Offering a history reader in
@@ -7936,11 +7949,19 @@ mod tests {
     }
 
     fn tool_names_for(round: u32, candidates: usize) -> Vec<String> {
-        let agent = super::ProposerEvaluatorAgent::new(
+        tool_names_for_config(
             AgentConfig {
                 name: "ALPHA".to_string(),
                 ..Default::default()
             },
+            round,
+            candidates,
+        )
+    }
+
+    fn tool_names_for_config(config: AgentConfig, round: u32, candidates: usize) -> Vec<String> {
+        let agent = super::ProposerEvaluatorAgent::new(
+            config,
             Box::new(CannedSummaryModel {
                 text: String::new(),
             }),
@@ -7966,6 +7987,35 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn an_agent_configured_for_delegated_search_is_given_the_tool() {
+        // The setting existed, was documented, and was read by nothing: an agent
+        // whose backend refuses to take its search tool alongside ours was left
+        // with no way to search at all, which reads as configured-and-working.
+        let names = tool_names_for_config(
+            AgentConfig {
+                name: "SEARCHER".to_string(),
+                delegated_search: Some("web_search".to_string()),
+                ..Default::default()
+            },
+            1,
+            0,
+        );
+        assert!(
+            names.iter().any(|n| n == "web_search"),
+            "a configured search tool must reach the agent: {names:?}"
+        );
+    }
+
+    #[test]
+    fn an_agent_without_delegated_search_is_given_no_search_tool() {
+        let names = tool_names_for(1, 0);
+        assert!(
+            !names.iter().any(|n| n == "web_search"),
+            "search is opt-in: {names:?}"
+        );
     }
 
     #[test]
