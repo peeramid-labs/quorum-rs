@@ -220,4 +220,31 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.digest(), b.digest(), "the same content, addressed twice");
     }
+
+    #[test]
+    fn each_refusal_says_which_one_it_was() {
+        // The value of five variants is that whoever reads one knows which
+        // component to look at, and that only holds if the messages differ and
+        // name the component they carry.
+        let said: Vec<String> = [
+            ParseError::MissingScheme,
+            ParseError::EmptyComponent("bucket"),
+            ParseError::Malformed,
+            ParseError::NotADigest,
+            ParseError::IllegalCharacter("scheme"),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+
+        for (i, message) in said.iter().enumerate() {
+            assert!(!message.is_empty());
+            assert!(
+                !said[i + 1..].contains(message),
+                "two refusals read the same: {message:?}"
+            );
+        }
+        assert!(said[1].contains("bucket"), "{}", said[1]);
+        assert!(said[4].contains("scheme"), "{}", said[4]);
+    }
 }
