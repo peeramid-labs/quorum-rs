@@ -83,6 +83,11 @@ pub struct AgentContext {
     /// the stable thread id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
+    /// How this deliberation carries what its seats write, as the job asked for
+    /// it. `None` is the long-standing behaviour, where a proposal carries its
+    /// answer. A seat that does not recognise the value writes as it always has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliberation_type: Option<String>,
     /// The new turn only (this job's incremental user message), when the thread's
     /// prior turns already live in the resumed claude session. Used as the delta
     /// prompt's task on a resumed session so we don't re-send the whole flattened
@@ -2520,6 +2525,7 @@ mod tests {
     #[test]
     fn agent_context_serde_roundtrip() {
         let ctx = AgentContext {
+            deliberation_type: None,
             issued_at: None,
             task_description: "Solve the halting problem".to_string(),
             round_number: 3,
