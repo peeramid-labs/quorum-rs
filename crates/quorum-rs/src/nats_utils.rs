@@ -190,6 +190,25 @@ pub fn validate_nats_name(name: &str, field_label: &str) -> Result<(), String> {
 
 /// Sanitizes a string for use as a NATS subject component.
 /// Replaces characters that aren't alphanumeric, `-`, or `_` with an underscore.
+/// Encode a name into one reversible NATS subject token.
+///
+/// Anything outside `[A-Za-z0-9_-]` becomes `=XX` (the byte, hex). Injective,
+/// so two names never share a token, and ASCII, so the token survives any
+/// subject. The router decodes with the inverse before opening a store.
+pub fn nats_kv_key_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' => out.push(b as char),
+            _ => {
+                out.push('=');
+                out.push_str(&format!("{b:02X}"));
+            }
+        }
+    }
+    out
+}
+
 /// Preserves hyphens and underscores to avoid key collisions.
 pub fn sanitize_subject_component(component: &str) -> String {
     component
@@ -2433,6 +2452,28 @@ invite_code: ${IC}
         assert!(
             !yaml.contains("invite_code"),
             "None invite_code must be skipped from output, got:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn the_token_codec_is_injective_and_subject_safe() {
+        // Two names never share a token, and a token survives any subject.
+        // `sanitize` alone guarantees neither: it is lossy (`a.b` and `a_b`
+        // collide) and Unicode-aware (`日本` passes through it un-encoded).
+        for (name, expect) in [
+            ("job-1", "job-1"),
+            ("a.b", "a=2Eb"),
+            ("a_b", "a_b"),
+            ("日本", "=E6=97=A5=E6=9C=AC"),
+            ("", ""),
+        ] {
+            assert_eq!(nats_kv_key_encode(name), expect, "{name:?}");
+        }
+        assert_ne!(nats_kv_key_encode("a.b"), nats_kv_key_encode("a_b"));
+        assert!(
+            nats_kv_key_encode("a b*c.d")
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '='),
         );
     }
 }

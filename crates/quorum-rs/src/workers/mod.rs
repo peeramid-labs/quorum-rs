@@ -517,10 +517,17 @@ fn seat_put_subject(
     // Without a job there is nowhere to store, and the answer stays put.
     let job = context.session_id.as_deref()?;
 
+    // Sanitised first, because that form is the job's identity everywhere else
+    // — its status key, its history bucket. Encoded second, because identity
+    // and a subject token are different problems: `sanitize` is Unicode-aware
+    // and lossy, the codec is ASCII and reversible, and the router decodes with
+    // its inverse before opening a store.
     Some(format!(
         "{subject_prefix}.content.{}.{}.put",
-        crate::nats_utils::sanitize_subject_component(job),
-        crate::nats_utils::sanitize_subject_component(agent_id)
+        crate::nats_utils::nats_kv_key_encode(&crate::nats_utils::sanitize_subject_component(job)),
+        crate::nats_utils::nats_kv_key_encode(&crate::nats_utils::sanitize_subject_component(
+            agent_id
+        ))
     ))
 }
 
@@ -5016,6 +5023,31 @@ mod tests {
                 &prose("hi")
             ),
             Some("nsed.content.job_1.alpha_two.put".to_string())
+        );
+    }
+
+    #[test]
+    fn a_job_the_alphabet_does_not_cover_still_travels_as_one_token() {
+        // `sanitize` is Unicode-aware, so a job id can survive it and still not
+        // be a subject token the router's reversible codec accepts. Without the
+        // encoding step every put for such a job is refused, and the seat
+        // silently falls back to carrying its answer inline.
+        let subject = seat_put_subject(
+            "nsed",
+            "alpha",
+            &addressed_context(Some("日本-7")),
+            &prose("hi"),
+        )
+        .expect("a subject is derived");
+        let token = subject
+            .strip_prefix("nsed.content.")
+            .and_then(|rest| rest.strip_suffix(".alpha.put"))
+            .expect("the token sits between the tree and the seat");
+        assert!(
+            token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '='),
+            "the token must be subject-safe ASCII: {token:?}"
         );
     }
 
