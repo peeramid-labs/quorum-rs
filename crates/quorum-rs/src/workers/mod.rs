@@ -485,6 +485,45 @@ pub struct NatsNsedWorker {
     job_complete_mw: Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
 }
 
+/// Where this seat should store its answer, or `None` to leave it in place.
+///
+/// The deliberation names how it carries what its seats write. Where it says
+/// `addressed`, a seat stores its own answer and proposes the name instead,
+/// which is what keeps a round's records small and lets a peer read a rival
+/// without the answer travelling through anything else.
+///
+/// The subject is derived rather than given: it names the job and this seat,
+/// under the same tree the worker already speaks on. Nothing is presented to
+/// use it — a seat may publish there because its NATS credentials name it in
+/// the subject, exactly as they already scope where it publishes proposals.
+fn seat_put_subject(
+    subject_prefix: &str,
+    agent_id: &str,
+    context: &AgentContext,
+    proposal: &crate::agents::Proposal,
+) -> Option<String> {
+    const ADDRESSED: &str = "addressed";
+
+    if !context
+        .deliberation_type
+        .as_deref()
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case(ADDRESSED))
+    {
+        return None;
+    }
+    if proposal.proposal_type != crate::agents::ProposalType::Text || proposal.content.is_empty() {
+        return None;
+    }
+    // Without a job there is nowhere to store, and the answer stays put.
+    let job = context.session_id.as_deref()?;
+
+    Some(format!(
+        "{subject_prefix}.content.{}.{}.put",
+        crate::nats_utils::sanitize_subject_component(job),
+        crate::nats_utils::sanitize_subject_component(agent_id)
+    ))
+}
+
 impl NatsNsedWorker {
     /// Creates a new worker, connecting to NATS and initializing KV buckets.
     pub async fn new(
@@ -1568,6 +1607,59 @@ impl NatsNsedWorker {
     /// Run one middleware pipeline for a hook point. Returns the (possibly
     /// transformed) `content` on pass, `None` when the pipeline is unconfigured,
     /// or an `Err` when a middleware blocks (fails the task).
+    /// Store this proposal's answer and let it carry the name instead.
+    ///
+    /// The deliberation says how it carries what its seats write. Where it says
+    /// `addressed`, a seat stores its own answer and proposes the address for
+    /// it, which is what keeps a round's records small and lets a peer read a
+    /// rival without the answer travelling through anything else.
+    ///
+    /// Nothing is presented to do it. The subject carries this agent's name, and
+    /// its NATS credentials are what allow that subject — the same scoping that
+    /// already decides where it may publish a proposal.
+    ///
+    /// A store that fails leaves the answer in the proposal. Losing a seat's
+    /// work to a storage hiccup would be worse than a record larger than it
+    /// needed to be, and the round still completes.
+    async fn store_by_address(
+        &self,
+        context: &AgentContext,
+        proposal: &mut crate::agents::Proposal,
+    ) {
+        use crate::agents::ProposalType;
+
+        let Some(subject) = seat_put_subject(
+            &self.config.subject_prefix,
+            &self.agent_id,
+            context,
+            proposal,
+        ) else {
+            return;
+        };
+
+        let content = std::mem::take(&mut proposal.content);
+        match self
+            .nats
+            .request(subject.clone(), content.clone().into())
+            .await
+        {
+            Ok(reply) => {
+                let address = String::from_utf8_lossy(&reply.payload).into_owned();
+                if address.starts_with("nats://") {
+                    proposal.content = address;
+                    proposal.proposal_type = ProposalType::Uri;
+                } else {
+                    warn!(subject, "storing an answer was refused: {address}");
+                    proposal.content = content;
+                }
+            }
+            Err(e) => {
+                warn!(subject, "storing an answer failed: {e}");
+                proposal.content = content;
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)] // cohesive hook-invocation signature
     async fn run_stage_mw(
         &self,
@@ -2003,6 +2095,7 @@ impl NatsNsedWorker {
                                     }
                                 }
                             }
+                            self.store_by_address(&context, &mut proposal).await;
                             proposal.published_at_ms = chrono::Utc::now().timestamp_millis();
                             serde_json::to_vec(&proposal).map_err(|e| anyhow::anyhow!(e))
                         }
@@ -4885,6 +4978,104 @@ mod tests {
     // ---- NATS integration tests: ack_wait & redelivery ----
 
     /// Helper: connect to a local NATS server, returning None if unavailable.
+    fn addressed_context(job: Option<&str>) -> AgentContext {
+        AgentContext {
+            deliberation_type: Some("addressed".into()),
+            session_id: job.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn prose(content: &str) -> crate::agents::Proposal {
+        crate::agents::Proposal {
+            content: content.into(),
+            proposal_type: crate::agents::ProposalType::Text,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_seat_derives_where_to_store_from_what_it_already_knows() {
+        // Nothing is handed to it: the job it was given, its own name, and the
+        // tree it already speaks on are the whole address.
+        assert_eq!(
+            seat_put_subject(
+                "nsed",
+                "alpha",
+                &addressed_context(Some("job-1")),
+                &prose("hi")
+            ),
+            Some("nsed.content.job-1.alpha.put".to_string())
+        );
+        // A job or a name that would break a subject travels as one token.
+        assert_eq!(
+            seat_put_subject(
+                "nsed",
+                "alpha.two",
+                &addressed_context(Some("job.1")),
+                &prose("hi")
+            ),
+            Some("nsed.content.job_1.alpha_two.put".to_string())
+        );
+    }
+
+    #[test]
+    fn a_seat_stores_nothing_unless_the_deliberation_asked() {
+        let cases = [
+            (None, "no type at all"),
+            (Some(""), "an empty type"),
+            (Some("teleported"), "a type this build does not know"),
+        ];
+        for (kind, what) in cases {
+            let context = AgentContext {
+                deliberation_type: kind.map(str::to_string),
+                session_id: Some("job-1".into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                seat_put_subject("nsed", "alpha", &context, &prose("hi")),
+                None,
+                "{what} must not be read as a request to store"
+            );
+        }
+        // And the value is matched as written rather than by accident of case.
+        let shouted = AgentContext {
+            deliberation_type: Some(" ADDRESSED ".into()),
+            session_id: Some("job-1".into()),
+            ..Default::default()
+        };
+        assert!(seat_put_subject("nsed", "alpha", &shouted, &prose("hi")).is_some());
+    }
+
+    #[test]
+    fn there_is_nothing_to_store_without_prose_or_a_job() {
+        // Already a name: storing it again would name the name.
+        let named = crate::agents::Proposal {
+            content: "nats://bucket/deadbeef".into(),
+            proposal_type: crate::agents::ProposalType::Uri,
+            ..Default::default()
+        };
+        assert_eq!(
+            seat_put_subject("nsed", "alpha", &addressed_context(Some("job-1")), &named),
+            None
+        );
+        assert_eq!(
+            seat_put_subject(
+                "nsed",
+                "alpha",
+                &addressed_context(Some("job-1")),
+                &prose("")
+            ),
+            None,
+            "an empty answer names nothing worth storing"
+        );
+        assert_eq!(
+            seat_put_subject("nsed", "alpha", &addressed_context(None), &prose("hi")),
+            None,
+            "without a job there is nowhere to store"
+        );
+    }
+
     async fn setup_nats() -> Option<async_nats::Client> {
         let nats_url =
             std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
