@@ -251,6 +251,12 @@ pub struct NatsScratchpadStore {
     store: kv::Store,
     js: jetstream::Context,
     scope_prefix: String,
+    /// Where this reader may resolve a record that carries a name: the subject
+    /// a seat reads content on, derived from the tree, its job and its own
+    /// name. `None` where the deployment stores nothing, and history then
+    /// comes back exactly as written.
+    content_subject: Option<String>,
+    client: Option<async_nats::Client>,
 }
 
 impl NatsScratchpadStore {
@@ -260,6 +266,58 @@ impl NatsScratchpadStore {
             store,
             js,
             scope_prefix,
+            content_subject: None,
+            client: None,
+        }
+    }
+
+    /// Let this reader resolve records that carry names instead of answers.
+    ///
+    /// A protocol tool serves what a model reads, and a round is stored as
+    /// names where the deliberation is addressed; without this every tool
+    /// backed by the store hands the model a URL where prose belongs.
+    pub fn with_content_reader(
+        mut self,
+        client: async_nats::Client,
+        subject_prefix: &str,
+        agent_id: &str,
+    ) -> Self {
+        self.content_subject = Some(format!(
+            "{subject_prefix}.content.{}.{}.get",
+            crate::nats_utils::nats_kv_key_encode(&sanitize_subject_component(&self.scope_prefix)),
+            crate::nats_utils::nats_kv_key_encode(&sanitize_subject_component(agent_id)),
+        ));
+        self.client = Some(client);
+        self
+    }
+
+    /// Resolve any record still carrying a name, in place. A record that
+    /// cannot be resolved keeps its name: one lost rival is better than a
+    /// round that fails to read.
+    async fn resolve_records(&self, records: &mut [ProposalRecord]) {
+        let (Some(subject), Some(client)) = (&self.content_subject, &self.client) else {
+            return;
+        };
+        for record in records.iter_mut() {
+            if record.proposal.proposal_type != crate::agents::ProposalType::Uri {
+                continue;
+            }
+            let Ok(address) = record
+                .proposal
+                .content
+                .parse::<crate::content_address::ContentAddress>()
+            else {
+                continue;
+            };
+            match crate::nats_utils::fetch_content_addressed(client, subject, &address).await {
+                Ok(bytes) => {
+                    record.proposal.content = String::from_utf8_lossy(&bytes).into_owned();
+                    record.proposal.proposal_type = crate::agents::ProposalType::Text;
+                }
+                Err(e) => {
+                    tracing::warn!("a recorded proposal stayed a name: {e:#}");
+                }
+            }
         }
     }
 
@@ -398,8 +456,11 @@ impl PersistenceStore for NatsScratchpadStore {
 
         match history_store.get(&key).await {
             Ok(Some(entry)) => {
-                let records = serde_json::from_slice(&entry)
+                let mut records: Vec<ProposalRecord> = serde_json::from_slice(&entry)
                     .context("Failed to deserialize round history")?;
+                // A round stored under an addressed deliberation carries names;
+                // what a tool serves a model has to be the answers.
+                self.resolve_records(&mut records).await;
                 Ok(Some(records))
             }
             Ok(None) => Ok(None),
@@ -1795,11 +1856,23 @@ impl NatsNsedWorker {
         }
 
         // Attach scratchpad store to context
-        context.store = Some(Arc::new(NatsScratchpadStore::new(
+        let mut scratchpad = NatsScratchpadStore::new(
             self.scratchpad_kv.clone(),
             self.js.clone(),
             session_id.clone(),
-        )) as Arc<dyn PersistenceStore>);
+        );
+        if context
+            .deliberation_type
+            .as_deref()
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case("addressed"))
+        {
+            scratchpad = scratchpad.with_content_reader(
+                self.nats.clone(),
+                &self.config.subject_prefix,
+                &self.agent_id,
+            );
+        }
+        context.store = Some(Arc::new(scratchpad) as Arc<dyn PersistenceStore>);
 
         context.telemetry = self.telemetry.clone();
         context.event_store = Some(self.event_store());
@@ -5106,6 +5179,120 @@ mod tests {
             None,
             "without a job there is nowhere to store"
         );
+    }
+
+    /// Serve every request on the seat's derived get subject with `answer` in
+    /// one complete window, exactly as the serving side speaks.
+    async fn serving_one_window(
+        client: &async_nats::Client,
+        job: &str,
+        answer: Vec<u8>,
+    ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+        use futures::StreamExt as _;
+        let subject = format!(
+            "nsed.content.{}.{}.get",
+            crate::nats_utils::nats_kv_key_encode(&sanitize_subject_component(job)),
+            crate::nats_utils::nats_kv_key_encode("alpha"),
+        );
+        let mut requests = client.subscribe(subject).await?;
+        let client = client.clone();
+        Ok(tokio::spawn(async move {
+            while let Some(message) = requests.next().await {
+                let Some(reply) = message.reply.clone() else {
+                    continue;
+                };
+                let mut headers = async_nats::HeaderMap::new();
+                headers.insert("Nsed-Content-Total", answer.len().to_string().as_str());
+                headers.insert("Nsed-Content-Eof", "true");
+                let _ = client
+                    .publish_with_headers(reply, headers, answer.clone().into())
+                    .await;
+            }
+        }))
+    }
+
+    /// Store round one as a single record naming `answer`, returning the name.
+    async fn a_round_stored_as_a_name(
+        kv: &jetstream::kv::Store,
+        answer: &[u8],
+    ) -> anyhow::Result<String> {
+        let address = format!(
+            "nats://a_bucket/{}",
+            crate::nats_utils::sha256_hex_bytes(answer)
+        );
+        let record = ProposalRecord {
+            round: 1,
+            author_agent_id: "alpha".into(),
+            proposal: crate::agents::Proposal {
+                content: address.clone(),
+                proposal_type: crate::agents::ProposalType::Uri,
+                ..Default::default()
+            },
+            evaluations: vec![],
+            aggregated_score: 0.5,
+        };
+        kv.put("round_1", serde_json::to_vec(&vec![record])?.into())
+            .await?;
+        Ok(address)
+    }
+
+    /// The reader behind every protocol tool resolves names back to answers.
+    ///
+    /// Rounds are stored as names where the deliberation is addressed, and this
+    /// store is what `read_proposal` and its siblings read through on the
+    /// worker's side of the wire — the side a deployed agent actually runs on.
+    /// Serving a model a name where prose belongs is the failure this pins.
+    #[tokio::test]
+    async fn a_tool_reads_answers_where_a_round_was_stored_as_names() {
+        let Some(client) = setup_nats().await else {
+            return;
+        };
+        let js = jetstream::new(client.clone());
+        let job = format!("toolread{}", uuid::Uuid::new_v4().simple());
+
+        let kv = js
+            .create_key_value(jetstream::kv::Config {
+                bucket: format!("nsed_hist_{job}"),
+                storage: jetstream::stream::StorageType::Memory,
+                ..Default::default()
+            })
+            .await
+            .expect("bucket");
+
+        let answer = b"what the seat actually said".to_vec();
+        let address = a_round_stored_as_a_name(&kv, &answer)
+            .await
+            .expect("stored");
+
+        let serving = serving_one_window(&client, &job, answer.clone())
+            .await
+            .expect("responder");
+
+        let resolving = NatsScratchpadStore::new(kv.clone(), js.clone(), job.clone())
+            .with_content_reader(client.clone(), "nsed", "alpha");
+        let back = resolving
+            .get_round_history(1)
+            .await
+            .expect("readable")
+            .expect("present");
+        assert_eq!(
+            back[0].proposal.content,
+            String::from_utf8_lossy(&answer),
+            "a tool must serve what was said, not the name it is stored under"
+        );
+
+        // Without a reader — a deployment that stores nothing — the record
+        // comes back exactly as written.
+        let plain = NatsScratchpadStore::new(kv, js.clone(), job.clone());
+        let raw = plain
+            .get_round_history(1)
+            .await
+            .expect("readable")
+            .expect("present");
+        assert_eq!(raw[0].proposal.content, address);
+
+        serving.abort();
+        let _ = js.delete_key_value(format!("nsed_hist_{job}")).await;
     }
 
     async fn setup_nats() -> Option<async_nats::Client> {

@@ -190,6 +190,55 @@ pub fn validate_nats_name(name: &str, field_label: &str) -> Result<(), String> {
 
 /// Sanitizes a string for use as a NATS subject component.
 /// Replaces characters that aren't alphanumeric, `-`, or `_` with an underscore.
+/// Fetch addressed content through a serving subject, window by window.
+///
+/// The responder states the whole size on every reply and marks the last
+/// window; the reader keeps asking at the next offset until it is told the
+/// content is complete, bounds what it accumulates by the stated size, and
+/// verifies the reassembled bytes against the digest the address asserts —
+/// the reply crossed an open subject, and the digest is the address's whole
+/// claim.
+pub async fn fetch_content_addressed(
+    client: &async_nats::Client,
+    subject: &str,
+    address: &crate::content_address::ContentAddress,
+) -> anyhow::Result<Vec<u8>> {
+    let mut content: Vec<u8> = Vec::new();
+    loop {
+        let request =
+            serde_json::json!({ "address": address.to_string(), "offset": content.len() });
+        let reply = client
+            .request(subject.to_string(), serde_json::to_vec(&request)?.into())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let headers = reply.headers.unwrap_or_default();
+        if let Some(error) = headers.get("Nsed-Content-Error") {
+            anyhow::bail!("responder refused {address}: {error}");
+        }
+        if let Some(total) = headers
+            .get("Nsed-Content-Total")
+            .and_then(|v| v.as_str().parse::<usize>().ok())
+            && content.len() + reply.payload.len() > total
+        {
+            anyhow::bail!("responder served more than the {total} bytes it says {address} holds");
+        }
+        let eof = headers.get("Nsed-Content-Eof").map(|v| v.as_str()) == Some("true");
+        if reply.payload.is_empty() && !eof {
+            anyhow::bail!("responder returned no bytes and no end for {address}");
+        }
+        content.extend_from_slice(&reply.payload);
+        if eof {
+            let actual = sha256_hex_bytes(&content);
+            if actual != address.digest() {
+                anyhow::bail!(
+                    "content served for {address} hashes to {actual}, so it is not what was named"
+                );
+            }
+            return Ok(content);
+        }
+    }
+}
+
 /// Encode a name into one reversible NATS subject token.
 ///
 /// Anything outside `[A-Za-z0-9_-]` becomes `=XX` (the byte, hex). Injective,
@@ -2475,5 +2524,173 @@ invite_code: ${IC}
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '='),
         );
+    }
+
+    /// One scripted reply: the headers to set and the body to send.
+    type Scripted = (Vec<(&'static str, String)>, Vec<u8>);
+
+    /// A responder that answers each request with a scripted (headers, body).
+    async fn scripted_responder(
+        client: &async_nats::Client,
+        replies: Vec<Scripted>,
+    ) -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
+        use futures::StreamExt as _;
+        let subject = format!("fetch.test.{}", uuid::Uuid::new_v4().simple());
+        let mut requests = client.subscribe(subject.clone()).await?;
+        let serving = tokio::spawn({
+            let client = client.clone();
+            async move {
+                for (headers, body) in replies {
+                    let Some(message) = requests.next().await else {
+                        return;
+                    };
+                    let Some(reply) = message.reply.clone() else {
+                        continue;
+                    };
+                    let mut map = async_nats::HeaderMap::new();
+                    for (name, value) in headers {
+                        map.insert(name, value.as_str());
+                    }
+                    let _ = client.publish_with_headers(reply, map, body.into()).await;
+                }
+            }
+        });
+        Ok((subject, serving))
+    }
+
+    #[tokio::test]
+    async fn a_fetch_reassembles_windows_and_proves_what_it_got() {
+        let Ok(client) = async_nats::connect(
+            std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),
+        )
+        .await
+        else {
+            return;
+        };
+        let content = b"an answer that arrives in two windows".to_vec();
+        let (a, b) = content.split_at(10);
+        let total = content.len().to_string();
+        let address: crate::content_address::ContentAddress =
+            format!("nats://bucket/{}", sha256_hex_bytes(&content))
+                .parse()
+                .expect("address");
+
+        let (subject, serving) = scripted_responder(
+            &client,
+            vec![
+                (
+                    vec![
+                        ("Nsed-Content-Total", total.clone()),
+                        ("Nsed-Content-Eof", "false".into()),
+                    ],
+                    a.to_vec(),
+                ),
+                (
+                    vec![
+                        ("Nsed-Content-Total", total),
+                        ("Nsed-Content-Eof", "true".into()),
+                    ],
+                    b.to_vec(),
+                ),
+            ],
+        )
+        .await
+        .expect("responder");
+        let got = fetch_content_addressed(&client, &subject, &address)
+            .await
+            .expect("fetched");
+        assert_eq!(got, content, "windows reassemble in order");
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn a_fetch_refuses_what_the_address_does_not_name() {
+        let Ok(client) = async_nats::connect(
+            std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),
+        )
+        .await
+        else {
+            return;
+        };
+        let address: crate::content_address::ContentAddress =
+            format!("nats://bucket/{}", "0".repeat(64))
+                .parse()
+                .expect("address");
+
+        // Forged bytes: length is trivial to match, the digest is not.
+        let (subject, serving) = scripted_responder(
+            &client,
+            vec![(
+                vec![
+                    ("Nsed-Content-Total", "5".into()),
+                    ("Nsed-Content-Eof", "true".into()),
+                ],
+                b"wrong".to_vec(),
+            )],
+        )
+        .await
+        .expect("responder");
+        let refused = fetch_content_addressed(&client, &subject, &address)
+            .await
+            .expect_err("forged content must not verify");
+        assert!(refused.to_string().contains("hashes to"), "{refused}");
+        serving.abort();
+
+        // A refusal header is an error, not empty content.
+        let (subject, serving) = scripted_responder(
+            &client,
+            vec![(
+                vec![("Nsed-Content-Error", "does not own".into())],
+                Vec::new(),
+            )],
+        )
+        .await
+        .expect("responder");
+        let refused = fetch_content_addressed(&client, &subject, &address)
+            .await
+            .expect_err("a refusal must surface");
+        assert!(refused.to_string().contains("does not own"), "{refused}");
+        serving.abort();
+
+        // No bytes and no end would loop forever; over-serving would grow
+        // without bound. Both are refused instead.
+        let (subject, serving) = scripted_responder(
+            &client,
+            vec![(
+                vec![
+                    ("Nsed-Content-Total", "5".into()),
+                    ("Nsed-Content-Eof", "false".into()),
+                ],
+                Vec::new(),
+            )],
+        )
+        .await
+        .expect("responder");
+        let refused = fetch_content_addressed(&client, &subject, &address)
+            .await
+            .expect_err("an endless responder must not hold the reader");
+        assert!(
+            refused.to_string().contains("no bytes and no end"),
+            "{refused}"
+        );
+        serving.abort();
+
+        let (subject, serving) = scripted_responder(
+            &client,
+            vec![(
+                vec![
+                    ("Nsed-Content-Total", "3".into()),
+                    ("Nsed-Content-Eof", "false".into()),
+                ],
+                b"more than three".to_vec(),
+            )],
+        )
+        .await
+        .expect("responder");
+        let refused = fetch_content_addressed(&client, &subject, &address)
+            .await
+            .expect_err("over-serving must be refused");
+        assert!(refused.to_string().contains("more than"), "{refused}");
+        serving.abort();
     }
 }
