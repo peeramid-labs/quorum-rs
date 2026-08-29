@@ -723,6 +723,11 @@ pub struct TaskFailed {
     pub failure_class: TaskFailureClass,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_publish_depth: Option<u32>,
+    /// The head of the failure's rendered chain, with the provider detail
+    /// where one exists. A class alone says a task failed; diagnosing which
+    /// of three provider behaviours is at fault needs the words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// G6 — NATS client transition on the agent side.
@@ -2204,6 +2209,7 @@ mod tests {
                 tool_call_count: Some(0),
                 failure_class: TaskFailureClass::Timeout,
                 pending_publish_depth: Some(0),
+                reason: None,
             }),
             TelemetryEvent::NatsConnectionStateChanged(NatsConnectionStateChanged {
                 common: sample_agent_common(),

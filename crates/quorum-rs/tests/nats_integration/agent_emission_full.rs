@@ -171,6 +171,7 @@ async fn every_event_type_lands_on_nats_and_validates() {
         tool_call_count: Some(8),
         failure_class: TaskFailureClass::LlmExhausted,
         pending_publish_depth: Some(0),
+        reason: None,
     });
     emitter.emit(&evt9);
 
