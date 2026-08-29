@@ -41,6 +41,10 @@ pub struct DeliberationRequest {
     /// (which the session already holds). `None` for the first turn / non-thread.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_turn: Option<String>,
+    /// How this deliberation should carry what its seats write. `None` leaves
+    /// it to the deployment's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deliberation_type: Option<String>,
 }
 
 /// The `ask_user` HITL tool: an agent asks the operator a clarifying question,
@@ -89,6 +93,7 @@ pub fn build_request_raw_policy_id(policy_id: &str, task: &str) -> DeliberationR
     let room_id = format!("adhoc_{nonce:016x}");
 
     DeliberationRequest {
+        deliberation_type: None,
         room_id,
         conversation_id: None,
         user_query: task.to_string(),
@@ -157,6 +162,7 @@ pub fn build_request(
         timeout_seconds,
         user_tools: Some(vec![ask_user_tool()]),
         new_turn: None,
+        deliberation_type: policy.deliberation_type.clone(),
     })
 }
 
@@ -168,6 +174,7 @@ mod tests {
 
     fn static_policy() -> PolicyConfig {
         PolicyConfig {
+            deliberation_type: None,
             agents: Some(vec!["agent-a".into(), "agent-b".into()]),
             roles: None,
             max_rounds: 3,
@@ -181,6 +188,7 @@ mod tests {
 
     fn roles_policy() -> PolicyConfig {
         PolicyConfig {
+            deliberation_type: None,
             agents: None,
             roles: Some(vec![crate::cli::workspace::RoleConfig {
                 role: "reviewer".into(),
@@ -397,5 +405,22 @@ mod tests {
         assert!(req.room_id.starts_with("adhoc_"));
         assert!(req.policy_id.is_some());
         assert_eq!(req.policy_id.unwrap(), policy.policy_id());
+    }
+
+    #[test]
+    fn the_policy_s_deliberation_type_reaches_the_request() {
+        let policy = PolicyConfig {
+            agents: Some(vec!["a".into(), "b".into()]),
+            deliberation_type: Some("addressed".into()),
+            ..static_policy()
+        };
+        let req = build_request("room", &policy, "task").expect("valid");
+        assert_eq!(req.deliberation_type.as_deref(), Some("addressed"));
+
+        let unset = build_request("room", &static_policy(), "task").expect("valid");
+        assert_eq!(
+            unset.deliberation_type, None,
+            "an unset policy leaves the choice to the deployment"
+        );
     }
 }

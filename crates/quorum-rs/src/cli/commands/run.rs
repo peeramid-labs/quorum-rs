@@ -746,6 +746,7 @@ mod tests {
 
     fn static_policy() -> PolicyConfig {
         PolicyConfig {
+            deliberation_type: None,
             agents: Some(vec!["agent-a".into(), "agent-b".into()]),
             roles: None,
             max_rounds: 3,
@@ -759,6 +760,7 @@ mod tests {
 
     fn role_policy() -> PolicyConfig {
         PolicyConfig {
+            deliberation_type: None,
             agents: None,
             roles: Some(vec![
                 RoleConfig {

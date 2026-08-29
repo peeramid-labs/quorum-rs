@@ -173,6 +173,11 @@ pub struct PolicyConfig {
     pub effort: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sla: Option<PolicySla>,
+    /// How this policy's deliberations carry what their seats write. Unset
+    /// keeps proposals carrying their answers; `addressed` stores them and
+    /// lets records carry names, given a deployment that serves the storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliberation_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

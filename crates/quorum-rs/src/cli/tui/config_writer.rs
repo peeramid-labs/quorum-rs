@@ -101,6 +101,7 @@ mod tests {
                 m.insert(
                     "review".into(),
                     crate::cli::workspace::PolicyConfig {
+                        deliberation_type: None,
                         agents: Some(vec!["Agent1".into(), "Agent2".into()]),
                         roles: None,
                         max_rounds: 2,
