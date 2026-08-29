@@ -1710,6 +1710,18 @@ fn known_refusers() -> &'static std::sync::Mutex<std::collections::HashSet<Strin
     SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
+/// Whether a tool call is refused by the active-set gate. Provider-executed
+/// names never appear in the active set (it holds only locally-run schemas),
+/// so they are exempt: refusing them answered a backend-run search call with
+/// "does not exist", and the model concluded the tool was unavailable.
+fn refused_by_active_set(
+    active: &std::collections::HashSet<&str>,
+    provider_executed: &[String],
+    tool_name: &str,
+) -> bool {
+    !active.contains(tool_name) && !provider_executed.iter().any(|t| t == tool_name)
+}
+
 /// The text to judge a refusal on: the provider's response body when the error
 /// carries one, else the error itself.
 ///
@@ -1968,60 +1980,47 @@ where
         // 5d. For proposals: split merged thought_process/solution_content.
         // gpt-oss and MiniMax frequently put everything into `thought_process`
         // with a `**Solution Content**` marker, leaving `solution_content` absent.
-        if parse_result.is_err() && terminal_tool_name == "submit_proposal" {
-            if let Ok(mut obj) = serde_json::from_str::<serde_json::Value>(&cleaned_json) {
-                let needs_split = obj.get("solution_content").is_none()
-                    && obj
-                        .get("thought_process")
-                        .and_then(|v| v.as_str())
-                        .is_some();
-                if needs_split {
-                    let tp = obj["thought_process"].as_str().unwrap_or_default();
-                    // Look for well-known section markers
-                    let markers = [
-                        "\n**Solution Content**\n",
-                        "\n**Solution Content:**\n",
-                        "\n**Solution Content**:",
-                        "\n## Solution Content\n",
-                        "\n### 1. ",
-                        "\n## 1. ",
-                    ];
-                    let mut split_pos = None;
-                    for marker in &markers {
-                        if let Some(pos) = tp.find(marker) {
-                            split_pos = Some((pos, marker.len()));
-                            break;
-                        }
-                    }
-                    if let Some((pos, _marker_len)) = split_pos {
-                        let thought = tp[..pos].trim().to_string();
-                        // For "### 1." style markers, include the marker in solution_content
-                        let solution = if markers.iter().take(4).any(|m| tp[pos..].starts_with(m)) {
-                            // Strip the "**Solution Content**" header itself
-                            tp[pos..]
-                                .trim_start_matches(|c: char| {
-                                    c.is_whitespace() || c == '*' || c == '#'
-                                })
-                                .trim_start_matches("Solution Content")
-                                .trim_start_matches(|c: char| {
-                                    c == ':' || c == '*' || c == '#' || c.is_whitespace()
-                                })
-                                .trim()
-                                .to_string()
-                        } else {
-                            // Keep the numbered section header
-                            tp[pos..].trim().to_string()
-                        };
-                        obj["thought_process"] = serde_json::Value::String(thought);
-                        obj["solution_content"] = serde_json::Value::String(solution);
-                        if let Ok(repaired_obj) = serde_json::from_value::<T>(obj) {
-                            warn!(
-                                agent_name = %agent_config.name,
-                                "Successfully split merged thought_process/solution_content."
-                            );
-                            parse_result = Ok(repaired_obj);
-                        }
-                    }
+        if parse_result.is_err()
+            && terminal_tool_name == "submit_proposal"
+            && let Ok(obj) = serde_json::from_str::<serde_json::Value>(&cleaned_json)
+            && let Some(repaired) = split_merged_solution(&obj)
+            && let Ok(repaired_obj) = serde_json::from_value::<T>(repaired)
+        {
+            warn!(
+                agent_name = %agent_config.name,
+                "Successfully split merged thought_process/solution_content."
+            );
+            parse_result = Ok(repaired_obj);
+        }
+
+        // 5f. A submit_proposal that parses cleanly but carries an empty
+        // solution is not a submission: the same merged shape as 5d with the
+        // field present-but-blank. Recover by the split; failing that, a
+        // schema error names the blank field so the retry asks again.
+        if terminal_tool_name == "submit_proposal"
+            && parse_result.is_ok()
+            && let Ok(obj) = serde_json::from_str::<serde_json::Value>(&cleaned_json)
+            && obj
+                .get("solution_content")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+        {
+            match split_merged_solution(&obj)
+                .and_then(|repaired| serde_json::from_value::<T>(repaired).ok())
+            {
+                Some(repaired_obj) => {
+                    warn!(
+                        agent_name = %agent_config.name,
+                        "Recovered an empty solution_content from its thought_process."
+                    );
+                    parse_result = Ok(repaired_obj);
+                }
+                None => {
+                    parse_result = Err(<serde_json::Error as serde::de::Error>::custom(
+                        "solution_content is empty — the answer belongs in \
+                         solution_content, not thought_process",
+                    ));
                 }
             }
         }
@@ -2825,6 +2824,37 @@ fn estimate_llm_cost_usd(
     let output_cost = (output_tokens as f64 / 1_000_000.0) * output_per_m;
 
     cached_cost + non_cached_cost + output_cost
+}
+
+/// Splits a `submit_proposal` whose whole answer sits in `thought_process`
+/// behind a `**Solution Content**`-style marker, the field itself absent or
+/// blank. `None` when no marker is found.
+fn split_merged_solution(obj: &serde_json::Value) -> Option<serde_json::Value> {
+    let tp = obj.get("thought_process")?.as_str()?;
+    let markers = [
+        "\n**Solution Content**\n",
+        "\n**Solution Content:**\n",
+        "\n**Solution Content**:",
+        "\n## Solution Content\n",
+        "\n### 1. ",
+        "\n## 1. ",
+    ];
+    let pos = markers.iter().find_map(|m| tp.find(m))?;
+    let thought = tp[..pos].trim().to_string();
+    let solution = if markers.iter().take(4).any(|m| tp[pos..].starts_with(m)) {
+        tp[pos..]
+            .trim_start_matches(|c: char| c.is_whitespace() || c == '*' || c == '#')
+            .trim_start_matches("Solution Content")
+            .trim_start_matches(|c: char| c == ':' || c == '*' || c == '#' || c.is_whitespace())
+            .trim()
+            .to_string()
+    } else {
+        tp[pos..].trim().to_string()
+    };
+    let mut repaired = obj.clone();
+    repaired["thought_process"] = serde_json::Value::String(thought);
+    repaired["solution_content"] = serde_json::Value::String(solution);
+    Some(repaired)
 }
 
 fn empty_terminal_tool_content(terminal_tool_name: Option<&str>) -> String {
@@ -3919,7 +3949,11 @@ async fn react_loop(
                             format!("compact_history failed: {e}")
                         }
                     }
-                } else if !active_tool_names.contains(tool_name.as_str()) {
+                } else if refused_by_active_set(
+                    &active_tool_names,
+                    &agent_config.provider_executed_tools,
+                    tool_name,
+                ) {
                     // Two different causes reach here and they need different
                     // responses from the model. Blaming "the current phase" for a
                     // budget strip sent it looking for a phase it could retry in,
@@ -3963,6 +3997,7 @@ async fn react_loop(
                         tool = %tool_name,
                         "Provider-executed tool — echoing arguments back for the backend to run"
                     );
+                    tool_success = true;
                     tool_call.function.arguments.clone()
                 } else if let Some(tool) = tool_map.get(tool_name) {
                     let arg_str = &tool_call.function.arguments;
@@ -4343,6 +4378,49 @@ impl Drop for ToolCallGuard {
 #[cfg(test)]
 mod tests {
     use crate::agents::nsed_agent::extract_user_request;
+
+    /// The live shape a condenser lost three rounds to: valid JSON, the whole
+    /// answer in `thought_process` behind a `**Solution Content**:` marker,
+    /// `solution_content` blank.
+    #[test]
+    fn an_answer_hiding_in_the_thought_process_is_split_out() {
+        use super::split_merged_solution;
+        let merged = serde_json::json!({
+            "thought_process": "Critique integration notes.\n\n**Solution Content**: The distilled answer.",
+            "solution_content": ""
+        });
+        let repaired = split_merged_solution(&merged).expect("marker found");
+        assert_eq!(repaired["solution_content"], "The distilled answer.");
+        assert_eq!(repaired["thought_process"], "Critique integration notes.");
+
+        // No marker → nothing to split; the caller must refuse instead.
+        let hopeless = serde_json::json!({
+            "thought_process": "just reasoning",
+            "solution_content": ""
+        });
+        assert!(split_merged_solution(&hopeless).is_none());
+    }
+
+    #[test]
+    fn a_backend_run_tool_call_is_not_refused_by_the_active_set() {
+        use super::refused_by_active_set;
+        let active: std::collections::HashSet<&str> =
+            ["submit_proposal", "read_proposal"].into_iter().collect();
+        let provider = vec!["web_search".to_string()];
+
+        // The backend runs this one; the active set knows only local tools.
+        assert!(!refused_by_active_set(&active, &provider, "web_search"));
+        // A local tool in the set passes as before.
+        assert!(!refused_by_active_set(
+            &active,
+            &provider,
+            "submit_proposal"
+        ));
+        // A name nobody owns is still refused.
+        assert!(refused_by_active_set(&active, &provider, "made_up_tool"));
+        // No provider tools declared: unknown names are refused as before.
+        assert!(refused_by_active_set(&active, &[], "web_search"));
+    }
 
     #[test]
     fn user_request_is_recovered_from_a_prompt_with_a_trailing_scratchpad() {

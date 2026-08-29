@@ -158,6 +158,34 @@ impl ChatStrategy for NativeStrategy {
                 Some(existing) => existing.extend(declared),
                 None => v["tools"] = serde_json::Value::Array(declared),
             }
+
+            // The inverse of the response normalisation: parsing rewrote the
+            // call's type to `function`, so history replayed as-is no longer
+            // marks the call as the backend's own. The backend then serves no
+            // results — the model reads back only the echoed metadata.
+            // Measured live: same history, `function` → "only metadata",
+            // `builtin_function` → the answer.
+            if let Some(messages) = v.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                for message in messages {
+                    let Some(calls) = message.get_mut("tool_calls").and_then(|t| t.as_array_mut())
+                    else {
+                        continue;
+                    };
+                    for call in calls {
+                        let wrapped = call
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            .is_some_and(|n| {
+                                n.starts_with('$')
+                                    && agent.provider_executed_tools.iter().any(|t| t == n)
+                            });
+                        if wrapped && let Some(obj) = call.as_object_mut() {
+                            obj.insert("type".to_string(), serde_json::json!("builtin_function"));
+                        }
+                    }
+                }
+            }
         }
 
         normalise_sampling_values(&mut v);
@@ -1248,6 +1276,53 @@ mod tests {
             plugins.as_array().unwrap().len(),
             0,
             "plugins array must be empty"
+        );
+    }
+
+    /// The response normalisation rewrote a backend-run call's type to
+    /// `function`; replayed history must carry `builtin_function` again or the
+    /// backend serves no results and the model reads only echoed metadata.
+    #[tokio::test]
+    async fn a_replayed_backend_run_call_is_marked_as_the_backends_own_again() {
+        use async_openai::types::{
+            ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
+            ChatCompletionToolType, FunctionCall,
+        };
+
+        let strategy = NativeStrategy::new("openai");
+        let agent = AgentConfig {
+            provider_executed_tools: vec!["$web_search".to_string()],
+            temperature: 0.7,
+            max_tokens: 512,
+            ..Default::default()
+        };
+        let request_config = RequestConfig {
+            messages: vec![ChatCompletionRequestMessage::Assistant(
+                ChatCompletionRequestAssistantMessage {
+                    tool_calls: Some(vec![ChatCompletionMessageToolCall {
+                        id: "t-web_search-1".to_string(),
+                        r#type: ChatCompletionToolType::Function,
+                        function: FunctionCall {
+                            name: "$web_search".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    }]),
+                    ..Default::default()
+                },
+            )],
+            tools: None,
+            tool_choice: None,
+            presence_penalty: None,
+            service_tier: None,
+        };
+        let body = strategy
+            .prepare_request(&agent, &request_config, &RequestOverrides::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            body["messages"][0]["tool_calls"][0]["type"], "builtin_function",
+            "a replayed provider-run call must be re-marked for the backend"
         );
     }
 
