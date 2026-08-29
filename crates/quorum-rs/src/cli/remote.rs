@@ -1519,6 +1519,7 @@ mod tests {
 
         let client = RemoteOrchestrator::new(&server.uri(), "test-token").unwrap();
         let req = DeliberationRequest {
+            variables: Default::default(),
             room_id: "room".into(),
             conversation_id: None,
             user_tools: None,
@@ -1547,6 +1548,7 @@ mod tests {
 
         let client = RemoteOrchestrator::new(&server.uri(), "bad-token").unwrap();
         let req = DeliberationRequest {
+            variables: Default::default(),
             room_id: "room".into(),
             conversation_id: None,
             user_tools: None,
@@ -1580,6 +1582,7 @@ mod tests {
 
         let client = RemoteOrchestrator::new(&server.uri(), "token").unwrap();
         let req = DeliberationRequest {
+            variables: Default::default(),
             room_id: "room".into(),
             conversation_id: None,
             user_tools: None,
@@ -1613,6 +1616,7 @@ mod tests {
 
         let client = RemoteOrchestrator::new(&server.uri(), "token").unwrap();
         let req = DeliberationRequest {
+            variables: Default::default(),
             room_id: "room".into(),
             conversation_id: None,
             user_tools: None,
@@ -2245,6 +2249,7 @@ mod tests {
 
     fn sample_cli_policy() -> crate::cli::workspace::PolicyConfig {
         crate::cli::workspace::PolicyConfig {
+            variables: None,
             agents: Some(vec!["alice".into(), "bob".into()]),
             roles: None,
             max_rounds: 2,
@@ -2407,6 +2412,7 @@ mod tests {
     fn build_policy_push_body_strips_context() {
         use crate::cli::workspace::RoleConfig;
         let policy = crate::cli::workspace::PolicyConfig {
+            variables: None,
             agents: None,
             roles: Some(vec![RoleConfig {
                 role: "reviewer".into(),

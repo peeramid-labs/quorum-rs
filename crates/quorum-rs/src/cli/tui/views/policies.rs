@@ -638,6 +638,7 @@ mod tests {
 
     fn local_policy() -> PolicyConfig {
         PolicyConfig {
+            variables: None,
             agents: Some(vec!["a".into(), "b".into()]),
             roles: None,
             max_rounds: 3,

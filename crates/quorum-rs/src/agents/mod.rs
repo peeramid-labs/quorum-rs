@@ -83,6 +83,13 @@ pub struct AgentContext {
     /// the stable thread id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
+    /// Generic per-job variables, passed through from the job manifest.
+    ///
+    /// The protocol carries them; it does not interpret them. A team's own
+    /// agent crate reads the variables it understands and ignores the rest,
+    /// which is what keeps deployment-specific behaviours out of this SDK.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub variables: std::collections::BTreeMap<String, String>,
     /// How this deliberation carries what its seats write, as the job asked for
     /// it. `None` is the long-standing behaviour, where a proposal carries its
     /// answer. A seat that does not recognise the value writes as it always has.
@@ -2525,6 +2532,7 @@ mod tests {
     #[test]
     fn agent_context_serde_roundtrip() {
         let ctx = AgentContext {
+            variables: Default::default(),
             deliberation_type: None,
             issued_at: None,
             task_description: "Solve the halting problem".to_string(),

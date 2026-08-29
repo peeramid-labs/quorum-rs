@@ -41,6 +41,11 @@ pub struct DeliberationRequest {
     /// (which the session already holds). `None` for the first turn / non-thread.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_turn: Option<String>,
+    /// Generic per-job variables, forwarded verbatim to the job manifest and
+    /// on to every seat's context. Interpreted by the deployment's own agent
+    /// code, never by this client.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub variables: std::collections::BTreeMap<String, String>,
 }
 
 /// The `ask_user` HITL tool: an agent asks the operator a clarifying question,
@@ -89,6 +94,7 @@ pub fn build_request_raw_policy_id(policy_id: &str, task: &str) -> DeliberationR
     let room_id = format!("adhoc_{nonce:016x}");
 
     DeliberationRequest {
+        variables: Default::default(),
         room_id,
         conversation_id: None,
         user_query: task.to_string(),
@@ -157,6 +163,7 @@ pub fn build_request(
         timeout_seconds,
         user_tools: Some(vec![ask_user_tool()]),
         new_turn: None,
+        variables: policy.variables.clone().unwrap_or_default(),
     })
 }
 
@@ -168,6 +175,7 @@ mod tests {
 
     fn static_policy() -> PolicyConfig {
         PolicyConfig {
+            variables: None,
             agents: Some(vec!["agent-a".into(), "agent-b".into()]),
             roles: None,
             max_rounds: 3,
@@ -181,6 +189,7 @@ mod tests {
 
     fn roles_policy() -> PolicyConfig {
         PolicyConfig {
+            variables: None,
             agents: None,
             roles: Some(vec![crate::cli::workspace::RoleConfig {
                 role: "reviewer".into(),
@@ -397,5 +406,21 @@ mod tests {
         assert!(req.room_id.starts_with("adhoc_"));
         assert!(req.policy_id.is_some());
         assert_eq!(req.policy_id.unwrap(), policy.policy_id());
+    }
+
+    #[test]
+    fn a_policy_s_variables_reach_the_request_verbatim() {
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert("deliberation_type".to_string(), "addressed".to_string());
+        vars.insert("anything_else".to_string(), "still carried".to_string());
+        let policy = PolicyConfig {
+            variables: Some(vars.clone()),
+            ..static_policy()
+        };
+        let req = build_request("room", &policy, "task").expect("valid");
+        assert_eq!(req.variables, vars, "carried, never interpreted");
+
+        let unset = build_request("room", &static_policy(), "task").expect("valid");
+        assert!(unset.variables.is_empty());
     }
 }

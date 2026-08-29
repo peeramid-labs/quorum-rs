@@ -173,6 +173,11 @@ pub struct PolicyConfig {
     pub effort: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sla: Option<PolicySla>,
+    /// Generic variables passed to every job this policy starts, forwarded
+    /// verbatim to the seats. What they mean is between the deployment's
+    /// configuration and its own agent code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variables: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
