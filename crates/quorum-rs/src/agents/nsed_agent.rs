@@ -1710,6 +1710,18 @@ fn known_refusers() -> &'static std::sync::Mutex<std::collections::HashSet<Strin
     SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
+/// Whether a tool call is refused by the active-set gate. Provider-executed
+/// names never appear in the active set (it holds only locally-run schemas),
+/// so they are exempt: refusing them answered a backend-run search call with
+/// "does not exist", and the model concluded the tool was unavailable.
+fn refused_by_active_set(
+    active: &std::collections::HashSet<&str>,
+    provider_executed: &[String],
+    tool_name: &str,
+) -> bool {
+    !active.contains(tool_name) && !provider_executed.iter().any(|t| t == tool_name)
+}
+
 /// The text to judge a refusal on: the provider's response body when the error
 /// carries one, else the error itself.
 ///
@@ -3919,7 +3931,11 @@ async fn react_loop(
                             format!("compact_history failed: {e}")
                         }
                     }
-                } else if !active_tool_names.contains(tool_name.as_str()) {
+                } else if refused_by_active_set(
+                    &active_tool_names,
+                    &agent_config.provider_executed_tools,
+                    tool_name,
+                ) {
                     // Two different causes reach here and they need different
                     // responses from the model. Blaming "the current phase" for a
                     // budget strip sent it looking for a phase it could retry in,
@@ -4343,6 +4359,27 @@ impl Drop for ToolCallGuard {
 #[cfg(test)]
 mod tests {
     use crate::agents::nsed_agent::extract_user_request;
+
+    #[test]
+    fn a_backend_run_tool_call_is_not_refused_by_the_active_set() {
+        use super::refused_by_active_set;
+        let active: std::collections::HashSet<&str> =
+            ["submit_proposal", "read_proposal"].into_iter().collect();
+        let provider = vec!["web_search".to_string()];
+
+        // The backend runs this one; the active set knows only local tools.
+        assert!(!refused_by_active_set(&active, &provider, "web_search"));
+        // A local tool in the set passes as before.
+        assert!(!refused_by_active_set(
+            &active,
+            &provider,
+            "submit_proposal"
+        ));
+        // A name nobody owns is still refused.
+        assert!(refused_by_active_set(&active, &provider, "made_up_tool"));
+        // No provider tools declared: unknown names are refused as before.
+        assert!(refused_by_active_set(&active, &[], "web_search"));
+    }
 
     #[test]
     fn user_request_is_recovered_from_a_prompt_with_a_trailing_scratchpad() {
