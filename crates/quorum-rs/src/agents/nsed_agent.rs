@@ -883,7 +883,7 @@ pub(crate) struct BatchEvaluationItem {
     #[serde(default)]
     pub(crate) claim_assessments: Vec<ClaimAssessment>,
     #[serde(default)]
-    disagreements: Vec<DisagreementPoint>,
+    pub(crate) disagreements: Vec<DisagreementPoint>,
     #[serde(default)]
     category_scores: Option<CategoryScores>,
 }
