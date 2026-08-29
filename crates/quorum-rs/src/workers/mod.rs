@@ -2414,8 +2414,16 @@ impl NatsNsedWorker {
                     (context.phase_budget_remaining_secs * 1000.0) as i64;
                 // Payment errors get a distinct class so the orchestrator
                 // can auto-resume when credits return.
+                // Classified from the chain, since the classes exist to be
+                // told apart: everything reported as a timeout for months was
+                // three different provider behaviours wearing one label.
+                let lowered = err_str.to_lowercase();
                 let failure_class = if is_payment_error {
                     TaskFailureClass::ToolError
+                } else if lowered.contains("parse") {
+                    TaskFailureClass::ParseRetryExhausted
+                } else if lowered.contains("empty") {
+                    TaskFailureClass::EmptyContentAfterRetries
                 } else {
                     TaskFailureClass::Timeout
                 };
@@ -2430,6 +2438,7 @@ impl NatsNsedWorker {
                         tool_call_count: None,
                         failure_class,
                         pending_publish_depth: None,
+                        reason: Some(err_str.chars().take(400).collect()),
                     }
                 );
             }
