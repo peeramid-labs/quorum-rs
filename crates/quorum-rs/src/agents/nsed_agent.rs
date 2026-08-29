@@ -3979,6 +3979,7 @@ async fn react_loop(
                         tool = %tool_name,
                         "Provider-executed tool — echoing arguments back for the backend to run"
                     );
+                    tool_success = true;
                     tool_call.function.arguments.clone()
                 } else if let Some(tool) = tool_map.get(tool_name) {
                     let arg_str = &tool_call.function.arguments;
