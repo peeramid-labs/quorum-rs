@@ -1653,6 +1653,7 @@ rooms:
     #[test]
     fn policy_id_static_agents() {
         let policy = PolicyConfig {
+            variables: None,
             agents: Some(vec!["a".into(), "b".into()]),
             roles: None,
             max_rounds: 2,
@@ -1685,6 +1686,7 @@ rooms:
         // future refactor ever inlines the canonical JSON, this test
         // still catches the regression.
         let policy_3 = PolicyConfig {
+            variables: None,
             agents: Some(vec!["a".into(), "b".into()]),
             roles: None,
             max_rounds: 3,
@@ -1706,6 +1708,7 @@ rooms:
     #[test]
     fn policy_id_role_based() {
         let policy = PolicyConfig {
+            variables: None,
             agents: None,
             roles: Some(vec![RoleConfig {
                 role: "reviewer".into(),

@@ -1364,6 +1364,7 @@ fn wizard_policy() -> Result<Option<(PolicyConfig, bool)>, String> {
         // Placeholder — agents assigned in step 4.
         Ok(Some((
             PolicyConfig {
+                variables: None,
                 agents: Some(vec!["__placeholder__".into(), "__placeholder__".into()]),
                 roles: None,
                 max_rounds: rounds,
@@ -1387,6 +1388,7 @@ fn wizard_policy() -> Result<Option<(PolicyConfig, bool)>, String> {
 
         Ok(Some((
             PolicyConfig {
+                variables: None,
                 agents: None,
                 roles: Some(roles),
                 max_rounds: rounds,

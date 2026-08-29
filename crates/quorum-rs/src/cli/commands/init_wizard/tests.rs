@@ -45,6 +45,7 @@ fn remote_orch(address: &str, token: &str) -> OrchestratorConfig {
 
 fn static_policy(agents: &[&str]) -> PolicyConfig {
     PolicyConfig {
+        variables: None,
         agents: Some(agents.iter().map(|s| s.to_string()).collect()),
         roles: None,
         max_rounds: 2,
@@ -502,6 +503,7 @@ fn build_config_embedded_orchestrator() {
         },
         "dev-policy",
         PolicyConfig {
+            variables: None,
             agents: Some(vec!["a".into(), "b".into()]),
             roles: None,
             max_rounds: 1,
@@ -607,6 +609,7 @@ fn render_yaml_includes_capabilities_and_tags() {
 #[test]
 fn build_config_role_based_policy() {
     let policy = PolicyConfig {
+        variables: None,
         agents: None,
         roles: Some(vec![
             RoleConfig {
@@ -654,6 +657,7 @@ fn build_config_role_based_policy() {
 #[test]
 fn build_config_role_based_validates_min_agents() {
     let policy = PolicyConfig {
+        variables: None,
         agents: None,
         roles: Some(vec![RoleConfig {
             role: "solo".into(),
@@ -688,6 +692,7 @@ fn build_config_role_based_validates_min_agents() {
 #[test]
 fn build_config_role_with_context() {
     let policy = PolicyConfig {
+        variables: None,
         agents: None,
         roles: Some(vec![
             RoleConfig {

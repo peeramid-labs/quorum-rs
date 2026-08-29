@@ -1257,6 +1257,7 @@ mod tests {
         policies.insert(
             "review".into(),
             PolicyConfig {
+                variables: None,
                 agents: Some(vec!["agent-a".into(), "agent-b".into()]),
                 roles: None,
                 max_rounds: 3,

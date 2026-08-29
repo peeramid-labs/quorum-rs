@@ -307,6 +307,7 @@ fn sample_events() -> Vec<TelemetryEvent> {
             tool_call_count: Some(3),
             failure_class: TaskFailureClass::Timeout,
             pending_publish_depth: Some(0),
+            reason: None,
         }),
         // Connection-state events are process-level — no task scope —
         // so the envelope's task fields are `None`. The `trace_id`
