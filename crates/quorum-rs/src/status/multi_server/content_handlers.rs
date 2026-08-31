@@ -43,6 +43,28 @@ pub struct ContentUploads {
     /// can be derived here.
     public_base: Option<String>,
     uploaded_by: String,
+    /// Segmenting for uploaded video. `None` where no transcoder was found on
+    /// this host, which is not an error — a library user who never asked for a
+    /// media pipeline gets their original stored and nothing else.
+    hls: Option<Arc<Segmenting>>,
+}
+
+/// How many uploads may be waiting to segment.
+///
+/// Each one holds its spool on disk until its turn comes, so an unbounded
+/// queue is an unbounded pile of temporary files the size of the uploads that
+/// made them. Past this an upload is stored whole and reported `Skipped`,
+/// which is honest and costs nothing.
+const MAX_QUEUED_SEGMENTATIONS: usize = 4;
+
+/// The transcoder, and the queue in front of it.
+struct Segmenting {
+    transcoder: crate::hls::Ffmpeg,
+    /// Admission: bounds how many spools are being held for a turn.
+    waiting: Arc<tokio::sync::Semaphore>,
+    /// One transcode at a time. Parallel ffmpeg is how a host with several
+    /// uploads in flight stops answering anything at all.
+    running: tokio::sync::Semaphore,
 }
 
 impl ContentUploads {
@@ -73,8 +95,23 @@ impl ContentUploads {
             }
         };
 
+        let transcoder = crate::hls::Ffmpeg::default();
+        let hls = if transcoder.available().await {
+            Some(Arc::new(Segmenting {
+                transcoder,
+                waiting: Arc::new(tokio::sync::Semaphore::new(MAX_QUEUED_SEGMENTATIONS)),
+                running: tokio::sync::Semaphore::new(1),
+            }))
+        } else {
+            tracing::info!(
+                "no ffmpeg on this host, so uploaded video is stored whole and not segmented"
+            );
+            None
+        };
+
         Some(Self {
             blob: Arc::new(blob),
+            hls,
             max_upload_bytes: std::env::var("NSED_MAX_UPLOAD_BYTES")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
@@ -108,6 +145,9 @@ pub(super) struct Uploaded {
     mime: String,
     bytes: u64,
     visibility: Visibility,
+    /// Where segmenting stands for this upload. `Skipped` for anything that is
+    /// not video, or on a host with no transcoder.
+    hls: crate::hls::HlsState,
 }
 
 /// A refusal, as the caller sees it.
@@ -243,15 +283,19 @@ pub(super) async fn upload(State(state): State<MultiAppState>, mut form: Multipa
         .put_stream(&spooled.digest, &mut spooled.file, &meta)
         .await
     {
-        Ok(stored) => Json(Uploaded {
-            address: format!("nats://{}/{}", content.blob.bucket(), stored.digest),
-            url: content.public_url(&stored.digest),
-            digest: stored.digest,
-            mime: stored.mime,
-            bytes: stored.bytes,
-            visibility: stored.visibility,
-        })
-        .into_response(),
+        Ok(stored) => {
+            let hls = start_segmenting(&content, &stored, spooled);
+            Json(Uploaded {
+                address: format!("nats://{}/{}", content.blob.bucket(), stored.digest),
+                url: content.public_url(&stored.digest),
+                digest: stored.digest,
+                mime: stored.mime,
+                bytes: stored.bytes,
+                visibility: stored.visibility,
+                hls,
+            })
+            .into_response()
+        }
         Err(e) => match e.downcast_ref::<QuotaExceeded>() {
             // 507 with the numbers, not a 500 with a string: the caller can
             // act on "you are out of space", and cannot act on "something
@@ -273,17 +317,103 @@ pub(super) async fn upload(State(state): State<MultiAppState>, mut form: Multipa
     }
 }
 
+/// Where segmenting is recorded against the original.
+const HLS_NOTE: &str = "hls";
+/// Where the produced playlist's digest is recorded against the original.
+const PLAYLIST_NOTE: &str = "playlist";
+
+/// Kick off segmenting for a video, and say what state that leaves it in.
+///
+/// Returns without waiting: a transcode takes far longer than an HTTP request
+/// should, and the original is already stored and servable. The uploader polls
+/// for the playlist.
+fn start_segmenting(
+    content: &ContentUploads,
+    stored: &ObjectMeta,
+    spool: Spooled,
+) -> crate::hls::HlsState {
+    let (Some(hls), Some(public_base)) = (content.hls.clone(), content.public_base.clone()) else {
+        // Nothing to segment with, or nowhere to point a playlist at: a
+        // playlist of relative names nobody can resolve is worse than none.
+        return crate::hls::HlsState::Skipped;
+    };
+    if !stored.mime.starts_with("video/") {
+        return crate::hls::HlsState::Skipped;
+    }
+
+    // Taken before the spool is moved into a task, so a backlog is refused
+    // rather than accumulating temporary files.
+    let Ok(slot) = hls.waiting.clone().try_acquire_owned() else {
+        tracing::warn!(
+            digest = %stored.digest,
+            "the segmenting queue is full, so this upload is stored whole"
+        );
+        return crate::hls::HlsState::Skipped;
+    };
+
+    let blob = content.blob.clone();
+    let uploaded_by = content.uploaded_by.clone();
+    let digest = stored.digest.clone();
+    tokio::spawn(async move {
+        let _slot = slot;
+        // The spool is moved in and dropped here, at the end of the transcode,
+        // rather than when the request returned — ffmpeg reads it.
+        let spool = spool;
+        if let Err(e) = blob.annotate(&digest, HLS_NOTE, "pending").await {
+            tracing::warn!(digest, error = %format!("{e:#}"), "could not mark an upload pending");
+        }
+
+        let _turn = hls.running.acquire().await;
+        let outcome = crate::hls::segment_and_store(
+            blob.as_ref(),
+            &hls.transcoder,
+            spool.path(),
+            &public_base,
+            &uploaded_by,
+        )
+        .await;
+
+        let state = match outcome {
+            Ok(segmented) => {
+                let _ = blob
+                    .annotate(&digest, PLAYLIST_NOTE, &segmented.playlist)
+                    .await;
+                tracing::info!(digest, playlist = %segmented.playlist, "segmented an upload");
+                "ready"
+            }
+            Err(e) => {
+                // The original is untouched and still servable whole; only the
+                // seekable form is missing.
+                tracing::warn!(digest, error = %format!("{e:#}"), "could not segment an upload");
+                "failed"
+            }
+        };
+        if let Err(e) = blob.annotate(&digest, HLS_NOTE, state).await {
+            tracing::warn!(digest, error = %format!("{e:#}"), "could not record the segmenting outcome");
+        }
+    });
+
+    crate::hls::HlsState::Pending
+}
+
 /// An upload on disk, hashed on the way there.
 struct Spooled {
     file: tokio::fs::File,
     /// Kept alive: dropping the handle deletes the file, and the spool has to
-    /// outlive the read that streams it into the bucket.
-    _guard: tempfile::TempPath,
+    /// outlive both the read that streams it into the bucket and any transcode
+    /// that follows.
+    guard: tempfile::TempPath,
     digest: String,
     bytes: u64,
     /// The first bytes, for deciding the media type without re-reading.
     head: Vec<u8>,
     filename: String,
+}
+
+impl Spooled {
+    fn path(&self) -> &std::path::Path {
+        &self.guard
+    }
 }
 
 /// Write a field to a temporary file, hashing as it lands and stopping at the
@@ -351,7 +481,7 @@ async fn spool(
 
     Ok(Spooled {
         file,
-        _guard: path,
+        guard: path,
         digest: hex::encode(hasher.finalize()),
         bytes,
         head,
@@ -478,6 +608,54 @@ pub(super) async fn fetch(
         wanted.to_string(),
     );
     (status, response_headers, body).into_response()
+}
+
+/// What is known about one stored file, including where segmenting got to.
+#[derive(Serialize)]
+struct FileStatus {
+    #[serde(flatten)]
+    meta: ObjectMeta,
+    hls: crate::hls::HlsState,
+    /// The playlist to hand a player, once there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    playlist_url: Option<String>,
+}
+
+/// `GET /api/content/{digest}/status` — the uploader's poll.
+///
+/// Segmenting outlives the request that started it, so this is how a caller
+/// learns the video became seekable.
+pub(super) async fn status(
+    State(state): State<MultiAppState>,
+    Path(digest): Path<String>,
+) -> Response {
+    let Some(content) = state.content.as_ref() else {
+        return not_configured();
+    };
+    let Ok(meta) = content.blob.head(&digest).await else {
+        return refuse(StatusCode::NOT_FOUND, "no such object");
+    };
+    let notes = content.blob.notes(&digest).await.unwrap_or_default();
+
+    let hls = match notes.get(HLS_NOTE).map(String::as_str) {
+        Some("pending") => crate::hls::HlsState::Pending,
+        Some("ready") => crate::hls::HlsState::Ready,
+        Some("failed") => crate::hls::HlsState::Failed,
+        _ => crate::hls::HlsState::Skipped,
+    };
+    // Only once it is ready. A playlist note can outlive the segmentation that
+    // wrote it — a later re-run that failed, say — and handing out a URL for a
+    // playlist whose segments are gone fails in the player rather than here.
+    let playlist_url = (hls == crate::hls::HlsState::Ready)
+        .then(|| notes.get(PLAYLIST_NOTE).and_then(|d| content.public_url(d)))
+        .flatten();
+
+    Json(FileStatus {
+        meta,
+        hls,
+        playlist_url,
+    })
+    .into_response()
 }
 
 /// `DELETE /api/content/{digest}` — remove an object and free its space.
@@ -649,6 +827,10 @@ mod tests {
             max_upload_bytes,
             public_base: Some("https://example.test/content/acme".to_string()),
             uploaded_by: "agent-7".to_string(),
+            // No transcoder in the tests that exercise the HTTP surface: the
+            // pipeline has its own, and spawning one here would make every
+            // upload test wait on a subprocess.
+            hls: None,
         })
     }
 
@@ -750,6 +932,152 @@ mod tests {
             &format!("bytes 1000-1999/{}", video.len())
         );
         assert_eq!(body_bytes(response).await, video[1000..2000]);
+    }
+
+    #[tokio::test]
+    async fn a_host_with_no_transcoder_stores_the_video_and_says_it_skipped() {
+        // Not an error, and not a lie about being pending: a library user who
+        // never asked for a media pipeline gets their original and a state
+        // that says why there is no playlist.
+        let Some(content) = configured(8 * 1024 * 1024, 4 * 1024 * 1024).await else {
+            require_broker("uploading needs a broker");
+            return;
+        };
+        let uploaded = body_json(
+            send(
+                Some(content.clone()),
+                upload_request(multipart("clip.mp4", &fake_mp4(2_000), None)),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(uploaded["mime"], "video/mp4");
+        assert_eq!(uploaded["hls"], "skipped");
+
+        // And the original is servable whole, which is the point of not
+        // failing the upload.
+        let digest = uploaded["digest"].as_str().unwrap();
+        let response = send(
+            Some(content),
+            Request::builder()
+                .uri(format!("/api/content/{digest}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_still_image_is_never_queued_for_segmenting() {
+        let Some(content) = configured(8 * 1024 * 1024, 4 * 1024 * 1024).await else {
+            require_broker("uploading needs a broker");
+            return;
+        };
+        let png = b"\x89PNG\r\n\x1a\n and some pixels".to_vec();
+        let uploaded = body_json(
+            send(
+                Some(content),
+                upload_request(multipart("shot.png", &png, None)),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(uploaded["mime"], "image/png");
+        assert_eq!(uploaded["hls"], "skipped");
+    }
+
+    #[tokio::test]
+    async fn status_reports_what_segmenting_recorded() {
+        // The uploader's poll: segmenting outlives the request that started
+        // it, so this is how they learn the video became seekable.
+        let Some(content) = configured(8 * 1024 * 1024, 4 * 1024 * 1024).await else {
+            require_broker("status needs a broker");
+            return;
+        };
+        let uploaded = body_json(
+            send(
+                Some(content.clone()),
+                upload_request(multipart("clip.mp4", &fake_mp4(2_000), None)),
+            )
+            .await,
+        )
+        .await;
+        let digest = uploaded["digest"].as_str().unwrap().to_string();
+
+        let status = |content: Option<ContentUploads>, digest: String| async move {
+            body_json(
+                send(
+                    content,
+                    Request::builder()
+                        .uri(format!("/api/content/{digest}/status"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await,
+            )
+            .await
+        };
+
+        let before = status(Some(content.clone()), digest.clone()).await;
+        assert_eq!(before["hls"], "skipped", "nothing has segmented it");
+        assert_eq!(before["mime"], "video/mp4");
+        assert!(
+            before["playlist_url"].is_null(),
+            "no playlist has been produced"
+        );
+
+        // Simulate what the background transcode records.
+        let playlist = "d".repeat(64);
+        content
+            .blob
+            .annotate(&digest, PLAYLIST_NOTE, &playlist)
+            .await
+            .expect("annotate");
+        content
+            .blob
+            .annotate(&digest, HLS_NOTE, "ready")
+            .await
+            .expect("annotate");
+
+        let after = status(Some(content.clone()), digest.clone()).await;
+        assert_eq!(after["hls"], "ready");
+        assert_eq!(
+            after["playlist_url"],
+            format!("https://example.test/content/acme/{playlist}"),
+            "the uploader is handed the link a player needs"
+        );
+
+        // A note left by a segmentation that later failed must not be handed
+        // out: its segments are gone, so the URL would fail in the player.
+        content
+            .blob
+            .annotate(&digest, HLS_NOTE, "failed")
+            .await
+            .expect("annotate");
+        let stale = status(Some(content), digest).await;
+        assert_eq!(stale["hls"], "failed");
+        assert!(
+            stale["playlist_url"].is_null(),
+            "a playlist is only offered once it is ready: {stale}"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_for_a_file_that_does_not_exist_is_a_404() {
+        let Some(content) = configured(8 * 1024 * 1024, 4 * 1024 * 1024).await else {
+            require_broker("status needs a broker");
+            return;
+        };
+        let response = send(
+            Some(content),
+            Request::builder()
+                .uri(format!("/api/content/{}/status", "e".repeat(64)))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

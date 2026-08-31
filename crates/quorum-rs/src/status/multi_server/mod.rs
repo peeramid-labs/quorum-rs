@@ -795,6 +795,10 @@ fn build_router(state: MultiAppState) -> Router {
         )
         .route("/api/content/usage", get(content_handlers::usage))
         .route(
+            "/api/content/{digest}/status",
+            get(content_handlers::status),
+        )
+        .route(
             "/api/content/{digest}",
             get(content_handlers::fetch).delete(content_handlers::remove),
         )

@@ -82,6 +82,16 @@ impl Visibility {
     }
 }
 
+/// Where an object's annotations live.
+///
+/// A separate object rather than the store's own metadata map, because
+/// `update_metadata` in `async-nats` 0.47 writes back only the name and
+/// description and drops the map — an annotation made that way is accepted
+/// and then silently absent. A sidecar also keeps annotations off the serving
+/// path: reading a file's type and size stays one round trip whether or not
+/// anything has annotated it.
+const NOTES_PREFIX: &str = "notes.";
+
 /// What is known about a stored object without reading it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ObjectMeta {
@@ -209,6 +219,15 @@ pub trait Blob: Send + Sync {
     /// Metadata without the bytes.
     async fn head(&self, digest: &str) -> Result<ObjectMeta>;
 
+    /// Record `value` against `key` on an object already stored.
+    ///
+    /// Additive: the object's own fields and its other annotations are left
+    /// as they are.
+    async fn annotate(&self, digest: &str, key: &str, value: &str) -> Result<()>;
+
+    /// Everything annotated against `digest`. Empty when nothing has been.
+    async fn notes(&self, digest: &str) -> Result<HashMap<String, String>>;
+
     async fn delete(&self, digest: &str) -> Result<()>;
 
     async fn usage(&self) -> Result<Usage>;
@@ -238,6 +257,14 @@ pub struct NatsBlob {
     /// evict each other's position on every window and drive both back to the
     /// quadratic path.
     cursors: tokio::sync::Mutex<CursorPool<object_store::Object>>,
+    /// Serialises the read-modify-write in [`Blob::annotate`].
+    ///
+    /// One lock for the whole blob rather than one per object: annotations are
+    /// a handful per upload, so contention is not a concern, and two callers
+    /// annotating the same digest at once would otherwise each write back a
+    /// map missing the other's note. Two uploads of identical bytes share a
+    /// digest, so that is reachable rather than theoretical.
+    annotating: tokio::sync::Mutex<()>,
 }
 
 /// Part-read objects, keyed by where each one stopped.
@@ -297,6 +324,7 @@ impl NatsBlob {
             store,
             quota_bytes,
             cursors: tokio::sync::Mutex::new(CursorPool::new(MAX_OPEN_CURSORS)),
+            annotating: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -412,7 +440,45 @@ impl Blob for NatsBlob {
         Ok(ObjectMeta::from_info(&stored))
     }
 
+    async fn annotate(&self, digest: &str, key: &str, value: &str) -> Result<()> {
+        let _serialised = self.annotating.lock().await;
+        let mut notes = self.notes(digest).await?;
+        notes.insert(key.to_string(), value.to_string());
+        let encoded = serde_json::to_vec(&notes).context("encode annotations")?;
+        let mut reader = encoded.as_slice();
+        self.store
+            .put(
+                object_store::ObjectMetadata {
+                    name: format!("{NOTES_PREFIX}{digest}"),
+                    ..Default::default()
+                },
+                &mut reader,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context(format!("annotate {digest}"))?;
+        Ok(())
+    }
+
+    async fn notes(&self, digest: &str) -> Result<HashMap<String, String>> {
+        use tokio::io::AsyncReadExt as _;
+
+        // Absent is empty, not an error: most objects are never annotated.
+        let Ok(mut object) = self.store.get(format!("{NOTES_PREFIX}{digest}")).await else {
+            return Ok(HashMap::new());
+        };
+        let mut raw = Vec::new();
+        object
+            .read_to_end(&mut raw)
+            .await
+            .context("read annotations")?;
+        serde_json::from_slice(&raw).context("decode annotations")
+    }
+
     async fn delete(&self, digest: &str) -> Result<()> {
+        // The sidecar goes with it, or it would outlive what it describes and
+        // reattach itself to the next object stored under the same digest.
+        let _ = self.store.delete(format!("{NOTES_PREFIX}{digest}")).await;
         self.store
             .delete(digest)
             .await
@@ -455,7 +521,7 @@ impl Blob for NatsBlob {
             .context("collect object listing")?;
         Ok(infos
             .iter()
-            .filter(|info| !info.deleted)
+            .filter(|info| !info.deleted && !info.name.starts_with(NOTES_PREFIX))
             .map(ObjectMeta::from_info)
             .collect())
     }
@@ -981,6 +1047,56 @@ mod tests {
             freed.used_bytes < filled.used_bytes,
             "deleting must return the space: {filled:?} -> {freed:?}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_annotation_survives_and_leaves_the_object_alone() -> Result<()> {
+        // A pipeline records its result against an object already written. It
+        // must not be able to change what the object *is* while doing so — an
+        // annotation named `mime` must not become the media type.
+        let Some(blob) = blob_for("annotate", TEST_QUOTA_BYTES).await else {
+            require_broker("annotation needs a broker");
+            return Ok(());
+        };
+        let digest = put(&blob, b"a video").await?;
+
+        blob.annotate(&digest, "hls", "ready").await?;
+        blob.annotate(&digest, "playlist", &"b".repeat(64)).await?;
+        blob.annotate(&digest, "mime", "text/html").await?;
+
+        let notes = blob.notes(&digest).await?;
+        assert_eq!(notes.get("hls").map(String::as_str), Some("ready"));
+        assert_eq!(
+            notes.get("playlist").map(String::as_str),
+            Some("b".repeat(64).as_str())
+        );
+
+        let meta = blob.head(&digest).await?;
+        assert_eq!(
+            meta.mime, "video/mp4",
+            "an annotation must not overwrite a field the store owns"
+        );
+        assert_eq!(meta.filename, "clip.mp4");
+        assert_eq!(meta.bytes, b"a video".len() as u64);
+        assert_eq!(
+            blob.list().await?.len(),
+            1,
+            "the sidecar is not a file of the operator's"
+        );
+
+        // Re-annotating replaces that one note and keeps the others.
+        blob.annotate(&digest, "hls", "failed").await?;
+        let notes = blob.notes(&digest).await?;
+        assert_eq!(notes.get("hls").map(String::as_str), Some("failed"));
+        assert!(notes.contains_key("playlist"));
+
+        // An object nobody annotated has no notes, and that is not an error.
+        assert!(blob.notes(&"c".repeat(64)).await?.is_empty());
+
+        // And the bytes are still readable afterwards.
+        let (bytes, _) = blob.get_range(&digest, 0, 64).await?;
+        assert_eq!(bytes, b"a video");
         Ok(())
     }
 
