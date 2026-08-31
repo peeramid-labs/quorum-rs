@@ -97,6 +97,7 @@ fn mcp_eval_to_evaluation(e: McpEvaluationResult) -> Evaluation {
         .into_iter()
         .map(|d| DisagreementPoint {
             claim_id: d.claim_id,
+            anchor: None,
             proposal_claims: d.proposal_claims,
             evaluator_position: d.evaluator_position,
             confidence: match d.confidence.as_str() {

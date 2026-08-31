@@ -156,6 +156,78 @@ pub fn resolve_cite(source: &str, cite: &str) -> Option<CiteSpan> {
             return Some(span);
         }
     }
+    resolve_table_row(source, cite)
+}
+
+/// Resolve a cite that quotes a markdown table row with cells dropped or the
+/// tail truncated — the shapes evaluators actually produce when quoting
+/// tables. Cite cells must appear as an ordered subsequence of one row's
+/// cells; the last cite cell may be a prefix of its row cell (a cut-off
+/// quote). The span runs from the first matched cell to the last, so the
+/// substituted claim is the author's own row text, skipped cells included.
+fn resolve_table_row(source: &str, cite: &str) -> Option<CiteSpan> {
+    if !cite.contains('|') {
+        return None;
+    }
+    let cite_cells: Vec<String> = cite
+        .split('|')
+        .map(|c| normalize(c).0)
+        .filter(|c| !c.is_empty())
+        .collect();
+    // One lone cell is an ordinary quote, already tried above; a trivial pair
+    // of short fragments could match rows the author never meant.
+    if cite_cells.len() < 2 {
+        return None;
+    }
+
+    let mut line_start = 0usize;
+    for line in source.split_inclusive('\n') {
+        let base = line_start;
+        line_start += line.len();
+        if !line.contains('|') {
+            continue;
+        }
+        // Cell byte-ranges within the line, pipes excluded.
+        let mut cells: Vec<(usize, usize)> = Vec::new();
+        let mut cell_start = 0usize;
+        for (i, b) in line.bytes().enumerate() {
+            if b == b'|' {
+                cells.push((cell_start, i));
+                cell_start = i + 1;
+            }
+        }
+        cells.push((cell_start, line.trim_end_matches('\n').len()));
+
+        let mut matched: Vec<(usize, usize)> = Vec::new();
+        let mut want = 0usize;
+        for &(cs, ce) in &cells {
+            if want >= cite_cells.len() {
+                break;
+            }
+            let cell_norm = normalize(&line[cs..ce]).0;
+            if cell_norm.is_empty() {
+                continue;
+            }
+            let is_last = want == cite_cells.len() - 1;
+            let hit = cell_norm == cite_cells[want]
+                || (is_last
+                    && cite_cells[want].len() >= 12
+                    && cell_norm.starts_with(&cite_cells[want]));
+            if hit {
+                matched.push((cs, ce));
+                want += 1;
+            }
+        }
+        if want == cite_cells.len() {
+            let raw_start = base + matched.first()?.0;
+            let raw_end = base + matched.last()?.1;
+            // Exclude the cells' padding whitespace from the span.
+            let text = &source[raw_start..raw_end];
+            let start = raw_start + (text.len() - text.trim_start().len());
+            let end = raw_end - (text.len() - text.trim_end().len());
+            return Some(span_of(source, start, end));
+        }
+    }
     None
 }
 
@@ -462,6 +534,12 @@ pub trait Groundable {
     fn target_id(&self) -> &str;
     /// The claim assessments to ground, in place.
     fn claims_mut(&mut self) -> &mut Vec<Self::Claim>;
+    /// The disagreement points to ground, for runtimes that carry them.
+    /// Disagreements are never pruned and never trigger a re-quote: an
+    /// unresolved dispute quote stays as written, merely unanchored.
+    fn disagreements_mut(&mut self) -> Option<&mut Vec<super::DisagreementPoint>> {
+        None
+    }
 }
 
 impl Groundable for (String, super::Evaluation) {
@@ -472,6 +550,9 @@ impl Groundable for (String, super::Evaluation) {
     fn claims_mut(&mut self) -> &mut Vec<Self::Claim> {
         &mut self.1.claim_assessments
     }
+    fn disagreements_mut(&mut self) -> Option<&mut Vec<super::DisagreementPoint>> {
+        Some(&mut self.1.disagreements)
+    }
 }
 
 impl Groundable for super::nsed_agent::BatchEvaluationItem {
@@ -481,6 +562,9 @@ impl Groundable for super::nsed_agent::BatchEvaluationItem {
     }
     fn claims_mut(&mut self) -> &mut Vec<Self::Claim> {
         &mut self.claim_assessments
+    }
+    fn disagreements_mut(&mut self) -> Option<&mut Vec<super::DisagreementPoint>> {
+        Some(&mut self.disagreements)
     }
 }
 
@@ -591,6 +675,40 @@ pub fn ground_all<E: Groundable>(
                     ca.set_resolved(text, anchor);
                 }
                 None => missed_at.push((idx, cite.to_string())),
+            }
+        }
+        if let Some(disagreements) = e.disagreements_mut() {
+            for d in disagreements.iter_mut() {
+                if d.proposal_claims.trim().is_empty() {
+                    continue;
+                }
+                let resolved = resolve_cite(content, &d.proposal_claims)
+                    .map(|span| {
+                        let (start_utf16, end_utf16) = span.utf16_range(content);
+                        (
+                            span.text,
+                            super::ClaimAnchor::AnswerBody {
+                                start_utf16,
+                                end_utf16,
+                            },
+                        )
+                    })
+                    .or_else(|| {
+                        resolve_cite(thoughts, &d.proposal_claims)
+                            .map(|span| (span.text, super::ClaimAnchor::ThoughtWindow))
+                    });
+                if let Some((text, anchor)) = resolved {
+                    if d.claim_id
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .is_empty()
+                    {
+                        d.claim_id = Some(claim_fingerprint(&target_id, &text, round));
+                    }
+                    d.proposal_claims = text;
+                    d.anchor = Some(anchor);
+                }
             }
         }
         if missed_at.is_empty() {
@@ -835,6 +953,57 @@ mod grounding_tests {
                 ..Default::default()
             },
         )
+    }
+
+    /// A disagreement's disputed quote is grounded like a claim: anchored,
+    /// substituted with the author's exact text, given an identity — but a
+    /// quote that resolves nowhere is kept as written, never pruned.
+    #[test]
+    fn a_disagreement_quote_is_anchored_but_never_pruned() {
+        use crate::agents::{Confidence, DisagreementPoint};
+        let cands = candidates();
+        let mut evals = vec![(
+            "Candidate_A".to_string(),
+            Evaluation {
+                disagreements: vec![
+                    DisagreementPoint {
+                        claim_id: None,
+                        anchor: None,
+                        proposal_claims: "sorts in O(N LOG N) time".to_string(),
+                        evaluator_position: "it is O(n^2) worst case".to_string(),
+                        confidence: Confidence::High,
+                    },
+                    DisagreementPoint {
+                        claim_id: None,
+                        anchor: None,
+                        proposal_claims: "a quote nobody wrote".to_string(),
+                        evaluator_position: "still on record".to_string(),
+                        confidence: Confidence::Low,
+                    },
+                ],
+                ..Default::default()
+            },
+        )];
+        let unresolved = ground_all(&cands, 1, &mut evals, GroundingPolicy::Reject);
+        assert!(
+            unresolved.is_empty(),
+            "disagreements never demand a re-quote"
+        );
+
+        let ds = &evals[0].1.disagreements;
+        assert_eq!(ds.len(), 2, "nothing pruned");
+        assert_eq!(ds[0].proposal_claims, "sorts in O(n log n) time");
+        assert!(
+            matches!(
+                ds[0].anchor,
+                Some(crate::agents::ClaimAnchor::AnswerBody { .. })
+            ),
+            "resolved quote is anchored: {:?}",
+            ds[0].anchor
+        );
+        assert!(ds[0].claim_id.is_some(), "grounded quote gains an identity");
+        assert_eq!(ds[1].proposal_claims, "a quote nobody wrote");
+        assert!(ds[1].anchor.is_none() && ds[1].claim_id.is_none());
     }
 
     /// Reproduces the production defect: the native runtime published a cite
@@ -1258,5 +1427,33 @@ mod grounding_tests {
 
         assert!(unresolved.is_empty());
         assert_eq!(evals[0].1.claim_assessments.len(), 1);
+    }
+
+    /// Live payload strings from an addressed job: the three table-row cite
+    /// shapes evaluators actually produced — the full row, a row with a cell
+    /// dropped, and a mid-cell truncation.
+    #[test]
+    fn a_table_row_cite_resolves_with_cells_dropped_or_truncated() {
+        let content = "| CFM Flash Market contract benchmark | 32 GB DDR5 RDIMM | **$900** (Aug 11, 2026) | Up 23.29% MoM from ~$730 in July 2026. Available only to large buyers with LTAs. |\n| US | Kingston KCP556SD8-32, DDR5-5600 SODIMM | **$575** | [CompSource](https://www.compsource.com/buy/KCP556SD832/) |";
+        let full_row = "CFM Flash Market contract benchmark | 32 GB DDR5 RDIMM | **$900** (Aug 11, 2026) | Up 23.29% MoM from ~$730 in July 2026. Available only to large buyers with LTAs.";
+        let skipped_col = "CFM Flash Market contract benchmark | **$900** (Aug 11, 2026) | Up 23.29% MoM from ~$730 in July 2026.";
+        let truncated = "Kingston KCP556SD8-32, DDR5-5600 SODIMM | **$575";
+
+        let full = resolve_cite(content, full_row).expect("full row");
+        assert!(full.text.starts_with("CFM Flash Market"));
+
+        let skipped = resolve_cite(content, skipped_col).expect("skipped column");
+        assert!(
+            skipped.text.starts_with("CFM Flash Market")
+                && skipped.text.contains("32 GB DDR5 RDIMM"),
+            "the span covers the author's own row, skipped cells included: {:?}",
+            skipped.text
+        );
+
+        let cut = resolve_cite(content, truncated).expect("truncated tail");
+        assert!(cut.text.starts_with("Kingston KCP556SD8-32"));
+
+        // A row nobody wrote still resolves to nothing.
+        assert!(resolve_cite(content, "Corsair | **$99**").is_none());
     }
 }

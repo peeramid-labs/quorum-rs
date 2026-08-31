@@ -641,6 +641,11 @@ pub struct DisagreementPoint {
     pub evaluator_position: String,
     /// How confident the evaluator is in their counter-position.
     pub confidence: Confidence,
+    /// Where the disputed quote was located in the proposal, filled in by
+    /// citation grounding — same contract as [`ClaimAssessment::anchor`].
+    /// Models do not supply this; anything they send is overwritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<ClaimAnchor>,
 }
 
 /// Per-category signed quality scores (-100 to +100 scale, same as endorsement_weight).
@@ -1668,6 +1673,7 @@ mod tests {
                 },
             ],
             disagreements: vec![DisagreementPoint {
+                anchor: None,
                 claim_id: Some("abc123".to_string()),
                 proposal_claims: "No race condition".to_string(),
                 evaluator_position: "Race condition on shared state".to_string(),
@@ -1899,6 +1905,7 @@ mod tests {
             None,
             vec![],
             vec![DisagreementPoint {
+                anchor: None,
                 claim_id: None,
                 proposal_claims: "Uses quicksort".to_string(),
                 evaluator_position: "Mergesort is better for stability".to_string(),
