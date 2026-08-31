@@ -160,12 +160,24 @@ jobs:
         with:
           key: "ci-test-v1"
 
+      - name: Install ffmpeg
+        # The HLS pipeline shells out to it. Without it the transcode tests
+        # skip, and the one thing a fake transcoder cannot check — that the
+        # argument vector we actually run produces a playlist — goes untested.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
+
       - name: Set up Environment Variables
         run: |
           # NATS reachable via DNS alias on per-workflow network
           echo "NATS_URL=nats://nats:4222" >> $GITHUB_ENV
           echo "RUST_LOG=info" >> $GITHUB_ENV
           echo "CARGO_BUILD_JOBS=2" >> $GITHUB_ENV
+          # This job provides a broker, so a test that skips for want of one is
+          # a test that silently stopped covering anything. Fail instead.
+          echo "REQUIRE_NATS=1" >> $GITHUB_ENV
 
       - name: Run Tests
         run: cargo test --workspace

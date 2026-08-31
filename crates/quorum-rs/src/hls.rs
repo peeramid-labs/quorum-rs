@@ -422,6 +422,112 @@ mod tests {
         );
     }
 
+    /// A few seconds of real H.264, made by ffmpeg itself.
+    ///
+    /// `None` where this host has no ffmpeg — the same gate the pipeline uses,
+    /// so a developer without one sees a skip rather than a failure, and CI,
+    /// which installs it, does not.
+    async fn real_video() -> Result<Option<(tempfile::TempDir, std::path::PathBuf)>> {
+        let ffmpeg = Ffmpeg::default();
+        if !ffmpeg.available().await {
+            eprintln!("Skipping: no ffmpeg on this host");
+            return Ok(None);
+        }
+        let dir = tempfile::tempdir().context("temp dir")?;
+        let path = dir.path().join("source.mp4");
+        let made = tokio::process::Command::new(&ffmpeg.binary)
+            .args([
+                "-nostdin",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=8:size=320x240:rate=15",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .context("run ffmpeg to build the fixture")?;
+        // Loud rather than a skip: ffmpeg is present, so a fixture it cannot
+        // build is a broken build of it, not a reason to stop testing.
+        anyhow::ensure!(made.success(), "ffmpeg could not make a test video");
+        Ok(Some((dir, path)))
+    }
+
+    #[tokio::test]
+    async fn real_ffmpeg_produces_a_playlist_whose_segments_all_resolve() -> Result<()> {
+        // The one thing the fake transcoder cannot tell us: that the argument
+        // vector we actually run produces an HLS playlist, and that every
+        // piece it names is something we stored.
+        let Some(blob) = blob_for("realffmpeg", 8 * 1024 * 1024).await else {
+            require_broker("the real transcode needs a broker");
+            return Ok(());
+        };
+        let Some((_dir, source)) = real_video().await? else {
+            return Ok(());
+        };
+
+        let result = segment_and_store(
+            &blob,
+            &Ffmpeg::default(),
+            &source,
+            "https://cdn.test/content/acme",
+            "agent-7",
+        )
+        .await
+        .expect("segmented");
+
+        // Eight seconds at six-second segments is two, plus an init segment
+        // and the playlist. Asserted as "more than one segment" rather than an
+        // exact count, which ffmpeg is entitled to change.
+        assert!(
+            result.stored.len() >= 3,
+            "expected an init segment, media segments and a playlist: {:?}",
+            result.stored
+        );
+
+        let playlist = blob.head(&result.playlist).await.expect("playlist stored");
+        assert_eq!(playlist.mime, "application/vnd.apple.mpegurl");
+        let (bytes, _) = blob
+            .get_range(&result.playlist, 0, playlist.bytes)
+            .await
+            .expect("read the playlist");
+        let text = String::from_utf8(bytes).expect("utf8");
+
+        assert!(text.starts_with("#EXTM3U"), "not a playlist: {text}");
+        assert!(
+            text.contains("#EXT-X-ENDLIST"),
+            "not a finished VOD: {text}"
+        );
+        assert!(
+            !text.contains(".m4s") && !text.contains(".ts"),
+            "a local filename survived: {text}"
+        );
+
+        // Every URL the playlist hands a player must resolve to bytes we hold,
+        // which is the property a viewer actually depends on.
+        let referenced: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("https://cdn.test/content/acme/"))
+            .filter_map(|line| line.rsplit('/').next())
+            .map(|tail| tail.trim_end_matches('"'))
+            .collect();
+        assert!(referenced.len() >= 2, "too few pieces: {text}");
+        for digest in referenced {
+            let piece = blob.head(digest).await.unwrap_or_else(|e| {
+                panic!("the playlist names {digest}, which is not stored: {e}")
+            });
+            assert!(piece.bytes > 0, "an empty segment: {digest}");
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_host_without_ffmpeg_reports_it_rather_than_failing() {
         // A library user who never asked for a media pipeline gets `Skipped`
