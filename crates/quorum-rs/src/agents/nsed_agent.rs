@@ -8082,7 +8082,9 @@ mod tests {
             0,
         );
         assert!(
-            names.iter().any(|n| n == "web_search"),
+            names
+                .iter()
+                .any(|n| n == crate::tools::delegated_search::LOCAL_TOOL_NAME),
             "a configured search tool must reach the agent: {names:?}"
         );
     }
@@ -8091,7 +8093,9 @@ mod tests {
     fn an_agent_without_delegated_search_is_given_no_search_tool() {
         let names = tool_names_for(1, 0);
         assert!(
-            !names.iter().any(|n| n == "web_search"),
+            !names
+                .iter()
+                .any(|n| n == crate::tools::delegated_search::LOCAL_TOOL_NAME),
             "search is opt-in: {names:?}"
         );
     }
