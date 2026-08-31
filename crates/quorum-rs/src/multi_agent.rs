@@ -235,6 +235,18 @@ impl MultiAgentRunner {
             let pause_handles = self.pause_handles.clone();
             let event_stores = self.event_stores.clone();
             let registry = self.orchestrator_registry.clone();
+            // Uploads need the agent's own NATS connection and a bucket the
+            // deployment named. Absent either, the routes answer 503.
+            let content = match self.workers.first() {
+                Some((name, worker)) => {
+                    crate::status::multi_server::content_uploads_from_env(
+                        worker.jetstream(),
+                        name.clone(),
+                    )
+                    .await
+                }
+                None => None,
+            };
             tokio::spawn(async move {
                 crate::status::multi_server::MultiAgentStatusServer::run_control_plane(
                     port,
@@ -246,6 +258,7 @@ impl MultiAgentRunner {
                     event_stores,
                     registry,
                     None, // Middleware pipeline — wired when MiddlewareConfig is available
+                    content,
                 )
                 .await;
             });

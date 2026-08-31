@@ -8,6 +8,7 @@
 
 pub mod api_docs;
 mod chat_handlers;
+pub mod content_handlers;
 mod hitl_handlers;
 mod registration_handlers;
 mod registry_handlers;
@@ -65,6 +66,10 @@ pub(crate) struct MultiAppState {
     /// (the loopback-default / dev behaviour); `Some` = every `/api/*` request
     /// must carry `Authorization: Bearer <token>`.
     auth_token: Option<Arc<str>>,
+    /// File uploads. `None` where the agent was given no bucket to write to,
+    /// which is the default — the routes then answer 503 rather than 404, so
+    /// "not configured" is distinguishable from "no such file".
+    content: Option<content_handlers::ContentUploads>,
 }
 
 /// Global configuration visible via the dashboard.
@@ -191,6 +196,40 @@ async fn auth_status(State(auth): State<DashAuth>, headers: HeaderMap) -> Json<A
     })
 }
 
+#[cfg(test)]
+impl MultiAppState {
+    /// A state carrying nothing but the upload configuration, for tests that
+    /// exercise the content routes and no agent.
+    pub(super) fn for_content(content: Option<content_handlers::ContentUploads>) -> Self {
+        Self {
+            statuses: HashMap::new(),
+            chat_agents: HashMap::new(),
+            configs: HashMap::new(),
+            buffers: HashMap::new(),
+            pause_handles: HashMap::new(),
+            event_stores: HashMap::new(),
+            orchestrator_registry: None,
+            base_hold_secs: Arc::new(AtomicU64::new(0)),
+            response_sla_secs: Arc::new(AtomicU64::new(0)),
+            buffer_floor_pct: Arc::new(AtomicU64::new(0)),
+            before_release_middleware: None,
+            auth_token: None,
+            content,
+        }
+    }
+}
+
+/// Build the upload configuration from this process's environment.
+///
+/// Exposed so the runner can construct it while it still holds a worker's NATS
+/// connection; the server itself is handed the result.
+pub async fn content_uploads_from_env(
+    js: &async_nats::jetstream::Context,
+    uploaded_by: String,
+) -> Option<content_handlers::ContentUploads> {
+    content_handlers::ContentUploads::from_env(js, uploaded_by).await
+}
+
 impl MultiAgentStatusServer {
     /// Start the multi-agent status server on the given port.
     ///
@@ -230,6 +269,7 @@ impl MultiAgentStatusServer {
             HashMap::new(),
             registry,
             None, // No middleware in basic mode
+            None, // No uploads without a bucket to write to
         )
         .await;
     }
@@ -251,6 +291,7 @@ impl MultiAgentStatusServer {
         event_stores: HashMap<String, AgentEventStore>,
         registry: Option<OrchestratorRegistry>,
         middleware: Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
+        content: Option<content_handlers::ContentUploads>,
     ) {
         // Compute the maximum base_hold_duration() across all buffers (full precision).
         // Defaults to Duration::ZERO (pass-through) when no buffers are configured.
@@ -276,6 +317,7 @@ impl MultiAgentStatusServer {
             buffer_floor_pct: Arc::new(AtomicU64::new(0)), // deprecated — SLA-based release replaces buffer floor
             before_release_middleware: middleware,
             auth_token: resolve_dashboard_token(std::env::var("QUORUM_DASHBOARD_TOKEN").ok()),
+            content,
         };
 
         // Propagate initial response SLA to all buffers for deadline-based release.
@@ -742,6 +784,19 @@ fn build_router(state: MultiAppState) -> Router {
         .route(
             "/api/config",
             get(registry_handlers::get_global_config).put(registry_handlers::update_global_config),
+        )
+        .route(
+            "/api/content",
+            post(content_handlers::upload)
+                // The upload's own ceiling is enforced while the body streams;
+                // axum's default 2 MiB limit would reject a video long before
+                // that and with a less useful answer.
+                .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route("/api/content/usage", get(content_handlers::usage))
+        .route(
+            "/api/content/{digest}",
+            get(content_handlers::fetch).delete(content_handlers::remove),
         )
         .route("/api/agents", get(list_agents))
         .route("/api/agents/errors", get(agents_errors))

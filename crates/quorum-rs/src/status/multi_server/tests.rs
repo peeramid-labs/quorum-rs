@@ -71,6 +71,7 @@ fn test_state() -> MultiAppState {
         buffer_floor_pct: Arc::new(AtomicU64::new(0)),
         before_release_middleware: None,
         auth_token: None,
+        content: None,
     }
 }
 
@@ -302,6 +303,7 @@ async fn list_agents_empty_state() {
         buffer_floor_pct: Arc::new(AtomicU64::new(0)),
         before_release_middleware: None,
         auth_token: None,
+        content: None,
     };
     let app = build_router(state);
     let (status, body) = get_request(app, "/api/agents").await;
@@ -782,6 +784,7 @@ async fn default_sla_is_zero_when_no_buffers() {
         buffer_floor_pct: Arc::new(AtomicU64::new(0)),
         before_release_middleware: None,
         auth_token: None,
+        content: None,
     };
     let app = build_router(state);
     let (status, body) = get_request(app, "/api/config").await;
@@ -1918,6 +1921,7 @@ async fn auto_all_empty_state_returns_zero_count() {
         buffer_floor_pct: Arc::new(AtomicU64::new(0)),
         before_release_middleware: None,
         auth_token: None,
+        content: None,
     };
     let app = build_router(state);
     let (status, body) = put_json(app, "/api/agents/auto-all", r#"{"enabled": true}"#).await;
