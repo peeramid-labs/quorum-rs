@@ -6,9 +6,9 @@
 //! process's job — this one returns the URL that process will serve.
 
 use crate::files::blob::{
-    Blob, NatsBlob, ObjectMeta, QuotaExceeded, Usage, Visibility, open_blob, parse_byte_range,
-    stamped_now,
+    Blob, NatsBlob, ObjectMeta, Usage, Visibility, open_blob, parse_byte_range,
 };
+use crate::files::upload::{Refusal as UploadRefusal, Spooled, read_upload_form, store_upload};
 use axum::{
     Json,
     body::Body,
@@ -17,17 +17,12 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use super::MultiAppState;
 
 /// The largest upload accepted when nothing says otherwise.
 const DEFAULT_MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
-
-/// How much of a file is read before its type is decided.
-const SNIFF_BYTES: usize = 16;
 
 /// Bounded so a whole-video read is never assembled in memory before answering.
 const READ_WINDOW: u64 = 512 * 1024;
@@ -166,6 +161,34 @@ fn boxed(status: StatusCode, message: impl Into<String>) -> Box<Response> {
     Box::new(refuse(status, message))
 }
 
+/// The shared upload layer's refusal, as this surface answers it.
+fn render(refusal: UploadRefusal) -> Box<Response> {
+    match refusal {
+        UploadRefusal::TooLarge { .. } => boxed(StatusCode::PAYLOAD_TOO_LARGE, refusal.to_string()),
+        UploadRefusal::UnsupportedType => {
+            boxed(StatusCode::UNSUPPORTED_MEDIA_TYPE, refusal.to_string())
+        }
+        UploadRefusal::Malformed(_) => boxed(StatusCode::BAD_REQUEST, refusal.to_string()),
+        // 507 with the numbers, not a 500 with a string: the caller can act on
+        // "you are out of space", and cannot act on "something went wrong".
+        UploadRefusal::OutOfSpace {
+            used_bytes,
+            quota_bytes,
+        } => Box::new(
+            (
+                StatusCode::INSUFFICIENT_STORAGE,
+                Json(Refusal {
+                    error: refusal.to_string(),
+                    used_bytes: Some(used_bytes),
+                    quota_bytes: Some(quota_bytes),
+                }),
+            )
+                .into_response(),
+        ),
+        UploadRefusal::Io(_) => boxed(StatusCode::INTERNAL_SERVER_ERROR, refusal.to_string()),
+    }
+}
+
 fn refuse(status: StatusCode, message: impl Into<String>) -> Response {
     (
         status,
@@ -207,122 +230,6 @@ fn not_configured() -> Response {
     )
 }
 
-/// Walk the multipart body: the file, spooled and hashed, and what visibility
-/// it was asked for.
-async fn read_form(
-    form: &mut Multipart,
-    max_upload_bytes: u64,
-) -> Result<(Visibility, Spooled), Box<Response>> {
-    let mut visibility: Option<Visibility> = None;
-    let mut file: Option<Spooled> = None;
-
-    while let Some(field) = form.next_field().await.map_err(|e| {
-        Box::new(refuse(
-            StatusCode::BAD_REQUEST,
-            format!("malformed upload: {e}"),
-        ))
-    })? {
-        match field.name().unwrap_or_default() {
-            "visibility" => visibility = Some(read_visibility(read_short_field(field).await?)?),
-            "file" => {
-                let filename = safe_filename(field.file_name().unwrap_or("upload"));
-                let spooled = spool(field, max_upload_bytes).await?;
-                file = Some(Spooled {
-                    filename,
-                    ..spooled
-                });
-            }
-            // Ignored rather than refused: a browser form carries fields this
-            // endpoint has no interest in, and rejecting the whole upload for
-            // one of them helps nobody.
-            _ => {}
-        }
-    }
-
-    let file = file.ok_or_else(|| {
-        boxed(
-            StatusCode::BAD_REQUEST,
-            "no `file` part in the upload".to_string(),
-        )
-    })?;
-    // Absent is refused rather than defaulted. Defaulting either way guesses
-    // whether the uploader meant to publish, and that mistake is invisible
-    // until the link is out — or until it is not.
-    let visibility = visibility.ok_or_else(|| {
-        boxed(
-            StatusCode::BAD_REQUEST,
-            "no `visibility` part: send `public` or `private` explicitly".to_string(),
-        )
-    })?;
-    Ok((visibility, file))
-}
-
-/// A filename safe to store and to hand to whatever serves it.
-///
-/// The value is the uploader's, and a downstream process puts it in a
-/// `Content-Disposition` header. Sanitised at the boundary where it enters
-/// storage rather than trusting every later reader to remember.
-fn safe_filename(raw: &str) -> String {
-    let cleaned: String = raw
-        .chars()
-        .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
-        .take(120)
-        .collect();
-    let cleaned = cleaned.trim().to_string();
-    if cleaned.is_empty() {
-        "upload".to_string()
-    } else {
-        cleaned
-    }
-}
-
-/// The longest a non-file part may be.
-///
-/// `Field::text()` collects a part whole with no ceiling of its own, and the
-/// upload route disables the request-level limit so a video can through. A
-/// part named anything but `file` would otherwise be an unbounded allocation.
-const MAX_FIELD_BYTES: usize = 256;
-
-/// Read a small non-file part, refusing one that is not small.
-async fn read_short_field(
-    mut field: axum::extract::multipart::Field<'_>,
-) -> Result<String, Box<Response>> {
-    let mut raw = Vec::new();
-    while let Some(chunk) = field
-        .chunk()
-        .await
-        .map_err(|e| boxed(StatusCode::BAD_REQUEST, format!("malformed upload: {e}")))?
-    {
-        raw.extend_from_slice(&chunk);
-        if raw.len() > MAX_FIELD_BYTES {
-            return Err(boxed(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("a form field exceeds {MAX_FIELD_BYTES} bytes"),
-            ));
-        }
-    }
-    String::from_utf8(raw).map_err(|_| {
-        boxed(
-            StatusCode::BAD_REQUEST,
-            "a form field is not text".to_string(),
-        )
-    })
-}
-
-/// Refused rather than defaulted: defaulting would publish a file whose
-/// uploader asked for something else, and the mistake is invisible until the
-/// link is out.
-fn read_visibility(raw: String) -> Result<Visibility, Box<Response>> {
-    match raw.trim() {
-        "public" => Ok(Visibility::Public),
-        "private" => Ok(Visibility::Private),
-        other => Err(Box::new(refuse(
-            StatusCode::BAD_REQUEST,
-            format!("visibility {other:?} is neither public nor private"),
-        ))),
-    }
-}
-
 /// `POST /api/content` — store a file and return the address it can be read at.
 ///
 /// The digest names the object, so it has to be known before the store is
@@ -334,72 +241,35 @@ pub(super) async fn upload(State(state): State<MultiAppState>, mut form: Multipa
         return not_configured();
     };
 
-    let (visibility, mut spooled) = match read_form(&mut form, content.max_upload_bytes).await {
-        Ok(parts) => parts,
-        Err(refusal) => return *refusal,
-    };
+    let (visibility, mut spooled) =
+        match read_upload_form(&mut form, content.max_upload_bytes).await {
+            Ok(parts) => parts,
+            Err(refusal) => return *render(refusal),
+        };
 
-    let Some(mime) = sniff_mime(&spooled.head) else {
-        return refuse(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "this is not a media type this deployment serves",
-        );
-    };
-
-    let meta = ObjectMeta {
-        digest: spooled.digest.clone(),
-        filename: spooled.filename.clone(),
-        mime: mime.to_string(),
-        bytes: spooled.bytes,
+    let stored = match store_upload(
+        content.blob.as_ref(),
+        &mut spooled,
         visibility,
-        uploaded_by: content.uploaded_by.clone(),
-        created_at: stamped_now(),
+        &content.uploaded_by,
+    )
+    .await
+    {
+        Ok(stored) => stored,
+        Err(refusal) => return *render(refusal),
     };
 
-    if let Err(e) = spooled.file.rewind().await {
-        return refuse(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("could not re-read the upload: {e}"),
-        );
-    }
-
-    match content
-        .blob
-        .put_stream(&spooled.digest, &mut spooled.file, &meta)
-        .await
-    {
-        Ok(stored) => {
-            let hls = start_segmenting(&content, &stored, spooled);
-            Json(Uploaded {
-                address: format!("nats://{}/{}", content.blob.bucket(), stored.digest),
-                url: content.public_url(&stored.digest),
-                digest: stored.digest,
-                mime: stored.mime,
-                bytes: stored.bytes,
-                visibility: stored.visibility,
-                hls,
-            })
-            .into_response()
-        }
-        Err(e) => match e.downcast_ref::<QuotaExceeded>() {
-            // 507 with the numbers, not a 500 with a string: the caller can
-            // act on "you are out of space", and cannot act on "something
-            // went wrong".
-            Some(full) => (
-                StatusCode::INSUFFICIENT_STORAGE,
-                Json(Refusal {
-                    error: full.to_string(),
-                    used_bytes: Some(full.used_bytes),
-                    quota_bytes: Some(full.quota_bytes),
-                }),
-            )
-                .into_response(),
-            None => refuse(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("could not store the upload: {e:#}"),
-            ),
-        },
-    }
+    let hls = start_segmenting(&content, &stored, spooled);
+    Json(Uploaded {
+        address: format!("nats://{}/{}", content.blob.bucket(), stored.digest),
+        url: content.public_url(&stored.digest),
+        digest: stored.digest,
+        mime: stored.mime,
+        bytes: stored.bytes,
+        visibility: stored.visibility,
+        hls,
+    })
+    .into_response()
 }
 
 /// Where segmenting is recorded against the original.
@@ -486,108 +356,6 @@ fn start_segmenting(
     });
 
     crate::files::hls::HlsState::Pending
-}
-
-/// An upload on disk, hashed on the way there.
-struct Spooled {
-    file: tokio::fs::File,
-    /// Kept alive: dropping the handle deletes the file, and the spool has to
-    /// outlive both the read that streams it into the bucket and any transcode
-    /// that follows.
-    guard: tempfile::TempPath,
-    digest: String,
-    bytes: u64,
-    /// The first bytes, for deciding the media type without re-reading.
-    head: Vec<u8>,
-    filename: String,
-}
-
-impl Spooled {
-    fn path(&self) -> &std::path::Path {
-        &self.guard
-    }
-}
-
-/// Write a field to a temporary file, hashing as it lands and stopping at the
-/// ceiling.
-///
-/// The cap is enforced while reading, not after: reading a whole body to
-/// discover it was too large is the denial of service the cap exists to
-/// prevent.
-async fn spool(
-    mut field: axum::extract::multipart::Field<'_>,
-    max: u64,
-) -> Result<Spooled, Box<Response>> {
-    let spool = tempfile::NamedTempFile::new().map_err(|e| {
-        refuse(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("no spool file: {e}"),
-        )
-    })?;
-    let path = spool.into_temp_path();
-    // Read *and* write: the same handle is rewound and streamed into the
-    // bucket once the digest is known, and a write-only handle fails there
-    // rather than here.
-    let mut file = tokio::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .truncate(true)
-        .open(&path)
-        .await
-        .map_err(|e| {
-            refuse(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("no spool file: {e}"),
-            )
-        })?;
-
-    let mut hasher = Sha256::new();
-    let mut bytes: u64 = 0;
-    let mut head = Vec::with_capacity(SNIFF_BYTES);
-
-    while let Some(chunk) = field
-        .chunk()
-        .await
-        .map_err(|e| boxed(StatusCode::BAD_REQUEST, format!("upload interrupted: {e}")))?
-    {
-        bytes += chunk.len() as u64;
-        if bytes > max {
-            return Err(boxed(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("upload exceeds the {max} byte limit"),
-            ));
-        }
-        if head.len() < SNIFF_BYTES {
-            let wanted = SNIFF_BYTES - head.len();
-            head.extend_from_slice(&chunk[..wanted.min(chunk.len())]);
-        }
-        hasher.update(&chunk);
-        file.write_all(&chunk).await.map_err(|e| {
-            boxed(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("could not spool the upload: {e}"),
-            )
-        })?;
-    }
-    // Propagated, not swallowed: `write_all` can return before the bytes reach
-    // the OS, so a full disk surfaces here. Ignoring it would store a short
-    // file under the digest of the whole one, which is the single invariant
-    // content addressing rests on.
-    file.flush().await.map_err(|e| {
-        boxed(
-            StatusCode::INSUFFICIENT_STORAGE,
-            format!("could not flush the upload to disk: {e}"),
-        )
-    })?;
-
-    Ok(Spooled {
-        file,
-        guard: path,
-        digest: hex::encode(hasher.finalize()),
-        bytes,
-        head,
-        filename: String::new(),
-    })
 }
 
 /// A body that reads windows as the client consumes them.
@@ -794,63 +562,6 @@ pub(super) async fn usage(State(state): State<MultiAppState>) -> Response {
             format!("could not read usage: {e:#}"),
         ),
     }
-}
-
-/// Magic numbers that identify a type outright, longest first so a shorter
-/// prefix cannot claim a file a longer one would have matched.
-const MAGIC: [(&[u8], &str); 8] = [
-    (b"\x89PNG\r\n\x1a\n", "image/png"),
-    (b"GIF87a", "image/gif"),
-    (b"GIF89a", "image/gif"),
-    (b"%PDF-", "application/pdf"),
-    (b"\x1a\x45\xdf\xa3", "video/webm"),
-    (b"OggS", "audio/ogg"),
-    (b"\xff\xd8\xff", "image/jpeg"),
-    (b"ID3", "audio/mpeg"),
-];
-
-/// The media types an upload may be.
-///
-/// An allowlist, not a blocklist: the type is stored and later echoed back as
-/// `Content-Type` by a public endpoint, so anything unrecognised here would be
-/// a type this deployment never decided it was willing to serve.
-fn sniff_mime(head: &[u8]) -> Option<&'static str> {
-    if let Some((_, mime)) = MAGIC
-        .iter()
-        .find(|(magic, _)| head.len() >= magic.len() && &head[..magic.len()] == *magic)
-    {
-        return Some(mime);
-    }
-    sniff_container(head).or_else(|| sniff_mpeg_frame(head))
-}
-
-/// Formats whose first four bytes name a container, not a type.
-///
-/// RIFF and ISO base media both need a second look: `RIFF` alone would serve a
-/// wav as a webp, and `ftyp` alone cannot tell mp4 from quicktime.
-fn sniff_container(head: &[u8]) -> Option<&'static str> {
-    if head.len() < 12 {
-        return None;
-    }
-    if &head[..4] == b"RIFF" {
-        return match &head[8..12] {
-            b"WEBP" => Some("image/webp"),
-            b"WAVE" => Some("audio/wav"),
-            _ => None,
-        };
-    }
-    if &head[4..8] == b"ftyp" {
-        return match &head[8..11] {
-            b"qt " => Some("video/quicktime"),
-            _ => Some("video/mp4"),
-        };
-    }
-    None
-}
-
-/// A bare MPEG audio frame, which carries no magic string — only a sync word.
-fn sniff_mpeg_frame(head: &[u8]) -> Option<&'static str> {
-    (head.len() >= 2 && head[0] == 0xff && (head[1] & 0xe0) == 0xe0).then_some("audio/mpeg")
 }
 
 #[cfg(test)]
@@ -1577,7 +1288,7 @@ mod tests {
             require_broker("the field cap needs a broker");
             return;
         };
-        let huge = "p".repeat(MAX_FIELD_BYTES * 4);
+        let huge = "p".repeat(crate::files::upload::MAX_FIELD_BYTES * 4);
         let response = send(
             Some(content),
             upload_request(multipart("clip.mp4", &fake_mp4(1_000), Some(&huge))),
@@ -1680,53 +1391,5 @@ mod tests {
         .await;
         assert_eq!(first["digest"], second["digest"], "the digest is the name");
         assert_eq!(content.blob.list().await.expect("list").len(), 1);
-    }
-
-    #[test]
-    fn sniffing_recognises_the_types_this_deployment_serves() {
-        assert_eq!(sniff_mime(b"\x89PNG\r\n\x1a\n....."), Some("image/png"));
-        assert_eq!(sniff_mime(b"\xff\xd8\xff\xe0JFIF"), Some("image/jpeg"));
-        assert_eq!(sniff_mime(b"GIF89a......"), Some("image/gif"));
-        assert_eq!(sniff_mime(b"RIFF____WEBPVP8 "), Some("image/webp"));
-        assert_eq!(
-            sniff_mime(b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00"),
-            Some("video/mp4")
-        );
-        assert_eq!(
-            sniff_mime(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00"),
-            Some("video/mp4")
-        );
-        assert_eq!(
-            sniff_mime(b"\x00\x00\x00\x1cftypqt  \x00\x00\x02\x00"),
-            Some("video/quicktime")
-        );
-        assert_eq!(sniff_mime(b"\x1a\x45\xdf\xa3........"), Some("video/webm"));
-        assert_eq!(sniff_mime(b"OggS\x00\x02\x00\x00"), Some("audio/ogg"));
-        assert_eq!(sniff_mime(b"ID3\x03\x00\x00\x00"), Some("audio/mpeg"));
-        assert_eq!(sniff_mime(b"RIFF____WAVEfmt "), Some("audio/wav"));
-        assert_eq!(sniff_mime(b"%PDF-1.7\n"), Some("application/pdf"));
-    }
-
-    #[test]
-    fn an_unrecognised_type_is_refused_rather_than_guessed() {
-        // The stored type is echoed back as `Content-Type` by a public
-        // endpoint, so "probably fine" is not a decision this can make.
-        assert_eq!(sniff_mime(b"MZ\x90\x00"), None, "an executable");
-        assert_eq!(sniff_mime(b"\x7fELF\x02\x01\x01"), None, "an executable");
-        assert_eq!(sniff_mime(b"PK\x03\x04"), None, "a zip");
-        assert_eq!(sniff_mime(b"<svg xmlns=\"http"), None, "svg is script");
-        assert_eq!(sniff_mime(b"<!DOCTYPE html>"), None, "html is script");
-        assert_eq!(sniff_mime(b""), None, "nothing at all");
-        assert_eq!(sniff_mime(b"\x89PN"), None, "a truncated magic number");
-    }
-
-    #[test]
-    fn riff_containers_are_told_apart_by_their_form_type() {
-        // Both start `RIFF`. Reading only the first four bytes would serve a
-        // wav as a webp.
-        assert_eq!(sniff_mime(b"RIFF____WEBPVP8 "), Some("image/webp"));
-        assert_eq!(sniff_mime(b"RIFF____WAVEfmt "), Some("audio/wav"));
-        assert_eq!(sniff_mime(b"RIFF____AVI LIST"), None, "avi is not served");
-        assert_eq!(sniff_mime(b"RIFF___"), None, "too short to tell");
     }
 }

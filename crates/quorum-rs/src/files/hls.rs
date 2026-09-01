@@ -743,6 +743,13 @@ mod tests {
 /// objects.
 const SEGMENT_SECONDS: u32 = 6;
 
+/// Prefix on the stored filename of everything segmenting produces.
+///
+/// A library view lists what someone uploaded, not the hundreds of segments
+/// derived from one video, and the filename is the only field that can say so
+/// without a second object per segment.
+pub const DERIVED_PREFIX: &str = "hls/";
+
 /// What ffmpeg is told to write, and what the pipeline then looks for.
 const PLAYLIST_NAME: &str = "index.m3u8";
 
@@ -1014,7 +1021,7 @@ async fn store_bytes(
         &mut reader,
         &ObjectMeta {
             digest: digest.clone(),
-            filename: name.to_string(),
+            filename: format!("{DERIVED_PREFIX}{name}"),
             mime: segment_mime(name).to_string(),
             bytes: bytes.len() as u64,
             // Inherited from the source. A private video whose segments were
