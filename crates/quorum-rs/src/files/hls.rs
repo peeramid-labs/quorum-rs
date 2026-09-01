@@ -750,6 +750,15 @@ const SEGMENT_SECONDS: u32 = 6;
 /// without a second object per segment.
 pub const DERIVED_PREFIX: &str = "hls/";
 
+/// Where segmenting is recorded against the original, as an annotation on it.
+///
+/// Public because the process that segments and the process that serves are
+/// not the same one: a playlist is content-addressed by its own bytes, so its
+/// digest cannot be derived from the source's and has to be read from here.
+pub const HLS_NOTE: &str = "hls";
+/// Where the produced playlist's digest is recorded against the original.
+pub const PLAYLIST_NOTE: &str = "playlist";
+
 /// What ffmpeg is told to write, and what the pipeline then looks for.
 const PLAYLIST_NAME: &str = "index.m3u8";
 

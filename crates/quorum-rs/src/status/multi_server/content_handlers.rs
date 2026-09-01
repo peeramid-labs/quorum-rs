@@ -8,6 +8,7 @@
 use crate::files::blob::{
     Blob, NatsBlob, ObjectMeta, Usage, Visibility, open_blob, parse_byte_range,
 };
+use crate::files::hls::{HLS_NOTE, PLAYLIST_NOTE};
 use crate::files::upload::{Refusal as UploadRefusal, Spooled, read_upload_form, store_upload};
 use axum::{
     Json,
@@ -309,11 +310,6 @@ pub(super) async fn upload(
     })
     .into_response()
 }
-
-/// Where segmenting is recorded against the original.
-const HLS_NOTE: &str = "hls";
-/// Where the produced playlist's digest is recorded against the original.
-const PLAYLIST_NOTE: &str = "playlist";
 
 /// Kick off segmenting for a video, and say what state that leaves it in.
 ///
