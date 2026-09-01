@@ -178,6 +178,26 @@ fn refuse(status: StatusCode, message: impl Into<String>) -> Response {
         .into_response()
 }
 
+/// A stored object is named by the SHA-256 of its bytes, and nothing else.
+///
+/// Checked before the name reaches the store: annotation sidecars live in the
+/// same bucket under a reserved prefix, so an unchecked name lets a caller
+/// read and delete the bookkeeping of objects that are not theirs.
+fn checked_digest(digest: &str) -> Result<(), Box<Response>> {
+    let well_formed = digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if well_formed {
+        Ok(())
+    } else {
+        Err(boxed(
+            StatusCode::BAD_REQUEST,
+            "not a SHA-256 digest".to_string(),
+        ))
+    }
+}
+
 /// 503 rather than 404: "this deployment configured no uploads" and "no such
 /// file" are different problems for whoever is debugging.
 fn not_configured() -> Response {
@@ -193,7 +213,7 @@ async fn read_form(
     form: &mut Multipart,
     max_upload_bytes: u64,
 ) -> Result<(Visibility, Spooled), Box<Response>> {
-    let mut visibility = Visibility::Public;
+    let mut visibility: Option<Visibility> = None;
     let mut file: Option<Spooled> = None;
 
     while let Some(field) = form.next_field().await.map_err(|e| {
@@ -203,9 +223,9 @@ async fn read_form(
         ))
     })? {
         match field.name().unwrap_or_default() {
-            "visibility" => visibility = read_visibility(field.text().await.unwrap_or_default())?,
+            "visibility" => visibility = Some(read_visibility(read_short_field(field).await?)?),
             "file" => {
-                let filename = field.file_name().unwrap_or("upload").to_string();
+                let filename = safe_filename(field.file_name().unwrap_or("upload"));
                 let spooled = spool(field, max_upload_bytes).await?;
                 file = Some(Spooled {
                     filename,
@@ -219,9 +239,74 @@ async fn read_form(
         }
     }
 
-    let file =
-        file.ok_or_else(|| refuse(StatusCode::BAD_REQUEST, "no `file` part in the upload"))?;
+    let file = file.ok_or_else(|| {
+        boxed(
+            StatusCode::BAD_REQUEST,
+            "no `file` part in the upload".to_string(),
+        )
+    })?;
+    // Absent is refused rather than defaulted. Defaulting either way guesses
+    // whether the uploader meant to publish, and that mistake is invisible
+    // until the link is out — or until it is not.
+    let visibility = visibility.ok_or_else(|| {
+        boxed(
+            StatusCode::BAD_REQUEST,
+            "no `visibility` part: send `public` or `private` explicitly".to_string(),
+        )
+    })?;
     Ok((visibility, file))
+}
+
+/// A filename safe to store and to hand to whatever serves it.
+///
+/// The value is the uploader's, and a downstream process puts it in a
+/// `Content-Disposition` header. Sanitised at the boundary where it enters
+/// storage rather than trusting every later reader to remember.
+fn safe_filename(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
+        .take(120)
+        .collect();
+    let cleaned = cleaned.trim().to_string();
+    if cleaned.is_empty() {
+        "upload".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// The longest a non-file part may be.
+///
+/// `Field::text()` collects a part whole with no ceiling of its own, and the
+/// upload route disables the request-level limit so a video can through. A
+/// part named anything but `file` would otherwise be an unbounded allocation.
+const MAX_FIELD_BYTES: usize = 256;
+
+/// Read a small non-file part, refusing one that is not small.
+async fn read_short_field(
+    mut field: axum::extract::multipart::Field<'_>,
+) -> Result<String, Box<Response>> {
+    let mut raw = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| boxed(StatusCode::BAD_REQUEST, format!("malformed upload: {e}")))?
+    {
+        raw.extend_from_slice(&chunk);
+        if raw.len() > MAX_FIELD_BYTES {
+            return Err(boxed(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("a form field exceeds {MAX_FIELD_BYTES} bytes"),
+            ));
+        }
+    }
+    String::from_utf8(raw).map_err(|_| {
+        boxed(
+            StatusCode::BAD_REQUEST,
+            "a form field is not text".to_string(),
+        )
+    })
 }
 
 /// Refused rather than defaulted: defaulting would publish a file whose
@@ -340,6 +425,11 @@ fn start_segmenting(
     if !stored.mime.starts_with("video/") {
         return crate::files::hls::HlsState::Skipped;
     }
+    // Segments are the video. Publishing them for a private upload would
+    // publish the upload, whatever the original object is marked.
+    if stored.visibility != Visibility::Public {
+        return crate::files::hls::HlsState::Skipped;
+    }
 
     // Taken before the spool is moved into a task, so a backlog is refused
     // rather than accumulating temporary files.
@@ -354,6 +444,7 @@ fn start_segmenting(
     let blob = content.blob.clone();
     let uploaded_by = content.uploaded_by.clone();
     let digest = stored.digest.clone();
+    let visibility = stored.visibility;
     tokio::spawn(async move {
         let _slot = slot;
         // The spool is moved in and dropped here, at the end of the transcode,
@@ -370,6 +461,7 @@ fn start_segmenting(
             spool.path(),
             &public_base,
             &uploaded_by,
+            visibility,
         )
         .await;
 
@@ -477,7 +569,16 @@ async fn spool(
             )
         })?;
     }
-    file.flush().await.ok();
+    // Propagated, not swallowed: `write_all` can return before the bytes reach
+    // the OS, so a full disk surfaces here. Ignoring it would store a short
+    // file under the digest of the whole one, which is the single invariant
+    // content addressing rests on.
+    file.flush().await.map_err(|e| {
+        boxed(
+            StatusCode::INSUFFICIENT_STORAGE,
+            format!("could not flush the upload to disk: {e}"),
+        )
+    })?;
 
     Ok(Spooled {
         file,
@@ -551,6 +652,9 @@ pub(super) async fn fetch(
     let Some(content) = state.content.as_ref() else {
         return not_configured();
     };
+    if let Err(refusal) = checked_digest(&digest) {
+        return *refusal;
+    }
 
     let meta = match content.blob.head(&digest).await {
         Ok(meta) => meta,
@@ -632,6 +736,9 @@ pub(super) async fn status(
     let Some(content) = state.content.as_ref() else {
         return not_configured();
     };
+    if let Err(refusal) = checked_digest(&digest) {
+        return *refusal;
+    }
     let Ok(meta) = content.blob.head(&digest).await else {
         return refuse(StatusCode::NOT_FOUND, "no such object");
     };
@@ -666,6 +773,9 @@ pub(super) async fn remove(
     let Some(content) = state.content.as_ref() else {
         return not_configured();
     };
+    if let Err(refusal) = checked_digest(&digest) {
+        return *refusal;
+    }
     match content.blob.delete(&digest).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(_) => refuse(StatusCode::NOT_FOUND, "no such object"),
@@ -807,9 +917,14 @@ mod tests {
     /// Uploads configured over a throwaway bucket. Small on purpose:
     /// JetStream reserves `max_bytes`, so provisioning at a production ceiling
     /// exhausts the broker's store for every later test.
-    async fn configured(max_upload_bytes: u64, quota: i64) -> Option<ContentUploads> {
+    async fn configured(tag: &str, max_upload_bytes: u64, quota: i64) -> Option<ContentUploads> {
         let js = context().await?;
-        let bucket = format!("test_upload_{}", uuid::Uuid::new_v4().simple());
+        // One per test — they run concurrently within a binary.
+        let bucket = format!("test_upload_{tag}");
+        // Deleted first: the bucket count stays bounded by the number of tests
+        // rather than growing with each run, and every test starts clean
+        // without teardown a panic would skip.
+        let _ = js.delete_object_store(&bucket).await;
         ensure_object_bucket(
             &js,
             object_store::Config {
@@ -832,6 +947,22 @@ mod tests {
             // upload test wait on a subprocess.
             hls: None,
         })
+    }
+
+    /// The same configuration with a transcoder attached.
+    ///
+    /// Without one `start_segmenting` returns at its first guard, so a test
+    /// that means to exercise a later gate — the media type, the visibility —
+    /// would pass for any input at all.
+    fn with_transcoder(content: ContentUploads) -> ContentUploads {
+        ContentUploads {
+            hls: Some(Arc::new(Segmenting {
+                transcoder: crate::files::hls::Ffmpeg::default(),
+                waiting: Arc::new(tokio::sync::Semaphore::new(4)),
+                running: tokio::sync::Semaphore::new(1),
+            })),
+            ..content
+        }
     }
 
     async fn send(content: Option<ContentUploads>, request: Request<Body>) -> Response {
@@ -869,7 +1000,13 @@ mod tests {
 
     #[tokio::test]
     async fn an_uploaded_video_comes_back_whole_and_by_range() {
-        let Some(content) = configured(8 * 1024 * 1024, 4 * 1024 * 1024).await else {
+        let Some(content) = configured(
+            "an_uploaded_video_comes_back_whole_and_by_range",
+            8 * 1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .await
+        else {
             require_broker("uploading needs a broker");
             return;
         };
@@ -877,7 +1014,7 @@ mod tests {
         let video = fake_mp4(300_000);
         let response = send(
             Some(content.clone()),
-            upload_request(multipart("clip.mp4", &video, None)),
+            upload_request(multipart("clip.mp4", &video, Some("public"))),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -939,14 +1076,20 @@ mod tests {
         // Not an error, and not a lie about being pending: a library user who
         // never asked for a media pipeline gets their original and a state
         // that says why there is no playlist.
-        let Some(content) = configured(8 * 1024 * 1024, 4 * 1024 * 1024).await else {
+        let Some(content) = configured(
+            "a_host_with_no_transcoder_stores_the_video_and_says_it_skipped",
+            8 * 1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .await
+        else {
             require_broker("uploading needs a broker");
             return;
         };
         let uploaded = body_json(
             send(
                 Some(content.clone()),
-                upload_request(multipart("clip.mp4", &fake_mp4(2_000), None)),
+                upload_request(multipart("clip.mp4", &fake_mp4(2_000), Some("public"))),
             )
             .await,
         )
@@ -970,15 +1113,21 @@ mod tests {
 
     #[tokio::test]
     async fn a_still_image_is_never_queued_for_segmenting() {
-        let Some(content) = configured(8 * 1024 * 1024, 4 * 1024 * 1024).await else {
+        let Some(content) = configured(
+            "a_still_image_is_never_queued_for_segmenting",
+            8 * 1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .await
+        else {
             require_broker("uploading needs a broker");
             return;
         };
         let png = b"\x89PNG\r\n\x1a\n and some pixels".to_vec();
         let uploaded = body_json(
             send(
-                Some(content),
-                upload_request(multipart("shot.png", &png, None)),
+                Some(with_transcoder(content)),
+                upload_request(multipart("shot.png", &png, Some("public"))),
             )
             .await,
         )
@@ -988,17 +1137,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_private_video_is_never_queued_for_segmenting() {
+        // Segments are the video, so the gate belongs before the queue.
+        let Some(content) = configured(
+            "a_private_video_is_never_queued_for_segmenting",
+            8 * 1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .await
+        else {
+            require_broker("the private-video gate needs a broker");
+            return;
+        };
+        let uploaded = body_json(
+            send(
+                Some(with_transcoder(content.clone())),
+                upload_request(multipart("clip.mp4", &fake_mp4(2_000), Some("private"))),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(uploaded["visibility"], "private");
+        assert_eq!(
+            uploaded["hls"], "skipped",
+            "a private video must not be segmented into public pieces"
+        );
+        assert_eq!(
+            content.blob.list().await.expect("list").len(),
+            1,
+            "nothing beyond the original may be stored"
+        );
+    }
+
+    #[tokio::test]
     async fn status_reports_what_segmenting_recorded() {
         // The uploader's poll: segmenting outlives the request that started
         // it, so this is how they learn the video became seekable.
-        let Some(content) = configured(8 * 1024 * 1024, 4 * 1024 * 1024).await else {
+        let Some(content) = configured(
+            "status_reports_what_segmenting_recorded",
+            8 * 1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .await
+        else {
             require_broker("status needs a broker");
             return;
         };
         let uploaded = body_json(
             send(
                 Some(content.clone()),
-                upload_request(multipart("clip.mp4", &fake_mp4(2_000), None)),
+                upload_request(multipart("clip.mp4", &fake_mp4(2_000), Some("public"))),
             )
             .await,
         )
@@ -1065,7 +1253,13 @@ mod tests {
 
     #[tokio::test]
     async fn status_for_a_file_that_does_not_exist_is_a_404() {
-        let Some(content) = configured(8 * 1024 * 1024, 4 * 1024 * 1024).await else {
+        let Some(content) = configured(
+            "status_for_a_file_that_does_not_exist_is_a_404",
+            8 * 1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .await
+        else {
             require_broker("status needs a broker");
             return;
         };
@@ -1084,7 +1278,13 @@ mod tests {
     async fn a_range_that_cannot_be_satisfied_is_refused_not_widened() {
         // Answering the whole object would have the caller splice all of it
         // where a slice belonged.
-        let Some(content) = configured(8 * 1024 * 1024, 4 * 1024 * 1024).await else {
+        let Some(content) = configured(
+            "a_range_that_cannot_be_satisfied_is_refused_not_widened",
+            8 * 1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .await
+        else {
             require_broker("range refusal needs a broker");
             return;
         };
@@ -1092,7 +1292,7 @@ mod tests {
         let uploaded = body_json(
             send(
                 Some(content.clone()),
-                upload_request(multipart("clip.mp4", &video, None)),
+                upload_request(multipart("clip.mp4", &video, Some("public"))),
             )
             .await,
         )
@@ -1117,13 +1317,23 @@ mod tests {
 
     #[tokio::test]
     async fn a_type_this_deployment_does_not_serve_is_refused() {
-        let Some(content) = configured(8 * 1024 * 1024, 4 * 1024 * 1024).await else {
+        let Some(content) = configured(
+            "a_type_this_deployment_does_not_serve_is_refused",
+            8 * 1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .await
+        else {
             require_broker("type refusal needs a broker");
             return;
         };
         let response = send(
             Some(content),
-            upload_request(multipart("payload.html", b"<!DOCTYPE html><script>", None)),
+            upload_request(multipart(
+                "payload.html",
+                b"<!DOCTYPE html><script>",
+                Some("public"),
+            )),
         )
         .await;
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
@@ -1131,13 +1341,19 @@ mod tests {
 
     #[tokio::test]
     async fn an_upload_past_the_ceiling_is_refused_while_it_streams() {
-        let Some(content) = configured(64 * 1024, 4 * 1024 * 1024).await else {
+        let Some(content) = configured(
+            "an_upload_past_the_ceiling_is_refused_while_it_streams",
+            64 * 1024,
+            4 * 1024 * 1024,
+        )
+        .await
+        else {
             require_broker("the size cap needs a broker");
             return;
         };
         let response = send(
             Some(content),
-            upload_request(multipart("big.mp4", &fake_mp4(200_000), None)),
+            upload_request(multipart("big.mp4", &fake_mp4(200_000), Some("public"))),
         )
         .await;
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
@@ -1147,13 +1363,19 @@ mod tests {
     async fn a_full_bucket_answers_with_the_numbers_not_a_five_hundred() {
         // A caller can act on "you are out of space" and cannot act on
         // "something went wrong".
-        let Some(content) = configured(8 * 1024 * 1024, 64 * 1024).await else {
+        let Some(content) = configured(
+            "a_full_bucket_answers_with_the_numbers_not_a_five_hundred",
+            8 * 1024 * 1024,
+            64 * 1024,
+        )
+        .await
+        else {
             require_broker("quota refusal needs a broker");
             return;
         };
         let first = send(
             Some(content.clone()),
-            upload_request(multipart("a.mp4", &fake_mp4(40_000), None)),
+            upload_request(multipart("a.mp4", &fake_mp4(40_000), Some("public"))),
         )
         .await;
         assert_eq!(first.status(), StatusCode::OK);
@@ -1162,7 +1384,7 @@ mod tests {
         second_bytes[100] = 0x01; // different content, so a different digest
         let response = send(
             Some(content),
-            upload_request(multipart("b.mp4", &second_bytes, None)),
+            upload_request(multipart("b.mp4", &second_bytes, Some("public"))),
         )
         .await;
         assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
@@ -1173,7 +1395,13 @@ mod tests {
 
     #[tokio::test]
     async fn visibility_is_recorded_as_asked_for() {
-        let Some(content) = configured(8 * 1024 * 1024, 4 * 1024 * 1024).await else {
+        let Some(content) = configured(
+            "visibility_is_recorded_as_asked_for",
+            8 * 1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .await
+        else {
             require_broker("visibility needs a broker");
             return;
         };
@@ -1198,7 +1426,13 @@ mod tests {
     async fn an_unknown_visibility_is_refused_rather_than_defaulted_to_public() {
         // Defaulting would publish a file whose uploader asked for something
         // else, and the mistake is invisible until the link is out.
-        let Some(content) = configured(8 * 1024 * 1024, 4 * 1024 * 1024).await else {
+        let Some(content) = configured(
+            "an_unknown_visibility_is_refused_rather_than_defaulted_to_public",
+            8 * 1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .await
+        else {
             require_broker("visibility refusal needs a broker");
             return;
         };
@@ -1212,14 +1446,20 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_frees_the_space_and_the_object_is_gone() {
-        let Some(content) = configured(8 * 1024 * 1024, 4 * 1024 * 1024).await else {
+        let Some(content) = configured(
+            "deleting_frees_the_space_and_the_object_is_gone",
+            8 * 1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .await
+        else {
             require_broker("deleting needs a broker");
             return;
         };
         let uploaded = body_json(
             send(
                 Some(content.clone()),
-                upload_request(multipart("clip.mp4", &fake_mp4(50_000), None)),
+                upload_request(multipart("clip.mp4", &fake_mp4(50_000), Some("public"))),
             )
             .await,
         )
@@ -1272,7 +1512,7 @@ mod tests {
         // that was never there.
         let response = send(
             None,
-            upload_request(multipart("clip.mp4", &fake_mp4(100), None)),
+            upload_request(multipart("clip.mp4", &fake_mp4(100), Some("public"))),
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1289,8 +1529,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_upload_that_does_not_say_public_or_private_is_refused() {
+        // Neither default is safe. Defaulting to public publishes a file whose
+        // uploader may have meant otherwise, and the mistake is invisible
+        // until the link is out; defaulting to private silently breaks the
+        // sharing this endpoint exists for.
+        let Some(content) = configured(
+            "an_upload_that_does_not_say_public_or_private_is_refused",
+            8 * 1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .await
+        else {
+            require_broker("the visibility requirement needs a broker");
+            return;
+        };
+        let response = send(
+            Some(content.clone()),
+            upload_request(multipart("clip.mp4", &fake_mp4(1_000), None)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            body_json(response).await["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("visibility"),
+            "the refusal must name the missing part"
+        );
+
+        // And nothing was stored despite the bytes having been read.
+        assert!(content.blob.list().await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_oversize_form_field_is_refused_before_it_is_buffered() {
+        // `Field::text()` has no ceiling of its own and this route disables the
+        // request-level limit so a video can through — an unbounded non-file
+        // part would otherwise be an unbounded allocation.
+        let Some(content) = configured(
+            "an_oversize_form_field_is_refused_before_it_is_buffered",
+            8 * 1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .await
+        else {
+            require_broker("the field cap needs a broker");
+            return;
+        };
+        let huge = "p".repeat(MAX_FIELD_BYTES * 4);
+        let response = send(
+            Some(content),
+            upload_request(multipart("clip.mp4", &fake_mp4(1_000), Some(&huge))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn a_digest_shaped_probe_never_reaches_the_store() {
+        // Annotation sidecars share the bucket under a reserved prefix, so an
+        // unchecked name would let a caller read and delete the bookkeeping of
+        // objects that are not theirs.
+        let Some(content) = configured(
+            "a_digest_shaped_probe_never_reaches_the_store",
+            8 * 1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .await
+        else {
+            require_broker("digest validation needs a broker");
+            return;
+        };
+        for probe in [
+            "notes.abc",
+            "../secrets",
+            "",
+            &"A".repeat(64),
+            &"a".repeat(63),
+        ] {
+            for (method, suffix) in [("GET", ""), ("DELETE", ""), ("GET", "/status")] {
+                let response = send(
+                    Some(content.clone()),
+                    Request::builder()
+                        .method(method)
+                        .uri(format!("/api/content/{probe}{suffix}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await;
+                assert!(
+                    matches!(
+                        response.status(),
+                        StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND
+                    ),
+                    "{method} {probe:?}{suffix} answered {}",
+                    response.status()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn an_upload_with_no_file_part_is_a_bad_request() {
-        let Some(content) = configured(8 * 1024 * 1024, 4 * 1024 * 1024).await else {
+        let Some(content) = configured(
+            "an_upload_with_no_file_part_is_a_bad_request",
+            8 * 1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .await
+        else {
             require_broker("the empty-upload check needs a broker");
             return;
         };
@@ -1303,7 +1651,13 @@ mod tests {
 
     #[tokio::test]
     async fn uploading_the_same_video_twice_yields_one_object() {
-        let Some(content) = configured(8 * 1024 * 1024, 4 * 1024 * 1024).await else {
+        let Some(content) = configured(
+            "uploading_the_same_video_twice_yields_one_object",
+            8 * 1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .await
+        else {
             require_broker("idempotent upload needs a broker");
             return;
         };
@@ -1311,7 +1665,7 @@ mod tests {
         let first = body_json(
             send(
                 Some(content.clone()),
-                upload_request(multipart("clip.mp4", &video, None)),
+                upload_request(multipart("clip.mp4", &video, Some("public"))),
             )
             .await,
         )
@@ -1319,7 +1673,7 @@ mod tests {
         let second = body_json(
             send(
                 Some(content.clone()),
-                upload_request(multipart("same-again.mp4", &video, None)),
+                upload_request(multipart("same-again.mp4", &video, Some("public"))),
             )
             .await,
         )

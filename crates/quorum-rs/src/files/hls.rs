@@ -183,7 +183,10 @@ mod tests {
     async fn blob_for(tag: &str, quota: i64) -> Option<NatsBlob> {
         let url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into());
         let js: jetstream::Context = jetstream::new(async_nats::connect(&url).await.ok()?);
-        let bucket = format!("test_hls_{tag}_{}", uuid::Uuid::new_v4().simple());
+        let bucket = format!("test_hls_{tag}");
+        // Deleted first, so the bucket count is bounded by the number of tests
+        // rather than growing with every run — JetStream reserves max_bytes.
+        let _ = js.delete_object_store(&bucket).await;
         let store = crate::nats_utils::ensure_object_bucket(
             &js,
             object_store::Config {
@@ -232,6 +235,7 @@ mod tests {
             source.path(),
             "https://cdn.test/content/acme",
             "agent-7",
+            Visibility::Public,
         )
         .await
         .expect("segmented");
@@ -270,6 +274,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn segments_of_a_private_video_are_not_published() {
+        // The segments are the video. Storing them public would publish an
+        // upload its owner marked private, and the playlist would hand out the
+        // link.
+        let Some(blob) = blob_for("privatesegments", 2 * 1024 * 1024).await else {
+            require_broker("private segmenting needs a broker");
+            return;
+        };
+        let source = tempfile::NamedTempFile::new().expect("source");
+
+        let result = segment_and_store(
+            &blob,
+            &FakeTranscoder::ok(),
+            source.path(),
+            "https://cdn.test/content/acme",
+            "agent-7",
+            Visibility::Private,
+        )
+        .await
+        .expect("segmented");
+
+        for digest in &result.stored {
+            let piece = blob.head(digest).await.expect("stored");
+            assert_eq!(
+                piece.visibility,
+                Visibility::Private,
+                "{digest} was published for a private source"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_transcoder_that_fails_leaves_nothing_behind() {
         let Some(blob) = blob_for("failure", 2 * 1024 * 1024).await else {
             require_broker("failure cleanup needs a broker");
@@ -286,6 +322,7 @@ mod tests {
             source.path(),
             "https://cdn.test/acme",
             "agent-7",
+            Visibility::Public,
         )
         .await
         .expect_err("the transcoder failed");
@@ -323,6 +360,7 @@ mod tests {
             source.path(),
             "https://cdn.test/acme",
             "agent-7",
+            Visibility::Public,
         )
         .await
         .expect_err("a dangling reference must not be published");
@@ -352,7 +390,8 @@ mod tests {
                 &silent,
                 source.path(),
                 "https://cdn.test/acme",
-                "agent-7"
+                "agent-7",
+                Visibility::Public
             )
             .await
             .is_err()
@@ -406,14 +445,19 @@ mod tests {
             .await;
 
         let before = blob.list().await.expect("list").len();
-        let _ = segment_and_store(
+        let refused = segment_and_store(
             &blob,
             &fat,
             source.path(),
             "https://cdn.test/acme",
             "agent-7",
+            Visibility::Public,
         )
         .await;
+        assert!(
+            refused.is_err(),
+            "a segmentation that cannot fit the quota must fail rather than half-store"
+        );
         let after = blob.list().await.expect("list");
         assert_eq!(
             after.len(),
@@ -430,6 +474,19 @@ mod tests {
     async fn real_video() -> Result<Option<(tempfile::TempDir, std::path::PathBuf)>> {
         let ffmpeg = Ffmpeg::default();
         if !ffmpeg.available().await {
+            // Same rule as the broker gate: CI installs ffmpeg, so a skip
+            // there is a test that silently stopped covering the one thing a
+            // fake transcoder cannot check.
+            let required = std::env::var("REQUIRE_FFMPEG")
+                .map(|v| {
+                    let v = v.trim().to_string();
+                    !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false"))
+                })
+                .unwrap_or(false);
+            anyhow::ensure!(
+                !required,
+                "REQUIRE_FFMPEG is set, so this test may not skip: no ffmpeg on this host"
+            );
             eprintln!("Skipping: no ffmpeg on this host");
             return Ok(None);
         }
@@ -479,6 +536,7 @@ mod tests {
             &source,
             "https://cdn.test/content/acme",
             "agent-7",
+            Visibility::Public,
         )
         .await
         .expect("segmented");
@@ -725,14 +783,19 @@ impl Ffmpeg {
     /// Probed rather than assumed: a library user who never asked for a media
     /// pipeline should get `Skipped` and an intact original, not a failure.
     pub async fn available(&self) -> bool {
-        tokio::process::Command::new(&self.binary)
+        // Bounded: this runs while the agent is starting, and a wedged binary
+        // would otherwise hang startup rather than reporting "no transcoder".
+        let probe = tokio::process::Command::new(&self.binary)
             .arg("-version")
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
-            .await
-            .map(|status| status.success())
-            .unwrap_or(false)
+            .kill_on_drop(true)
+            .status();
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), probe).await,
+            Ok(Ok(status)) if status.success()
+        )
     }
 
     /// The argument vector, so what is run is testable without running it.
@@ -741,6 +804,12 @@ impl Ffmpeg {
         vec![
             "-nostdin".into(),
             "-y".into(),
+            // The input is a file this process spooled, and nothing else. An
+            // uploaded container can carry external references (`dref` boxes
+            // pointing at file:// or http://) which ffmpeg would otherwise
+            // resolve and mux into segments this pipeline then publishes.
+            "-protocol_whitelist".into(),
+            "file".into(),
             "-i".into(),
             s(input),
             "-c".into(),
@@ -770,6 +839,9 @@ impl Transcoder for Ffmpeg {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
+            // Without this a cancelled segmentation task, or a runtime
+            // shutdown, drops the handle and leaves ffmpeg running orphaned.
+            .kill_on_drop(true)
             .spawn()
             .context("run ffmpeg")?;
 
@@ -839,6 +911,7 @@ pub async fn segment_and_store(
     source: &std::path::Path,
     public_base: &str,
     uploaded_by: &str,
+    visibility: crate::files::blob::Visibility,
 ) -> Result<Segmented> {
     let work = tempfile::tempdir().context("make a working directory")?;
     transcoder.segment(source, work.path()).await?;
@@ -848,7 +921,7 @@ pub async fn segment_and_store(
     let mut stored = Vec::new();
     let mut urls = HashMap::new();
     for name in produced.iter().filter(|name| *name != PLAYLIST_NAME) {
-        match store_file(blob, &work.path().join(name), name, uploaded_by).await {
+        match store_file(blob, &work.path().join(name), name, uploaded_by, visibility).await {
             Ok(digest) => {
                 urls.insert(name.clone(), format!("{public_base}/{digest}"));
                 stored.push(digest);
@@ -860,7 +933,7 @@ pub async fn segment_and_store(
         }
     }
 
-    let playlist = match finish(blob, work.path(), &urls, uploaded_by).await {
+    let playlist = match finish(blob, work.path(), &urls, uploaded_by, visibility).await {
         Ok(digest) => digest,
         Err(e) => {
             remove_all(blob, &stored).await;
@@ -896,12 +969,20 @@ async fn finish(
     work: &std::path::Path,
     urls: &HashMap<String, String>,
     uploaded_by: &str,
+    visibility: crate::files::blob::Visibility,
 ) -> Result<String> {
     let raw = tokio::fs::read_to_string(work.join(PLAYLIST_NAME))
         .await
         .context("read the playlist")?;
     let rewritten = rewrite_playlist(&raw, urls)?;
-    store_bytes(blob, rewritten.as_bytes(), PLAYLIST_NAME, uploaded_by).await
+    store_bytes(
+        blob,
+        rewritten.as_bytes(),
+        PLAYLIST_NAME,
+        uploaded_by,
+        visibility,
+    )
+    .await
 }
 
 async fn store_file(
@@ -909,11 +990,12 @@ async fn store_file(
     path: &std::path::Path,
     name: &str,
     uploaded_by: &str,
+    visibility: crate::files::blob::Visibility,
 ) -> Result<String> {
     let bytes = tokio::fs::read(path)
         .await
         .with_context(|| format!("read {name}"))?;
-    store_bytes(blob, &bytes, name, uploaded_by).await
+    store_bytes(blob, &bytes, name, uploaded_by, visibility).await
 }
 
 async fn store_bytes(
@@ -921,8 +1003,9 @@ async fn store_bytes(
     bytes: &[u8],
     name: &str,
     uploaded_by: &str,
+    visibility: crate::files::blob::Visibility,
 ) -> Result<String> {
-    use crate::files::blob::{ObjectMeta, Visibility, stamped_now};
+    use crate::files::blob::{ObjectMeta, stamped_now};
 
     let digest = crate::nats_utils::sha256_hex_bytes(bytes);
     let mut reader = bytes;
@@ -934,11 +1017,9 @@ async fn store_bytes(
             filename: name.to_string(),
             mime: segment_mime(name).to_string(),
             bytes: bytes.len() as u64,
-            // A segment is only reachable through a playlist the uploader was
-            // given, and a private video whose segments were public would not
-            // be private at all — but nothing serves a private object yet, so
-            // segments follow the playlist and both are public.
-            visibility: Visibility::Public,
+            // Inherited from the source. A private video whose segments were
+            // public would not be private at all: the segments are the video.
+            visibility,
             uploaded_by: uploaded_by.to_string(),
             created_at: stamped_now(),
         },

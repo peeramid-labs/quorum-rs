@@ -386,7 +386,15 @@ impl Blob for NatsBlob {
     async fn get_range(&self, digest: &str, offset: u64, len: u64) -> Result<(Vec<u8>, u64)> {
         use tokio::io::AsyncReadExt as _;
 
-        let mut object = match self.cursors.lock().await.take(digest, offset) {
+        // Taken and released before anything is awaited on the broker: a match
+        // scrutinee's temporaries live to the end of the match, so holding the
+        // guard here would serialise every read in the bucket behind one
+        // reader's offset skip — the opposite of what the pool is for.
+        let resumed = {
+            let mut cursors = self.cursors.lock().await;
+            cursors.take(digest, offset)
+        };
+        let mut object = match resumed {
             Some(open) => open,
             None => {
                 let mut fresh = self
@@ -790,7 +798,12 @@ mod tests {
     /// `REQUIRE_NATS=1` turns that skip back into a failure.
     async fn blob_for(tag: &str, quota: i64) -> Option<NatsBlob> {
         let js = context().await?;
-        let bucket = format!("test_blob_{tag}_{}", uuid::Uuid::new_v4().simple());
+        // Named after the test rather than randomised, and deleted first, so
+        // the number of test buckets stays bounded by the number of tests
+        // instead of growing with every run — JetStream *reserves* a bucket's
+        // max_bytes, so leaked buckets exhaust the account's store.
+        let bucket = format!("test_blob_{tag}");
+        let _ = js.delete_object_store(&bucket).await;
         let store = crate::nats_utils::ensure_object_bucket(
             &js,
             object_store::Config {
@@ -976,7 +989,8 @@ mod tests {
             require_broker("the broker backstop needs a broker");
             return Ok(());
         };
-        let bucket = format!("test_blob_backstop_{}", uuid::Uuid::new_v4().simple());
+        let bucket = "test_blob_backstop".to_string();
+        let _ = js.delete_object_store(&bucket).await;
         let store = crate::nats_utils::ensure_object_bucket(
             &js,
             object_store::Config {
@@ -1122,7 +1136,8 @@ mod tests {
             require_broker("opening a bucket needs a broker");
             return Ok(());
         };
-        let bucket = format!("test_blob_open_{}", uuid::Uuid::new_v4().simple());
+        let bucket = "test_blob_open".to_string();
+        let _ = js.delete_object_store(&bucket).await;
         crate::nats_utils::ensure_object_bucket(
             &js,
             object_store::Config {

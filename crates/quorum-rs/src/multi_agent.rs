@@ -248,7 +248,7 @@ impl MultiAgentRunner {
                 None => None,
             };
             tokio::spawn(async move {
-                crate::status::multi_server::MultiAgentStatusServer::run_control_plane(
+                crate::status::multi_server::MultiAgentStatusServer::run_control_plane_with_uploads(
                     port,
                     statuses,
                     chat_agents,

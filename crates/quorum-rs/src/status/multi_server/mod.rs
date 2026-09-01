@@ -269,7 +269,6 @@ impl MultiAgentStatusServer {
             HashMap::new(),
             registry,
             None, // No middleware in basic mode
-            None, // No uploads without a bucket to write to
         )
         .await;
     }
@@ -280,8 +279,38 @@ impl MultiAgentStatusServer {
     /// The `pause_handles` map provides direct access to each worker's pause
     /// `AtomicBool`, enabling pause/resume even when no response buffer is
     /// configured.
+    /// Unchanged nine-argument form, kept so adding uploads is not a breaking
+    /// change for anyone already calling this on a published version.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_control_plane(
+        port: u16,
+        statuses: HashMap<String, SharedAgentStatus>,
+        chat_agents: HashMap<String, Arc<dyn ChatCapable>>,
+        configs: HashMap<String, Arc<RwLock<AgentConfig>>>,
+        buffers: HashMap<String, Arc<ResponseBuffer>>,
+        pause_handles: HashMap<String, Arc<AtomicBool>>,
+        event_stores: HashMap<String, AgentEventStore>,
+        registry: Option<OrchestratorRegistry>,
+        middleware: Option<Arc<crate::middleware::pipeline::MiddlewarePipeline>>,
+    ) {
+        Self::run_control_plane_with_uploads(
+            port,
+            statuses,
+            chat_agents,
+            configs,
+            buffers,
+            pause_handles,
+            event_stores,
+            registry,
+            middleware,
+            None,
+        )
+        .await
+    }
+
+    /// As [`Self::run_control_plane`], plus the file-upload routes.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_control_plane_with_uploads(
         port: u16,
         statuses: HashMap<String, SharedAgentStatus>,
         chat_agents: HashMap<String, Arc<dyn ChatCapable>>,
