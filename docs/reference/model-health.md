@@ -22,28 +22,25 @@ the discovery. The proactive probe exists so nobody does.
 
 ## What the proactive probe checks
 
-Two steps, in order, throttled to one round every five minutes:
-
-1. **Catalog** — fetch the provider's OpenAI-compatible `/models` list and look
-   for the id. A successful fetch that omits it is a verdict.
-2. **Serving** — ask the endpoint for a single token. A catalog is an
-   advertisement: a provider can list an id whose `/chat/completions` answers
-   `404`, and a catalog-only check then reports the agent healthy while every
-   task fails. Skipped when step 1 already said the id is absent.
+One free request, throttled to once every five minutes: fetch the provider's
+OpenAI-compatible `/models` list and look for the id. A successful fetch that
+omits it is a verdict.
 
 ```rust
 ModelAvailability::new(format!("{base}/models"), provider_id)
-    .with_serving_probe(format!("{base}/chat/completions"), api_key)
 ```
 
-Without `with_serving_probe` the second step is a no-op and the verdict is
-catalog-only.
+The probe never sends a completion. A catalog is an advertisement — a
+provider can list an id whose `/chat/completions` answers `404` — but
+confirming that costs a billed request per seat per interval, and a fleet
+doing so paid for a token on every tick. A listed-but-unserved model is
+instead caught by the reactive detector on its first real task.
 
 ## Fail-open is the invariant
 
 `Availability::Unavailable` is returned **only** when the provider says the
-model is not there — omitted from a successfully fetched catalog, or a `404`
-from the endpoint. Everything else is `Availability::Unknown`, which never
+model is not there — omitted from a successfully fetched catalog. Everything
+else is `Availability::Unknown`, which never
 benches:
 
 - a catalog fetch that failed
