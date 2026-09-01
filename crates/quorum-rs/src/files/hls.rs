@@ -105,7 +105,7 @@ fn resolve(reference: &str, urls: &HashMap<String, String>) -> Result<String> {
 mod tests {
     use super::*;
 
-    use crate::content_blob::{Blob as _, NatsBlob, Visibility, quota_from_max_bytes};
+    use crate::files::blob::{Blob as _, NatsBlob, Visibility, quota_from_max_bytes};
     use async_nats::jetstream::{self, object_store};
     use std::path::Path;
 
@@ -393,14 +393,14 @@ mod tests {
             .put_stream(
                 &digest,
                 &mut reader,
-                &crate::content_blob::ObjectMeta {
+                &crate::files::blob::ObjectMeta {
                     digest: digest.clone(),
                     filename: "filler".into(),
                     mime: "video/mp4".into(),
                     bytes: filler.len() as u64,
                     visibility: Visibility::Public,
                     uploaded_by: "agent-7".into(),
-                    created_at: crate::content_blob::stamped_now(),
+                    created_at: crate::files::blob::stamped_now(),
                 },
             )
             .await;
@@ -834,7 +834,7 @@ pub struct Segmented {
 /// segmentation is worse than none: it consumes the operator's quota and
 /// nothing references it, so nothing will ever clean it up.
 pub async fn segment_and_store(
-    blob: &dyn crate::content_blob::Blob,
+    blob: &dyn crate::files::blob::Blob,
     transcoder: &dyn Transcoder,
     source: &std::path::Path,
     public_base: &str,
@@ -892,7 +892,7 @@ async fn produced_files(work: &std::path::Path) -> Result<Vec<String>> {
 
 /// Rewrite the playlist against the stored URLs and store it too.
 async fn finish(
-    blob: &dyn crate::content_blob::Blob,
+    blob: &dyn crate::files::blob::Blob,
     work: &std::path::Path,
     urls: &HashMap<String, String>,
     uploaded_by: &str,
@@ -905,7 +905,7 @@ async fn finish(
 }
 
 async fn store_file(
-    blob: &dyn crate::content_blob::Blob,
+    blob: &dyn crate::files::blob::Blob,
     path: &std::path::Path,
     name: &str,
     uploaded_by: &str,
@@ -917,12 +917,12 @@ async fn store_file(
 }
 
 async fn store_bytes(
-    blob: &dyn crate::content_blob::Blob,
+    blob: &dyn crate::files::blob::Blob,
     bytes: &[u8],
     name: &str,
     uploaded_by: &str,
 ) -> Result<String> {
-    use crate::content_blob::{ObjectMeta, Visibility, stamped_now};
+    use crate::files::blob::{ObjectMeta, Visibility, stamped_now};
 
     let digest = crate::nats_utils::sha256_hex_bytes(bytes);
     let mut reader = bytes;
@@ -951,7 +951,7 @@ async fn store_bytes(
 ///
 /// Failures are logged, not propagated: the caller is already reporting why
 /// segmenting failed, and replacing that with a cleanup error would hide it.
-async fn remove_all(blob: &dyn crate::content_blob::Blob, digests: &[String]) {
+async fn remove_all(blob: &dyn crate::files::blob::Blob, digests: &[String]) {
     for digest in digests {
         if let Err(e) = blob.delete(digest).await {
             tracing::warn!(digest, error = %format!("{e:#}"), "could not remove a partial segment");

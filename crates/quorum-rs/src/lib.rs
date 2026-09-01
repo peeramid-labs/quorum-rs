@@ -28,14 +28,13 @@ pub mod brand;
 pub mod cli;
 pub mod config;
 pub mod content_address;
-pub mod content_blob;
 pub mod control_plane;
 pub mod conversation;
 #[cfg(feature = "audit")]
 pub mod crypto;
 pub mod dump_prompts;
 pub mod events;
-pub mod hls;
+pub mod files;
 /// Workspace + agent-fleet config primitives that `quorum init`
 /// composes: provider catalog, persona presets, yaml renderer,
 /// env-file merger, generic wizard helpers. No CLI surface —

@@ -5,7 +5,7 @@
 //! routed through anything else. Reading them back publicly is a different
 //! process's job — this one returns the URL that process will serve.
 
-use crate::content_blob::{
+use crate::files::blob::{
     Blob, NatsBlob, ObjectMeta, QuotaExceeded, Usage, Visibility, open_blob, parse_byte_range,
     stamped_now,
 };
@@ -59,7 +59,7 @@ const MAX_QUEUED_SEGMENTATIONS: usize = 4;
 
 /// The transcoder, and the queue in front of it.
 struct Segmenting {
-    transcoder: crate::hls::Ffmpeg,
+    transcoder: crate::files::hls::Ffmpeg,
     /// Admission: bounds how many spools are being held for a turn.
     waiting: Arc<tokio::sync::Semaphore>,
     /// One transcode at a time. Parallel ffmpeg is how a host with several
@@ -95,7 +95,7 @@ impl ContentUploads {
             }
         };
 
-        let transcoder = crate::hls::Ffmpeg::default();
+        let transcoder = crate::files::hls::Ffmpeg::default();
         let hls = if transcoder.available().await {
             Some(Arc::new(Segmenting {
                 transcoder,
@@ -147,7 +147,7 @@ pub(super) struct Uploaded {
     visibility: Visibility,
     /// Where segmenting stands for this upload. `Skipped` for anything that is
     /// not video, or on a host with no transcoder.
-    hls: crate::hls::HlsState,
+    hls: crate::files::hls::HlsState,
 }
 
 /// A refusal, as the caller sees it.
@@ -331,14 +331,14 @@ fn start_segmenting(
     content: &ContentUploads,
     stored: &ObjectMeta,
     spool: Spooled,
-) -> crate::hls::HlsState {
+) -> crate::files::hls::HlsState {
     let (Some(hls), Some(public_base)) = (content.hls.clone(), content.public_base.clone()) else {
         // Nothing to segment with, or nowhere to point a playlist at: a
         // playlist of relative names nobody can resolve is worse than none.
-        return crate::hls::HlsState::Skipped;
+        return crate::files::hls::HlsState::Skipped;
     };
     if !stored.mime.starts_with("video/") {
-        return crate::hls::HlsState::Skipped;
+        return crate::files::hls::HlsState::Skipped;
     }
 
     // Taken before the spool is moved into a task, so a backlog is refused
@@ -348,7 +348,7 @@ fn start_segmenting(
             digest = %stored.digest,
             "the segmenting queue is full, so this upload is stored whole"
         );
-        return crate::hls::HlsState::Skipped;
+        return crate::files::hls::HlsState::Skipped;
     };
 
     let blob = content.blob.clone();
@@ -364,7 +364,7 @@ fn start_segmenting(
         }
 
         let _turn = hls.running.acquire().await;
-        let outcome = crate::hls::segment_and_store(
+        let outcome = crate::files::hls::segment_and_store(
             blob.as_ref(),
             &hls.transcoder,
             spool.path(),
@@ -393,7 +393,7 @@ fn start_segmenting(
         }
     });
 
-    crate::hls::HlsState::Pending
+    crate::files::hls::HlsState::Pending
 }
 
 /// An upload on disk, hashed on the way there.
@@ -615,7 +615,7 @@ pub(super) async fn fetch(
 struct FileStatus {
     #[serde(flatten)]
     meta: ObjectMeta,
-    hls: crate::hls::HlsState,
+    hls: crate::files::hls::HlsState,
     /// The playlist to hand a player, once there is one.
     #[serde(skip_serializing_if = "Option::is_none")]
     playlist_url: Option<String>,
@@ -638,15 +638,15 @@ pub(super) async fn status(
     let notes = content.blob.notes(&digest).await.unwrap_or_default();
 
     let hls = match notes.get(HLS_NOTE).map(String::as_str) {
-        Some("pending") => crate::hls::HlsState::Pending,
-        Some("ready") => crate::hls::HlsState::Ready,
-        Some("failed") => crate::hls::HlsState::Failed,
-        _ => crate::hls::HlsState::Skipped,
+        Some("pending") => crate::files::hls::HlsState::Pending,
+        Some("ready") => crate::files::hls::HlsState::Ready,
+        Some("failed") => crate::files::hls::HlsState::Failed,
+        _ => crate::files::hls::HlsState::Skipped,
     };
     // Only once it is ready. A playlist note can outlive the segmentation that
     // wrote it — a later re-run that failed, say — and handing out a URL for a
     // playlist whose segments are gone fails in the player rather than here.
-    let playlist_url = (hls == crate::hls::HlsState::Ready)
+    let playlist_url = (hls == crate::files::hls::HlsState::Ready)
         .then(|| notes.get(PLAYLIST_NOTE).and_then(|d| content.public_url(d)))
         .flatten();
 
@@ -747,7 +747,7 @@ fn sniff_mpeg_frame(head: &[u8]) -> Option<&'static str> {
 mod tests {
     use super::*;
 
-    use crate::content_blob::{Usage, open_blob};
+    use crate::files::blob::{Usage, open_blob};
     use crate::nats_utils::ensure_object_bucket;
     use async_nats::jetstream::{self, object_store};
     use axum::body::Body;
