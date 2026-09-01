@@ -349,6 +349,10 @@ fn start_segmenting(
     let uploaded_by = content.uploaded_by.clone();
     let digest = stored.digest.clone();
     let visibility = stored.visibility;
+    // The same place the upload was spooled: ffmpeg's output is the same order
+    // of size as its input, and a deployment that gave the upload room meant
+    // to give the transcode room too.
+    let work_dir = content.spool_dir.clone();
     tokio::spawn(async move {
         let _slot = slot;
         // The spool is moved in and dropped here, at the end of the transcode,
@@ -362,11 +366,14 @@ fn start_segmenting(
         let outcome = crate::files::hls::segment_and_store(
             blob.as_ref(),
             &hls.transcoder,
-            &digest,
             spool.path(),
-            &public_base,
-            &uploaded_by,
-            visibility,
+            &crate::files::hls::SegmentSpec {
+                source_digest: &digest,
+                public_base: &public_base,
+                uploaded_by: &uploaded_by,
+                visibility,
+                work_dir: work_dir.as_deref(),
+            },
         )
         .await;
 

@@ -167,11 +167,14 @@ mod tests {
         let result = segment_and_store(
             &blob,
             &FakeTranscoder::ok(),
-            &uploaded,
             source.path(),
-            "https://cdn.test/content/acme",
-            "agent-7",
-            Visibility::Public,
+            &SegmentSpec {
+                source_digest: &uploaded,
+                public_base: "https://cdn.test/content/acme",
+                uploaded_by: "agent-7",
+                visibility: Visibility::Public,
+                work_dir: None,
+            },
         )
         .await
         .expect("segmented");
@@ -229,11 +232,14 @@ mod tests {
         let ours = segment_and_store(
             &blob,
             &FakeTranscoder::ok(),
-            &mine,
             source.path(),
-            "https://cdn.test/c",
-            "agent-7",
-            Visibility::Public,
+            &SegmentSpec {
+                source_digest: &mine,
+                public_base: "https://cdn.test/c",
+                uploaded_by: "agent-7",
+                visibility: Visibility::Public,
+                work_dir: None,
+            },
         )
         .await
         .expect("segmented");
@@ -399,11 +405,14 @@ mod tests {
         let result = segment_and_store(
             &blob,
             &FakeTranscoder::ok(),
-            SOURCE_DIGEST,
             source.path(),
-            "https://cdn.test/content/acme",
-            "agent-7",
-            Visibility::Public,
+            &SegmentSpec {
+                source_digest: SOURCE_DIGEST,
+                public_base: "https://cdn.test/content/acme",
+                uploaded_by: "agent-7",
+                visibility: Visibility::Public,
+                work_dir: None,
+            },
         )
         .await
         .expect("segmented");
@@ -455,11 +464,14 @@ mod tests {
         let result = segment_and_store(
             &blob,
             &FakeTranscoder::ok(),
-            SOURCE_DIGEST,
             source.path(),
-            "https://cdn.test/content/acme",
-            "agent-7",
-            Visibility::Private,
+            &SegmentSpec {
+                source_digest: SOURCE_DIGEST,
+                public_base: "https://cdn.test/content/acme",
+                uploaded_by: "agent-7",
+                visibility: Visibility::Private,
+                work_dir: None,
+            },
         )
         .await
         .expect("segmented");
@@ -488,11 +500,14 @@ mod tests {
                 fail: true,
                 ..FakeTranscoder::ok()
             },
-            SOURCE_DIGEST,
             source.path(),
-            "https://cdn.test/acme",
-            "agent-7",
-            Visibility::Public,
+            &SegmentSpec {
+                source_digest: SOURCE_DIGEST,
+                public_base: "https://cdn.test/acme",
+                uploaded_by: "agent-7",
+                visibility: Visibility::Public,
+                work_dir: None,
+            },
         )
         .await
         .expect_err("the transcoder failed");
@@ -527,11 +542,14 @@ mod tests {
         let refused = segment_and_store(
             &blob,
             &dangling,
-            SOURCE_DIGEST,
             source.path(),
-            "https://cdn.test/acme",
-            "agent-7",
-            Visibility::Public,
+            &SegmentSpec {
+                source_digest: SOURCE_DIGEST,
+                public_base: "https://cdn.test/acme",
+                uploaded_by: "agent-7",
+                visibility: Visibility::Public,
+                work_dir: None,
+            },
         )
         .await
         .expect_err("a dangling reference must not be published");
@@ -559,11 +577,14 @@ mod tests {
             segment_and_store(
                 &blob,
                 &silent,
-                SOURCE_DIGEST,
                 source.path(),
-                "https://cdn.test/acme",
-                "agent-7",
-                Visibility::Public
+                &SegmentSpec {
+                    source_digest: SOURCE_DIGEST,
+                    public_base: "https://cdn.test/acme",
+                    uploaded_by: "agent-7",
+                    visibility: Visibility::Public,
+                    work_dir: None,
+                },
             )
             .await
             .is_err()
@@ -620,11 +641,14 @@ mod tests {
         let refused = segment_and_store(
             &blob,
             &fat,
-            SOURCE_DIGEST,
             source.path(),
-            "https://cdn.test/acme",
-            "agent-7",
-            Visibility::Public,
+            &SegmentSpec {
+                source_digest: SOURCE_DIGEST,
+                public_base: "https://cdn.test/acme",
+                uploaded_by: "agent-7",
+                visibility: Visibility::Public,
+                work_dir: None,
+            },
         )
         .await;
         assert!(
@@ -706,11 +730,14 @@ mod tests {
         let result = segment_and_store(
             &blob,
             &Ffmpeg::default(),
-            SOURCE_DIGEST,
             &source,
-            "https://cdn.test/content/acme",
-            "agent-7",
-            Visibility::Public,
+            &SegmentSpec {
+                source_digest: SOURCE_DIGEST,
+                public_base: "https://cdn.test/content/acme",
+                uploaded_by: "agent-7",
+                visibility: Visibility::Public,
+                work_dir: None,
+            },
         )
         .await
         .expect("segmented");
@@ -1106,16 +1133,58 @@ pub struct Segmented {
 /// Everything stored is removed again if any step fails. A half-stored
 /// segmentation is worse than none: it consumes the operator's quota and
 /// nothing references it, so nothing will ever clean it up.
+/// What a segmentation should produce, and where.
+///
+/// Grouped rather than passed one by one: five of these are strings and paths
+/// whose order the compiler cannot always tell apart, and the cost of getting
+/// two of them the wrong way round is a playlist that points somewhere wrong
+/// on every viewer's screen.
+pub struct SegmentSpec<'a> {
+    /// The stored object being segmented. Derived objects are named under it,
+    /// so deleting it can find them again.
+    pub source_digest: &'a str,
+    /// What a playlist's entries are addressed against, including the path the
+    /// operator's files answer on — entries come out as `{public_base}/{digest}`.
+    pub public_base: &'a str,
+    pub uploaded_by: &'a str,
+    /// Inherited by every derived object. A private video whose segments were
+    /// public would not be private at all: the segments are the video.
+    pub visibility: crate::files::blob::Visibility,
+    /// Where the transcoder writes before anything is stored. `None` is the
+    /// platform temporary directory, which in a container is frequently a
+    /// tmpfs sized for nothing like a video.
+    pub work_dir: Option<&'a std::path::Path>,
+}
+
 pub async fn segment_and_store(
     blob: &dyn crate::files::blob::Blob,
     transcoder: &dyn Transcoder,
-    source_digest: &str,
     source: &std::path::Path,
-    public_base: &str,
-    uploaded_by: &str,
-    visibility: crate::files::blob::Visibility,
+    spec: &SegmentSpec<'_>,
 ) -> Result<Segmented> {
-    let work = tempfile::tempdir().context("make a working directory")?;
+    let SegmentSpec {
+        source_digest,
+        public_base,
+        uploaded_by,
+        visibility,
+        work_dir,
+    } = *spec;
+    // ffmpeg writes every segment here before any of it is stored, so this
+    // needs room for the whole output. Unset it is the platform temporary
+    // directory, which in a container is frequently a tmpfs sized for nothing
+    // like a video — and a transcode that fills it reports only `failed`.
+    let work = match work_dir {
+        Some(dir) => tempfile::tempdir_in(dir),
+        None => tempfile::tempdir(),
+    }
+    .with_context(|| {
+        format!(
+            "make a working directory in {}",
+            work_dir
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|| std::env::temp_dir().display().to_string())
+        )
+    })?;
     transcoder.segment(source, work.path()).await?;
 
     let produced = produced_files(work.path()).await?;
