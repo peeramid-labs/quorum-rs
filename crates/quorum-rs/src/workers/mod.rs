@@ -692,20 +692,8 @@ impl NatsNsedWorker {
             &self.agent_config.provider_id,
             &self.agent_config.model_name,
         );
-        // A catalog is an advertisement, so a listed model is asked for one
-        // token before it is believed. Only when the catalog omits the id is
-        // that call skipped — the answer is already known.
-        let reason = if listed == Availability::Unavailable {
-            Some("absent from the provider catalog")
-        } else if probe.probe_serving(&self.agent_config.model_name).await
-            == Availability::Unavailable
-        {
-            Some("listed by the provider but not served")
-        } else {
-            None
-        };
-
-        if let Some(reason) = reason {
+        if listed == Availability::Unavailable {
+            let reason = "absent from the provider catalog";
             let strikes = self.model_down_strikes.fetch_add(1, Ordering::Relaxed) + 1;
             let cooldown = escalated_cooldown_ms(strikes);
             let until = now + cooldown;
