@@ -27,6 +27,13 @@ pub enum Refusal {
     Malformed(String),
     /// The operator's file space is full.
     OutOfSpace { used_bytes: u64, quota_bytes: u64 },
+    /// The spool filesystem is full.
+    ///
+    /// Separate from a quota: the operator has room, the *server* does not.
+    /// An upload is written to disk before it is hashed, so a 200 MB upload
+    /// needs 200 MB of spool — and in a container that is often a small tmpfs
+    /// nobody sized for video.
+    NoSpoolSpace { dir: String },
     /// Spooling or storing failed for a reason the caller cannot fix.
     Io(String),
 }
@@ -45,6 +52,10 @@ impl std::fmt::Display for Refusal {
             } => write!(
                 f,
                 "storage quota exceeded: {used_bytes} of {quota_bytes} bytes used"
+            ),
+            Self::NoSpoolSpace { dir } => write!(
+                f,
+                "the server ran out of spool space in {dir} while receiving this upload"
             ),
             Self::Io(why) => write!(f, "{why}"),
         }
@@ -103,9 +114,18 @@ impl Spooled {
 pub async fn spool(
     mut field: axum::extract::multipart::Field<'_>,
     max: u64,
+    spool_dir: Option<&std::path::Path>,
 ) -> Result<Spooled, Refusal> {
-    let spool =
-        tempfile::NamedTempFile::new().map_err(|e| Refusal::Io(format!("no spool file: {e}")))?;
+    let where_ = || {
+        spool_dir
+            .map(|d| d.display().to_string())
+            .unwrap_or_else(|| std::env::temp_dir().display().to_string())
+    };
+    let spool = match spool_dir {
+        Some(dir) => tempfile::NamedTempFile::new_in(dir),
+        None => tempfile::NamedTempFile::new(),
+    }
+    .map_err(|e| Refusal::Io(format!("no spool file in {}: {e}", where_())))?;
     let path = spool.into_temp_path();
     // Read *and* write: the same handle is rewound and streamed into the
     // bucket once the digest is known, and a write-only handle fails there
@@ -116,7 +136,7 @@ pub async fn spool(
         .truncate(true)
         .open(&path)
         .await
-        .map_err(|e| Refusal::Io(format!("no spool file: {e}")))?;
+        .map_err(|e| Refusal::Io(format!("no spool file in {}: {e}", where_())))?;
 
     let mut hasher = Sha256::new();
     let mut bytes: u64 = 0;
@@ -138,15 +158,13 @@ pub async fn spool(
         hasher.update(&chunk);
         file.write_all(&chunk)
             .await
-            .map_err(|e| Refusal::Io(format!("could not spool the upload: {e}")))?;
+            .map_err(|e| out_of_room(e, &where_()))?;
     }
     // Propagated, not swallowed: `write_all` can return before the bytes reach
     // the OS, so a full disk surfaces here. Ignoring it would store a short
     // file under the digest of the whole one, which is the single invariant
     // content addressing rests on.
-    file.flush()
-        .await
-        .map_err(|e| Refusal::Io(format!("could not flush the upload to disk: {e}")))?;
+    file.flush().await.map_err(|e| out_of_room(e, &where_()))?;
 
     Ok(Spooled {
         file,
@@ -256,6 +274,7 @@ pub const MULTIPART_ENVELOPE_ALLOWANCE: u64 = 64 * 1024;
 pub async fn read_upload_form(
     form: &mut axum::extract::Multipart,
     max_upload_bytes: u64,
+    spool_dir: Option<&std::path::Path>,
 ) -> Result<(Visibility, Spooled), Refusal> {
     let mut visibility: Option<Visibility> = None;
     let mut file: Option<Spooled> = None;
@@ -269,7 +288,7 @@ pub async fn read_upload_form(
             "visibility" => visibility = Some(read_visibility(read_short_field(field).await?)?),
             "file" => {
                 let filename = safe_filename(field.file_name().unwrap_or("upload"));
-                let spooled = spool(field, max_upload_bytes).await?;
+                let spooled = spool(field, max_upload_bytes, spool_dir).await?;
                 file = Some(Spooled {
                     filename,
                     ..spooled
@@ -316,6 +335,20 @@ fn read_visibility(raw: String) -> Result<Visibility, Refusal> {
         other => Err(Refusal::Malformed(format!(
             "visibility {other:?} is neither public nor private"
         ))),
+    }
+}
+
+/// A filesystem-full error said plainly, so an operator reading a log knows
+/// which disk to look at rather than seeing a bare 500.
+fn out_of_room(e: std::io::Error, dir: &str) -> Refusal {
+    // ENOSPC. Named by number because `ErrorKind::StorageFull` is still
+    // unstable, and this is the one io error an operator can actually act on.
+    if e.raw_os_error() == Some(28) {
+        Refusal::NoSpoolSpace {
+            dir: dir.to_string(),
+        }
+    } else {
+        Refusal::Io(format!("could not spool the upload to {dir}: {e}"))
     }
 }
 
@@ -469,5 +502,65 @@ mod tests {
         assert_eq!(safe_filename(""), "upload");
         assert_eq!(safe_filename("   "), "upload");
         assert_eq!(safe_filename(&"x".repeat(500)).len(), 120);
+    }
+
+    #[test]
+    fn a_full_spool_disk_is_told_apart_from_every_other_io_failure() {
+        // ENOSPC is the one io error the caller can act on, so it gets its own
+        // refusal — a 507 that says to retry, rather than a 500 that says
+        // nothing. Everything else stays generic but names the directory,
+        // which is what makes a log entry actionable.
+        let full = out_of_room(std::io::Error::from_raw_os_error(28), "/spool");
+        assert!(
+            matches!(&full, Refusal::NoSpoolSpace { dir } if dir == "/spool"),
+            "ENOSPC should be its own refusal, got {full:?}"
+        );
+        assert!(full.to_string().contains("/spool"));
+
+        let other = out_of_room(
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "nope"),
+            "/spool",
+        );
+        assert!(matches!(other, Refusal::Io(_)));
+        assert!(other.to_string().contains("/spool"), "{other}");
+    }
+
+    #[tokio::test]
+    async fn an_unusable_spool_directory_is_reported_with_its_path() {
+        // Without the path in the message, an operator reading a 500 in the
+        // log has no way to tell which filesystem to go and look at — which is
+        // the whole difficulty this reported as a bare "no spool file".
+        let missing = std::path::Path::new("/definitely/not/a/directory/here");
+        let refusal = spool_into(missing).unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .contains("/definitely/not/a/directory/here"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_configured_spool_directory_is_where_the_upload_lands() {
+        // The default is the platform temporary directory, which in a
+        // container is routinely a small tmpfs. Pointing it elsewhere is the
+        // only way a deployment can give a 500 MB upload 500 MB to land in.
+        let dir = tempfile::tempdir().expect("a directory to spool into");
+        let spooled = spool_into(dir.path()).expect("spool into the given directory");
+        assert_eq!(
+            spooled.parent(),
+            Some(dir.path()),
+            "spooled to {} instead",
+            spooled.display()
+        );
+    }
+
+    /// The directory-choosing half of `spool`, which is all these two can
+    /// reach: the rest needs a live multipart field.
+    fn spool_into(dir: &std::path::Path) -> Result<std::path::PathBuf, Refusal> {
+        let where_ = || dir.display().to_string();
+        let spool = tempfile::NamedTempFile::new_in(dir)
+            .map_err(|e| Refusal::Io(format!("no spool file in {}: {e}", where_())))?;
+        Ok(spool.path().to_path_buf())
     }
 }

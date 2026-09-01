@@ -38,6 +38,12 @@ pub struct ContentUploads {
     /// can be derived here.
     public_base: Option<String>,
     uploaded_by: String,
+    /// Where an upload is spooled while it is hashed.
+    ///
+    /// `None` means the platform temporary directory, which in a container is
+    /// routinely a small tmpfs — an upload needs as much room here as it has
+    /// bytes, so a deployment that accepts video should point this at a volume.
+    spool_dir: Option<std::path::PathBuf>,
     /// Segmenting for uploaded video. `None` where no transcoder was found on
     /// this host, which is not an error — a library user who never asked for a
     /// media pipeline gets their original stored and nothing else.
@@ -115,6 +121,11 @@ impl ContentUploads {
                 .ok()
                 .map(|v| v.trim().trim_end_matches('/').to_string())
                 .filter(|v| !v.is_empty()),
+            spool_dir: std::env::var("NSED_UPLOAD_SPOOL_DIR")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from),
             uploaded_by,
         })
     }
@@ -185,6 +196,17 @@ fn render(refusal: UploadRefusal) -> Box<Response> {
             )
                 .into_response(),
         ),
+        // The server is out of room, not the operator. Logged with the path so
+        // whoever runs it knows which filesystem filled; the caller is told
+        // only that retrying later is worth it, since a server path is not
+        // theirs to see.
+        UploadRefusal::NoSpoolSpace { ref dir } => {
+            tracing::error!(spool_dir = %dir, "out of spool space while receiving an upload");
+            boxed(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "the server is out of room to receive uploads right now",
+            )
+        }
         UploadRefusal::Io(_) => boxed(StatusCode::INTERNAL_SERVER_ERROR, refusal.to_string()),
     }
 }
@@ -252,11 +274,16 @@ pub(super) async fn upload(
         return *render(refusal);
     }
 
-    let (visibility, mut spooled) =
-        match read_upload_form(&mut form, content.max_upload_bytes).await {
-            Ok(parts) => parts,
-            Err(refusal) => return *render(refusal),
-        };
+    let (visibility, mut spooled) = match read_upload_form(
+        &mut form,
+        content.max_upload_bytes,
+        content.spool_dir.as_deref(),
+    )
+    .await
+    {
+        Ok(parts) => parts,
+        Err(refusal) => return *render(refusal),
+    };
 
     let stored = match store_upload(
         content.blob.as_ref(),
@@ -664,6 +691,7 @@ mod tests {
             max_upload_bytes,
             public_base: Some("https://example.test/content/acme".to_string()),
             uploaded_by: "agent-7".to_string(),
+            spool_dir: None,
             // No transcoder in the tests that exercise the HTTP surface: the
             // pipeline has its own, and spawning one here would make every
             // upload test wait on a subprocess.
