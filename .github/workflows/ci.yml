@@ -164,9 +164,41 @@ jobs:
         # The HLS pipeline shells out to it. Without it the transcode tests
         # skip, and the one thing a fake transcoder cannot check — that the
         # argument vector we actually run produces a playlist — goes untested.
+        #
+        # This runs on a self-hosted Forgejo runner whose image we choose, so
+        # it assumes as little about that image as it can: ffmpeg may already
+        # be there, the job may be root with no `sudo` binary, and the package
+        # manager may be apt or apk. `sudo` appears nowhere else in this file,
+        # so requiring it here would be this step's own assumption.
+        #
+        # The cheapest arrangement is to bake ffmpeg into the runner image —
+        # the first branch then short-circuits and this costs nothing per run,
+        # instead of ~45s of apt.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ffmpeg
+          set -eu
+          if command -v ffmpeg >/dev/null 2>&1; then
+            echo "ffmpeg already in the runner image:"
+            ffmpeg -version | head -1
+            exit 0
+          fi
+          SUDO=""
+          if [ "$(id -u)" -ne 0 ]; then
+            if command -v sudo >/dev/null 2>&1; then
+              SUDO=sudo
+            else
+              echo "no ffmpeg, not root, and no sudo: bake ffmpeg into the runner image" >&2
+              exit 1
+            fi
+          fi
+          if command -v apt-get >/dev/null 2>&1; then
+            $SUDO apt-get update -qq
+            $SUDO apt-get install -y --no-install-recommends ffmpeg
+          elif command -v apk >/dev/null 2>&1; then
+            $SUDO apk add --no-cache ffmpeg
+          else
+            echo "no ffmpeg and no known package manager: bake it into the runner image" >&2
+            exit 1
+          fi
           ffmpeg -version | head -1
 
       - name: Set up Environment Variables
@@ -175,9 +207,11 @@ jobs:
           echo "NATS_URL=nats://nats:4222" >> $GITHUB_ENV
           echo "RUST_LOG=info" >> $GITHUB_ENV
           echo "CARGO_BUILD_JOBS=2" >> $GITHUB_ENV
-          # This job provides a broker, so a test that skips for want of one is
-          # a test that silently stopped covering anything. Fail instead.
+          # This job provides a broker and a transcoder, so a test that skips
+          # for want of either is a test that silently stopped covering
+          # anything. Fail instead.
           echo "REQUIRE_NATS=1" >> $GITHUB_ENV
+          echo "REQUIRE_FFMPEG=1" >> $GITHUB_ENV
 
       - name: Run Tests
         run: cargo test --workspace
