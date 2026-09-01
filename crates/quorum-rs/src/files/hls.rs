@@ -135,6 +135,122 @@ fn resolve(reference: &str, urls: &HashMap<String, String>) -> Result<String> {
 #[cfg(test)]
 mod tests {
 
+    /// Stands in for the digest of whatever was uploaded. Derived objects are
+    /// named under it, so a test asserting cleanup needs the same value the
+    /// pipeline was given.
+    const SOURCE_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[tokio::test]
+    async fn deleting_a_video_takes_its_segments_off_the_air_too() {
+        // The bug this exists for: a playlist and its segments are separate
+        // public objects. Deleting only the source leaves a video that anyone
+        // holding the playlist URL keeps streaming, and that keeps spending
+        // the operator's quota with nothing referencing it — invisibly, since
+        // the library view hides derived objects.
+        let Some(blob) = blob_for("deletederived", 4 * 1024 * 1024).await else {
+            require_broker("deleting derived objects needs a broker");
+            return;
+        };
+        let source = tempfile::NamedTempFile::new().expect("source");
+        // The source itself, as an upload would have stored it.
+        let uploaded = store_bytes(
+            &blob,
+            b"the original",
+            SOURCE_DIGEST,
+            "clip.mp4",
+            "agent-7",
+            Visibility::Public,
+        )
+        .await
+        .expect("store the source");
+
+        let result = segment_and_store(
+            &blob,
+            &FakeTranscoder::ok(),
+            &uploaded,
+            source.path(),
+            "https://cdn.test/content/acme",
+            "agent-7",
+            Visibility::Public,
+        )
+        .await
+        .expect("segmented");
+        assert!(!result.stored.is_empty());
+
+        delete_with_derived(&blob, &uploaded)
+            .await
+            .expect("delete the video");
+
+        for digest in &result.stored {
+            assert!(
+                blob.head(digest).await.is_err(),
+                "a segment outlived the video it came from: {digest}"
+            );
+        }
+        assert!(blob.head(&uploaded).await.is_err(), "the source survived");
+        // Nothing left behind: the quota is the operator's, and an object with
+        // nothing referencing it is one they can never find to remove.
+        let left = blob.list().await.expect("list");
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[tokio::test]
+    async fn one_videos_segments_are_not_deleted_with_anothers() {
+        // Derived objects are found by a name built from the source digest,
+        // so two videos segmented into the same bucket must not collide.
+        let Some(blob) = blob_for("deleteisolated", 4 * 1024 * 1024).await else {
+            require_broker("deleting derived objects needs a broker");
+            return;
+        };
+        let source = tempfile::NamedTempFile::new().expect("source");
+        let other_digest = "f".repeat(64);
+
+        let mine = store_bytes(
+            &blob,
+            b"mine",
+            SOURCE_DIGEST,
+            "a.mp4",
+            "agent-7",
+            Visibility::Public,
+        )
+        .await
+        .expect("store");
+        let theirs = store_bytes(
+            &blob,
+            b"theirs",
+            &other_digest,
+            "b.mp4",
+            "agent-7",
+            Visibility::Public,
+        )
+        .await
+        .expect("store");
+
+        let ours = segment_and_store(
+            &blob,
+            &FakeTranscoder::ok(),
+            &mine,
+            source.path(),
+            "https://cdn.test/c",
+            "agent-7",
+            Visibility::Public,
+        )
+        .await
+        .expect("segmented");
+
+        delete_with_derived(&blob, &theirs)
+            .await
+            .expect("delete the other video");
+
+        for digest in &ours.stored {
+            assert!(
+                blob.head(digest).await.is_ok(),
+                "deleting one video removed another's segment: {digest}"
+            );
+        }
+        assert!(blob.head(&mine).await.is_ok());
+    }
+
     #[test]
     fn a_state_survives_the_annotation_it_is_written_to() {
         // Written by the process that transcodes, read by the one that polls
@@ -283,6 +399,7 @@ mod tests {
         let result = segment_and_store(
             &blob,
             &FakeTranscoder::ok(),
+            SOURCE_DIGEST,
             source.path(),
             "https://cdn.test/content/acme",
             "agent-7",
@@ -338,6 +455,7 @@ mod tests {
         let result = segment_and_store(
             &blob,
             &FakeTranscoder::ok(),
+            SOURCE_DIGEST,
             source.path(),
             "https://cdn.test/content/acme",
             "agent-7",
@@ -370,6 +488,7 @@ mod tests {
                 fail: true,
                 ..FakeTranscoder::ok()
             },
+            SOURCE_DIGEST,
             source.path(),
             "https://cdn.test/acme",
             "agent-7",
@@ -408,6 +527,7 @@ mod tests {
         let refused = segment_and_store(
             &blob,
             &dangling,
+            SOURCE_DIGEST,
             source.path(),
             "https://cdn.test/acme",
             "agent-7",
@@ -439,6 +559,7 @@ mod tests {
             segment_and_store(
                 &blob,
                 &silent,
+                SOURCE_DIGEST,
                 source.path(),
                 "https://cdn.test/acme",
                 "agent-7",
@@ -499,6 +620,7 @@ mod tests {
         let refused = segment_and_store(
             &blob,
             &fat,
+            SOURCE_DIGEST,
             source.path(),
             "https://cdn.test/acme",
             "agent-7",
@@ -584,6 +706,7 @@ mod tests {
         let result = segment_and_store(
             &blob,
             &Ffmpeg::default(),
+            SOURCE_DIGEST,
             &source,
             "https://cdn.test/content/acme",
             "agent-7",
@@ -801,6 +924,17 @@ const SEGMENT_SECONDS: u32 = 6;
 /// without a second object per segment.
 pub const DERIVED_PREFIX: &str = "hls/";
 
+/// Where a source's derived objects are named, as a filename prefix.
+///
+/// Namespaced by the source so its segments can be found again from the
+/// digest alone. Without that, deleting a video would delete only the video:
+/// its segments are separate public objects, and they would keep serving to
+/// anyone holding the playlist and keep spending the operator's quota, with
+/// nothing left that referenced them.
+pub fn derived_prefix(source_digest: &str) -> String {
+    format!("{DERIVED_PREFIX}{source_digest}/")
+}
+
 /// Where segmenting is recorded against the original, as an annotation on it.
 ///
 /// Public because the process that segments and the process that serves are
@@ -975,6 +1109,7 @@ pub struct Segmented {
 pub async fn segment_and_store(
     blob: &dyn crate::files::blob::Blob,
     transcoder: &dyn Transcoder,
+    source_digest: &str,
     source: &std::path::Path,
     public_base: &str,
     uploaded_by: &str,
@@ -988,7 +1123,16 @@ pub async fn segment_and_store(
     let mut stored = Vec::new();
     let mut urls = HashMap::new();
     for name in produced.iter().filter(|name| *name != PLAYLIST_NAME) {
-        match store_file(blob, &work.path().join(name), name, uploaded_by, visibility).await {
+        match store_file(
+            blob,
+            &work.path().join(name),
+            source_digest,
+            name,
+            uploaded_by,
+            visibility,
+        )
+        .await
+        {
             Ok(digest) => {
                 urls.insert(name.clone(), format!("{public_base}/{digest}"));
                 stored.push(digest);
@@ -1000,7 +1144,16 @@ pub async fn segment_and_store(
         }
     }
 
-    let playlist = match finish(blob, work.path(), &urls, uploaded_by, visibility).await {
+    let playlist = match finish(
+        blob,
+        work.path(),
+        source_digest,
+        &urls,
+        uploaded_by,
+        visibility,
+    )
+    .await
+    {
         Ok(digest) => digest,
         Err(e) => {
             remove_all(blob, &stored).await;
@@ -1034,6 +1187,7 @@ async fn produced_files(work: &std::path::Path) -> Result<Vec<String>> {
 async fn finish(
     blob: &dyn crate::files::blob::Blob,
     work: &std::path::Path,
+    source_digest: &str,
     urls: &HashMap<String, String>,
     uploaded_by: &str,
     visibility: crate::files::blob::Visibility,
@@ -1045,6 +1199,7 @@ async fn finish(
     store_bytes(
         blob,
         rewritten.as_bytes(),
+        source_digest,
         PLAYLIST_NAME,
         uploaded_by,
         visibility,
@@ -1055,6 +1210,7 @@ async fn finish(
 async fn store_file(
     blob: &dyn crate::files::blob::Blob,
     path: &std::path::Path,
+    source_digest: &str,
     name: &str,
     uploaded_by: &str,
     visibility: crate::files::blob::Visibility,
@@ -1062,12 +1218,13 @@ async fn store_file(
     let bytes = tokio::fs::read(path)
         .await
         .with_context(|| format!("read {name}"))?;
-    store_bytes(blob, &bytes, name, uploaded_by, visibility).await
+    store_bytes(blob, &bytes, source_digest, name, uploaded_by, visibility).await
 }
 
 async fn store_bytes(
     blob: &dyn crate::files::blob::Blob,
     bytes: &[u8],
+    source_digest: &str,
     name: &str,
     uploaded_by: &str,
     visibility: crate::files::blob::Visibility,
@@ -1081,7 +1238,7 @@ async fn store_bytes(
         &mut reader,
         &ObjectMeta {
             digest: digest.clone(),
-            filename: format!("{DERIVED_PREFIX}{name}"),
+            filename: format!("{}{name}", derived_prefix(source_digest)),
             mime: segment_mime(name).to_string(),
             bytes: bytes.len() as u64,
             // Inherited from the source. A private video whose segments were
@@ -1093,6 +1250,47 @@ async fn store_bytes(
     )
     .await?;
     Ok(digest)
+}
+
+/// Delete a stored object and everything segmenting derived from it.
+///
+/// Deleting only the source would not take the video off the air: its segments
+/// and playlist are separate objects, public in their own right, and a player
+/// already holding the playlist URL would keep streaming from them. They would
+/// also keep spending the operator's quota with nothing referencing them, and
+/// the library view hides them, so nothing would ever notice.
+///
+/// The derived objects go first. Interrupted halfway, that leaves a source
+/// whose playlist is incomplete — a video that still plays, since the original
+/// is intact and a retry finishes the job. The other order leaves segments
+/// nothing points at and nothing can find again.
+pub async fn delete_with_derived(
+    blob: &dyn crate::files::blob::Blob,
+    source_digest: &str,
+) -> Result<()> {
+    for digest in derived_of(blob, source_digest).await {
+        if let Err(e) = blob.delete(&digest).await {
+            tracing::warn!(digest, error = %format!("{e:#}"), "could not remove a derived object");
+        }
+    }
+    blob.delete(source_digest).await
+}
+
+/// The digests of everything segmenting produced from `source_digest`.
+///
+/// Found by name rather than from a manifest: a list of segments recorded
+/// against the source would be one more thing that can disagree with what the
+/// bucket actually holds, and a partial segmentation writes objects before it
+/// would ever write the manifest.
+async fn derived_of(blob: &dyn crate::files::blob::Blob, source_digest: &str) -> Vec<String> {
+    let prefix = derived_prefix(source_digest);
+    blob.list()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|meta| meta.filename.starts_with(&prefix))
+        .map(|meta| meta.digest)
+        .collect()
 }
 
 /// Best-effort removal of a partial segmentation.

@@ -362,6 +362,7 @@ fn start_segmenting(
         let outcome = crate::files::hls::segment_and_store(
             blob.as_ref(),
             &hls.transcoder,
+            &digest,
             spool.path(),
             &public_base,
             &uploaded_by,
@@ -573,7 +574,8 @@ pub(super) async fn remove(
     if let Err(refusal) = checked_digest(&digest) {
         return *refusal;
     }
-    match content.blob.delete(&digest).await {
+    // Segments too, or deleting a video would not stop it being watchable.
+    match crate::files::hls::delete_with_derived(content.blob.as_ref(), &digest).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(_) => refuse(StatusCode::NOT_FOUND, "no such object"),
     }
