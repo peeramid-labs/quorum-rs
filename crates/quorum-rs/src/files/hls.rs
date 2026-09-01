@@ -28,6 +28,37 @@ pub enum HlsState {
     Skipped,
 }
 
+impl HlsState {
+    /// How the state reads back out of an annotation.
+    ///
+    /// One place, because the process that writes the note, the one that polls
+    /// it, and the one that turns it into a playlist link are three different
+    /// processes — and a state parsed differently in any of them is a video
+    /// that plays in one surface and not another.
+    ///
+    /// An absent or unrecognised note is [`Self::Skipped`]: every object
+    /// predates this annotation, and treating unknown as "not attempted" says
+    /// exactly what is true of them.
+    pub fn from_note(note: Option<&str>) -> Self {
+        match note {
+            Some("pending") => Self::Pending,
+            Some("ready") => Self::Ready,
+            Some("failed") => Self::Failed,
+            _ => Self::Skipped,
+        }
+    }
+
+    /// The value written back into the annotation.
+    pub fn as_note(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
 /// The `EXT-X-MAP` tag names an initialisation segment in an attribute rather
 /// than on a line of its own, so a rewriter that only looked at non-comment
 /// lines would leave it pointing at a file nobody stored.
@@ -103,6 +134,26 @@ fn resolve(reference: &str, urls: &HashMap<String, String>) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_state_survives_the_annotation_it_is_written_to() {
+        // Written by the process that transcodes, read by the one that polls
+        // and by the one that builds a playlist link. Three processes, so a
+        // round trip that loses a state is a video playable in one surface
+        // and not another.
+        for state in [
+            HlsState::Pending,
+            HlsState::Ready,
+            HlsState::Failed,
+            HlsState::Skipped,
+        ] {
+            assert_eq!(HlsState::from_note(Some(state.as_note())), state);
+        }
+        // Every object stored before this annotation existed has no note, and
+        // "not attempted" is exactly what is true of them.
+        assert_eq!(HlsState::from_note(None), HlsState::Skipped);
+        assert_eq!(HlsState::from_note(Some("banana")), HlsState::Skipped);
+    }
     use super::*;
 
     use crate::files::blob::{Blob as _, NatsBlob, Visibility, quota_from_max_bytes};

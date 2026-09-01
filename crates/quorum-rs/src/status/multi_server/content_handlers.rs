@@ -546,12 +546,7 @@ pub(super) async fn status(
     };
     let notes = content.blob.notes(&digest).await.unwrap_or_default();
 
-    let hls = match notes.get(HLS_NOTE).map(String::as_str) {
-        Some("pending") => crate::files::hls::HlsState::Pending,
-        Some("ready") => crate::files::hls::HlsState::Ready,
-        Some("failed") => crate::files::hls::HlsState::Failed,
-        _ => crate::files::hls::HlsState::Skipped,
-    };
+    let hls = crate::files::hls::HlsState::from_note(notes.get(HLS_NOTE).map(String::as_str));
     // Only once it is ready. A playlist note can outlive the segmentation that
     // wrote it — a later re-run that failed, say — and handing out a URL for a
     // playlist whose segments are gone fails in the player rather than here.
