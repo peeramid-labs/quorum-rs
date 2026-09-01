@@ -141,6 +141,94 @@ mod tests {
     const SOURCE_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[tokio::test]
+    async fn a_video_deleted_and_uploaded_again_is_segmented_afresh() {
+        // Content addressing means the same bytes come back under the same
+        // digest, so a note left behind by the previous life would be read as
+        // this one's: `hls=ready` pointing at a playlist that was deleted with
+        // the video. Segmenting would short-circuit, the status would claim
+        // ready, and the player would be handed a 404.
+        let Some(blob) = blob_for("reupload", 4 * 1024 * 1024).await else {
+            require_broker("a re-upload needs a broker");
+            return;
+        };
+        let source = tempfile::NamedTempFile::new().expect("source");
+        let body = b"the same video, uploaded twice";
+
+        let first = store_bytes(
+            &blob,
+            body,
+            SOURCE_DIGEST,
+            "clip.mp4",
+            "agent-7",
+            Visibility::Public,
+        )
+        .await
+        .expect("store");
+        let before = segment_and_store(
+            &blob,
+            &FakeTranscoder::ok(),
+            source.path(),
+            &SegmentSpec {
+                source_digest: &first,
+                public_base: "https://cdn.test/c",
+                uploaded_by: "agent-7",
+                visibility: Visibility::Public,
+                work_dir: None,
+            },
+        )
+        .await
+        .expect("segmented");
+        blob.annotate(&first, HLS_NOTE, "ready")
+            .await
+            .expect("note");
+        blob.annotate(&first, PLAYLIST_NOTE, &before.playlist)
+            .await
+            .expect("note");
+
+        delete_with_derived(&blob, &first).await.expect("delete");
+
+        // The same bytes again: the digest is identical, which is the whole
+        // point of content addressing and the whole hazard here.
+        let again = store_bytes(
+            &blob,
+            body,
+            SOURCE_DIGEST,
+            "clip.mp4",
+            "agent-7",
+            Visibility::Public,
+        )
+        .await
+        .expect("store again");
+        assert_eq!(again, first, "the same bytes must address the same object");
+
+        let notes = blob.notes(&again).await.unwrap_or_default();
+        assert!(
+            !notes.contains_key(HLS_NOTE) && !notes.contains_key(PLAYLIST_NOTE),
+            "a previous life's notes reattached to the new upload: {notes:?}"
+        );
+
+        // And segmenting it again produces something that is actually there.
+        let after = segment_and_store(
+            &blob,
+            &FakeTranscoder::ok(),
+            source.path(),
+            &SegmentSpec {
+                source_digest: &again,
+                public_base: "https://cdn.test/c",
+                uploaded_by: "agent-7",
+                visibility: Visibility::Public,
+                work_dir: None,
+            },
+        )
+        .await
+        .expect("segmented again");
+        assert!(
+            blob.head(&after.playlist).await.is_ok(),
+            "the playlist recorded after a re-upload must be one that exists"
+        );
+    }
+
+    #[tokio::test]
     async fn deleting_a_video_takes_its_segments_off_the_air_too() {
         // The bug this exists for: a playlist and its segments are separate
         // public objects. Deleting only the source leaves a video that anyone
