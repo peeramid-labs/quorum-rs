@@ -142,11 +142,7 @@ pub async fn spool(
     let mut bytes: u64 = 0;
     let mut head = Vec::with_capacity(SNIFF_BYTES);
 
-    while let Some(chunk) = field
-        .chunk()
-        .await
-        .map_err(|e| Refusal::Malformed(format!("upload interrupted: {e}")))?
-    {
+    while let Some(chunk) = field.chunk().await.map_err(|e| interrupted(e, max))? {
         bytes += chunk.len() as u64;
         if bytes > max {
             return Err(Refusal::TooLarge { max });
@@ -279,10 +275,13 @@ pub async fn read_upload_form(
     let mut visibility: Option<Visibility> = None;
     let mut file: Option<Spooled> = None;
 
+    // Classified, not flattened: the body cap can trip while the next field is
+    // being read just as easily as while its bytes are, and both mean the same
+    // thing to a caller.
     while let Some(field) = form
         .next_field()
         .await
-        .map_err(|e| Refusal::Malformed(e.to_string()))?
+        .map_err(|e| interrupted(e, max_upload_bytes))?
     {
         match field.name().unwrap_or_default() {
             "visibility" => visibility = Some(read_visibility(read_short_field(field).await?)?),
@@ -335,6 +334,22 @@ fn read_visibility(raw: String) -> Result<Visibility, Refusal> {
         other => Err(Refusal::Malformed(format!(
             "visibility {other:?} is neither public nor private"
         ))),
+    }
+}
+
+/// A read that stopped part-way, told apart from one that stopped because the
+/// body was too large.
+///
+/// The route caps the body before this sees it, so the ceiling can be reached
+/// in two places: here, counting bytes, and in the layer above, which surfaces
+/// as a read error. Reporting the second as malformed tells a client its
+/// request was badly formed when it was merely too big — and "too big" is the
+/// one of those it can do something about.
+fn interrupted(e: axum::extract::multipart::MultipartError, max: u64) -> Refusal {
+    if e.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+        Refusal::TooLarge { max }
+    } else {
+        Refusal::Malformed(format!("upload interrupted: {e}"))
     }
 }
 
