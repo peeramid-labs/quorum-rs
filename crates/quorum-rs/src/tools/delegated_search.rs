@@ -28,6 +28,11 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::error::Error;
 
+/// The function name the model sees. Must never equal a backend's search tool
+/// name (`web_search`, `$web_search`): gateways translate a same-named
+/// function into the provider tool, recreating the rejected mixed array.
+pub const LOCAL_TOOL_NAME: &str = "search_web";
+
 /// Runs a web search by asking the same model again, with only the provider's
 /// search tool declared.
 #[derive(Clone, Debug)]
@@ -52,15 +57,18 @@ impl DelegatedSearchTool {
 
 #[async_trait]
 impl Tool for DelegatedSearchTool {
+    /// Deliberately not the provider's own name: a gateway maps a function
+    /// tool called `web_search` onto the backend's search tool, which puts the
+    /// mix this indirection exists to avoid right back on the wire.
     fn name(&self) -> String {
-        "web_search".to_string()
+        LOCAL_TOOL_NAME.to_string()
     }
 
     fn schema(&self) -> ChatCompletionTool {
         ChatCompletionTool {
             r#type: ChatCompletionToolType::Function,
             function: FunctionObject {
-                name: "web_search".to_string(),
+                name: LOCAL_TOOL_NAME.to_string(),
                 description: Some(
                     "Search the live web and return what was found. Use it for anything \
                      that depends on the present — prices, availability, releases, news, \
@@ -261,9 +269,14 @@ mod tests {
         let (model, _) = spy("x");
         let tool = DelegatedSearchTool::new(Box::new(model), &AgentConfig::default(), "web_search");
 
-        assert_eq!(tool.name(), "web_search");
+        assert_eq!(tool.name(), "search_web");
+        assert_ne!(
+            tool.name(),
+            "web_search",
+            "the local name must not be a provider search tool name"
+        );
         let schema = tool.schema();
         assert!(matches!(schema.r#type, ChatCompletionToolType::Function));
-        assert_eq!(schema.function.name, "web_search");
+        assert_eq!(schema.function.name, "search_web");
     }
 }
