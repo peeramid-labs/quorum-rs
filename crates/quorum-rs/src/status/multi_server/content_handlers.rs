@@ -236,10 +236,21 @@ fn not_configured() -> Response {
 /// written to, and a video cannot be held in memory to hash it. The body is
 /// therefore spooled to a temporary file while being hashed, and the spool is
 /// what gets streamed into the bucket.
-pub(super) async fn upload(State(state): State<MultiAppState>, mut form: Multipart) -> Response {
+pub(super) async fn upload(
+    State(state): State<MultiAppState>,
+    headers: HeaderMap,
+    mut form: Multipart,
+) -> Response {
     let Some(content) = state.content.clone() else {
         return not_configured();
     };
+    // Refused from the declared length before the body is read, so an oversize
+    // upload does not end as a reset connection minutes in.
+    if let Some(refusal) =
+        crate::files::upload::declared_too_large(&headers, content.max_upload_bytes)
+    {
+        return *render(refusal);
+    }
 
     let (visibility, mut spooled) =
         match read_upload_form(&mut form, content.max_upload_bytes).await {
@@ -1048,6 +1059,40 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn an_upload_that_declares_itself_too_large_never_reaches_the_spool() {
+        // Rejecting mid-body reaches the client as a reset connection, so a
+        // long upload ends in "the connection dropped" and says nothing about
+        // the ceiling. A declared length can be answered before a byte lands.
+        let Some(content) = configured(
+            "an_upload_that_declares_itself_too_large_never_reaches_the_spool",
+            64 * 1024,
+            4 * 1024 * 1024,
+        )
+        .await
+        else {
+            require_broker("the declared-size check needs a broker");
+            return;
+        };
+        let claimed = Request::builder()
+            .method("POST")
+            .uri("/api/content")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={BOUNDARY}"),
+            )
+            .header(header::CONTENT_LENGTH, (100 * 1024 * 1024).to_string())
+            .body(Body::empty())
+            .expect("request");
+
+        let response = send(Some(content.clone()), claimed).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            content.blob.list().await.expect("list").is_empty(),
+            "nothing may be stored for an upload that was never read"
+        );
     }
 
     #[tokio::test]

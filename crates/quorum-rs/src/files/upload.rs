@@ -220,6 +220,33 @@ pub fn sniff_mpeg_frame(head: &[u8]) -> Option<&'static str> {
 /// A part named anything but `file` would otherwise be unbounded.
 pub const MAX_FIELD_BYTES: usize = 256;
 
+/// Refuse an upload whose declared size is already over the ceiling.
+///
+/// The streaming check catches an oversize body too, but only once enough of
+/// it has arrived to exceed the limit — and a server that rejects while the
+/// client is still sending gives the client a reset connection rather than the
+/// status it sent. For a large file over a slow link that is minutes of
+/// upload ending in "the connection dropped", which says nothing about why.
+///
+/// `Content-Length` is absent on a chunked body, in which case there is
+/// nothing to check here and the streaming limit is what stops it.
+pub fn declared_too_large(headers: &axum::http::HeaderMap, max: u64) -> Option<Refusal> {
+    let declared = headers
+        .get(axum::http::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    // The envelope rides along with the file, so this only fires where the
+    // body could not possibly fit however small the envelope is.
+    (declared > max.saturating_add(MULTIPART_ENVELOPE_ALLOWANCE))
+        .then_some(Refusal::TooLarge { max })
+}
+
+/// Room left for multipart boundaries and part headers when judging a declared
+/// body length against the file ceiling.
+pub const MULTIPART_ENVELOPE_ALLOWANCE: u64 = 64 * 1024;
+
 /// Walk an upload form: the file, spooled and hashed, and its visibility.
 ///
 /// Shared so both surfaces enforce the same rules — in particular that
@@ -390,6 +417,47 @@ mod tests {
         assert_eq!(sniff_mime(b"RIFF____WAVEfmt "), Some("audio/wav"));
         assert_eq!(sniff_mime(b"RIFF____AVI LIST"), None, "avi is not served");
         assert_eq!(sniff_mime(b"RIFF___"), None, "too short to tell");
+    }
+
+    #[test]
+    fn a_declared_length_over_the_ceiling_is_refused_before_the_body_arrives() {
+        let max = 1_000_u64;
+        let with = |value: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(axum::http::header::CONTENT_LENGTH, value.parse().unwrap());
+            headers
+        };
+
+        assert!(
+            declared_too_large(
+                &with(&(max + MULTIPART_ENVELOPE_ALLOWANCE + 1).to_string()),
+                max
+            )
+            .is_some(),
+            "a body that cannot fit however small the envelope is must be refused"
+        );
+
+        // Everything that could still fit is left to the streaming check,
+        // which measures the file rather than the envelope around it.
+        for could_fit in [
+            "0",
+            "999",
+            "1000",
+            &(max + MULTIPART_ENVELOPE_ALLOWANCE).to_string(),
+        ] {
+            assert!(
+                declared_too_large(&with(could_fit), max).is_none(),
+                "{could_fit} might still fit"
+            );
+        }
+
+        // No length at all is a chunked body: nothing to judge here, and the
+        // streaming limit is what stops it.
+        assert!(declared_too_large(&axum::http::HeaderMap::new(), max).is_none());
+        // Nor is a length that is not a number a reason to refuse outright.
+        assert!(declared_too_large(&with("banana"), max).is_none());
+        // And an absurd one does not overflow into acceptance.
+        assert!(declared_too_large(&with(&u64::MAX.to_string()), max).is_some());
     }
 
     #[test]
