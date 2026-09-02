@@ -286,7 +286,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_videos_segments_are_not_deleted_with_anothers() {
+    async fn deleting_one_video_leaves_another_videos_segments_alone() {
         // Derived objects are found by a name built from the source digest,
         // so two videos segmented into the same bucket must not collide.
         let Some(blob) = blob_for("deleteisolated", 4 * 1024 * 1024).await else {
