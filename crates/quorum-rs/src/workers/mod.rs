@@ -845,6 +845,14 @@ impl NatsNsedWorker {
         self.paused.load(Ordering::Relaxed)
     }
 
+    /// The agent's own JetStream context.
+    ///
+    /// Handed out so a caller that already owns this worker can open buckets
+    /// on the same connection rather than dialling a second one.
+    pub fn jetstream(&self) -> &jetstream::Context {
+        &self.js
+    }
+
     /// A handle to this agent's own event log (24h JetStream history). Public so
     /// the multi-agent runner can hand the dashboard a per-agent read handle.
     pub fn event_store(&self) -> AgentEventStore {

@@ -34,6 +34,7 @@ pub mod conversation;
 pub mod crypto;
 pub mod dump_prompts;
 pub mod events;
+pub mod files;
 /// Workspace + agent-fleet config primitives that `quorum init`
 /// composes: provider catalog, persona presets, yaml renderer,
 /// env-file merger, generic wizard helpers. No CLI surface —
