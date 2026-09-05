@@ -28,10 +28,21 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::error::Error;
 
-/// The function name the model sees. Must never equal a backend's search tool
-/// name (`web_search`, `$web_search`): gateways translate a same-named
-/// function into the provider tool, recreating the rejected mixed array.
-pub const LOCAL_TOOL_NAME: &str = "search_web";
+/// The function name the model sees.
+///
+/// Namespaced, and deliberately not a name anyone else would reach for. Two
+/// parties can otherwise claim it out from under us:
+///
+/// * a backend, whose own search tool is spelled `web_search` or
+///   `$web_search` — a gateway translates a same-named function into the
+///   provider tool, recreating the mixed array this type exists to avoid;
+/// * a room, whose `user_tools` are named by whoever opened it and arrive per
+///   task, too late for [`ProposerEvaluatorAgent::validate_tool_names`] to
+///   see. A room that declared `search_web` — the name this constant used to
+///   hold, and still the example name in this workspace's own job fixtures —
+///   put two functions of that name in one request, and the provider answered
+///   `Duplicate function declaration found` on every round.
+pub const LOCAL_TOOL_NAME: &str = "nsed_delegated_search";
 
 /// Runs a web search by asking the same model again, with only the provider's
 /// search tool declared.
@@ -269,7 +280,7 @@ mod tests {
         let (model, _) = spy("x");
         let tool = DelegatedSearchTool::new(Box::new(model), &AgentConfig::default(), "web_search");
 
-        assert_eq!(tool.name(), "search_web");
+        assert_eq!(tool.name(), LOCAL_TOOL_NAME);
         assert_ne!(
             tool.name(),
             "web_search",
@@ -277,6 +288,35 @@ mod tests {
         );
         let schema = tool.schema();
         assert!(matches!(schema.r#type, ChatCompletionToolType::Function));
-        assert_eq!(schema.function.name, "search_web");
+        assert_eq!(schema.function.name, LOCAL_TOOL_NAME);
+    }
+
+    /// The name has to be one nobody else will reach for.
+    ///
+    /// Two parties can claim it: a backend whose own search tool shares the
+    /// spelling, and a room whose `user_tools` are named by whoever opened it
+    /// and arrive per task — too late to validate. `search_web`, which this
+    /// constant used to hold, is also the example user-tool name in this
+    /// workspace's own job fixtures, so a room copying those fixtures put two
+    /// functions of one name in a request and every round 400'd.
+    #[test]
+    fn the_local_tool_name_is_namespaced_and_unclaimed() {
+        assert!(
+            LOCAL_TOOL_NAME.starts_with("nsed_"),
+            "the name must be namespaced so a room's user tool cannot collide with it, got {LOCAL_TOOL_NAME:?}"
+        );
+        for taken in [
+            "web_search",
+            "$web_search",
+            "search_web",
+            "search",
+            "browse",
+            "google_search",
+        ] {
+            assert_ne!(
+                LOCAL_TOOL_NAME, taken,
+                "{taken:?} is a name a backend or a room may already use"
+            );
+        }
     }
 }
