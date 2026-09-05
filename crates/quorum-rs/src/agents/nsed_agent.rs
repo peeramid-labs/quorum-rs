@@ -1112,6 +1112,33 @@ impl ProposerEvaluatorAgent {
             ));
         }
 
+        // One declaration per name. A provider is entitled to refuse a request
+        // that declares the same function twice — Gemini answers 400
+        // "Duplicate function declaration found" and the whole round fails —
+        // and the collision is reachable without anybody doing anything odd:
+        // a room may declare a user tool called `search_web` while the agent
+        // already carries the delegated-search tool of that name.
+        //
+        // The first registration wins, which keeps the agent's own tools
+        // authoritative: a user tool cannot quietly replace the implementation
+        // behind a name the agent already serves.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut deduped: Vec<Box<dyn Tool>> = Vec::with_capacity(all_tools.len());
+        for tool in all_tools {
+            let name = tool.name();
+            if seen.insert(name.clone()) {
+                deduped.push(tool);
+            } else {
+                warn!(
+                    agent = %self.config.name,
+                    tool = %name,
+                    "two tools declared the same name; keeping the first and dropping the later \
+                     one, which would otherwise be refused by the provider"
+                );
+            }
+        }
+        let all_tools = deduped;
+
         // Debug log for active tools
         let tool_names: Vec<String> = all_tools.iter().map(|t| t.name()).collect();
         debug!(agent=%self.config.name, available_tools=?tool_names, "Tools configured for this run");
@@ -8065,6 +8092,80 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    /// User tools are injected only when a handler is present, so the test
+    /// needs one to exist. Nothing calls it — presence is its whole purpose.
+    #[derive(Debug)]
+    struct PresenceOnlyUserToolHandler;
+
+    #[async_trait::async_trait]
+    impl crate::agents::UserToolHandlerTrait for PresenceOnlyUserToolHandler {
+        async fn handle_call(
+            &self,
+            _tool_name: &str,
+            _arguments_json: &str,
+            _round: u32,
+            _phase: crate::agents::DeliberationPhase,
+        ) -> String {
+            String::new()
+        }
+    }
+
+    #[test]
+    fn a_name_is_declared_once_even_when_two_tools_claim_it() {
+        // A provider is entitled to refuse a request declaring the same
+        // function twice — Gemini answers 400 "Duplicate function declaration
+        // found: search_web" and the round dies. The collision needs nothing
+        // strange: a room declares a user tool called `search_web` while the
+        // agent already carries the delegated-search tool of that name.
+        let agent = super::ProposerEvaluatorAgent::new(
+            AgentConfig {
+                name: "COLLIDER".to_string(),
+                delegated_search: Some("web_search".to_string()),
+                ..Default::default()
+            },
+            Box::new(CannedSummaryModel {
+                text: String::new(),
+            }),
+            Box::new(crate::prompts::defaults::DefaultPromptSet::default()),
+            vec![],
+            vec![],
+        );
+
+        let context = AgentContext {
+            round_number: 1,
+            store: Some(std::sync::Arc::new(EmptyStore)),
+            user_tool_handler: Some(std::sync::Arc::new(PresenceOnlyUserToolHandler)),
+            user_tools: vec![crate::agents::UserToolDefinition {
+                name: crate::tools::delegated_search::LOCAL_TOOL_NAME.to_string(),
+                description: "a room's own search, colliding with ours".to_string(),
+                parameters: None,
+                strict: None,
+            }],
+            ..Default::default()
+        };
+
+        let names: Vec<String> = agent
+            .aggregate_tools(&context)
+            .iter()
+            .map(|t| t.name())
+            .collect();
+        let clashes = names
+            .iter()
+            .filter(|n| n.as_str() == crate::tools::delegated_search::LOCAL_TOOL_NAME)
+            .count();
+        assert_eq!(
+            clashes, 1,
+            "the name must be declared once, not once per source: {names:?}"
+        );
+
+        // The agent's own tool is the one kept, so a user tool cannot quietly
+        // replace the implementation behind a name the agent already serves.
+        assert!(
+            names.contains(&crate::tools::delegated_search::LOCAL_TOOL_NAME.to_string()),
+            "{names:?}"
+        );
     }
 
     #[test]
