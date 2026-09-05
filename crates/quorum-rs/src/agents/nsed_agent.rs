@@ -8386,4 +8386,126 @@ mod tests {
         assert!(msg.contains("is provably optimal"));
         assert!(msg.contains("Candidate_B"));
     }
+
+    /// Captures the tool schemas of every request, so a test can assert what
+    /// actually goes on the wire rather than what the assembly code looks like
+    /// it should produce.
+    #[derive(Clone, Debug, Default)]
+    struct ToolCapturingModel {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait]
+    impl AiModel for ToolCapturingModel {
+        async fn chat_completion(
+            &self,
+            _agent: &AgentConfig,
+            request_config: RequestConfig,
+        ) -> Result<ChatCompletionResult, LlmError> {
+            self.seen.lock().expect("lock").push(
+                request_config
+                    .tools
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|t| t.function.name.clone())
+                    .collect(),
+            );
+            CannedSummaryModel {
+                text: String::new(),
+            }
+            .chat_completion(
+                _agent,
+                RequestConfig {
+                    messages: vec![],
+                    tools: None,
+                    tool_choice: None,
+                    presence_penalty: None,
+                    service_tier: None,
+                },
+            )
+            .await
+        }
+    }
+
+    /// Present so the room's tools are injected; never actually called here.
+    #[derive(Debug)]
+    struct SilentUserToolHandler;
+
+    #[async_trait]
+    impl crate::agents::UserToolHandlerTrait for SilentUserToolHandler {
+        async fn handle_call(
+            &self,
+            _tool_name: &str,
+            _arguments_json: &str,
+            _round: u32,
+            _phase: crate::agents::DeliberationPhase,
+        ) -> String {
+            String::new()
+        }
+    }
+
+    /// A deliberating seat must never name one function twice.
+    ///
+    /// Corepunk23's shape, from the live fleet: `delegated_search` set, and
+    /// the two tools the front end exposes on a room. The provider answers
+    /// `Duplicate function declaration found` and every propose fails — not
+    /// only the searches — so the assertion is on the schemas that leave the
+    /// agent, which is the only place the whole set is visible at once.
+    #[tokio::test]
+    async fn a_propose_never_declares_one_function_twice() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = super::ProposerEvaluatorAgent::new(
+            AgentConfig {
+                name: "Corepunk23".to_string(),
+                delegated_search: Some("web_search".to_string()),
+                ..Default::default()
+            },
+            Box::new(ToolCapturingModel { seen: seen.clone() }),
+            Box::new(crate::prompts::defaults::DefaultPromptSet::default()),
+            vec![],
+            vec![],
+        );
+
+        let context = AgentContext {
+            // Round two with a store and candidates: the shape that injects
+            // every protocol tool, which round one does not.
+            round_number: 2,
+            total_rounds: 3,
+            store: Some(std::sync::Arc::new(EmptyStore)),
+            candidates: vec![crate::agents::CandidateProposal {
+                id: "Candidate_0".to_string(),
+                proposal: crate::agents::Proposal::default(),
+            }],
+            session_id: Some("room-be6f6448".to_string()),
+            user_tools: ["dm_user", "query_history"]
+                .iter()
+                .map(|name| crate::agents::UserToolDefinition {
+                    name: (*name).to_string(),
+                    description: "exposed by the front end".to_string(),
+                    parameters: None,
+                    strict: None,
+                })
+                .collect(),
+            user_tool_handler: Some(std::sync::Arc::new(SilentUserToolHandler)),
+            ..Default::default()
+        };
+
+        let _ = crate::agents::NsedAgent::propose(&agent, &context).await;
+
+        let requests = seen.lock().expect("lock").clone();
+        assert!(
+            !requests.is_empty(),
+            "the agent never reached the model, so nothing was measured"
+        );
+        for names in &requests {
+            let mut sorted = names.clone();
+            sorted.sort();
+            let mut unique = sorted.clone();
+            unique.dedup();
+            assert_eq!(
+                sorted, unique,
+                "a function is declared more than once: {sorted:?}"
+            );
+        }
+    }
 }
