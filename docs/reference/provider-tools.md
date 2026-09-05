@@ -91,6 +91,21 @@ issues a second completion that declares the provider's search tool alone —
 the shape those backends do accept — and returns what came back. Costs one
 extra round trip per search.
 
+Setting both is refused, at config load and again when the seat starts:
+
+```
+agent "COREPUNK23" sets both `delegated_search` ("search_web") and
+`provider_executed_tools` (["search_web"]); they are alternatives — ...
+```
+
+The pair is what produces `Duplicate function declaration found` from the
+backend: `provider_executed_tools` are appended to the same `tools` array the
+function tools go in, so the name is declared twice. It is refused rather than
+deduplicated because the two entries mean different things — one runs the
+provider's search, the other our nested call — and dropping the wrong one
+leaves an agent that starts, offers the name, and calls something else behind
+it. Clear `provider_executed_tools` to keep the delegated form.
+
 Which of the two a model needs is measured against the endpoint, not inferred
 from the vendor: of the models on one EU router, some accept the mix, one
 accepts search only when alone, and others reject the search tool in any shape

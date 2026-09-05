@@ -550,6 +550,9 @@ pub fn load_agent_from_config_with_registry(
     agent
         .validate_compaction_knobs()
         .map_err(|e| anyhow::anyhow!(e))?;
+    agent
+        .validate_search_tools()
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     // Only require API keys for remote providers
     let is_local_url = provider_entry.base_url.starts_with("http://localhost")
@@ -1158,6 +1161,32 @@ agents:
         let (agent, provider) = load_agent_from_config(&config, "alpha").unwrap();
         assert_eq!(agent.name, "ALPHA");
         assert_eq!(provider.provider_type, "stub");
+    }
+
+    /// Config-load guard. A fleet file that sets both search forms must not
+    /// resolve at all — the seat it describes would 400 on every task.
+    #[test]
+    fn a_fleet_file_setting_both_search_forms_does_not_resolve() {
+        let fleet: AgentFleetConfig = serde_yaml::from_str(
+            r#"
+providers:
+  local_ollama:
+    type: ollama
+    base_url: "http://localhost:11434/v1"
+agents:
+  - name: corepunk
+    provider_id: local_ollama
+    model_name: llama3
+    delegated_search: search_web
+    provider_executed_tools: ["search_web"]
+"#,
+        )
+        .expect("fleet yaml must parse");
+        let said = load_agent_from_config(&fleet, "corepunk")
+            .expect_err("the two search forms are alternatives")
+            .to_string();
+        assert!(said.contains("delegated_search"), "{said}");
+        assert!(said.contains("provider_executed_tools"), "{said}");
     }
 
     #[test]
