@@ -86,16 +86,18 @@ Set `delegated_search` instead of `provider_executed_tools` for such a seat:
 delegated_search: "web_search"   # the backend's own name for the tool
 ```
 
-The agent is then given an ordinary `web_search` function tool. Calling it
-issues a second completion that declares the provider's search tool alone —
+The agent is then given an ordinary function tool named `nsed_delegated_search`.
+The name is namespaced on purpose: a backend whose own search tool shares a
+spelling gets translated onto it by the gateway, and a room may name its
+`user_tools` anything at all. Calling it issues a second completion that declares the provider's search tool alone —
 the shape those backends do accept — and returns what came back. Costs one
 extra round trip per search.
 
 Setting both is refused, at config load and again when the seat starts:
 
 ```
-agent "COREPUNK23" sets both `delegated_search` ("search_web") and
-`provider_executed_tools` (["search_web"]); they are alternatives — ...
+agent "COREPUNK23" sets both `delegated_search` ("web_search") and
+`provider_executed_tools` (["web_search"]); they are alternatives — ...
 ```
 
 The pair is what produces `Duplicate function declaration found` from the
