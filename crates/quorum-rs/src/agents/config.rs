@@ -586,6 +586,37 @@ impl AgentConfig {
     /// `scratchpad_squeeze_fraction` outside `(0.0, 1.0]` and a
     /// `compact_history_default_keep` of zero would silently produce
     /// degenerate compaction behavior.
+    /// Reject a search configuration that would declare one tool twice.
+    ///
+    /// `delegated_search` and `provider_executed_tools` are alternatives, not
+    /// companions: the first exists for a backend that refuses our function
+    /// tools beside its own, and it runs the provider's search from a nested
+    /// call instead. Setting both puts the provider tool in the request's
+    /// `tools` array *and* a function tool of the same name beside it, and the
+    /// backend answers `Duplicate function declaration found` — which fails
+    /// every task, not only the searches.
+    ///
+    /// Caught here rather than deduplicated later because choosing which of
+    /// the two the operator meant is a guess, and the wrong guess is silent:
+    /// the agent would run, offer the name, and call the other thing behind it.
+    pub fn validate_search_tools(&self) -> Result<(), String> {
+        let Some(delegated) = self.delegated_search.as_deref().map(str::trim) else {
+            return Ok(());
+        };
+        if delegated.is_empty() || self.provider_executed_tools.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "agent {:?} sets both `delegated_search` ({delegated:?}) and \
+             `provider_executed_tools` ({:?}); they are alternatives — the delegated form runs \
+             the provider's search from a nested call, so declaring the same tool again beside \
+             our own makes the backend refuse every request. Keep `delegated_search` and clear \
+             `provider_executed_tools`, or drop `delegated_search` if the backend accepts a \
+             mixed tool array.",
+            self.name, self.provider_executed_tools
+        ))
+    }
+
     pub fn validate_compaction_knobs(&self) -> Result<(), String> {
         if !(self.scratchpad_squeeze_fraction > 0.0 && self.scratchpad_squeeze_fraction <= 1.0) {
             return Err(format!(
@@ -1965,6 +1996,51 @@ provider_config:
         assert_eq!(env_obj["AUTH_TOKEN"], "<redacted>");
         assert_eq!(env_obj["MY_CREDENTIAL_ID"], "<redacted>");
         assert_eq!(env_obj["AWS_SECRET_ACCESS_KEY"], "<redacted>");
+    }
+
+    #[test]
+    fn setting_both_search_forms_is_refused_at_config_time() {
+        // The pair that produced `Duplicate function declaration found:
+        // search_web` in production: the provider tool rides in the same
+        // `tools` array as our function tools, so naming it twice is a 400 and
+        // every task fails, not only the searches.
+        let both = AgentConfig {
+            name: "COREPUNK".to_string(),
+            delegated_search: Some("search_web".to_string()),
+            provider_executed_tools: vec!["search_web".to_string()],
+            ..Default::default()
+        };
+        let said = both
+            .validate_search_tools()
+            .expect_err("the two forms are alternatives");
+        assert!(said.contains("COREPUNK"), "{said}");
+        assert!(said.contains("delegated_search"), "{said}");
+        assert!(said.contains("provider_executed_tools"), "{said}");
+    }
+
+    #[test]
+    fn the_delegated_search_bypass_on_its_own_is_accepted() {
+        // The whole point of the setting. If this ever starts failing, the
+        // backends that refuse a mixed tool array lose their only way to
+        // search, which reads as configured-and-working.
+        AgentConfig {
+            name: "VERTEX".to_string(),
+            delegated_search: Some("google_search".to_string()),
+            provider_executed_tools: Vec::new(),
+            ..Default::default()
+        }
+        .validate_search_tools()
+        .expect("the delegated form alone is the supported bypass");
+
+        // And the native form alone, for a backend that takes a mixed array.
+        AgentConfig {
+            name: "OPENAI".to_string(),
+            delegated_search: None,
+            provider_executed_tools: vec!["web_search".to_string()],
+            ..Default::default()
+        }
+        .validate_search_tools()
+        .expect("declaring the provider tool alone is ordinary");
     }
 
     #[test]

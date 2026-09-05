@@ -272,13 +272,25 @@ impl ProviderFactory for OpenAiCompatibleFactory {
             );
         }
 
-        Ok(Some(Arc::new(ProposerEvaluatorAgent::new(
+        // Checked here as well as at config load: an agent whose config came
+        // from the registry rather than a file never passes through the
+        // loader, and this pair is what the provider rejects.
+        agent_config
+            .validate_search_tools()
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let agent = ProposerEvaluatorAgent::new(
             agent_config.clone(),
             Box::new(llm),
             Box::new(DefaultPromptSet::new()),
             vec![],
             builtin_tools,
-        ))))
+        );
+        // Refuse to start rather than serve an agent whose tools collide: the
+        // provider would reject every request it made, and which of the two
+        // tools was meant is not ours to guess.
+        agent.validate_tool_names()?;
+        Ok(Some(Arc::new(agent)))
     }
 }
 
@@ -677,5 +689,52 @@ agents:
             .unwrap()
             .expect("ollama with base_url must build");
         assert_eq!(agent.name(), "llama");
+    }
+
+    /// Launch-path guard, which is the one that matters in production: an
+    /// agent whose config comes from the registry never passes through the
+    /// loader, so the check above would never run for it.
+    #[test]
+    fn a_registry_config_setting_both_search_forms_never_starts() {
+        let cfg = AgentConfig {
+            name: "corepunk".to_string(),
+            model_name: "llama3".to_string(),
+            delegated_search: Some("search_web".to_string()),
+            provider_executed_tools: vec!["search_web".to_string()],
+            ..Default::default()
+        };
+        let provider = ProviderEntry {
+            provider_type: "ollama".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            ..Default::default()
+        };
+        let said = OpenAiCompatibleFactory::new("ollama", false)
+            .build_agent(&cfg, &provider)
+            .expect_err("a colliding seat must refuse to start")
+            .to_string();
+        assert!(said.contains("corepunk"), "{said}");
+        assert!(said.contains("provider_executed_tools"), "{said}");
+    }
+
+    /// The bypass itself still starts. If this breaks, the backends that
+    /// reject a mixed tool array lose their only route to search, and the
+    /// failure reads as configured-and-working.
+    #[test]
+    fn the_delegated_search_bypass_alone_still_starts() {
+        let cfg = AgentConfig {
+            name: "corepunk".to_string(),
+            model_name: "llama3".to_string(),
+            delegated_search: Some("search_web".to_string()),
+            ..Default::default()
+        };
+        let provider = ProviderEntry {
+            provider_type: "ollama".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            ..Default::default()
+        };
+        OpenAiCompatibleFactory::new("ollama", false)
+            .build_agent(&cfg, &provider)
+            .expect("the delegated form alone is the supported bypass")
+            .expect("ollama with base_url must build");
     }
 }
