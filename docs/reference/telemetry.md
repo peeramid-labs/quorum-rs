@@ -203,6 +203,7 @@ Task-level bookends.
 | `tool_call_count` | int \| null | Internal tool calls executed (omitted until wired) |
 | `pending_publish_depth` | int \| null | `> 0` at submit time = NATS backpressure (omitted until wired) |
 | `failure_class` | enum | `task_failed` only: `llm_exhausted` / `tool_error` / `timeout` / `context_overflow` / `parse_retry_exhausted` / `empty_content_after_retries` |
+| `reason` | string \| null | `task_failed` only: the head of the failure's rendered error chain, with the provider detail where one exists. Omitted when no detail was captured |
 
 Not sent: what the agent proposed.
 
