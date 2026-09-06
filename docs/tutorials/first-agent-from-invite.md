@@ -90,7 +90,7 @@ Three files, one operator identity, split by transport:
 
 > **Chat-only code?** If output says "chat-only" and no `agent.creds` is
 > written, you can submit tasks but not run an agent — ask the admin for a
-> unified code (`capabilities: ["chat", "agent"]`).
+> unified code (`preset: "operator_agent"`).
 
 (No need to copy the NATS URL — Step 3's `quorum init` writes it into your
 config, so `quorum serve` finds it automatically.)

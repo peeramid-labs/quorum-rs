@@ -1025,7 +1025,8 @@ pub struct RedeemOperatorInviteResponse {
 /// and embeds the returned token in their workspace config.
 ///
 /// When the code is a *unified* code (admin minted it with
-/// `grants: ["chat","agent"]`), pass `user_pub_key = Some(pub)` — the
+/// `preset: "operator_agent"`, or with the `agent` transport role in
+/// `roles`), pass `user_pub_key = Some(pub)` — the
 /// orchestrator additionally mints a scoped NATS User JWT bound to
 /// that pubkey and returns `user_jwt` + `nats_url` in the response.
 /// For chat-only codes, pass `user_pub_key = None`.

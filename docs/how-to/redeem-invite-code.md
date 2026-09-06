@@ -93,6 +93,18 @@ quorum redeem eyJhbGc... \
 `--force` overwrites existing files; without it the command bails
 rather than clobbering a credential you might still need.
 
+Two more flags matter on a flaky link:
+
+- `--seed-in PATH` reuses an existing `SU…` seed instead of generating a
+  fresh keypair, so the pubkey stays the same across redemptions. Use it
+  when a transient failure consumed a code *after* the orchestrator
+  marked it redeemed — pre-stage the seed once, then redeem the fresh
+  code with `--seed-in ~/.nsed/agent.seed`. An empty or non-`SU…` file
+  is rejected before any orchestrator round-trip.
+- `--max-attempts N` (default `5`) caps retries on transient failures
+  (5xx, `kv_unavailable`, network blips). The same pubkey is presented on
+  every attempt, so a retry can never turn into a replayed code.
+
 ### 3. Point your agent at the creds
 
 Two options:
@@ -117,9 +129,24 @@ let auth = NatsAuth { inline_creds: Some(creds), ..Default::default() };
 
 The agent connects to `nats_url` from the redeem response with the
 `.creds` you wrote. The JWT scopes the connection to your
-`agent_id`'s subjects — publish to `*.result.*.<agent_id>.*` and
-heartbeat to `*.agent.heartbeat.<agent_id>` is allowed; everything
-else is denied at the NATS server boundary.
+`agent_id`'s subjects; everything else is denied at the NATS server
+boundary. With `<sp>` the deployment's subject prefix and `<ap>` its
+API prefix:
+
+| Direction | Subject | Purpose |
+|---|---|---|
+| publish | `<sp>.*.result.*.<agent_id>.*` | proposals and evaluations |
+| publish | `<ap>.agent.heartbeat.<agent_id>` | heartbeats |
+| publish | `<ap>.jobs.ack.*.<agent_id>` | job acks |
+| publish | `<sp>.*.result.event.*` | accepted / working / error events (agent id in payload) |
+| publish | `<sp>.*.audit.*` | audit trail |
+| publish | `<sp>.content.*.<agent_id>.put` / `.get` | the agent's own content-addressed answers |
+| subscribe | `<sp>.*.task.<agent_id>.*` | task assignments |
+| subscribe | `<ap>.jobs.manifest.>` | job manifests |
+| subscribe | `<ap>.orchestrator.ping` | orchestrator pings |
+| subscribe | `<sp>.*.audit.*` | audit trail |
+
+Plus `_INBOX.>` both ways for request-reply.
 
 ## When something goes wrong
 
@@ -128,17 +155,36 @@ else is denied at the NATS server boundary.
 | "This invite code has expired."                  | Ask the admin for a fresh code.                                 |
 | "This invite code was already redeemed."         | Same — codes are single-use; either you double-ran the command, or someone else got there first. |
 | "The admin revoked this invite code."            | Admin pulled it deliberately; check with them.                  |
-| "This invite code is invalid."                   | Copy/paste glitch most likely. Re-copy the full `eyJhbGc...` string from the source. |
+| "This invite code is invalid."                   | Tampered during copy/paste (re-copy the full `eyJhbGc...` string), or the minting and redeeming orchestrators use different `APP_INVITES__SIGNING_SECRET` values. The CLI picks `/redeem` vs `/redeem-agent` from the code's `aud`, so a wrong code type only produces this when you call the endpoint by hand. |
+| "invite code is not in JWT shape" / "carries unknown audience" | Not a code this CLI can redeem — you pasted something other than the `eyJhbGc...` string, or a truncated one. Nothing was sent to the orchestrator. |
 | "The orchestrator does not have invite codes configured." | Operator-side issue, not yours — the orchestrator needs `APP_INVITES__SIGNING_SECRET` set. |
 | "The orchestrator's backing store is temporarily unreachable." | Transient. The CLI retries with backoff; if it gives up, try again in a minute. |
 
 ## Unified codes — one paste, chat + agent
 
-The `/admin/api/invites` operator endpoint (the one originally for
-HTTP bearer tokens) now accepts an optional `grants` field. Mint
-with `grants: ["chat", "agent"]` and the single code carries both
-capabilities: redeeming at `/redeem` returns the bearer token AND a
-scoped NATS User JWT + `nats_url`.
+The `/admin/api/invites` operator endpoint (the one for HTTP bearer
+tokens) mints a *unified* code when the transport role `agent` is in
+the recipient's roles. The shortcut is the `operator_agent` preset:
+
+```bash
+curl -X POST https://api.peeramid.xyz/admin/api/invites \
+     -H "Authorization: Bearer $ADMIN_TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"username":"alice","preset":"operator_agent"}'
+```
+
+Equivalent: `"roles": ["post_deliberation", "view_results",
+"manage_agents", "agent"]` (`capabilities` is accepted as an alias for
+`roles`). Redeeming the single code at `/redeem` returns the bearer
+token AND a scoped NATS User JWT + `nats_url`. Without `agent` the
+code is chat-only: `preset: "operator"` (or omitting both fields)
+gives the operator default set, `preset: "guest"` gives
+`post_deliberation` + `view_results`.
+
+`grants` is a different field — tenancy globs pinned on the redeemed
+token, not a capability list. Older docs that show `grants: ["chat",
+"agent"]` predate that split; a body written that way mints a chat-only
+code with two junk grants.
 
 For SDK consumers this is the helper:
 
@@ -154,7 +200,7 @@ let resp = redeem_operator_invite_with_orchestrator(
 ).await?;
 
 // `resp.token`     — HTTP bearer (always present)
-// `resp.user_jwt`  — NATS User JWT (only when grants include "agent")
+// `resp.user_jwt`  — NATS User JWT (only when roles include "agent")
 // `resp.nats_url`  — NATS server URL (paired with user_jwt)
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
