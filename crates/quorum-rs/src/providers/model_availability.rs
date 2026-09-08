@@ -17,7 +17,7 @@
 //! [`Availability::Unknown`] so a network blip can never mass-deactivate the
 //! fleet.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::RwLock;
 
 /// Availability verdict for a `(provider_id, model_name)` pair.
@@ -47,8 +47,10 @@ pub struct ModelAvailability {
     /// The provider id whose agents this catalog covers. Agents on any other
     /// provider resolve to [`Availability::Unknown`] (fail-open).
     provider_id: String,
-    /// `None` until the first successful fetch; then the set of catalog model ids.
-    ids: RwLock<Option<HashSet<String>>>,
+    /// `None` until the first successful fetch; then, per catalog model id,
+    /// the context length the catalog states for it (`None` when the entry
+    /// carries no context field).
+    ids: RwLock<Option<HashMap<String, Option<i64>>>>,
 }
 
 impl ModelAvailability {
@@ -109,14 +111,55 @@ impl ModelAvailability {
         };
         match &*guard {
             None => Availability::Unknown,
-            Some(ids) if ids.contains(model_name) => Availability::Available,
+            Some(ids) if ids.contains_key(model_name) => Availability::Available,
             Some(_) => Availability::Unavailable,
         }
     }
+
+    /// Context length the last successful catalog states for an agent's
+    /// `(provider_id, model_name)`. `None` when the probe covers a different
+    /// provider, no catalog was fetched yet, the model is absent, or its entry
+    /// carries no context field — all fail-open (the config value then stands).
+    pub fn context_length(&self, provider_id: &str, model_name: &str) -> Option<i64> {
+        if provider_id != self.provider_id {
+            return None;
+        }
+        let guard = self.ids.read().ok()?;
+        guard.as_ref()?.get(model_name).copied().flatten()
+    }
+
+    /// Push an agent's `context_window` to what the catalog states for its
+    /// model. The catalog wins in both directions: an understated config
+    /// wastes context the provider serves (the shrink-guard clamps output
+    /// against the stated window), an overstated one ships requests the
+    /// provider rejects. Returns `true` when the config was changed; a probe
+    /// with no verdict leaves the config untouched (fail-open).
+    pub fn apply_catalog_context(&self, cfg: &mut crate::agents::AgentConfig) -> bool {
+        let Some(catalog) = self.context_length(&cfg.provider_id, &cfg.model_name) else {
+            return false;
+        };
+        let catalog = i32::try_from(catalog).unwrap_or(i32::MAX);
+        if catalog <= 0 || catalog == cfg.context_window {
+            return false;
+        }
+        tracing::info!(
+            agent = %cfg.name,
+            model = %cfg.model_name,
+            configured = cfg.context_window,
+            catalog,
+            "context_window set from provider catalog"
+        );
+        cfg.context_window = catalog;
+        true
+    }
 }
 
-/// Extract `data[].id` from an OpenAI-compatible `/models` response.
-fn parse_catalog_ids(body: &str) -> Result<HashSet<String>, String> {
+/// Extract `data[].id` → stated context length from an OpenAI-compatible
+/// `/models` response. Context is read from `context_length` (OpenRouter),
+/// then `max_context_length`, then `context_window`, then
+/// `top_provider.context_length` (OpenRouter's serving-provider limit) —
+/// `None` when an entry states none of them.
+fn parse_catalog_ids(body: &str) -> Result<HashMap<String, Option<i64>>, String> {
     let catalog: serde_json::Value =
         serde_json::from_str(body).map_err(|e| format!("catalog json parse: {e}"))?;
     let entries = catalog
@@ -126,10 +169,17 @@ fn parse_catalog_ids(body: &str) -> Result<HashSet<String>, String> {
     Ok(entries
         .iter()
         .filter_map(|model| {
-            model
-                .get("id")
-                .and_then(|id| id.as_str())
-                .map(str::to_string)
+            let id = model.get("id").and_then(|id| id.as_str())?;
+            let context = ["context_length", "max_context_length", "context_window"]
+                .iter()
+                .find_map(|k| model.get(k).and_then(|v| v.as_i64()))
+                .or_else(|| {
+                    model
+                        .get("top_provider")
+                        .and_then(|tp| tp.get("context_length"))
+                        .and_then(|v| v.as_i64())
+                });
+            Some((id.to_string(), context))
         })
         .collect())
 }
@@ -240,10 +290,112 @@ mod tests {
     #[test]
     fn parse_catalog_ids_extracts_ids_and_rejects_garbage() {
         let ids = parse_catalog_ids(CATALOG).unwrap();
-        assert!(ids.contains("vendor/model-b"));
+        assert!(ids.contains_key("vendor/model-b"));
         assert_eq!(ids.len(), 3);
         assert!(parse_catalog_ids("not json").is_err());
         assert!(parse_catalog_ids(r#"{"no_data":1}"#).is_err());
+    }
+
+    const CATALOG_WITH_CONTEXT: &str = r#"{"data":[
+        {"id":"vendor/model-a","context_length":131072},
+        {"id":"vendor/model-b","max_context_length":32768},
+        {"id":"vendor/model-c","top_provider":{"context_length":200000}},
+        {"id":"vendor/model-d"}
+    ]}"#;
+
+    /// The catalog is the authority on how much context a model serves.
+    /// OpenRouter puts it in `context_length`, others in
+    /// `max_context_length`; OpenRouter also mirrors the serving
+    /// provider's real limit in `top_provider.context_length`.
+    #[tokio::test]
+    async fn refresh_captures_context_length_per_model() {
+        let (_server, url) = serve(200, CATALOG_WITH_CONTEXT).await;
+        let probe = ModelAvailability::new(url, PROVIDER.to_string());
+        probe.refresh().await.unwrap();
+
+        assert_eq!(
+            probe.context_length(PROVIDER, "vendor/model-a"),
+            Some(131_072)
+        );
+        assert_eq!(
+            probe.context_length(PROVIDER, "vendor/model-b"),
+            Some(32_768)
+        );
+        assert_eq!(
+            probe.context_length(PROVIDER, "vendor/model-c"),
+            Some(200_000)
+        );
+        assert_eq!(
+            probe.context_length(PROVIDER, "vendor/model-d"),
+            None,
+            "a catalog entry with no context field reports None"
+        );
+        assert_eq!(
+            probe.context_length(PROVIDER, "vendor/withdrawn"),
+            None,
+            "an absent model reports None"
+        );
+        assert_eq!(
+            probe.context_length("other-provider", "vendor/model-a"),
+            None,
+            "another provider's agents are not covered (fail-open)"
+        );
+    }
+
+    #[test]
+    fn before_refresh_context_length_is_none() {
+        let probe = ModelAvailability::new("http://unused".to_string(), PROVIDER.to_string());
+        assert_eq!(probe.context_length(PROVIDER, "vendor/model-a"), None);
+    }
+
+    /// The catalog wins in both directions: a config understating the window
+    /// wastes context the provider serves (a shrink-guard clamps output
+    /// against the stated window), and a config overstating it ships
+    /// requests the provider 400s.
+    #[tokio::test]
+    async fn apply_catalog_context_pushes_config_to_the_catalog_value() {
+        let (_server, url) = serve(200, CATALOG_WITH_CONTEXT).await;
+        let probe = ModelAvailability::new(url, PROVIDER.to_string());
+        probe.refresh().await.unwrap();
+
+        // Understated config → pushed up.
+        let mut cfg = crate::agents::AgentConfig {
+            provider_id: PROVIDER.to_string(),
+            model_name: "vendor/model-a".to_string(),
+            context_window: 21_000,
+            ..Default::default()
+        };
+        assert!(probe.apply_catalog_context(&mut cfg));
+        assert_eq!(cfg.context_window, 131_072);
+
+        // Overstated config → pulled down to what the provider serves.
+        let mut cfg = crate::agents::AgentConfig {
+            provider_id: PROVIDER.to_string(),
+            model_name: "vendor/model-b".to_string(),
+            context_window: 128_000,
+            ..Default::default()
+        };
+        assert!(probe.apply_catalog_context(&mut cfg));
+        assert_eq!(cfg.context_window, 32_768);
+
+        // No context in the catalog → config untouched.
+        let mut cfg = crate::agents::AgentConfig {
+            provider_id: PROVIDER.to_string(),
+            model_name: "vendor/model-d".to_string(),
+            context_window: 128_000,
+            ..Default::default()
+        };
+        assert!(!probe.apply_catalog_context(&mut cfg));
+        assert_eq!(cfg.context_window, 128_000);
+
+        // Already at the catalog value → reported as no change.
+        let mut cfg = crate::agents::AgentConfig {
+            provider_id: PROVIDER.to_string(),
+            model_name: "vendor/model-a".to_string(),
+            context_window: 131_072,
+            ..Default::default()
+        };
+        assert!(!probe.apply_catalog_context(&mut cfg));
     }
 
     /// Health is read from the catalog only. A completion is a billed

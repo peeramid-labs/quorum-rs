@@ -25,6 +25,11 @@ For a single chat call, every OpenAI-compatible provider tokenizes:
   reply. The provider rejects with HTTP 400 when
   `input_tokens + tool_tokens + max_tokens > context_window`.
 
+Under `quorum serve`, `context_window` itself is pushed to what the
+provider's model catalog states for the pinned model at startup (see
+[model health](../reference/model-health.md)) — the guard then fits
+calls against the provider's real window rather than a yaml guess.
+
 A shrink-guard that only counts message tokens under-reserves by
 exactly the tool budget. With a 131k context window and ~1.9K tokens
 of tools, requesting `max_tokens = 131072` ships ~131820 tokens of

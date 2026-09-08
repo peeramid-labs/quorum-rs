@@ -36,6 +36,20 @@ confirming that costs a billed request per seat per interval, and a fleet
 doing so paid for a token on every tick. A listed-but-unserved model is
 instead caught by the reactive detector on its first real task.
 
+## Context length from the same catalog
+
+The probe also reads each entry's stated context length —
+`context_length` (OpenRouter), then `max_context_length`, then
+`context_window`, then `top_provider.context_length` — and `quorum
+serve` pushes the agent's `context_window` to that value at startup,
+in both directions: an understated yaml wastes context the provider
+serves (the shrink-guard clamps output against the stated window), an
+overstated one ships requests the provider rejects. The catalog, not
+the yaml, is the authority on what the provider serves. When the
+catalog is unreachable or its entry states no context field, the
+configured value stands (fail-open); the change is logged as
+`context_window set from provider catalog`.
+
 ## Fail-open is the invariant
 
 `Availability::Unavailable` is returned **only** when the provider says the
