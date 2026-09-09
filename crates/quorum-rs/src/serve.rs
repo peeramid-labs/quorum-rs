@@ -252,6 +252,43 @@ fn worker_conn<'a>(
     }
 }
 
+/// Build the provider's model-catalog probe and push the agent's
+/// `context_window` to what the catalog states for its pinned model.
+///
+/// Only providers exposing an OpenAI-compatible catalog (they have a
+/// `base_url`) have one; subprocess exec/mcp agents get `None` and rely on
+/// the reactive model-down detector. The refresh runs here, before the model
+/// is built, so the shrink-guard and the `Length`-escalation ceiling work
+/// against the provider's real window rather than a yaml guess. Fail-open: a
+/// catalog that cannot be fetched, or that states no context for the model,
+/// leaves the configured value alone.
+///
+/// Network-only (no NATS) so the wiring is testable without a broker.
+async fn catalog_probe(
+    provider: &crate::config::ProviderEntry,
+    agent_config: &mut AgentConfig,
+) -> Option<Arc<crate::providers::ModelAvailability>> {
+    let base = provider.base_url.trim_end_matches('/');
+    if base.is_empty() {
+        return None;
+    }
+    let probe = crate::providers::ModelAvailability::new(
+        format!("{base}/models"),
+        agent_config.provider_id.clone(),
+    );
+    match probe.refresh().await {
+        Ok(_) => {
+            probe.apply_catalog_context(agent_config);
+        }
+        Err(e) => warn!(
+            agent = %agent_config.name,
+            error = %e,
+            "model catalog unreachable at startup — keeping configured context_window"
+        ),
+    }
+    Some(Arc::new(probe))
+}
+
 pub async fn build_worker(
     fleet: &AgentFleetConfig,
     agent_name: &str,
@@ -261,9 +298,11 @@ pub async fn build_worker(
     api_prefix: &str,
     registry: &ProviderRegistry,
 ) -> Result<Option<(NatsNsedWorker, AgentConfig)>> {
-    let (agent_config, provider) =
+    let (mut agent_config, provider) =
         load_agent_from_config_with_registry(fleet, agent_name, registry)
             .with_context(|| format!("failed to load agent '{agent_name}' from fleet config"))?;
+
+    let probe = catalog_probe(&provider, &mut agent_config).await;
 
     let consumer_name = format!("agent_{}", agent_config.name);
     let mut worker_config =
@@ -294,18 +333,11 @@ pub async fn build_worker(
         NatsNsedWorker::from_dyn_agent(agent, agent_config.clone(), worker_config, None)
             .await?
             .with_user_tool_factory(Arc::new(crate::agents::NatsUserToolHandlerFactory));
-    // Proactive model-availability self-bench: when the provider exposes an
-    // OpenAI-compatible model catalog (it has a base_url), poll it so the agent
-    // benches itself if its pinned model leaves the catalog — before a task
-    // fails. Providers without a base_url (subprocess exec/mcp agents) get no
-    // probe and rely on the reactive detector only.
-    let base = provider.base_url.trim_end_matches('/');
-    if !base.is_empty() {
-        let probe = crate::providers::ModelAvailability::new(
-            format!("{base}/models"),
-            agent_config.provider_id.clone(),
-        );
-        worker = worker.with_model_availability(Arc::new(probe));
+    // Proactive model-availability self-bench: the same catalog probe polls
+    // periodically so the agent benches itself if its pinned model leaves
+    // the catalog — before a task fails.
+    if let Some(probe) = probe {
+        worker = worker.with_model_availability(probe);
     }
     Ok(Some((worker, agent_config)))
 }
@@ -570,6 +602,126 @@ agents:
             "exec provider with no exec section must skip cleanly (Ok(None)) before NATS connect; \
              if NATS connection was attempted it would have errored on the unbindable port"
         );
+    }
+
+    /// Build a `ProviderEntry` pointing at a catalog URL, via the fleet
+    /// loader so the test exercises the same parse path `serve` uses.
+    fn provider_and_agent(
+        base_url: &str,
+        model: &str,
+        configured_window: i32,
+    ) -> (crate::config::ProviderEntry, AgentConfig) {
+        let fleet = fleet_yaml(&format!(
+            r#"
+providers:
+  catalog_prov:
+    type: openai
+    base_url: {base_url}
+    api_key: test-key
+agents:
+  - name: probed
+    provider_id: catalog_prov
+    model_name: {model}
+    context_window: {configured_window}
+"#
+        ));
+        let (agent_config, provider) = crate::config::load_agent_from_config_with_registry(
+            &fleet,
+            "probed",
+            &ProviderRegistry::with_builtins(),
+        )
+        .expect("fleet loads");
+        (provider, agent_config)
+    }
+
+    async fn catalog_server(body: &str) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/models"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(body.to_string()))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The catalog, not the yaml, is the authority on how much context the
+    /// provider serves: `serve`'s startup probe pushes `context_window` to
+    /// the catalog value before the model is built.
+    #[tokio::test]
+    async fn catalog_probe_sets_context_window_from_the_catalog() {
+        let server =
+            catalog_server(r#"{"data":[{"id":"vendor/big-model","context_length":131072}]}"#).await;
+        let (provider, mut agent_config) =
+            provider_and_agent(&format!("{}/v1", server.uri()), "vendor/big-model", 21_000);
+
+        let probe = catalog_probe(&provider, &mut agent_config).await;
+        assert!(probe.is_some(), "an http provider gets a catalog probe");
+        assert_eq!(
+            agent_config.context_window, 131_072,
+            "yaml said 21000; the catalog serves 131072 — the catalog wins"
+        );
+    }
+
+    /// The push runs in both directions: an overstated yaml would ship
+    /// requests the provider rejects.
+    #[tokio::test]
+    async fn catalog_probe_pulls_an_overstated_window_down() {
+        let server =
+            catalog_server(r#"{"data":[{"id":"vendor/small","max_context_length":32768}]}"#).await;
+        let (provider, mut agent_config) =
+            provider_and_agent(&format!("{}/v1", server.uri()), "vendor/small", 128_000);
+
+        catalog_probe(&provider, &mut agent_config).await;
+        assert_eq!(agent_config.context_window, 32_768);
+    }
+
+    /// A catalog that cannot be reached keeps the configured window — a
+    /// provider outage must not resize the fleet's context.
+    #[tokio::test]
+    async fn catalog_probe_keeps_configured_window_when_catalog_unreachable() {
+        // Port 1 refuses immediately: no wall-clock cost, no network egress.
+        let (provider, mut agent_config) =
+            provider_and_agent("http://127.0.0.1:1/v1", "vendor/some-model", 21_000);
+
+        let probe = catalog_probe(&provider, &mut agent_config).await;
+        assert!(
+            probe.is_some(),
+            "the probe is still wired for the periodic self-bench"
+        );
+        assert_eq!(
+            agent_config.context_window, 21_000,
+            "catalog unreachable — configured value stands (fail-open)"
+        );
+    }
+
+    /// A provider with no `base_url` (subprocess exec/mcp) has no catalog:
+    /// no probe, no context change.
+    #[tokio::test]
+    async fn catalog_probe_is_absent_without_a_base_url() {
+        let fleet = fleet_yaml(
+            r#"
+providers:
+  exec_local:
+    type: exec
+    exec:
+      command: ["/bin/true"]
+agents:
+  - name: probed
+    provider_id: exec_local
+    model_name: custom
+    context_window: 21000
+"#,
+        );
+        let (mut agent_config, provider) = crate::config::load_agent_from_config_with_registry(
+            &fleet,
+            "probed",
+            &ProviderRegistry::with_builtins(),
+        )
+        .expect("fleet loads");
+
+        let probe = catalog_probe(&provider, &mut agent_config).await;
+        assert!(probe.is_none(), "no base_url — no catalog to probe");
+        assert_eq!(agent_config.context_window, 21_000);
     }
 
     /// `redact_userinfo` must scrub `user:pass@` from the
