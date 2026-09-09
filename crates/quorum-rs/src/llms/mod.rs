@@ -7,6 +7,7 @@
 //! For a quick-start model implementation, see [`SimpleOpenAIModel`].
 
 pub mod error;
+pub mod openai_codex;
 pub mod openai_compatible;
 pub mod provider_usage;
 pub mod rate_limiter;
@@ -16,6 +17,7 @@ pub mod span;
 pub mod strategies;
 pub mod stub;
 pub use error::LlmError;
+pub use openai_codex::{OpenAICodexAuthStore, OpenAICodexModel};
 pub use openai_compatible::OpenAICompatibleModel;
 pub use provider_usage::ProviderUsage;
 pub use rate_limiter::RateLimiter;
