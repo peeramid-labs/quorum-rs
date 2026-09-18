@@ -67,12 +67,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Need enough history for the dep-age script to resolve the
-          # diff target (PR base or HEAD~1 on push events) via
-          # `git show <ref>:Cargo.lock`. Depth 2 covers push events;
-          # for PR events GitHub Actions already fetches the base
-          # commit as part of the merge-commit setup.
-          fetch-depth: 2
+          # Full history: the dep-age script resolves its diff target (PR base
+          # or HEAD~1 on push events) with `git show <ref>:Cargo.lock`. Depth 2
+          # covers push events only — Forgejo does not pre-fetch the PR base,
+          # so `git show <base>:Cargo.lock` failed there and the script fell
+          # back to scanning all ~550 crates at one request per second, an
+          # 11-minute job that also re-flags versions the base already ships.
+          fetch-depth: 0
 
       - name: Check if Cargo.lock changed
         id: filter

@@ -44,7 +44,7 @@
 # every new fast-track should land as a separate, auditable commit.
 
 [[fasttrack]]
-name    = "crossbeam-epoch"
-version = "0.9.20"
-reason  = "RUSTSEC-2026-0204 — invalid pointer deref in crossbeam-epoch fmt::Pointer for Atomic/Shared. 0.9.20 is the only patched release and cargo-deny rejects the vulnerable 0.9.18. Transitive via openai-harmony 0.0.8 → image → rayon (image is a hard, non-optional dep — not droppable). Cooldown would keep cargo-deny red on a known advisory."
-expires = 2026-07-16
+name    = "rustls"
+version = "0.23.45"
+reason  = "RUSTSEC-2026-0285 — TLS 1.3 handshake messages accepted across encryption-level boundaries. 0.23.45 is the first patched release and cargo-deny rejects every earlier 0.23.x, so the cooldown would keep `make audit` red on a known advisory."
+expires = 2026-09-23
