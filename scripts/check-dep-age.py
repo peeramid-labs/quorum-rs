@@ -62,6 +62,9 @@ from pathlib import Path
 
 CRATES_IO_API = "https://crates.io/api/v1/crates/{name}/{version}"
 RATE_LIMIT_DELAY = 1.0  # seconds between requests — crates.io policy: ≤1 req/s
+FETCH_TIMEOUT_SECONDS = 10
+FETCH_ATTEMPTS = 3  # a slow crates.io response must not fail the whole job
+FETCH_RETRY_DELAY = 2.0  # multiplied by the attempt number
 USER_AGENT = "nsed-supply-chain-check (github.com/peeramid-labs/nsed)"
 DEFAULT_FASTTRACK = Path("scripts/supply-chain-fasttrack.toml")
 
@@ -143,17 +146,39 @@ def load_target_packages(
 
 
 def fetch_publish_date(name: str, version: str) -> datetime | None:
-    """Return the UTC publish datetime for a given crate version, or None on error."""
+    """
+    Return the UTC publish datetime for a given crate version, or None on error.
+
+    A read that times out mid-response raises ``TimeoutError``, which is an
+    ``OSError`` and not a ``URLError`` — catching only the latter turned a
+    single slow crates.io response into a traceback that failed the whole job.
+    Every network error is retried ``FETCH_ATTEMPTS`` times with a widening
+    pause; what survives that is reported by the caller, which decides whether
+    missing metadata fails the check.
+    """
     url = CRATES_IO_API.format(name=name, version=version)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-        created = data["version"]["created_at"]
-        return datetime.fromisoformat(created.replace("Z", "+00:00"))
-    except (urllib.error.HTTPError, urllib.error.URLError, KeyError, ValueError) as exc:
-        print(f"  ⚠ Could not fetch {name}@{version}: {exc}", file=sys.stderr)
-        return None
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_SECONDS) as resp:
+                data = json.loads(resp.read())
+            created = data["version"]["created_at"]
+            return datetime.fromisoformat(created.replace("Z", "+00:00"))
+        except (KeyError, ValueError) as exc:
+            # A 200 whose body is not the shape we expect. Retrying cannot
+            # change it.
+            print(f"  ⚠ Could not read {name}@{version}: {exc}", file=sys.stderr)
+            return None
+        except OSError as exc:
+            if attempt == FETCH_ATTEMPTS:
+                print(
+                    f"  ⚠ Could not fetch {name}@{version} after "
+                    f"{FETCH_ATTEMPTS} attempts: {exc}",
+                    file=sys.stderr,
+                )
+                return None
+            time.sleep(FETCH_RETRY_DELAY * attempt)
+    return None
 
 
 def load_fasttrack(
