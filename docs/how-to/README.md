@@ -19,5 +19,6 @@ Goal-oriented recipes. Assume the reader is already competent — get them to th
 | [Dump outgoing prompts](dump-outgoing-prompts.md) | You suspect prompt bloat and want each agent's exact model payload on disk — no config change, no rebuild. |
 | [Use the thread TUI](use-the-thread-tui.md) | You want to hold a branching, email-style conversation with a deliberation — reply, fork off an older turn, start a new line, expand / full-view, and delete threads from the inbox. |
 | [Use the Claude Code plugin](use-the-claude-code-plugin.md) | You want `/quorum:init`, `:redeem`, `:run`, `:serve`, `:status`, `:trace`, `:validate`, `:tui` as slash commands inside Claude Code, with `.env` auto-detection and failure-mode guidance on top of the CLI. |
+| [Use OpenAI ChatGPT OAuth](use-openai-oauth.md) | You want a native LLM agent to use a ChatGPT/Codex subscription through OAuth instead of an `OPENAI_API_KEY`. |
 
 For the underlying *why*, jump to [explanation](../explanation/README.md). For schema and field-level definitions, jump to [reference](../reference/README.md).
