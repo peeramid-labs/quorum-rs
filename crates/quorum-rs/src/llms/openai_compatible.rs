@@ -20,7 +20,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use super::RateLimiter;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// A client for any LLM that exposes an OpenAI-compatible API.
@@ -32,17 +32,26 @@ pub struct OpenAICompatibleModel {
     semaphore: Option<Arc<Semaphore>>,
     rate_limiter: Option<Arc<RateLimiter>>,
     engine: Option<String>,
-    /// Model ids on this endpoint that have refused `max_tokens` and asked
-    /// for `max_completion_tokens` instead.
+    /// What each model on this endpoint has refused, learned from its own
+    /// refusals rather than configured.
     ///
-    /// Learned rather than configured, and remembered so the refusal is paid
-    /// for once. Keyed by model rather than held as one flag for the whole
-    /// endpoint because a vendor migrates its families one at a time: the
-    /// reasoning models take only the new name while everything beside them
-    /// still takes the old one. Shared across clones — the client is cloned
-    /// per agent, and what one seat learns is true for every other seat on
-    /// the same model.
-    renamed_ceiling: Arc<Mutex<HashSet<String>>>,
+    /// Keyed by model rather than held per endpoint because a vendor migrates
+    /// its families one at a time: the reasoning models take only the new
+    /// parameter spellings while everything beside them still takes the old.
+    /// Shared across clones — the client is cloned per agent, and what one
+    /// seat learns is true for every other seat on the same model.
+    quirks: Arc<Mutex<HashMap<String, ModelQuirks>>>,
+}
+
+/// The parameter rules one model turned out to have, discovered by asking.
+///
+/// Each is a 400 the SDK can answer by re-sending the same request shaped the
+/// way the provider named, so the seat loses a round trip rather than its
+/// turn. Remembering them means the round trip is spent once per process.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ModelQuirks {
+    /// Send the token ceiling as `max_completion_tokens`, not `max_tokens`.
+    renames_ceiling: bool,
 }
 
 /// Join a configured `base_url` with a strategy's endpoint suffix.
@@ -80,7 +89,7 @@ impl OpenAICompatibleModel {
             semaphore: None,
             rate_limiter: None,
             engine,
-            renamed_ceiling: Arc::new(Mutex::new(HashSet::new())),
+            quirks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -94,21 +103,23 @@ impl OpenAICompatibleModel {
         self
     }
 
-    /// Whether this model has already asked for `max_completion_tokens`.
+    /// What this model has refused before.
     ///
-    /// A poisoned lock answers `false`: the cost of forgetting is one extra
-    /// round trip, and the retry re-learns it, so there is nothing here worth
+    /// A poisoned lock answers "nothing": the cost of forgetting is one extra
+    /// round trip, which the retry re-learns, so there is nothing here worth
     /// failing a request over.
-    fn model_renames_ceiling(&self, model_name: &str) -> bool {
-        self.renamed_ceiling
+    fn quirks_of(&self, model_name: &str) -> ModelQuirks {
+        self.quirks
             .lock()
-            .is_ok_and(|seen| seen.contains(model_name))
+            .ok()
+            .and_then(|seen| seen.get(model_name).copied())
+            .unwrap_or_default()
     }
 
-    /// Remember that this model takes the other spelling.
-    fn remember_renamed_ceiling(&self, model_name: &str) {
-        if let Ok(mut seen) = self.renamed_ceiling.lock() {
-            seen.insert(model_name.to_string());
+    /// Remember a rule this model just stated.
+    fn remember_quirk(&self, model_name: &str, apply: impl FnOnce(&mut ModelQuirks)) {
+        if let Ok(mut seen) = self.quirks.lock() {
+            apply(seen.entry(model_name.to_string()).or_default());
         }
     }
 }
@@ -135,10 +146,9 @@ impl AiModel for OpenAICompatibleModel {
         // Reactive retries (vLLM 400 below) overwrite the proactive
         // value: only the shrink that left the SDK is reported.
         let mut shrink_info: Option<ShrinkInfo> = None;
-        // Starts true when this model has already refused `max_tokens` on an
-        // earlier call, so the wasted round trip is paid once per process
-        // rather than once per turn.
-        let mut use_max_completion_tokens = self.model_renames_ceiling(&agent.model_name);
+        // Seeded from what this model has already refused, so a wasted round
+        // trip is paid once per process rather than once per turn.
+        let mut quirks = self.quirks_of(&agent.model_name);
         const SHRINK_FLOOR: u32 = 200;
         let requested_max_tokens = agent.max_tokens as u32;
         let mut final_max_tokens = requested_max_tokens;
@@ -194,9 +204,7 @@ impl AiModel for OpenAICompatibleModel {
             let mut request_json = strategy
                 .prepare_request(agent, &request_config, &overrides)
                 .await?;
-            if use_max_completion_tokens {
-                rename_max_tokens_key(&mut request_json);
-            }
+            apply_quirks(&mut request_json, quirks);
 
             let request_body =
                 serde_json::to_string(&request_json).map_err(|e| LlmError::Parse(Box::new(e)))?;
@@ -266,7 +274,7 @@ impl AiModel for OpenAICompatibleModel {
                 // the name it asked for: the request is otherwise good, and
                 // failing here costs the seat its whole turn over a key.
                 if status.as_u16() == 400
-                    && !use_max_completion_tokens
+                    && !quirks.renames_ceiling
                     && wants_max_completion_tokens(&body)
                 {
                     warn!(
@@ -274,9 +282,23 @@ impl AiModel for OpenAICompatibleModel {
                         model = %agent.model_name,
                         "Reactive Retry: this model takes `max_completion_tokens`, not `max_tokens`."
                     );
-                    use_max_completion_tokens = true;
-                    self.remember_renamed_ceiling(&agent.model_name);
+                    quirks.renames_ceiling = true;
+                    self.remember_quirk(&agent.model_name, |q| q.renames_ceiling = true);
                     continue;
+                }
+
+                // Nothing to re-send here, so say what would actually fix
+                // it rather than leaving the operator with a bare 400 and a
+                // provider message whose own suggestion this endpoint
+                // rejects.
+                if status.as_u16() == 400 && refuses_tools_on_this_endpoint(&body) {
+                    warn!(
+                        agent = %agent.name,
+                        model = %agent.model_name,
+                        "This model will not take function tools on /v1/chat/completions. \
+                         Set `disable_native_tools: true` on the seat to move the tools into \
+                         the prompt; no retry can shape the request past this."
+                    );
                 }
 
                 // 402 Payment Required — provider billing / credits issue.
@@ -761,9 +783,32 @@ fn rename_max_tokens_key(request_json: &mut serde_json::Value) {
     }
 }
 
+/// Whether a 400 is the provider refusing function tools on this endpoint.
+///
+/// There is nothing the SDK can re-send to get past this one. The refusal
+/// names `reasoning_effort` and suggests setting it to `'none'`, but the same
+/// endpoint then rejects `'none'` for the same model, and omitting the
+/// parameter entirely does not help either: the model reasons by default, and
+/// reasoning and function tools cannot both be had on `/v1/chat/completions`.
+/// Only `disable_native_tools`, which moves the tools into the prompt, or the
+/// `/v1/responses` endpoint gets a turn out of it — and both are the
+/// operator's choice, not a retry.
+fn refuses_tools_on_this_endpoint(body: &str) -> bool {
+    body.contains("Function tools") && body.contains("not supported")
+}
+
+/// Shape a prepared request the way this model has said it wants one.
+fn apply_quirks(request_json: &mut serde_json::Value, quirks: ModelQuirks) {
+    if quirks.renames_ceiling {
+        rename_max_tokens_key(request_json);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{rename_max_tokens_key, wants_max_completion_tokens};
+    use super::{
+        refuses_tools_on_this_endpoint, rename_max_tokens_key, wants_max_completion_tokens,
+    };
 
     /// The verbatim refusal from `gpt-6-astra` on `/v1/chat/completions`.
     const UNSUPPORTED_PARAM: &str = r#"{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.","type":"invalid_request_error","param":"max_tokens","code":"unsupported_parameter"}}"#;
@@ -803,23 +848,87 @@ mod tests {
         assert_eq!(body["model"], "gpt-6-astra");
     }
 
+    /// The verbatim refusal from `gpt-6-astra` when a request carries tools.
+    const REASONING_WITH_TOOLS: &str = r#"{"error":{"message":"Function tools with reasoning_effort are not supported for gpt-6-astra in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.","type":"invalid_request_error","param":"reasoning_effort","code":null}}"#;
+
     #[test]
-    fn the_refusal_is_learned_once_and_only_for_that_model() {
+    fn a_tools_refusal_is_recognised_and_claims_nothing_else() {
+        assert!(refuses_tools_on_this_endpoint(REASONING_WITH_TOOLS));
+        assert!(
+            !wants_max_completion_tokens(REASONING_WITH_TOOLS),
+            "the two 400s must not claim each other"
+        );
+        assert!(!refuses_tools_on_this_endpoint(UNSUPPORTED_PARAM));
+    }
+
+    /// Checked against the live API, because the provider's own advice is
+    /// wrong: `reasoning_effort: "none"` comes back as
+    /// `Unsupported value: 'reasoning_effort' does not support 'none' with
+    /// this model`, and omitting the parameter altogether still refuses. So
+    /// there is deliberately no retry for this one, and this test is what
+    /// stops a future reader adding it back.
+    #[test]
+    fn the_tools_refusal_is_not_something_a_retry_can_shape_away() {
+        let mut body = serde_json::json!({
+            "model": "gpt-6-astra",
+            "reasoning_effort": "medium",
+            "tools": [{"type": "function"}],
+        });
+        let before = body.clone();
+        super::apply_quirks(&mut body, super::ModelQuirks::default());
+        assert_eq!(
+            body, before,
+            "no learned rule rewrites this request; the seat needs \
+             disable_native_tools instead"
+        );
+    }
+
+    #[test]
+    fn the_quirks_are_learned_once_and_only_for_that_model() {
         let model = super::OpenAICompatibleModel::new(
             "https://api.openai.test/v1".to_string(),
             "k".to_string(),
             None,
         );
-        assert!(!model.model_renames_ceiling("gpt-6-astra"));
-        model.remember_renamed_ceiling("gpt-6-astra");
+        assert!(!model.quirks_of("gpt-6-astra").renames_ceiling);
+        model.remember_quirk("gpt-6-astra", |q| q.renames_ceiling = true);
         assert!(
-            model.model_renames_ceiling("gpt-6-astra"),
+            model.quirks_of("gpt-6-astra").renames_ceiling,
             "a second turn must not re-pay the 400"
         );
         assert!(
-            !model.model_renames_ceiling("gpt-4o-mini"),
+            !model.quirks_of("gpt-4o-mini").renames_ceiling,
             "a vendor migrates its families one at a time"
         );
+    }
+
+    #[test]
+    fn a_learned_rule_shapes_the_request() {
+        let mut body = serde_json::json!({
+            "model": "gpt-6-astra",
+            "max_tokens": 4096,
+            "reasoning_effort": "medium",
+        });
+        super::apply_quirks(
+            &mut body,
+            super::ModelQuirks {
+                renames_ceiling: true,
+            },
+        );
+        assert_eq!(body["max_completion_tokens"], 4096);
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(
+            body["reasoning_effort"], "medium",
+            "the ceiling rule touches only the ceiling"
+        );
+    }
+
+    #[test]
+    fn a_model_with_nothing_learned_is_sent_as_prepared() {
+        let mut body = serde_json::json!({ "model": "m", "max_tokens": 10 });
+        let before = body.clone();
+        super::apply_quirks(&mut body, super::ModelQuirks::default());
+        assert_eq!(body, before);
     }
 
     #[test]
@@ -832,8 +941,8 @@ mod tests {
             None,
         );
         let other = model.clone();
-        model.remember_renamed_ceiling("gpt-6-astra");
-        assert!(other.model_renames_ceiling("gpt-6-astra"));
+        model.remember_quirk("gpt-6-astra", |q| q.renames_ceiling = true);
+        assert!(other.quirks_of("gpt-6-astra").renames_ceiling);
     }
 
     #[test]
