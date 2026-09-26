@@ -47,6 +47,14 @@ pub struct ModelAvailability {
     /// The provider id whose agents this catalog covers. Agents on any other
     /// provider resolve to [`Availability::Unknown`] (fail-open).
     provider_id: String,
+    /// Bearer for the catalog request, when the provider needs one.
+    ///
+    /// OpenRouter and Phala serve `/models` to anyone; the OpenAI API answers
+    /// `401` without a key. Every seat shipped before this went through a
+    /// provider of the first kind, so an unauthenticated probe looked correct
+    /// until the first direct-OpenAI seat, where it disabled availability
+    /// checking and context-window detection on every boot.
+    api_key: Option<String>,
     /// `None` until the first successful fetch; then, per catalog model id,
     /// the context length the catalog states for it (`None` when the entry
     /// carries no context field).
@@ -57,7 +65,7 @@ impl ModelAvailability {
     /// `catalog_url` is the provider's OpenAI-compatible `/models` endpoint;
     /// `provider_id` is the provider whose agents this catalog governs. Both are
     /// caller-supplied so the probe stays provider-agnostic.
-    pub fn new(catalog_url: String, provider_id: String) -> Self {
+    pub fn new(catalog_url: String, provider_id: String, api_key: Option<String>) -> Self {
         Self {
             // A probe with no timeout can hang on an endpoint that accepts the
             // connection and never answers. It runs inline before the
@@ -69,6 +77,7 @@ impl ModelAvailability {
                 .unwrap_or_default(),
             catalog_url,
             provider_id,
+            api_key: api_key.filter(|k| !k.trim().is_empty()),
             ids: RwLock::new(None),
         }
     }
@@ -76,9 +85,11 @@ impl ModelAvailability {
     /// Fetch the catalog and replace the cached id set. On any failure the
     /// previous set is kept (fail-open) and the error is returned.
     pub async fn refresh(&self) -> Result<usize, String> {
-        let body = self
-            .client
-            .get(&self.catalog_url)
+        let mut request = self.client.get(&self.catalog_url);
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+        let body = request
             .send()
             .await
             .map_err(|e| format!("catalog request failed: {e}"))?;
@@ -209,10 +220,62 @@ mod tests {
         (server, url)
     }
 
+    /// The OpenAI API answers `401` on `/models` without a key, so a probe
+    /// that sends none disables availability checking and context-window
+    /// detection for every direct-OpenAI seat — silently, because the probe
+    /// fails open. OpenRouter and Phala serve the catalog anonymously, which
+    /// is why no shipped seat caught this.
+    #[tokio::test]
+    async fn the_catalog_request_carries_the_provider_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(wiremock::matchers::header("authorization", "Bearer sk-probe"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(CATALOG))
+            .mount(&server)
+            .await;
+        // Anything without the header 401s, as the real API does.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/v1/models", server.uri());
+        let probe = ModelAvailability::new(
+            url.clone(),
+            PROVIDER.to_string(),
+            Some("sk-probe".to_string()),
+        );
+        probe.refresh().await.expect("the key must reach the catalog");
+
+        // And a probe with no key still gets the unauthenticated answer,
+        // so providers that need none are unaffected.
+        let bare = ModelAvailability::new(url, PROVIDER.to_string(), None);
+        assert!(bare.refresh().await.is_err(), "no key, no catalog");
+    }
+
+    /// A blank key is the same as none: an empty `${VAR}` expansion must not
+    /// send `Authorization: Bearer `, which some providers reject outright.
+    #[tokio::test]
+    async fn a_blank_key_sends_no_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(CATALOG))
+            .mount(&server)
+            .await;
+        let probe = ModelAvailability::new(
+            format!("{}/v1/models", server.uri()),
+            PROVIDER.to_string(),
+            Some("   ".to_string()),
+        );
+        probe.refresh().await.expect("blank key is simply no key");
+    }
+
     #[test]
     fn before_refresh_everything_is_unknown() {
         // Fail-open: never deactivate an agent just because we haven't polled yet.
-        let probe = ModelAvailability::new("http://unused".to_string(), PROVIDER.to_string());
+        let probe = ModelAvailability::new("http://unused".to_string(), PROVIDER.to_string(), None);
         assert_eq!(
             probe.is_available(PROVIDER, "vendor/model-a"),
             Availability::Unknown
@@ -222,7 +285,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_marks_present_available_and_absent_unavailable() {
         let (_server, url) = serve(200, CATALOG).await;
-        let probe = ModelAvailability::new(url, PROVIDER.to_string());
+        let probe = ModelAvailability::new(url, PROVIDER.to_string(), None);
         let n = probe.refresh().await.unwrap();
         assert_eq!(n, 3);
 
@@ -244,7 +307,7 @@ mod tests {
         // A 5xx on the very first fetch must NOT flip agents to Unavailable — a
         // network blip can't mass-deactivate the fleet.
         let (_server, url) = serve(500, "upstream down").await;
-        let probe = ModelAvailability::new(url, PROVIDER.to_string());
+        let probe = ModelAvailability::new(url, PROVIDER.to_string(), None);
         assert!(probe.refresh().await.is_err());
         assert_eq!(
             probe.is_available(PROVIDER, "vendor/some-model"),
@@ -258,11 +321,11 @@ mod tests {
         // Good fetch, then a failing refresh: the previous good set survives so a
         // transient outage doesn't drop a live agent.
         let (_ok_server, ok_url) = serve(200, CATALOG).await;
-        let probe = ModelAvailability::new(ok_url, PROVIDER.to_string());
+        let probe = ModelAvailability::new(ok_url, PROVIDER.to_string(), None);
         probe.refresh().await.unwrap();
 
         let (_bad_server, bad_url) = serve(500, "upstream down").await;
-        let probe = ModelAvailability::new(bad_url, PROVIDER.to_string());
+        let probe = ModelAvailability::new(bad_url, PROVIDER.to_string(), None);
         {
             // Simulate a poller that already holds a good catalog.
             *probe.ids.write().unwrap() = parse_catalog_ids(CATALOG).ok();
@@ -278,7 +341,7 @@ mod tests {
     #[tokio::test]
     async fn other_provider_is_unknown() {
         let (_server, url) = serve(200, CATALOG).await;
-        let probe = ModelAvailability::new(url, PROVIDER.to_string());
+        let probe = ModelAvailability::new(url, PROVIDER.to_string(), None);
         probe.refresh().await.unwrap();
         // Only the covered provider is checked; others fail-open.
         assert_eq!(
@@ -310,7 +373,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_captures_context_length_per_model() {
         let (_server, url) = serve(200, CATALOG_WITH_CONTEXT).await;
-        let probe = ModelAvailability::new(url, PROVIDER.to_string());
+        let probe = ModelAvailability::new(url, PROVIDER.to_string(), None);
         probe.refresh().await.unwrap();
 
         assert_eq!(
@@ -344,7 +407,7 @@ mod tests {
 
     #[test]
     fn before_refresh_context_length_is_none() {
-        let probe = ModelAvailability::new("http://unused".to_string(), PROVIDER.to_string());
+        let probe = ModelAvailability::new("http://unused".to_string(), PROVIDER.to_string(), None);
         assert_eq!(probe.context_length(PROVIDER, "vendor/model-a"), None);
     }
 
@@ -355,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn apply_catalog_context_pushes_config_to_the_catalog_value() {
         let (_server, url) = serve(200, CATALOG_WITH_CONTEXT).await;
-        let probe = ModelAvailability::new(url, PROVIDER.to_string());
+        let probe = ModelAvailability::new(url, PROVIDER.to_string(), None);
         probe.refresh().await.unwrap();
 
         // Understated config → pushed up.
@@ -418,7 +481,7 @@ mod tests {
             .mount(&server)
             .await;
         let probe =
-            ModelAvailability::new(format!("{}/v1/models", server.uri()), PROVIDER.to_string());
+            ModelAvailability::new(format!("{}/v1/models", server.uri()), PROVIDER.to_string(), None);
 
         probe.refresh().await.unwrap();
         assert_eq!(

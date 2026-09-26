@@ -275,6 +275,7 @@ async fn catalog_probe(
     let probe = crate::providers::ModelAvailability::new(
         format!("{base}/models"),
         agent_config.provider_id.clone(),
+        Some(provider.api_key.clone()),
     );
     match probe.refresh().await {
         Ok(_) => {
