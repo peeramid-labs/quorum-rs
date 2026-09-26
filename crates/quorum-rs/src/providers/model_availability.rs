@@ -230,7 +230,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
-            .and(wiremock::matchers::header("authorization", "Bearer sk-probe"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer sk-probe",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_string(CATALOG))
             .mount(&server)
             .await;
@@ -246,7 +249,10 @@ mod tests {
             PROVIDER.to_string(),
             Some("sk-probe".to_string()),
         );
-        probe.refresh().await.expect("the key must reach the catalog");
+        assert!(
+            probe.refresh().await.is_ok(),
+            "the key must reach the catalog"
+        );
 
         // And a probe with no key still gets the unauthenticated answer,
         // so providers that need none are unaffected.
@@ -480,8 +486,11 @@ mod tests {
             .expect(0)
             .mount(&server)
             .await;
-        let probe =
-            ModelAvailability::new(format!("{}/v1/models", server.uri()), PROVIDER.to_string(), None);
+        let probe = ModelAvailability::new(
+            format!("{}/v1/models", server.uri()),
+            PROVIDER.to_string(),
+            None,
+        );
 
         probe.refresh().await.unwrap();
         assert_eq!(

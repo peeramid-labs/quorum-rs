@@ -20,7 +20,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use super::RateLimiter;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 /// A client for any LLM that exposes an OpenAI-compatible API.
@@ -32,6 +32,17 @@ pub struct OpenAICompatibleModel {
     semaphore: Option<Arc<Semaphore>>,
     rate_limiter: Option<Arc<RateLimiter>>,
     engine: Option<String>,
+    /// Model ids on this endpoint that have refused `max_tokens` and asked
+    /// for `max_completion_tokens` instead.
+    ///
+    /// Learned rather than configured, and remembered so the refusal is paid
+    /// for once. Keyed by model rather than held as one flag for the whole
+    /// endpoint because a vendor migrates its families one at a time: the
+    /// reasoning models take only the new name while everything beside them
+    /// still takes the old one. Shared across clones — the client is cloned
+    /// per agent, and what one seat learns is true for every other seat on
+    /// the same model.
+    renamed_ceiling: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Join a configured `base_url` with a strategy's endpoint suffix.
@@ -69,6 +80,7 @@ impl OpenAICompatibleModel {
             semaphore: None,
             rate_limiter: None,
             engine,
+            renamed_ceiling: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -80,6 +92,24 @@ impl OpenAICompatibleModel {
     pub fn with_rate_limiter(mut self, rate_limiter: Arc<RateLimiter>) -> Self {
         self.rate_limiter = Some(rate_limiter);
         self
+    }
+
+    /// Whether this model has already asked for `max_completion_tokens`.
+    ///
+    /// A poisoned lock answers `false`: the cost of forgetting is one extra
+    /// round trip, and the retry re-learns it, so there is nothing here worth
+    /// failing a request over.
+    fn model_renames_ceiling(&self, model_name: &str) -> bool {
+        self.renamed_ceiling
+            .lock()
+            .is_ok_and(|seen| seen.contains(model_name))
+    }
+
+    /// Remember that this model takes the other spelling.
+    fn remember_renamed_ceiling(&self, model_name: &str) {
+        if let Ok(mut seen) = self.renamed_ceiling.lock() {
+            seen.insert(model_name.to_string());
+        }
     }
 }
 
@@ -105,6 +135,10 @@ impl AiModel for OpenAICompatibleModel {
         // Reactive retries (vLLM 400 below) overwrite the proactive
         // value: only the shrink that left the SDK is reported.
         let mut shrink_info: Option<ShrinkInfo> = None;
+        // Starts true when this model has already refused `max_tokens` on an
+        // earlier call, so the wasted round trip is paid once per process
+        // rather than once per turn.
+        let mut use_max_completion_tokens = self.model_renames_ceiling(&agent.model_name);
         const SHRINK_FLOOR: u32 = 200;
         let requested_max_tokens = agent.max_tokens as u32;
         let mut final_max_tokens = requested_max_tokens;
@@ -157,9 +191,12 @@ impl AiModel for OpenAICompatibleModel {
             // `?` so the caller observes the original variant (e.g.
             // `Parse` for serialisation failures inside the strategy)
             // rather than re-wrapping into `Other` and erasing it.
-            let request_json = strategy
+            let mut request_json = strategy
                 .prepare_request(agent, &request_config, &overrides)
                 .await?;
+            if use_max_completion_tokens {
+                rename_max_tokens_key(&mut request_json);
+            }
 
             let request_body =
                 serde_json::to_string(&request_json).map_err(|e| LlmError::Parse(Box::new(e)))?;
@@ -223,6 +260,23 @@ impl AiModel for OpenAICompatibleModel {
                     });
                     final_max_tokens = clamped; // Ensure minimal output
                     continue; // Retry with new token limit
+                }
+
+                // The provider refused the ceiling by name. Retry once under
+                // the name it asked for: the request is otherwise good, and
+                // failing here costs the seat its whole turn over a key.
+                if status.as_u16() == 400
+                    && !use_max_completion_tokens
+                    && wants_max_completion_tokens(&body)
+                {
+                    warn!(
+                        agent = %agent.name,
+                        model = %agent.model_name,
+                        "Reactive Retry: this model takes `max_completion_tokens`, not `max_tokens`."
+                    );
+                    use_max_completion_tokens = true;
+                    self.remember_renamed_ceiling(&agent.model_name);
+                    continue;
                 }
 
                 // 402 Payment Required — provider billing / credits issue.
@@ -682,8 +736,116 @@ fn parse_vllm_context_error(body: &str) -> Option<(u32, u32)> {
     None
 }
 
+/// Whether a 400 is the provider asking for `max_completion_tokens` in place
+/// of `max_tokens`.
+///
+/// OpenAI's reasoning models refuse `max_tokens` outright rather than
+/// accepting it as a synonym, and they are the only backends that do: every
+/// other OpenAI-compatible server in the fleet knows only the old name. So the
+/// SDK cannot pick a spelling up front from the model id — a list of which
+/// families have switched would be wrong by the next release — and asks the
+/// provider instead, by sending the old name and reading the refusal.
+fn wants_max_completion_tokens(body: &str) -> bool {
+    body.contains("max_completion_tokens") && body.contains("max_tokens")
+}
+
+/// Rename the token ceiling in a prepared request body.
+///
+/// Only the key differs between the two spellings, so the retry re-sends the
+/// same request under the name the provider named.
+fn rename_max_tokens_key(request_json: &mut serde_json::Value) {
+    if let Some(obj) = request_json.as_object_mut()
+        && let Some(value) = obj.remove("max_tokens")
+    {
+        obj.insert("max_completion_tokens".to_string(), value);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{rename_max_tokens_key, wants_max_completion_tokens};
+
+    /// The verbatim refusal from `gpt-6-astra` on `/v1/chat/completions`.
+    const UNSUPPORTED_PARAM: &str = r#"{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.","type":"invalid_request_error","param":"max_tokens","code":"unsupported_parameter"}}"#;
+
+    #[test]
+    fn the_reasoning_models_refusal_asks_for_the_other_spelling() {
+        assert!(wants_max_completion_tokens(UNSUPPORTED_PARAM));
+    }
+
+    #[test]
+    fn a_context_overflow_is_not_a_request_to_rename_anything() {
+        // This one names both spellings, and renaming would not fix it — the
+        // ceiling is too high under either name. The shrink branch runs first
+        // and `continue`s, so the two never compete for the same 400; the
+        // guard here is that the rename alone would not claim it.
+        let overflow = r#"{"error":{"message":"'max_tokens' or 'max_completion_tokens' is too large: 16000. This model's maximum context length is 21000 tokens and your request has 5395 input tokens","code":400}}"#;
+        assert!(super::parse_vllm_context_error(overflow).is_some());
+    }
+
+    #[test]
+    fn an_unrelated_bad_request_is_left_alone() {
+        let other = r#"{"error":{"message":"Invalid schema for function 'x'","code":"invalid_function_parameters"}}"#;
+        assert!(!wants_max_completion_tokens(other));
+    }
+
+    #[test]
+    fn renaming_moves_the_ceiling_and_touches_nothing_else() {
+        let mut body = serde_json::json!({
+            "model": "gpt-6-astra",
+            "max_tokens": 4096,
+            "temperature": 0.7,
+        });
+        rename_max_tokens_key(&mut body);
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["max_completion_tokens"], 4096);
+        assert_eq!(body["temperature"], 0.7);
+        assert_eq!(body["model"], "gpt-6-astra");
+    }
+
+    #[test]
+    fn the_refusal_is_learned_once_and_only_for_that_model() {
+        let model = super::OpenAICompatibleModel::new(
+            "https://api.openai.test/v1".to_string(),
+            "k".to_string(),
+            None,
+        );
+        assert!(!model.model_renames_ceiling("gpt-6-astra"));
+        model.remember_renamed_ceiling("gpt-6-astra");
+        assert!(
+            model.model_renames_ceiling("gpt-6-astra"),
+            "a second turn must not re-pay the 400"
+        );
+        assert!(
+            !model.model_renames_ceiling("gpt-4o-mini"),
+            "a vendor migrates its families one at a time"
+        );
+    }
+
+    #[test]
+    fn what_one_clone_learns_every_clone_knows() {
+        // The client is cloned per agent, and two seats on the same model
+        // should not each discover the rename separately.
+        let model = super::OpenAICompatibleModel::new(
+            "https://api.openai.test/v1".to_string(),
+            "k".to_string(),
+            None,
+        );
+        let other = model.clone();
+        model.remember_renamed_ceiling("gpt-6-astra");
+        assert!(other.model_renames_ceiling("gpt-6-astra"));
+    }
+
+    #[test]
+    fn renaming_a_body_that_sends_no_ceiling_adds_none() {
+        // A seat on `max_tokens: 0` omits the key entirely, and the rename
+        // must not invent one — an explicit null fails the request.
+        let mut body = serde_json::json!({ "model": "gpt-6-astra" });
+        rename_max_tokens_key(&mut body);
+        assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.get("max_tokens").is_none());
+    }
+
     #[test]
     fn endpoint_keeps_a_base_that_already_names_its_version() {
         assert_eq!(
