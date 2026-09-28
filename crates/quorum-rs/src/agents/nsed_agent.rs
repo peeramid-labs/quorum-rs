@@ -1212,6 +1212,21 @@ impl ProposerEvaluatorAgent {
         self
     }
 
+    /// What opens every propose and evaluate user message: the clock, the
+    /// round and phase, and the seat's role with its private context.
+    fn turn_prelude(&self, context: &AgentContext) -> String {
+        format!(
+            "{}{}{}",
+            crate::prompts::clock_block(context.issued_at.as_deref()),
+            self.prompt_set.get_turn_header(
+                context.round_number as usize,
+                context.total_rounds as usize,
+                context.phase,
+            ),
+            crate::prompts::role_block(context.role.as_deref(), context.role_context.as_deref()),
+        )
+    }
+
     /// Direct chat with the agent's LLM, using the agent's persona but
     /// bypassing NSED deliberation constraints via an "internal voice" wrapper.
     ///
@@ -1282,17 +1297,9 @@ impl NsedAgent for ProposerEvaluatorAgent {
             &context.user_injections,
             context.structured_feedback.as_ref(),
         );
-        // Dynamic round + phase go in the user message; the system message is static
-        // for prompt-cache reuse.
-        let prompt = format!(
-            "{}{}{prompt}",
-            crate::prompts::clock_block(context.issued_at.as_deref()),
-            self.prompt_set.get_turn_header(
-                context.round_number as usize,
-                context.total_rounds as usize,
-                context.phase,
-            )
-        );
+        // Dynamic round, phase and role go in the user message; the system
+        // message is static for prompt-cache reuse.
+        let prompt = format!("{}{prompt}", self.turn_prelude(context));
 
         // A `before_prompt` middleware may constrain the submission to its own
         // JSON schema (structured output); otherwise the default thought/solution.
@@ -1448,16 +1455,9 @@ impl NsedAgent for ProposerEvaluatorAgent {
             context.round_number as usize,
             &context.user_injections,
         );
-        // Dynamic round + phase → user message (static system prompt for cache reuse).
-        let prompt = format!(
-            "{}{}{prompt}",
-            crate::prompts::clock_block(context.issued_at.as_deref()),
-            self.prompt_set.get_turn_header(
-                context.round_number as usize,
-                context.total_rounds as usize,
-                context.phase,
-            )
-        );
+        // Dynamic round, phase and role → user message (static system prompt
+        // for cache reuse).
+        let prompt = format!("{}{prompt}", self.turn_prelude(context));
 
         let all_tools = self.aggregate_tools(context);
 

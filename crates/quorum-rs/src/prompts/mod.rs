@@ -45,6 +45,33 @@ pub fn clock_block(issued_at: Option<&str>) -> String {
     )
 }
 
+/// The seat's role and what that role alone was told. Rides in the user
+/// message for the same reason as [`clock_block`]: it differs per seat and
+/// per job, and the system prefix must not.
+///
+/// Empty when the job assigned no role; a role without context is still
+/// named, so the seat knows which lane it holds.
+pub fn role_block(role: Option<&str>, role_context: Option<&str>) -> String {
+    let context = role_context.map(str::trim).filter(|c| !c.is_empty());
+    let mut out = match role {
+        Some(role) => {
+            format!("<role name=\"{role}\">\nYour role in this deliberation is `{role}`.")
+        }
+        None => match context {
+            Some(_) => "<role>".to_string(),
+            None => return String::new(),
+        },
+    };
+    if let Some(context) = context {
+        out.push_str(
+            "\nWhat follows was given to this role alone; the other seats do not see it.\n\n",
+        );
+        out.push_str(context);
+    }
+    out.push_str("\n</role>\n\n");
+    out
+}
+
 /// A trait for a collection of prompt templates used by an NSED agent.
 ///
 /// This allows for different "personalities" or model-specific instructions
@@ -181,7 +208,27 @@ dyn_clone::clone_trait_object!(PromptSet);
 
 #[cfg(test)]
 mod tests {
-    use super::clock_block;
+    use super::{clock_block, role_block};
+
+    #[test]
+    fn a_role_with_context_names_the_lane_and_marks_the_context_private() {
+        let block = role_block(Some("slop"), Some("## Static prepass\n\n3 hits\n"));
+        assert!(block.starts_with("<role name=\"slop\">"));
+        assert!(block.contains("Your role in this deliberation is `slop`."));
+        assert!(block.contains("this role alone"));
+        assert!(block.contains("## Static prepass\n\n3 hits\n</role>"));
+        assert!(block.ends_with("</role>\n\n"));
+    }
+
+    #[test]
+    fn a_role_without_context_is_still_named_and_nothing_is_rendered_for_no_role() {
+        let named = role_block(Some("spec"), None);
+        assert!(named.contains("`spec`"));
+        assert!(!named.contains("role alone"));
+        assert_eq!(role_block(None, None), "");
+        assert_eq!(role_block(None, Some("   ")), "");
+        assert!(role_block(None, Some("ctx")).starts_with("<role>\n"));
+    }
 
     #[test]
     fn the_clock_states_the_date_and_what_it_implies_about_recall() {
