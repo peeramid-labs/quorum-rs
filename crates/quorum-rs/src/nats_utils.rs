@@ -514,15 +514,23 @@ pub async fn register_with_orchestrator(
         "signature": signature,
     });
 
-    let reg_resp: RegistrationResponse = http
+    let raw = http
         .post(format!("{base}/credentials/register"))
         .bearer_auth(bearer_token)
         .json(&reg_body)
         .send()
         .await
-        .context("Failed to send registration request")?
-        .error_for_status()
-        .context("Registration request rejected")?
+        .context("Failed to send registration request")?;
+    // `error_for_status` drops the body, and the body is the only place the
+    // orchestrator says *why* — role, tag reach, an id already claimed. A
+    // fleet that cannot register is a fleet that receives no jobs, so the
+    // reason has to reach the operator rather than a bare status.
+    let status = raw.status();
+    if !status.is_success() {
+        let body = raw.text().await.unwrap_or_default();
+        anyhow::bail!("Registration request rejected: {status} {body}");
+    }
+    let reg_resp: RegistrationResponse = raw
         .json()
         .await
         .context("Failed to parse registration response")?;
@@ -1567,6 +1575,52 @@ mod tests {
             }
             Ok(_) => panic!("Should return error after exhausting retries"),
         }
+    }
+
+    /// A refused registration must carry the orchestrator's own words.
+    ///
+    /// `error_for_status` gave only "Registration request rejected: 403",
+    /// which sent the operator looking at roles while the server was asking
+    /// for something else entirely. The fleet still connects to NATS and logs
+    /// "agent ready" when this fails, so the message is the only place the
+    /// problem is ever stated.
+    #[tokio::test]
+    async fn a_refused_registration_says_why_the_orchestrator_refused() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/credentials/challenge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "orchestrator_pub_key": "AATESTACCOUNTKEY",
+                "nats_url_hash": "0".repeat(64),
+                "nonce": "nonce-1",
+                "expires_in_secs": 60,
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/credentials/register"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string(r#"{"error":"Bearer token must have a display_name"}"#),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let err = register_with_orchestrator(&mock_server.uri(), "test-agent", "test-token")
+            .await
+            .expect_err("a 403 is not a registration");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("display_name"),
+            "the server's reason has to survive into the error: {message}"
+        );
+        assert!(
+            message.contains("403"),
+            "and the status alongside it: {message}"
+        );
     }
 
     /// Verifies that a 4xx response is NOT retried (permanent failure).

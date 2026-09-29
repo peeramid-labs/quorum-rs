@@ -31,6 +31,34 @@ fn normalise_sampling_values(v: &mut serde_json::Value) {
     }
 }
 
+/// What the broker said went wrong upstream, read from wherever it put it.
+///
+/// A choice flagged `finish_reason: "error"` carries the reason in one of
+/// three places depending on the broker, and a caller reading the log wants
+/// the sentence, not the shape it arrived in. Falls back to naming the
+/// provider's own terminal reason when there is no message at all, which is
+/// still more than "unknown variant".
+fn upstream_error_message(
+    choice: &serde_json::Value,
+    top_level: Option<&serde_json::Value>,
+) -> String {
+    let from_choice = choice.get("error");
+    let source = from_choice.or(top_level);
+    if let Some(error) = source {
+        if let Some(message) = error.get("message").and_then(|m| m.as_str()) {
+            return message.to_string();
+        }
+        if let Some(message) = error.as_str() {
+            return message.to_string();
+        }
+        return error.to_string();
+    }
+    match choice.get("native_finish_reason").and_then(|n| n.as_str()) {
+        Some(native) => format!("the provider ended the turn as `{native}` and said no more"),
+        None => "the provider reported an error and gave no reason".to_string(),
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct NativeStrategy {
     engine: Option<String>,
@@ -470,6 +498,40 @@ impl ChatStrategy for NativeStrategy {
                     {
                         obj.insert("type".to_string(), serde_json::json!("function"));
                     }
+                }
+            }
+        }
+
+        // A broker reports an upstream model's failure as `finish_reason:
+        // "error"`, which the response enum does not know — so the whole
+        // completion fails to deserialize and the seat reports
+        // `unknown variant `error`` instead of what actually went wrong.
+        //
+        // Two shapes hide behind it. When the choice still carries content,
+        // the broker is flagging a partial result and the completion is
+        // usable, so the tag is dropped and the turn stands. When it does
+        // not, the turn is genuinely lost, and the useful thing to surface
+        // is the broker's own message rather than a parse error naming a
+        // serde variant.
+        let top_level_error = value.get("error").cloned();
+        if let Some(choices) = value.get_mut("choices").and_then(|c| c.as_array_mut()) {
+            for choice in choices {
+                if choice.get("finish_reason").and_then(|f| f.as_str()) != Some("error") {
+                    continue;
+                }
+                let has_content = choice
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| !c.trim().is_empty());
+                if !has_content {
+                    return Err(LlmError::Api {
+                        status: 502,
+                        body: upstream_error_message(choice, top_level_error.as_ref()),
+                    });
+                }
+                if let Some(obj) = choice.as_object_mut() {
+                    obj.insert("finish_reason".to_string(), serde_json::json!("stop"));
                 }
             }
         }
@@ -1707,6 +1769,118 @@ mod tests {
 
         let response = strategy.parse_response(body).await.expect("Should parse");
         assert!(response.service_tier.is_none());
+    }
+
+    // --- finish_reason: "error" (broker reporting an upstream failure) ---
+
+    /// The shape OpenRouter returns when the model behind it fails: a choice
+    /// tagged `error`, no content, and the reason in a sibling object.
+    fn upstream_failure(content: serde_json::Value) -> String {
+        serde_json::json!({
+            "id": "gen-1",
+            "created": 123,
+            "model": "openai/gpt-oss-safeguard-20b",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "error",
+                "native_finish_reason": "error",
+                "error": {"message": "upstream provider returned 503", "code": 503}
+            }]
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn an_upstream_failure_reports_what_the_broker_said() {
+        let strategy = NativeStrategy::default();
+        let err = strategy
+            .parse_response(&upstream_failure(serde_json::Value::Null))
+            .await
+            .expect_err("a turn that produced nothing is not a completion");
+        match err {
+            LlmError::Api { status, body } => {
+                assert_eq!(status, 502);
+                assert_eq!(body, "upstream provider returned 503");
+            }
+            other => panic!("expected the broker's own message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_upstream_failure_is_never_an_unknown_variant() {
+        // The regression: `async-openai`'s FinishReason has no `error`, so
+        // this body used to fail deserialization and the seat reported
+        // `unknown variant `error`` — a serde detail, not the failure.
+        let strategy = NativeStrategy::default();
+        let err = strategy
+            .parse_response(&upstream_failure(serde_json::Value::Null))
+            .await
+            .expect_err("still an error");
+        assert!(
+            !err.display_chain().contains("unknown variant"),
+            "the parse detail must not stand in for the provider's reason: {}",
+            err.display_chain()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flagged_choice_that_still_answered_keeps_its_answer() {
+        let strategy = NativeStrategy::default();
+        let response = strategy
+            .parse_response(&upstream_failure(serde_json::json!("partial answer")))
+            .await
+            .expect("content means the turn is usable");
+        assert_eq!(
+            response.choices[0].message.content.as_deref(),
+            Some("partial answer")
+        );
+        assert_eq!(
+            response.choices[0].finish_reason,
+            Some(async_openai::types::FinishReason::Stop),
+            "a tag the enum cannot hold is dropped, not carried"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_with_no_message_still_says_something_useful() {
+        let strategy = NativeStrategy::default();
+        let body = serde_json::json!({
+            "id": "gen-2",
+            "created": 123,
+            "model": "m",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": null},
+                "finish_reason": "error",
+                "native_finish_reason": "content_filter"
+            }]
+        })
+        .to_string();
+        let err = strategy.parse_response(&body).await.expect_err("an error");
+        match err {
+            LlmError::Api { body, .. } => assert!(
+                body.contains("content_filter"),
+                "the provider's own terminal reason is the fallback: {body}"
+            ),
+            other => panic!("expected Api, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_completion_is_untouched() {
+        let strategy = NativeStrategy::default();
+        let body = r#"{
+            "id": "x", "created": 1, "model": "m", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "fine"}, "finish_reason": "stop"}]
+        }"#;
+        let response = strategy.parse_response(body).await.expect("parses");
+        assert_eq!(
+            response.choices[0].finish_reason,
+            Some(async_openai::types::FinishReason::Stop)
+        );
     }
 
     // --- extract_from_result_field tests ---
