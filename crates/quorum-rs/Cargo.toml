@@ -56,6 +56,7 @@ dyn-clone = "1.0.20"
 fs4 = "0.13"
 futures = "0.3.31"
 hex = { version = "0.4", optional = true }
+hmac = "0.12"
 nkeys = "0.4"
 quorum-crypto-core = { version = "0.7.1", path = "../quorum-crypto-core", features = ["schema"] }
 llm-repair = { version = "0.7.1", path = "../llm-repair" }

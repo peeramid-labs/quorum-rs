@@ -3217,6 +3217,7 @@ dependencies = [
  "futures",
  "futures-util",
  "hex",
+ "hmac",
  "http-body-util",
  "indicatif",
  "inquire",
