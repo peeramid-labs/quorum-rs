@@ -662,8 +662,8 @@ pub(super) fn render_agent_config(
                 writeln!(out, "    concurrency: 100").unwrap();
             }
             // TODO(slop): add test for new `match_arm` branch (no paired test file in this patch)
-            "exec" | "claude" => {
-                // Exec/Claude providers have no additional config at the provider level.
+            "exec" | "claude" | "openai-oauth" => {
+                // Exec/Claude/OpenAI OAuth providers have no additional config at the provider level.
             }
             // TODO(slop): add test for new `match_arm` branch (no paired test file in this patch)
             _ if p.is_local() => {
@@ -1115,7 +1115,7 @@ pub(super) fn render_orchestrator_config(
                 writeln!(out, "    concurrency: 100").unwrap();
             }
             // TODO(slop): add test for new `match_arm` branch (no paired test file in this patch)
-            "exec" | "claude" => {}
+            "exec" | "claude" | "openai-oauth" => {}
             // TODO(slop): add test for new `match_arm` branch (no paired test file in this patch)
             _ if p.is_local() => {
                 // TODO(slop): `.unwrap()` / `.expect()` outside tests — propagate the error with `?` or handle it

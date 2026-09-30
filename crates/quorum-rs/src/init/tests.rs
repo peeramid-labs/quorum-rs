@@ -3810,6 +3810,30 @@ fn render_agent_config_local_provider_concurrency() {
 }
 
 #[test]
+fn render_agent_config_openai_oauth_provider_has_no_api_key() {
+    let providers = vec![build_openai_oauth_provider()];
+    let agent = AgentSlot::new(
+        "OAUTH".to_string(),
+        "openai_oauth".to_string(),
+        "gpt-5.5".to_string(),
+        None,
+        None,
+    );
+    let cfg = render_agent_config("http://nsed:8080", &providers, &[agent]);
+    let provider_idx = cfg.find("openai_oauth:").unwrap();
+    let provider_section = &cfg[provider_idx..];
+    let next_section = provider_section
+        .find("\n\n")
+        .unwrap_or(provider_section.len());
+    let provider_section = &provider_section[..next_section];
+
+    assert!(provider_section.contains("type: openai-oauth"));
+    assert!(!provider_section.contains("api_key:"));
+    assert!(!provider_section.contains("base_url:"));
+    assert!(cfg.contains("model: \"openai_oauth.gpt-5.5\""));
+}
+
+#[test]
 fn render_agent_config_remote_provider_has_qps() {
     let providers = vec![Provider {
         id: "together_ai".to_string(),
