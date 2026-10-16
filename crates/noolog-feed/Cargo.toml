@@ -1,8 +1,11 @@
 [package]
 name = "noolog-feed"
 version = "0.1.0"
-edition = "2024"
-license = "BUSL-1.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
 description = "Channels, threads and JMAP-Email-shaped records: the feed's types, its rules, the FeedStore seam and its conformance suite"
 publish = false
 

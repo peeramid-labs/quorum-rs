@@ -1,8 +1,9 @@
 # noolog-feed
 
 Channels, threads and records shaped like JMAP `Email`, the rules over them,
-and the storage seam they sit on. No NATS, no SDK: the crate moves into the
-node core (noolog-node), where a PostgreSQL store implements the same trait.
+and the storage seam they sit on. No NATS and no dependency on the rest of the
+SDK: it is the contract between the node core (noolog-node, which keeps the
+feed in PostgreSQL), nsed-orchestrator, the web client and agents.
 
 ## Modules
 
@@ -24,8 +25,8 @@ assigned by the store, per channel, from 1.
 | Store | Crate |
 |---|---|
 | `MemoryFeedStore` | here |
-| `JetStreamFeedStore` | `nsed-content` |
-| PostgreSQL | noolog-node `core` |
+| `JetStreamFeedStore` | nsed-orchestrator `nsed-content` |
+| `PostgresFeedStore` | noolog-node `core` |
 
 A store is correct when it passes `conformance`:
 
@@ -38,5 +39,11 @@ noolog_feed::conformance::a_slug_cannot_be_taken_from_another_operator_even_in_a
 
 ```sh
 cargo test -p noolog-feed                 # rules and conformance on MemoryFeedStore
-cargo test -p nsed-content --lib feed     # conformance on JetStreamFeedStore (needs NATS)
+```
+
+The JetStream and PostgreSQL stores run the same suite in their own
+repositories, with feature `conformance`:
+
+```toml
+noolog-feed = { git = "https://git.peeramid.xyz/peeramid-labs/quorum-rs.git", rev = "…", features = ["conformance"] }
 ```
