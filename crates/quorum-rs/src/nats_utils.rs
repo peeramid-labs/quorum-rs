@@ -1162,9 +1162,69 @@ fn is_retryable_registration_error(e: &anyhow::Error) -> bool {
     true
 }
 
+/// Encode an arbitrary string into a valid NATS KV key.
+///
+/// KV keys must match `[-/_=.a-zA-Z0-9]+`, and `.`/`/` separate subject
+/// tokens, so `[A-Za-z0-9_-]` pass through and every other byte becomes
+/// `=XX` (uppercase hex), `=` included. Injective and ASCII: a dotted or
+/// email principal yields a key the client accepts.
+pub fn nats_kv_key_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' => out.push(b as char),
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "={b:02X}");
+            }
+        }
+    }
+    out
+}
+
+/// Reverse [`nats_kv_key_encode`]. `None` for anything that encoder does not
+/// produce, so a token from the wire cannot be coerced into a different one.
+pub fn nats_kv_key_decode(s: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut bytes = s.bytes();
+    while let Some(b) = bytes.next() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' => out.push(b),
+            b'=' => {
+                let pair = [bytes.next()?, bytes.next()?];
+                // Uppercase only, so one byte has one encoding.
+                if pair.iter().any(u8::is_ascii_lowercase) {
+                    return None;
+                }
+                out.push(u8::from_str_radix(std::str::from_utf8(&pair).ok()?, 16).ok()?);
+            }
+            _ => return None,
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kv_key_round_trips_and_only_the_encoders_output_decodes() {
+        for raw in ["plain-key_1", "op.acme@example.com", "a b/c=d", "ünï", ""] {
+            let key = nats_kv_key_encode(raw);
+            assert!(
+                key.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'='),
+                "{key} is not a NATS-safe key"
+            );
+            assert_eq!(nats_kv_key_decode(&key).as_deref(), Some(raw));
+        }
+        assert_eq!(nats_kv_key_encode("a.b"), "a=2Eb");
+        assert_eq!(nats_kv_key_encode("a=b"), "a=3Db");
+        for foreign in ["a=2eb", "a=2", "a=ZZ", "a.b", "a b"] {
+            assert_eq!(nats_kv_key_decode(foreign), None, "{foreign}");
+        }
+    }
 
     #[test]
     fn test_sanitize_subject_component() {

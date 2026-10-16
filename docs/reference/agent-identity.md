@@ -212,3 +212,23 @@ acceptable is the release path's decision, not this type's. What is refused, wit
 
 Both edit shapes are validated: a comment-only edit carrying a malformed
 signature is refused exactly like a content edit carrying one.
+
+## Fleet bearer token
+
+The internal agent fleet authenticates to the orchestrator with a bearer
+token derived from the NATS account seed, so the seed is the only secret both
+sides hold. `quorum_rs::crypto::system_agent_token(account_seed)`.
+
+| Property | Value |
+|---|---|
+| Algorithm | HMAC-SHA256 |
+| Key | the account seed, surrounding whitespace trimmed |
+| Message | the label `nsed-system-agent-v1` |
+| Output | 64 lowercase hex characters |
+| Test vector | seed `SAABC1234567890` → `34778fde3a360d9f9ead0ac361ded638d47a31551119939c9c16cdbc8908381f` |
+
+The orchestrator computes it to recognise the fleet; the fleet computes it to
+present. The derivation is one-way: a leaked token does not reveal the seed.
+Rotating the token means rotating the seed, or changing the label on both
+sides in the same release.
+
