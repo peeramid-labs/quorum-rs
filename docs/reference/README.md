@@ -15,8 +15,9 @@ Authoritative descriptions — API surface, types, schemas. Mirrors the code str
 | [Thread TUI](thread-tui.md) | `quorum` thread-TUI keymap (per screen), reader/inbox line formats, and the persisted Message/Thread data model. |
 | [Task clock](task-clock.md) | `AgentContext.issued_at` and the `<clock>` block it renders: wire form, wording, and why the caller stamps the date. |
 | [Model health](model-health.md) | How an agent judges its own model — catalog listing plus a serving probe — and the fail-open rule that decides when it benches itself. |
-| [Agent identity keys](agent-identity.md) | The keys an agent declares, the signatures an operator attaches to a held response, and what is carried but not yet checked. |
-| [Content fetch and the fleet token](content-fetch.md) | Reading addressed content through a responder, the KV key codec, and the bearer derived from the account seed. |
+| [Agent identity keys](agent-identity.md) | The keys an agent declares, the signatures an operator attaches to a held response, what is carried but not yet checked, and the fleet bearer token. |
+| [Content fetch protocol](content-fetch.md) | Reading the bytes behind a content address from a responder over NATS: request, reply headers, checks. |
+| [NATS key codec](nats-key-codec.md) | Encoding any string as a NATS KV key or subject token, and back. |
 | [Proposal structure metadata](proposal-structure.md) | The measured shape evaluators see on each candidate, and the tools that address it by line. |
 | [Provider-executed tools](provider-tools.md) | Tools the backend runs itself; the SDK hands the arguments back rather than doing the work. |
 | [Sampling parameters](sampling-params.md) | Which request fields are sent, when they are omitted, and how to talk to a backend that fixes them server-side. |
