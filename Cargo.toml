@@ -1,0 +1,23 @@
+[package]
+name = "noolog-feed"
+version = "0.1.0"
+edition = "2024"
+license = "BUSL-1.1"
+description = "Channels, threads and JMAP-Email-shaped records: the feed's types, its rules, the FeedStore seam and its conformance suite"
+publish = false
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4.38", default-features = false, features = ["clock", "std"], optional = true }
+tokio = { version = "1", features = ["macros"], optional = true }
+
+[features]
+# The FeedStore conformance suite, for stores implemented in other crates.
+conformance = ["dep:chrono", "dep:tokio"]
+
+[dev-dependencies]
+chrono = { version = "0.4.38", default-features = false, features = ["clock", "std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
