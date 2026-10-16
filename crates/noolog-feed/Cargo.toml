@@ -1,11 +1,13 @@
 [package]
 name = "noolog-feed"
 version = "0.1.0"
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-rust-version.workspace = true
-authors.workspace = true
+# Literal, not inherited: nsed-orchestrator uses this crate by path through
+# its quorum-rs submodule, and inherited fields would resolve against its root.
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/peeramid-labs/quorum-rs"
+rust-version = "1.85"
+authors = ["Peeramid Labs"]
 description = "Channels, threads and JMAP-Email-shaped records: the feed's types, its rules, the FeedStore seam and its conformance suite"
 publish = false
 
