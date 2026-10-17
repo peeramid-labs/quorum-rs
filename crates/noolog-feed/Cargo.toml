@@ -18,10 +18,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4.38", default-features = false, features = ["clock", "std"] }
 tokio = { version = "1", features = ["macros"], optional = true }
+noolog-jmap = { path = "../noolog-jmap", optional = true }
+base64 = { version = "0.22", optional = true }
 
 [features]
 # The FeedStore conformance suite, for stores implemented in other crates.
 conformance = ["dep:tokio"]
+# `jmap`: records, channels and their ids as JMAP types.
+jmap = ["dep:noolog-jmap", "dep:base64"]
 
 [dev-dependencies]
+jmap-client = { version = "0.4.3", default-features = false, features = ["async"] }
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
