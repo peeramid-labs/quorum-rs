@@ -2323,6 +2323,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "jmap-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "jmap-mail"
+version = "0.1.0"
+dependencies = [
+ "jmap-client",
+ "jmap-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2796,19 +2814,11 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "jmap-client",
- "noolog-jmap",
+ "jmap-core",
+ "jmap-mail",
  "serde",
  "serde_json",
  "tokio",
-]
-
-[[package]]
-name = "noolog-jmap"
-version = "0.1.0"
-dependencies = [
- "jmap-client",
- "serde",
- "serde_json",
 ]
 
 [[package]]

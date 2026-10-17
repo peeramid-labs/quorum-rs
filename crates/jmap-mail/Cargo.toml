@@ -1,5 +1,5 @@
 [package]
-name = "noolog-jmap"
+name = "jmap-mail"
 version = "0.1.0"
 # Literal, not inherited: nsed-orchestrator uses this crate by path through
 # its quorum-rs submodule, and inherited fields would resolve against its root.
@@ -8,10 +8,11 @@ license = "Apache-2.0 OR MIT"
 repository = "https://github.com/peeramid-labs/quorum-rs"
 rust-version = "1.85"
 authors = ["Peeramid Labs"]
-description = "JMAP (RFC 8620) and JMAP Mail (RFC 8621) wire types, written from the RFCs"
+description = "JMAP for Mail (RFC 8621): Mailbox, Thread and Email data types, written from the RFC"
 publish = false
 
 [dependencies]
+jmap-core = { path = "../jmap-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

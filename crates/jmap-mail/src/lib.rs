@@ -1,13 +1,18 @@
-//! Mailbox, Thread and Email (RFC 8621 §2–§4).
+//! JMAP for Mail (RFC 8621): Mailbox, Thread and Email, written from the RFC
+//! text, over the core types of `jmap-core`.
 //!
 //! Every Email property is optional: `Email/get` with `properties` returns a
-//! subset, and `Email/set` creates from one.
+//! subset, and `Email/set` creates from one. Properties a type does not name
+//! (vendor extensions, header forms such as `header:List-Post:asURLs`) are
+//! kept in `extra`.
 
 use std::collections::BTreeMap;
 
+use jmap_core::{Extra, Id};
 use serde::{Deserialize, Serialize};
 
-use crate::{Extra, Id};
+/// The mail capability (RFC 8621 §1.3.1).
+pub const MAIL: &str = "urn:ietf:params:jmap:mail";
 
 /// RFC 8621 §2.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

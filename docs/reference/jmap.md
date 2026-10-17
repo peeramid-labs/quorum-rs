@@ -1,9 +1,17 @@
 # JMAP types
 
-`noolog-jmap` ([crate](../../crates/noolog-jmap/README.md)): JMAP wire types
-written from the RFC texts. No code is taken from other JMAP implementations.
+Two crates, split as JMAP splits its capabilities, written from the RFC texts.
+No code is taken from other JMAP implementations; neither crate has
+noolog-specific code.
+
+| Crate | Capability | Now | Planned |
+|---|---|---|---|
+| `jmap-core` ([crate](../../crates/jmap-core/README.md)) | `urn:ietf:params:jmap:core`, RFC 8620 | data types | request processing, result references, method semantics over store traits, `/changes`, blobs, push |
+| `jmap-mail` ([crate](../../crates/jmap-mail/README.md)) | `urn:ietf:params:jmap:mail`, RFC 8621 | data types | mail method semantics |
 
 ## Coverage
+
+RFC 8620 types are in `jmap-core`, RFC 8621 types in `jmap-mail`.
 
 | RFC | Section | Types |
 |---|---|---|
@@ -27,11 +35,11 @@ download, `EmailSubmission`, `Identity`, header parsed forms as typed fields.
 
 `Email`, `EmailBodyPart`, `EmailFilterCondition`, `Mailbox`, `GetRequest` and
 `MethodError` keep properties they do not name in `extra`, so a round trip
-loses nothing: vendor properties (`noolog:blog`) and header forms
+loses nothing: vendor properties (`vendor:property`) and header forms
 (`header:List-Post:asURLs`).
 
 A server shows a vendor property only to a client that listed its capability
-in `using` (RFC 8620 §1.8). This crate does not enforce that; the code mapping
+in `using` (RFC 8620 §1.8). These crates do not enforce that; the code mapping
 domain objects to these types does.
 
 ## Conformance

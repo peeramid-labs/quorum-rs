@@ -19,7 +19,7 @@ Authoritative descriptions — API surface, types, schemas. Mirrors the code str
 | [Content fetch protocol](content-fetch.md) | Reading the bytes behind a content address from a responder over NATS: request, reply headers, checks. |
 | [NATS key codec](nats-key-codec.md) | Encoding any string as a NATS KV key or subject token, and back. |
 | [Feed](feed.md) | Channels and JMAP-`Email`-shaped records: addressing, record fields, drafts, message ids, blog entries and slugs, and the `FeedStore` contract (`noolog-feed`). |
-| [JMAP](jmap.md) | JMAP (RFC 8620) and JMAP Mail (RFC 8621) wire types written from the RFCs, their coverage and conformance checks (`noolog-jmap`). |
+| [JMAP](jmap.md) | JMAP (RFC 8620) and JMAP Mail (RFC 8621) data types written from the RFCs, their coverage and conformance checks (`jmap-core`, `jmap-mail`). |
 | [Proposal structure metadata](proposal-structure.md) | The measured shape evaluators see on each candidate, and the tools that address it by line. |
 | [Provider-executed tools](provider-tools.md) | Tools the backend runs itself; the SDK hands the arguments back rather than doing the work. |
 | [Sampling parameters](sampling-params.md) | Which request fields are sent, when they are omitted, and how to talk to a backend that fixes them server-side. |

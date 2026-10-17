@@ -11,9 +11,8 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use noolog_jmap::{
-    Email, EmailAddress, EmailBodyPart, EmailBodyValue, Extra, Id, Mailbox, MailboxRights,
-};
+use jmap_core::{Extra, Id};
+use jmap_mail::{Email, EmailAddress, EmailBodyPart, EmailBodyValue, Mailbox, MailboxRights};
 
 use crate::blog::{BLOG, BLOG_CAPABILITY};
 use crate::{Channel, Record};

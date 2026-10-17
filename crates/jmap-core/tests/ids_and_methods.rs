@@ -1,8 +1,6 @@
 //! Id validation (RFC 8620 §1.2) and the standard method arguments (§5).
 
-use noolog_jmap::{
-    Comparator, Email, EmailFilterCondition, Filter, Id, QueryRequest, SetError, SetRequest,
-};
+use jmap_core::{Comparator, Extra, Filter, Id, QueryRequest, SetError, SetRequest};
 use serde_json::json;
 
 #[test]
@@ -18,13 +16,13 @@ fn an_id_is_one_to_255_characters_of_the_url_safe_alphabet() {
 
 #[test]
 fn a_query_takes_defaults_and_nested_filters() {
-    let query: QueryRequest<EmailFilterCondition> = serde_json::from_value(json!({
+    let query: QueryRequest<Extra> = serde_json::from_value(json!({
         "accountId": "a1",
         "filter": {
             "operator": "AND",
             "conditions": [
                 { "inMailbox": "m1" },
-                { "hasKeyword": "$flagged", "noolog:slug": "hello" }
+                { "hasKeyword": "$flagged", "vendor:slug": "hello" }
             ]
         },
         "sort": [{ "property": "receivedAt", "isAscending": false }, { "property": "size" }]
@@ -50,23 +48,20 @@ fn a_query_takes_defaults_and_nested_filters() {
     let Filter::Condition(second) = &conditions[1] else {
         panic!("a condition")
     };
-    assert_eq!(second.has_keyword.as_deref(), Some("$flagged"));
-    assert_eq!(second.extra["noolog:slug"], "hello");
+    assert_eq!(second["hasKeyword"], "$flagged");
+    assert_eq!(second["vendor:slug"], "hello");
 }
 
 #[test]
 fn a_set_carries_creates_patches_and_errors() {
-    let set: SetRequest<Email> = serde_json::from_value(json!({
+    let set: SetRequest<Extra> = serde_json::from_value(json!({
         "accountId": "a1",
         "create": { "k1": { "subject": "hi", "mailboxIds": { "m1": true } } },
         "update": { "e1": { "keywords/$seen": true } },
         "destroy": ["e2"]
     }))
     .unwrap();
-    assert_eq!(
-        set.create.as_ref().unwrap()["k1"].subject.as_deref(),
-        Some("hi")
-    );
+    assert_eq!(set.create.as_ref().unwrap()["k1"]["subject"], "hi");
     assert_eq!(
         set.update.as_ref().unwrap()[&Id::new("e1").unwrap()]["keywords/$seen"],
         true

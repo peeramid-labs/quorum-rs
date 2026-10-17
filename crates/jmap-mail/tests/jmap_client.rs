@@ -3,9 +3,9 @@
 
 use std::collections::BTreeMap;
 
-use noolog_jmap::{
-    Email, EmailAddress, EmailBodyPart, EmailBodyValue, GetResponse, Id, Mailbox, MailboxRights,
-    Thread,
+use jmap_core::{GetResponse, Id};
+use jmap_mail::{
+    Email, EmailAddress, EmailBodyPart, EmailBodyValue, Mailbox, MailboxRights, Thread,
 };
 
 fn id(s: &str) -> Id {
@@ -23,21 +23,21 @@ fn an_email() -> Email {
         },
     );
     Email {
-        id: Some(id("Ym94QG5vb2xvZy5pbw-7")),
-        thread_id: Some(id("Ym94QG5vb2xvZy5pbw-3")),
-        mailbox_ids: Some([(id("Ym94QG5vb2xvZy5pbw"), true)].into()),
+        id: Some(id("mInbox-7")),
+        thread_id: Some(id("mInbox-3")),
+        mailbox_ids: Some([(id("mInbox"), true)].into()),
         keywords: Some([("$seen".to_string(), true)].into()),
         size: Some(8),
         received_at: Some("2026-10-17T10:00:00Z".into()),
-        message_id: Some(vec!["m1@noolog.io".into()]),
-        in_reply_to: Some(vec!["m0@noolog.io".into()]),
+        message_id: Some(vec!["m1@example.com".into()]),
+        in_reply_to: Some(vec!["m0@example.com".into()]),
         from: Some(vec![EmailAddress {
             name: Some("Acme".into()),
-            email: "acme@noolog.io".into(),
+            email: "acme@example.com".into(),
         }]),
         to: Some(vec![EmailAddress {
             name: None,
-            email: "box@noolog.io".into(),
+            email: "box@example.com".into(),
         }]),
         subject: Some("[PATCH 1/2] a change".into()),
         body_values: Some(body),
@@ -70,14 +70,14 @@ fn an_email_parses_as_jmap_client_reads_it() {
     let wire = serde_json::to_value(an_email()).unwrap();
     let theirs: jmap_client::email::Email =
         serde_json::from_value(wire).expect("jmap-client parses it");
-    assert_eq!(theirs.id(), Some("Ym94QG5vb2xvZy5pbw-7"));
-    assert_eq!(theirs.thread_id(), Some("Ym94QG5vb2xvZy5pbw-3"));
-    assert_eq!(theirs.mailbox_ids(), ["Ym94QG5vb2xvZy5pbw"]);
+    assert_eq!(theirs.id(), Some("mInbox-7"));
+    assert_eq!(theirs.thread_id(), Some("mInbox-3"));
+    assert_eq!(theirs.mailbox_ids(), ["mInbox"]);
     assert_eq!(theirs.subject(), Some("[PATCH 1/2] a change"));
-    assert_eq!(theirs.from().unwrap()[0].email(), "acme@noolog.io");
+    assert_eq!(theirs.from().unwrap()[0].email(), "acme@example.com");
     assert_eq!(theirs.from().unwrap()[0].name(), Some("Acme"));
-    assert_eq!(theirs.message_id().unwrap(), ["m1@noolog.io"]);
-    assert_eq!(theirs.in_reply_to().unwrap(), ["m0@noolog.io"]);
+    assert_eq!(theirs.message_id().unwrap(), ["m1@example.com"]);
+    assert_eq!(theirs.in_reply_to().unwrap(), ["m0@example.com"]);
     assert!(
         theirs.received_at().is_some(),
         "receivedAt is a UTCDate it can read"
@@ -92,8 +92,8 @@ fn an_email_parses_as_jmap_client_reads_it() {
 #[test]
 fn a_mailbox_and_a_thread_parse_as_jmap_client_reads_them() {
     let mailbox = Mailbox {
-        id: id("Ym94QG5vb2xvZy5pbw"),
-        name: "box@noolog.io".into(),
+        id: id("mInbox"),
+        name: "box@example.com".into(),
         parent_id: None,
         role: None,
         sort_order: 0,
@@ -110,7 +110,7 @@ fn a_mailbox_and_a_thread_parse_as_jmap_client_reads_them() {
     };
     let theirs: jmap_client::mailbox::Mailbox =
         serde_json::from_value(serde_json::to_value(&mailbox).unwrap()).expect("parses");
-    assert_eq!(theirs.name(), Some("box@noolog.io"));
+    assert_eq!(theirs.name(), Some("box@example.com"));
     assert_eq!(theirs.total_emails(), 3);
 
     let got = GetResponse {

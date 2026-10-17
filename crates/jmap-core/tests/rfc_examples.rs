@@ -1,9 +1,7 @@
-//! The examples printed in RFC 8620 and RFC 8621 parse into these types and
-//! serialize back to the same JSON.
+//! The examples printed in RFC 8620 parse into these types and serialize back
+//! to the same JSON.
 
-use noolog_jmap::{
-    CORE, Email, GetResponse, Id, Invocation, MAIL, MethodError, Request, Response, Session, Thread,
-};
+use jmap_core::{CORE, Id, Invocation, MethodError, Request, Response, Session};
 use serde_json::{Value, json};
 
 fn round_trips<T: serde::de::DeserializeOwned + serde::Serialize>(example: &Value) -> T {
@@ -28,7 +26,7 @@ fn the_example_request() {
       ]
     });
     let request: Request = round_trips(&example);
-    assert_eq!(request.using, [CORE, MAIL]);
+    assert_eq!(request.using, [CORE, "urn:ietf:params:jmap:mail"]);
     assert_eq!(request.method_calls[1].name, "method2");
     assert_eq!(request.method_calls[1].call_id, "c2");
     assert_eq!(request.method_calls[1].arguments["arg1"], "arg1data");
@@ -112,57 +110,8 @@ fn the_example_session() {
     assert_eq!(session.core().unwrap().max_objects_in_get, 256);
     let shared = &session.accounts[&Id::new("A97813").unwrap()];
     assert!(shared.is_read_only && !shared.is_personal);
-    assert_eq!(session.primary_accounts[MAIL].as_str(), "A13824");
-}
-
-/// RFC 8621 §3.1.1.
-#[test]
-fn the_example_thread_get_response() {
-    let example = json!({
-      "accountId": "acme",
-      "state": "f6a7e214",
-      "list": [
-        { "id": "f123u4", "emailIds": [ "eaa623", "f782cbb"] },
-        { "id": "f41u44", "emailIds": [ "82cf7bb" ] }
-      ],
-      "notFound": []
-    });
-    let got: GetResponse<Thread> = round_trips(&example);
-    assert_eq!(got.list[0].email_ids.len(), 2);
-}
-
-/// RFC 8621 §4.2.1: a property subset, a header form kept as an extra
-/// property, and body values.
-#[test]
-fn the_example_email_get_response() {
-    let example = json!({
-      "accountId": "abc",
-      "state": "41234123231",
-      "list": [
-        {
-          "id": "f123u457",
-          "threadId": "ef1314a",
-          "mailboxIds": { "f123": true },
-          "from": [{ "name": "Joe Bloggs", "email": "joe@example.com" }],
-          "subject": "Dinner on Thursday?",
-          "receivedAt": "2013-10-13T14:12:00Z",
-          "header:List-POST:asURLs": [ "mailto:partytime@lists.example.com" ],
-          "htmlBody": [
-            { "partId": "1", "blobId": "B841623871", "size": 283331, "type": "text/html" },
-            { "partId": "2", "blobId": "B319437193", "size": 10343, "type": "text/plain" }
-          ],
-          "bodyValues": {
-            "1": { "isEncodingProblem": false, "isTruncated": true, "value": "<html><body><p>Hello ..." },
-            "2": { "isEncodingProblem": false, "isTruncated": false, "value": "-- Sent by your friendly mailing list ..." }
-          }
-        }
-      ],
-      "notFound": [ "f123u456" ]
-    });
-    let got: GetResponse<Email> = round_trips(&example);
-    let email = &got.list[0];
-    assert_eq!(email.from.as_ref().unwrap()[0].email, "joe@example.com");
-    assert!(email.extra.contains_key("header:List-POST:asURLs"));
-    assert!(email.body_values.as_ref().unwrap()["1"].is_truncated);
-    assert_eq!(got.not_found[0].as_str(), "f123u456");
+    assert_eq!(
+        session.primary_accounts["urn:ietf:params:jmap:mail"].as_str(),
+        "A13824"
+    );
 }

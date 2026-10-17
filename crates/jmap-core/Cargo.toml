@@ -1,0 +1,18 @@
+[package]
+name = "jmap-core"
+version = "0.1.0"
+# Literal, not inherited: nsed-orchestrator uses this crate by path through
+# its quorum-rs submodule, and inherited fields would resolve against its root.
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/peeramid-labs/quorum-rs"
+rust-version = "1.85"
+authors = ["Peeramid Labs"]
+description = "JMAP core (RFC 8620): the protocol's data types, written from the RFC"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
