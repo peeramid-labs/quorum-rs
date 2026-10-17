@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/quorum-rs", "crates/llm-repair", "crates/quorum-crypto-core", "crates/noolog-feed"]
+members = ["crates/quorum-rs", "crates/llm-repair", "crates/quorum-crypto-core", "crates/noolog-feed", "crates/noolog-jmap"]
 
 [workspace.package]
 edition = "2024"
