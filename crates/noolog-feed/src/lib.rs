@@ -233,6 +233,8 @@ pub struct Channel {
 pub mod blog;
 #[cfg(any(test, feature = "conformance"))]
 pub mod conformance;
+#[cfg(feature = "jmap")]
+pub mod jmap;
 pub mod mbox;
 pub mod store;
 

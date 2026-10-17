@@ -131,6 +131,33 @@ A slug names an entry permanently within its channel.
 | `mbox(records, address)` | mboxrd archive in the given order; body lines starting `From ` (or already `>`-quoted) gain one `>` |
 | `message_id(record, address)` | The record's own `message_id` if it arrived as mail, else `<{id}.{local}@{domain}>` |
 
+## JMAP form
+
+Feature `jmap` maps the feed onto [JMAP types](jmap.md): channel ↔ `Mailbox`,
+record ↔ `Email`, thread ↔ `Thread`.
+
+| Id | Form |
+|---|---|
+| Mailbox | `m` + channel address, unpadded base64url |
+| Email | mailbox id + `-` + record id |
+| Thread | `t` + address, base64url, + `-` + root record id |
+
+| Record | Email |
+|---|---|
+| `from`, `to` (`Name <addr>` or `addr`) | `EmailAddress[]` |
+| `receivedAt` (RFC 3339) | `receivedAt` as `UTCDate` (`Z`) |
+| `messageId`, `inReplyTo`, `references` | arrays of ids without angle brackets |
+| `textBody`, `htmlBody` | parts `text` and `html` with `bodyValues`; each list falls back to the other part |
+| `keywords` | `keywords` map |
+| `attachments` | `attachments` parts (`blobId`, `size`, `name`, `type`, `disposition`) |
+| `threadId`, or the record's own id | `threadId` |
+| `noolog:blog` | only for a client whose `using` lists `https://noolog.io/jmap/blog` |
+| `signedBy` | not mapped |
+
+`to_mailbox` gives a read-only mailbox named by the address; counts read 0
+until they are tracked. Vendor `Email/query` conditions: `noolog:before`
+(record ids below) and `noolog:slug`.
+
 ## Stores
 
 `FeedStore` is what a store implements: channel registration and lookup,
