@@ -70,6 +70,15 @@ ignore = [
     # past the 7-day cooldown and `cargo update` can bump both.
     "RUSTSEC-2026-0097",   # rand 0.8.5 / 0.9.2 / 0.10.0 (preconditions not met)
     "RUSTSEC-2024-0449",   # unsafe-libyaml (via serde_yaml, itself deprecated, used for every config). REMOVE when configs move to serde_yml/serde_norway.
+
+    # zip 3.0.0, only as utoipa-swagger-ui's build-dependency: its build script
+    # unpacks the Swagger UI archive vendored in utoipa-swagger-ui-vendored, never
+    # an archive an attacker supplies, which all three advisories require. No
+    # utoipa-swagger-ui release uses zip >= 9.0.0 (master is on 8.6).
+    # REMOVE when one does.
+    "RUSTSEC-2026-0367",   # zip: SUID/SGID bits kept on extraction
+    "RUSTSEC-2026-0368",   # zip: extracted symlinks may point outside the destination
+    "RUSTSEC-2026-0369",   # zip: permissions applied through extracted symlinks
 ]
 
 [bans]

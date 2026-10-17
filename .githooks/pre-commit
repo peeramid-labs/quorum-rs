@@ -1,0 +1,18 @@
+#!/usr/bin/env sh
+# The Lint & Audit checks CI runs, minus clippy, cheapest first.
+# Enable once per clone: git config core.hooksPath .githooks
+set -e
+
+cargo fmt --all -- --check
+
+# The advisory database moves on its own: a commit touching no manifest can
+# still be the one that lands on a red audit. Without git's hook variables:
+# cargo-deny's advisory-db fetch would otherwise run against this repository.
+echo "license & advisory audit: cargo deny check"
+env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY cargo deny check
+
+# Only a changed lockfile can add a too-young dependency.
+if git diff --cached --name-only | grep -qE '(^|/)Cargo\.lock$'; then
+  echo "Cargo.lock changed: dependency age check"
+  python3 scripts/check-dep-age.py --min-age-days 7 --target HEAD --allow-missing-metadata
+fi

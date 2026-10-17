@@ -233,6 +233,7 @@ pub struct Channel {
 pub mod blog;
 #[cfg(any(test, feature = "conformance"))]
 pub mod conformance;
+pub mod mbox;
 pub mod store;
 
 pub use store::{FeedStore, MemoryFeedStore};

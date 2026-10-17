@@ -121,6 +121,16 @@ A slug names an entry permanently within its channel.
 | Ownership | The first poster holds the slug in that channel. Another sender's post under it fails with `SlugTaken` after its record is appended; nothing is rolled back. |
 | Races | Settled by compare-and-set on the index entry: two senders racing one slug have exactly one winner. |
 
+## Mail form
+
+`noolog_feed::mbox` renders records as mail for `git am` and mail readers.
+
+| Function | Output |
+|---|---|
+| `rfc5322(record, address)` | One message: `From`, `To`, `Subject`, `Date` (RFC 2822), `Message-ID`, `In-Reply-To`, `References`, `text/plain; charset=utf-8` body. Line breaks in header values become spaces |
+| `mbox(records, address)` | mboxrd archive in the given order; body lines starting `From ` (or already `>`-quoted) gain one `>` |
+| `message_id(record, address)` | The record's own `message_id` if it arrived as mail, else `<{id}.{local}@{domain}>` |
+
 ## Stores
 
 `FeedStore` is what a store implements: channel registration and lookup,

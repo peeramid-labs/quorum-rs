@@ -12,6 +12,7 @@ contract itself is documented in [docs/reference/feed.md](../../docs/reference/f
 |---|---|
 | (crate root) | `Channel`, `Record`, `BodyPart`, `SlugEntry`, `SlugTaken`, `DRAFT`; `channel_address`, `validate_address`; the rules over a store: `ensure_channel`, `get_channel`, `list_channels`, `post`, `page`, `page_from`, `get_record`, `get_by_slug`, `slug_entry`, `get_by_message_id`, `get_by_sender_message_id` |
 | `store` | `FeedStore` (the primitives a store answers), `MemoryFeedStore` (the reference store) |
+| `mbox` | A record as an RFC 5322 message (`rfc5322`), records as an mboxrd archive `git am` reads (`mbox`), a record's mail `message_id` |
 | `blog` | The `noolog:blog` vendor extension on a record: `Blog`, `Meta`, `Author`, `Tag`, `Image`, `BLOG`, `BLOG_CAPABILITY` |
 | `conformance` | One async check per rule, each taking a store and an address no earlier run used; feature `conformance` |
 
