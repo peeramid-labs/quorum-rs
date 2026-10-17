@@ -2822,6 +2822,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "noolog-files"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "axum",
+ "chrono",
+ "futures",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "noop_proc_macro"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3439,6 +3458,7 @@ dependencies = [
  "libloading",
  "llm-repair",
  "nkeys",
+ "noolog-files",
  "open",
  "openai-harmony",
  "owo-colors",
