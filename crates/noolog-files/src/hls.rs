@@ -366,7 +366,7 @@ mod tests {
     }
     use super::*;
 
-    use crate::files::blob::{Blob as _, NatsBlob, Visibility, quota_from_max_bytes};
+    use crate::blob::{Blob as _, NatsBlob, Visibility, quota_from_max_bytes};
     use async_nats::jetstream::{self, object_store};
     use std::path::Path;
 
@@ -448,7 +448,7 @@ mod tests {
         // Deleted first, so the bucket count is bounded by the number of tests
         // rather than growing with every run — JetStream reserves max_bytes.
         let _ = js.delete_object_store(&bucket).await;
-        let store = crate::nats_utils::ensure_object_bucket(
+        let store = crate::object_bucket(
             &js,
             object_store::Config {
                 bucket: bucket.clone(),
@@ -707,20 +707,20 @@ mod tests {
         };
         // Fill the bucket first so the segmentation cannot fit.
         let filler = vec![b'z'; 3_000];
-        let digest = crate::nats_utils::sha256_hex_bytes(&filler);
+        let digest = crate::sha256_hex_bytes(&filler);
         let mut reader = filler.as_slice();
         let _ = blob
             .put_stream(
                 &digest,
                 &mut reader,
-                &crate::files::blob::ObjectMeta {
+                &crate::blob::ObjectMeta {
                     digest: digest.clone(),
                     filename: "filler".into(),
                     mime: "video/mp4".into(),
                     bytes: filler.len() as u64,
                     visibility: Visibility::Public,
                     uploaded_by: "agent-7".into(),
-                    created_at: crate::files::blob::stamped_now(),
+                    created_at: crate::blob::stamped_now(),
                 },
             )
             .await;
@@ -1237,7 +1237,7 @@ pub struct SegmentSpec<'a> {
     pub uploaded_by: &'a str,
     /// Inherited by every derived object. A private video whose segments were
     /// public would not be private at all: the segments are the video.
-    pub visibility: crate::files::blob::Visibility,
+    pub visibility: crate::blob::Visibility,
     /// Where the transcoder writes before anything is stored. `None` is the
     /// platform temporary directory, which in a container is frequently a
     /// tmpfs sized for nothing like a video.
@@ -1245,7 +1245,7 @@ pub struct SegmentSpec<'a> {
 }
 
 pub async fn segment_and_store(
-    blob: &dyn crate::files::blob::Blob,
+    blob: &dyn crate::blob::Blob,
     transcoder: &dyn Transcoder,
     source: &std::path::Path,
     spec: &SegmentSpec<'_>,
@@ -1342,12 +1342,12 @@ async fn produced_files(work: &std::path::Path) -> Result<Vec<String>> {
 
 /// Rewrite the playlist against the stored URLs and store it too.
 async fn finish(
-    blob: &dyn crate::files::blob::Blob,
+    blob: &dyn crate::blob::Blob,
     work: &std::path::Path,
     source_digest: &str,
     urls: &HashMap<String, String>,
     uploaded_by: &str,
-    visibility: crate::files::blob::Visibility,
+    visibility: crate::blob::Visibility,
 ) -> Result<String> {
     let raw = tokio::fs::read_to_string(work.join(PLAYLIST_NAME))
         .await
@@ -1365,12 +1365,12 @@ async fn finish(
 }
 
 async fn store_file(
-    blob: &dyn crate::files::blob::Blob,
+    blob: &dyn crate::blob::Blob,
     path: &std::path::Path,
     source_digest: &str,
     name: &str,
     uploaded_by: &str,
-    visibility: crate::files::blob::Visibility,
+    visibility: crate::blob::Visibility,
 ) -> Result<String> {
     let bytes = tokio::fs::read(path)
         .await
@@ -1379,16 +1379,16 @@ async fn store_file(
 }
 
 async fn store_bytes(
-    blob: &dyn crate::files::blob::Blob,
+    blob: &dyn crate::blob::Blob,
     bytes: &[u8],
     source_digest: &str,
     name: &str,
     uploaded_by: &str,
-    visibility: crate::files::blob::Visibility,
+    visibility: crate::blob::Visibility,
 ) -> Result<String> {
-    use crate::files::blob::{ObjectMeta, stamped_now};
+    use crate::blob::{ObjectMeta, stamped_now};
 
-    let digest = crate::nats_utils::sha256_hex_bytes(bytes);
+    let digest = crate::sha256_hex_bytes(bytes);
     let mut reader = bytes;
     blob.put_stream(
         &digest,
@@ -1421,10 +1421,7 @@ async fn store_bytes(
 /// whose playlist is incomplete — a video that still plays, since the original
 /// is intact and a retry finishes the job. The other order leaves segments
 /// nothing points at and nothing can find again.
-pub async fn delete_with_derived(
-    blob: &dyn crate::files::blob::Blob,
-    source_digest: &str,
-) -> Result<()> {
+pub async fn delete_with_derived(blob: &dyn crate::blob::Blob, source_digest: &str) -> Result<()> {
     for digest in derived_of(blob, source_digest).await {
         if let Err(e) = blob.delete(&digest).await {
             tracing::warn!(digest, error = %format!("{e:#}"), "could not remove a derived object");
@@ -1439,7 +1436,7 @@ pub async fn delete_with_derived(
 /// against the source would be one more thing that can disagree with what the
 /// bucket actually holds, and a partial segmentation writes objects before it
 /// would ever write the manifest.
-async fn derived_of(blob: &dyn crate::files::blob::Blob, source_digest: &str) -> Vec<String> {
+async fn derived_of(blob: &dyn crate::blob::Blob, source_digest: &str) -> Vec<String> {
     let prefix = derived_prefix(source_digest);
     blob.list()
         .await
@@ -1454,7 +1451,7 @@ async fn derived_of(blob: &dyn crate::files::blob::Blob, source_digest: &str) ->
 ///
 /// Failures are logged, not propagated: the caller is already reporting why
 /// segmenting failed, and replacing that with a cleanup error would hide it.
-async fn remove_all(blob: &dyn crate::files::blob::Blob, digests: &[String]) {
+async fn remove_all(blob: &dyn crate::blob::Blob, digests: &[String]) {
     for digest in digests {
         if let Err(e) = blob.delete(digest).await {
             tracing::warn!(digest, error = %format!("{e:#}"), "could not remove a partial segment");

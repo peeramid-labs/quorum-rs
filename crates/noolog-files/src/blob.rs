@@ -8,7 +8,7 @@
 //! This module holds the *mechanism* only — how named bytes and their metadata
 //! are stored, read back and bounded. What a bucket is called and who is
 //! entitled to how much are deployment policy and live with the side that owns
-//! storage, the same split [`crate::nats_utils::put_content_addressed`]
+//! storage, the same split quorum-rs's `nats_utils::put_content_addressed`
 //! already follows.
 //!
 //! The metadata keys written here are a contract: whoever uploads and whoever
@@ -615,7 +615,7 @@ fn closed_range(start: &str, end: &str, last_byte: u64) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nats_utils::sha256_hex_bytes;
+    use crate::sha256_hex_bytes;
 
     #[test]
     fn a_range_is_read_as_an_inclusive_pair() {
@@ -804,7 +804,7 @@ mod tests {
         // max_bytes, so leaked buckets exhaust the account's store.
         let bucket = format!("test_blob_{tag}");
         let _ = js.delete_object_store(&bucket).await;
-        let store = crate::nats_utils::ensure_object_bucket(
+        let store = crate::object_bucket(
             &js,
             object_store::Config {
                 bucket: bucket.clone(),
@@ -991,7 +991,7 @@ mod tests {
         };
         let bucket = "test_blob_backstop".to_string();
         let _ = js.delete_object_store(&bucket).await;
-        let store = crate::nats_utils::ensure_object_bucket(
+        let store = crate::object_bucket(
             &js,
             object_store::Config {
                 bucket: bucket.clone(),
@@ -1138,7 +1138,7 @@ mod tests {
         };
         let bucket = "test_blob_open".to_string();
         let _ = js.delete_object_store(&bucket).await;
-        crate::nats_utils::ensure_object_bucket(
+        crate::object_bucket(
             &js,
             object_store::Config {
                 bucket: bucket.clone(),

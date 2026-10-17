@@ -6,7 +6,7 @@
 //! and what the stored metadata says. One implementation, two HTTP shells —
 //! each renders [`Refusal`] in its own idiom.
 
-use crate::files::blob::{Blob, ObjectMeta, QuotaExceeded, Visibility, stamped_now};
+use crate::blob::{Blob, ObjectMeta, QuotaExceeded, Visibility, stamped_now};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
