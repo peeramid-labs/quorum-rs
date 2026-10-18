@@ -28,6 +28,8 @@ sequenceDiagram
 | `Staged` | `upload_id`, `owner` (filled by the node), `meta`, `encryption`, `plan`, `derived`, `notes`, `job` |
 | `Staged::advance(js)` | drops the step just done, publishes to the next |
 | `open(js, staged)` | the staged bytes behind `Verified`, which fails with `InvalidData` at the end unless length and SHA-256 match |
+| `open_derived(js, staged, meta)` | one derived object behind `Verified` |
+| `Deriving::new(js, staged)` | a `Blob` over the inbox for one upload: what a step writes is a derived object (`derived_name(upload_id, filename)`), `made()` is what to append to `Staged::derived`; takes no notes. Code written against `Blob` (`hls::segment_and_store`) runs on it unchanged |
 | `discard(js, staged)` | deletes the source and derived objects; idempotent |
 | `derived_name(upload_id, name)` | inbox name of a derived object |
 
