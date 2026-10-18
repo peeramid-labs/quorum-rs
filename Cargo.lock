@@ -2842,6 +2842,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "noolog-policy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "utoipa",
+]
+
+[[package]]
 name = "noop_proc_macro"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3460,6 +3470,7 @@ dependencies = [
  "llm-repair",
  "nkeys",
  "noolog-files",
+ "noolog-policy",
  "open",
  "openai-harmony",
  "owo-colors",
