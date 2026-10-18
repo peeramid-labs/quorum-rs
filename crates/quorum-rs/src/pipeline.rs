@@ -21,9 +21,9 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use async_nats::jetstream::{self, object_store, stream};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncReadExt as _};
 
-use crate::files::blob::ObjectMeta;
+use crate::files::blob::{Blob, ObjectMeta, Usage};
 
 /// The shared object store uploads are staged in.
 pub const INBOX: &str = "files_inbox";
@@ -247,11 +247,7 @@ pub async fn stage(
     job: Option<JobRequest>,
 ) -> Result<String> {
     let upload_id = uuid::Uuid::new_v4().simple().to_string();
-    let inbox = js
-        .get_object_store(INBOX)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("open the files inbox")?;
+    let inbox = inbox(js).await?;
     let mut reader = reader;
     inbox
         .put(upload_id.as_str(), &mut reader)
@@ -277,11 +273,7 @@ pub async fn open(
     js: &jetstream::Context,
     staged: &Staged,
 ) -> Result<Verified<object_store::Object>> {
-    let inbox = js
-        .get_object_store(INBOX)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("open the files inbox")?;
+    let inbox = inbox(js).await?;
     let source = inbox
         .get(staged.upload_id.as_str())
         .await
@@ -290,14 +282,153 @@ pub async fn open(
     Ok(Verified::new(source, &staged.meta))
 }
 
+/// The staged bytes of one of `staged`'s derived objects, checked as they
+/// are read.
+pub async fn open_derived(
+    js: &jetstream::Context,
+    staged: &Staged,
+    derived: &ObjectMeta,
+) -> Result<Verified<object_store::Object>> {
+    let name = derived_name(&staged.upload_id, &derived.filename);
+    let source = inbox(js)
+        .await?
+        .get(name.as_str())
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("read derived {name}"))?;
+    Ok(Verified::new(source, derived))
+}
+
+/// A step's output store: what a step writes through it is staged in the
+/// inbox as a derived object of one upload, for `commit` to store with the
+/// source. Code written against [`Blob`] (segmenting) runs on it unchanged;
+/// [`Deriving::made`] is what to append to [`Staged::derived`].
+pub struct Deriving {
+    inbox: object_store::ObjectStore,
+    upload_id: String,
+    made: std::sync::Mutex<Vec<ObjectMeta>>,
+}
+
+impl Deriving {
+    pub async fn new(js: &jetstream::Context, staged: &Staged) -> Result<Self> {
+        Ok(Self {
+            inbox: inbox(js).await?,
+            upload_id: staged.upload_id.clone(),
+            made: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Everything written and not deleted, in order.
+    pub fn made(&self) -> Vec<ObjectMeta> {
+        self.made.lock().map(|m| m.clone()).unwrap_or_default()
+    }
+
+    fn find(&self, digest: &str) -> Result<ObjectMeta> {
+        self.made()
+            .into_iter()
+            .find(|m| m.digest == digest)
+            .with_context(|| format!("no derived object {digest}"))
+    }
+
+    fn name_of(&self, meta: &ObjectMeta) -> String {
+        derived_name(&self.upload_id, &meta.filename)
+    }
+}
+
+#[async_trait::async_trait]
+impl Blob for Deriving {
+    async fn put_stream(
+        &self,
+        digest: &str,
+        reader: &mut (dyn AsyncRead + Unpin + Send),
+        meta: &ObjectMeta,
+    ) -> Result<ObjectMeta> {
+        let stored = ObjectMeta {
+            digest: digest.to_string(),
+            ..meta.clone()
+        };
+        let mut reader = reader;
+        let put = self
+            .inbox
+            .put(self.name_of(&stored).as_str(), &mut reader)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("stage derived {}", stored.filename))?;
+        let stored = ObjectMeta {
+            bytes: put.size as u64,
+            ..stored
+        };
+        if let Ok(mut made) = self.made.lock() {
+            made.retain(|m| m.digest != stored.digest);
+            made.push(stored.clone());
+        }
+        Ok(stored)
+    }
+
+    async fn get_range(&self, digest: &str, offset: u64, len: u64) -> Result<(Vec<u8>, u64)> {
+        let meta = self.find(digest)?;
+        let mut object = self
+            .inbox
+            .get(self.name_of(&meta).as_str())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut all = Vec::new();
+        object.read_to_end(&mut all).await?;
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(all.len());
+        let end = start
+            .saturating_add(usize::try_from(len).unwrap_or(usize::MAX))
+            .min(all.len());
+        Ok((all[start..end].to_vec(), meta.bytes))
+    }
+
+    async fn head(&self, digest: &str) -> Result<ObjectMeta> {
+        self.find(digest)
+    }
+
+    async fn annotate(&self, _: &str, _: &str, _: &str) -> Result<()> {
+        anyhow::bail!("derived objects take no notes; record them on the upload")
+    }
+
+    async fn notes(&self, _: &str) -> Result<std::collections::HashMap<String, String>> {
+        Ok(Default::default())
+    }
+
+    async fn delete(&self, digest: &str) -> Result<()> {
+        let meta = self.find(digest)?;
+        self.inbox
+            .delete(self.name_of(&meta).as_str())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if let Ok(mut made) = self.made.lock() {
+            made.retain(|m| m.digest != digest);
+        }
+        Ok(())
+    }
+
+    async fn usage(&self) -> Result<Usage> {
+        let used_bytes = self.made().iter().map(|m| m.bytes).sum();
+        Ok(Usage {
+            used_bytes,
+            quota_bytes: u64::MAX,
+        })
+    }
+
+    async fn list(&self) -> Result<Vec<ObjectMeta>> {
+        Ok(self.made())
+    }
+}
+
+async fn inbox(js: &jetstream::Context) -> Result<object_store::ObjectStore> {
+    js.get_object_store(INBOX)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("open the files inbox")
+}
+
 /// Delete what `staged` holds in the inbox: its source and every derived
 /// object. Already-missing objects are not an error, so a retry is safe.
 pub async fn discard(js: &jetstream::Context, staged: &Staged) -> Result<()> {
-    let inbox = js
-        .get_object_store(INBOX)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("open the files inbox")?;
+    let inbox = inbox(js).await?;
     let derived = staged
         .derived
         .iter()
@@ -404,7 +535,6 @@ mod tests {
     use super::*;
     use crate::files::blob::{Visibility, stamped_now};
     use futures::StreamExt as _;
-    use tokio::io::AsyncReadExt as _;
 
     fn meta(bytes: &[u8]) -> ObjectMeta {
         ObjectMeta {
@@ -664,6 +794,68 @@ mod tests {
                 .is_ok_and(|info| info.deleted),
             "discarded, twice without error"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn what_a_step_derives_is_staged_read_back_verified_and_discarded() -> Result<()> {
+        let Some(js) = broker().await else {
+            eprintln!("no broker; skipping");
+            return Ok(());
+        };
+        ensure(&js, 64 * 1024 * 1024).await?;
+        let owner = format!("op_test{}", uuid::Uuid::new_v4().simple());
+        let upload_id = stage(&js, &owner, &mut &b"video"[..], &meta(b"video"), None).await?;
+        let mut staged = Staged {
+            upload_id: upload_id.clone(),
+            owner,
+            meta: meta(b"video"),
+            encryption: Encryption::None,
+            plan: vec![],
+            derived: vec![],
+            notes: Default::default(),
+            job: None,
+        };
+        let deriving = Deriving::new(&js, &staged).await?;
+        let segment = b"segment bytes";
+        let segment_meta = ObjectMeta {
+            filename: "hls/src/seg0.m4s".into(),
+            mime: "video/iso.segment".into(),
+            ..meta(segment)
+        };
+        let digest = crate::files::sha256_hex_bytes(segment);
+        deriving
+            .put_stream(&digest, &mut &segment[..], &segment_meta)
+            .await?;
+        let scrap = ObjectMeta {
+            filename: "hls/src/scrap".into(),
+            ..meta(b"scrap")
+        };
+        let scrap_digest = crate::files::sha256_hex_bytes(b"scrap");
+        deriving
+            .put_stream(&scrap_digest, &mut &b"scrap"[..], &scrap)
+            .await?;
+        assert_eq!(deriving.head(&digest).await?.bytes, segment.len() as u64);
+        assert_eq!(deriving.get_range(&digest, 8, 5).await?.0, b"bytes");
+        deriving.delete(&scrap_digest).await?;
+        assert_eq!(
+            deriving.list().await?.len(),
+            1,
+            "a deleted object is no longer derived"
+        );
+        assert!(deriving.annotate(&digest, "k", "v").await.is_err());
+
+        staged.derived = deriving.made();
+        let back = read_all(open_derived(&js, &staged, &staged.derived[0]).await?).await?;
+        assert_eq!(back, segment);
+
+        discard(&js, &staged).await?;
+        let inbox = js
+            .get_object_store(INBOX)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let name = derived_name(&upload_id, "hls/src/seg0.m4s");
+        assert!(inbox.info(name.as_str()).await.is_ok_and(|i| i.deleted));
         Ok(())
     }
 
