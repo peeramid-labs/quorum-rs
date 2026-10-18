@@ -9,7 +9,6 @@
 
 pub mod blob;
 pub mod hls;
-pub mod pipeline;
 pub mod upload;
 
 use sha2::{Digest as _, Sha256};

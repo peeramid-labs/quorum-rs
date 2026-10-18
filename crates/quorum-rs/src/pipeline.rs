@@ -23,7 +23,7 @@ use async_nats::jetstream::{self, object_store, stream};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncRead;
 
-use crate::blob::ObjectMeta;
+use crate::files::blob::ObjectMeta;
 
 /// The shared object store uploads are staged in.
 pub const INBOX: &str = "files_inbox";
@@ -88,7 +88,7 @@ pub struct Staged {
 /// their identity and paid by them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobRequest {
-    pub policy: noolog_policy::PolicyConfig,
+    pub policy: crate::scheduling::PolicyConfig,
     /// The task for the agents.
     pub query: String,
     /// Passed to the seats with the file's own variables.
@@ -114,7 +114,7 @@ pub struct JobGrant {
 impl JobRequest {
     /// A job not yet signed: its grant authorises nothing until [`Self::sign`].
     pub fn new(
-        policy: noolog_policy::PolicyConfig,
+        policy: crate::scheduling::PolicyConfig,
         query: String,
         variables: std::collections::BTreeMap<String, String>,
     ) -> Self {
@@ -402,13 +402,13 @@ async fn publish(js: &jetstream::Context, subject: &str, staged: &Staged) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::{Visibility, stamped_now};
+    use crate::files::blob::{Visibility, stamped_now};
     use futures::StreamExt as _;
     use tokio::io::AsyncReadExt as _;
 
     fn meta(bytes: &[u8]) -> ObjectMeta {
         ObjectMeta {
-            digest: crate::sha256_hex_bytes(bytes),
+            digest: crate::files::sha256_hex_bytes(bytes),
             filename: "talk.mp4".into(),
             mime: "video/mp4".into(),
             bytes: bytes.len() as u64,
@@ -451,7 +451,7 @@ mod tests {
         );
     }
 
-    fn review_policy() -> noolog_policy::PolicyConfig {
+    fn review_policy() -> crate::scheduling::PolicyConfig {
         serde_json::from_value(serde_json::json!({
             "roles": [{"role": "reviewer", "capabilities": ["lang:rust"]}],
             "max_rounds": 2
@@ -472,7 +472,7 @@ mod tests {
     #[test]
     fn a_job_grant_covers_exactly_the_job_the_uploader_signed() {
         let key = nkeys::KeyPair::new_user();
-        let digest = crate::sha256_hex_bytes(b"patch");
+        let digest = crate::files::sha256_hex_bytes(b"patch");
         let job = signed_job(&key, "op_ann", &digest, 2_000);
         assert_eq!(job.grant.public_key, key.public_key());
         assert!(job.verify("op_ann", &digest, 1_000).is_ok());
@@ -482,7 +482,7 @@ mod tests {
             "another owner"
         );
         assert!(
-            job.verify("op_ann", &crate::sha256_hex_bytes(b"other"), 1_000)
+            job.verify("op_ann", &crate::files::sha256_hex_bytes(b"other"), 1_000)
                 .is_err(),
             "another file"
         );
@@ -493,7 +493,7 @@ mod tests {
         };
         assert!(rewritten.verify("op_ann", &digest, 1_000).is_err());
         let longer = JobRequest {
-            policy: noolog_policy::PolicyConfig {
+            policy: crate::scheduling::PolicyConfig {
                 max_rounds: 9,
                 ..review_policy()
             },
@@ -607,7 +607,12 @@ mod tests {
 
         let bytes = b"a staged video";
         let key = nkeys::KeyPair::new_user();
-        let job = signed_job(&key, &owner, &crate::sha256_hex_bytes(bytes), u64::MAX);
+        let job = signed_job(
+            &key,
+            &owner,
+            &crate::files::sha256_hex_bytes(bytes),
+            u64::MAX,
+        );
         let upload_id = stage(
             &js,
             &owner,
@@ -620,7 +625,7 @@ mod tests {
         let announced = take_one(&received).await?;
         assert_eq!(announced.upload_id, upload_id);
         assert_eq!(announced.job, Some(job), "the job travels with the upload");
-        assert_eq!(announced.meta.digest, crate::sha256_hex_bytes(bytes));
+        assert_eq!(announced.meta.digest, crate::files::sha256_hex_bytes(bytes));
         assert!(
             announced.owner.is_empty(),
             "the node, not the producer, names the owner"

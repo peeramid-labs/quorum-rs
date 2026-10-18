@@ -2832,25 +2832,12 @@ dependencies = [
  "chrono",
  "futures",
  "hex",
- "nkeys",
- "noolog-policy",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tracing",
- "uuid",
-]
-
-[[package]]
-name = "noolog-policy"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "utoipa",
 ]
 
 [[package]]
@@ -3472,7 +3459,6 @@ dependencies = [
  "llm-repair",
  "nkeys",
  "noolog-files",
- "noolog-policy",
  "open",
  "openai-harmony",
  "owo-colors",

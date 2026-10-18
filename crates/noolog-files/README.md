@@ -14,34 +14,11 @@ re-exports this crate unchanged.
 | `blob` | `Blob` (put, ranged get, head, annotations, delete, usage, list), `ObjectMeta`, `Visibility`, `Usage`, `QuotaExceeded`; `NatsBlob` and `open_blob` over a JetStream object store; `parse_byte_range` |
 | `upload` | `spool` (hash while writing to disk, size cap enforced while streaming), `sniff_mime`, `read_upload_form` (axum multipart), `store_upload`, `Refusal` |
 | `hls` | `segment_and_store` over any `Blob` with a `Transcoder` (`Ffmpeg`), `rewrite_playlist`, `HlsState`, derived-object naming (`derived_prefix`), `delete_with_derived` |
-| `pipeline` | The files pipeline contract: the shared inbox `files_inbox`, the work-queue stream `FILES_PIPELINE`, `stage` (put the bytes, announce on `files.received.<owner>`), `Staged` (upload id, owner, metadata, `encryption`, plan of steps, derived objects, notes, and an optional `job`), `advance` along `files.step.<name>`, `open` (the staged bytes behind a `Verified` reader that fails unless they hash to the digest) and `discard` |
 | (crate root) | `sha256_hex_bytes`, the name a blob is stored under |
 
 A store implements `Blob`; `upload` and `hls` work over the trait, so a new
 store gets uploads and segmenting without changes here. The NATS tests need a
 broker at `NATS_URL` (default `nats://localhost:4222`).
 
-## The pipeline
-
-A producer stages bytes and announces them for its owner; the owner is the
-subject's last token, which each producer's NATS credentials allow only for
-its own operator. The consumer of `files.received.*` plans the steps (ending
-in `commit`), and each step's worker reads the staged object, re-hashes it
-against the digest, does its work and calls `advance`; `commit` streams `open` into the store, so altered bytes error before they land, then calls `discard`. Messages carry no
-bytes. Staged objects are plaintext (`Encryption::None`) until steps run in
-attested enclaves with released keys; the inbox is shared until per-operator
-NATS tenancy.
-
-An upload may carry a `JobRequest`: a `noolog-policy` `PolicyConfig`, a
-query and variables, for a deliberation on the file once it is stored. The
-uploader authorises and pays for it with a `JobGrant`, an nkey signature
-(lowercase hex, as orchestrator challenges are signed) over the owner, the
-digest, the `policy_id`, the query, the variables and an expiry, tagged
-`noolog-files-job-v1`. It is a signature rather than a bearer because staged
-messages are readable by every producer until NATS tenancy; a stolen grant
-can only run the job it names, before it expires.
-
-```rust
-let job = JobRequest::new(policy, query, variables).sign(&key, owner, &digest, expires_at)?;
-pipeline::stage(&js, owner, &mut reader, &meta, Some(job)).await?;
-```
+The files pipeline that stages uploads in NATS before a store keeps them is
+`quorum_rs::pipeline` ([reference](../../docs/reference/files-pipeline.md)).

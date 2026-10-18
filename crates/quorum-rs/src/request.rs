@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::cli::workspace::PolicyConfig;
+use crate::scheduling::PolicyConfig;
 
 /// Generate a random u64 from OS entropy (no extra deps).
 fn rand_u64() -> u64 {
@@ -170,7 +170,7 @@ pub fn build_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::workspace::PolicyConfig;
+    use crate::scheduling::PolicyConfig;
     use crate::scheduling::PolicySla;
 
     fn static_policy() -> PolicyConfig {
@@ -191,7 +191,7 @@ mod tests {
         PolicyConfig {
             variables: None,
             agents: None,
-            roles: Some(vec![crate::cli::workspace::RoleConfig {
+            roles: Some(vec![crate::scheduling::RoleConfig {
                 role: "reviewer".into(),
                 count: 2,
                 capabilities: vec!["lang:rust".into()],

@@ -9,8 +9,7 @@ use thiserror::Error;
 use utoipa::ToSchema;
 
 // Re-export shared SLA type from SDK — single source of truth.
-pub use crate::scheduling::PolicySla;
-pub use noolog_policy::{ContextRef, PolicyConfig, PolicyMode, RoleConfig};
+pub use crate::scheduling::{ContextRef, PolicyConfig, PolicyMode, PolicySla, RoleConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceConfig {

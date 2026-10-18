@@ -463,6 +463,7 @@ pub async fn serve_fleet(fleet: &AgentFleetConfig, opts: ServeOptions) -> Result
 /// extracted so the CLI command and any user binary that wants
 /// matching log output can share one definition.
 #[doc(hidden)]
+#[cfg(feature = "cli")]
 pub fn install_default_tracing() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env()
