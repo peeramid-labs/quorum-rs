@@ -9,7 +9,7 @@ use utoipa::ToSchema;
 /// Defines the operational boundaries for a deliberation: timeouts, token limits,
 /// and per-agent response deadlines. Agents receive this to configure their
 /// LLM calls and timeout behavior.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PolicySla {
     /// Total job timeout in seconds. The BudgetManager uses this as the
     /// wall-clock envelope for the entire deliberation and divides it

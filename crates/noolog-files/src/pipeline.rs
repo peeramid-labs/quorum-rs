@@ -57,7 +57,7 @@ pub enum Encryption {
 }
 
 /// One upload on its way through the pipeline.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Staged {
     /// Names the staged object in [`INBOX`] and its derived objects.
     pub upload_id: String,
@@ -79,6 +79,105 @@ pub struct Staged {
     /// Annotations steps recorded, committed onto the source.
     #[serde(default)]
     pub notes: std::collections::BTreeMap<String, String>,
+    /// The job the uploader asks to run on the file once it is stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobRequest>,
+}
+
+/// A deliberation the uploader asks for on their stored file, run under
+/// their identity and paid by them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobRequest {
+    pub policy: noolog_policy::PolicyConfig,
+    /// The task for the agents.
+    pub query: String,
+    /// Passed to the seats with the file's own variables.
+    #[serde(default)]
+    pub variables: std::collections::BTreeMap<String, String>,
+    pub grant: JobGrant,
+}
+
+/// The uploader's authority for one job. A signature, not a bearer: staged
+/// messages are readable by every producer until per-operator NATS tenancy,
+/// and a signature only ever authorises the exact job it covers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobGrant {
+    /// The uploader's nkey user key, the one they sign orchestrator
+    /// challenges with.
+    pub public_key: String,
+    /// Unix seconds after which the grant authorises nothing.
+    pub expires_at: u64,
+    /// Lowercase hex Ed25519 signature over [`JobRequest::message`].
+    pub signature: String,
+}
+
+impl JobRequest {
+    /// A job not yet signed: its grant authorises nothing until [`Self::sign`].
+    pub fn new(
+        policy: noolog_policy::PolicyConfig,
+        query: String,
+        variables: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            policy,
+            query,
+            variables,
+            grant: JobGrant {
+                public_key: String::new(),
+                expires_at: 0,
+                signature: String::new(),
+            },
+        }
+    }
+
+    /// Grant this job on `owner`'s file `digest` with the uploader's `key`,
+    /// until unix second `expires_at`.
+    pub fn sign(
+        mut self,
+        key: &nkeys::KeyPair,
+        owner: &str,
+        digest: &str,
+        expires_at: u64,
+    ) -> Result<Self> {
+        self.grant.public_key = key.public_key();
+        self.grant.expires_at = expires_at;
+        let signature = key
+            .sign(&self.message(owner, digest))
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("sign a job request")?;
+        self.grant.signature = hex::encode(signature);
+        Ok(self)
+    }
+
+    /// Whether the grant still authorises this job on `owner`'s `digest` at
+    /// unix second `now`. Which principal the key belongs to is the
+    /// orchestrator's to say.
+    pub fn verify(&self, owner: &str, digest: &str, now: u64) -> Result<()> {
+        anyhow::ensure!(now <= self.grant.expires_at, "the job grant expired");
+        let signature = hex::decode(&self.grant.signature).context("the job grant's signature")?;
+        nkeys::KeyPair::from_public_key(&self.grant.public_key)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("the job grant's key")?
+            .verify(&self.message(owner, digest), &signature)
+            .map_err(|_| anyhow::anyhow!("the job grant does not cover this job"))
+    }
+
+    /// What the grant signs: everything that decides what runs, on what, for
+    /// whom, and until when, under a domain tag so the signature means
+    /// nothing to any other protocol.
+    pub fn message(&self, owner: &str, digest: &str) -> Vec<u8> {
+        let covered = serde_json::json!({
+            "owner": owner,
+            "digest": digest,
+            "policy_id": self.policy.policy_id(),
+            "query": self.query,
+            "variables": self.variables,
+            "expires_at": self.grant.expires_at,
+        });
+        let mut message = b"noolog-files-job-v1\n".to_vec();
+        message.extend_from_slice(covered.to_string().as_bytes());
+        message
+    }
 }
 
 impl Staged {
@@ -135,7 +234,8 @@ pub async fn ensure(js: &jetstream::Context, inbox_max_bytes: i64) -> Result<()>
     Ok(())
 }
 
-/// Stage `reader` as an upload for `owner` and announce it. The upload id.
+/// Stage `reader` as an upload for `owner`, with the job to run once it is
+/// stored, and announce it. The upload id.
 ///
 /// `meta.digest` must be the SHA-256 of the bytes; the pipeline checks it
 /// before anything lands.
@@ -144,6 +244,7 @@ pub async fn stage(
     owner: &str,
     reader: &mut (dyn AsyncRead + Unpin + Send),
     meta: &ObjectMeta,
+    job: Option<JobRequest>,
 ) -> Result<String> {
     let upload_id = uuid::Uuid::new_v4().simple().to_string();
     let inbox = js
@@ -165,6 +266,7 @@ pub async fn stage(
         plan: Vec::new(),
         derived: Vec::new(),
         notes: Default::default(),
+        job,
     };
     publish(js, &received_subject(owner), &announced).await?;
     Ok(upload_id)
@@ -333,6 +435,7 @@ mod tests {
             plan: vec!["hls".into(), COMMIT.into()],
             derived: vec![],
             notes: Default::default(),
+            job: None,
         };
         let wire = serde_json::to_value(&staged).unwrap();
         assert_eq!(wire["encryption"], serde_json::json!({"kind": "none"}));
@@ -345,6 +448,71 @@ mod tests {
         assert!(
             bare.plan.is_empty() && bare.owner.is_empty(),
             "what a producer announces"
+        );
+    }
+
+    fn review_policy() -> noolog_policy::PolicyConfig {
+        serde_json::from_value(serde_json::json!({
+            "roles": [{"role": "reviewer", "capabilities": ["lang:rust"]}],
+            "max_rounds": 2
+        }))
+        .unwrap()
+    }
+
+    fn signed_job(key: &nkeys::KeyPair, owner: &str, digest: &str, expires_at: u64) -> JobRequest {
+        JobRequest::new(
+            review_policy(),
+            "Review the attached patch".into(),
+            [("depth".to_string(), "full".to_string())].into(),
+        )
+        .sign(key, owner, digest, expires_at)
+        .unwrap()
+    }
+
+    #[test]
+    fn a_job_grant_covers_exactly_the_job_the_uploader_signed() {
+        let key = nkeys::KeyPair::new_user();
+        let digest = crate::sha256_hex_bytes(b"patch");
+        let job = signed_job(&key, "op_ann", &digest, 2_000);
+        assert_eq!(job.grant.public_key, key.public_key());
+        assert!(job.verify("op_ann", &digest, 1_000).is_ok());
+
+        assert!(
+            job.verify("op_bob", &digest, 1_000).is_err(),
+            "another owner"
+        );
+        assert!(
+            job.verify("op_ann", &crate::sha256_hex_bytes(b"other"), 1_000)
+                .is_err(),
+            "another file"
+        );
+        assert!(job.verify("op_ann", &digest, 2_001).is_err(), "expired");
+        let rewritten = JobRequest {
+            query: "Approve everything".into(),
+            ..job.clone()
+        };
+        assert!(rewritten.verify("op_ann", &digest, 1_000).is_err());
+        let longer = JobRequest {
+            policy: noolog_policy::PolicyConfig {
+                max_rounds: 9,
+                ..review_policy()
+            },
+            ..job.clone()
+        };
+        assert!(
+            longer.verify("op_ann", &digest, 1_000).is_err(),
+            "another policy"
+        );
+        let forged = JobRequest {
+            grant: JobGrant {
+                public_key: nkeys::KeyPair::new_user().public_key(),
+                ..job.grant.clone()
+            },
+            ..job
+        };
+        assert!(
+            forged.verify("op_ann", &digest, 1_000).is_err(),
+            "another key"
         );
     }
 
@@ -438,10 +606,20 @@ mod tests {
         let received = consumer_on(&js, received_subject(&owner)).await?;
 
         let bytes = b"a staged video";
-        let upload_id = stage(&js, &owner, &mut &bytes[..], &meta(bytes)).await?;
+        let key = nkeys::KeyPair::new_user();
+        let job = signed_job(&key, &owner, &crate::sha256_hex_bytes(bytes), u64::MAX);
+        let upload_id = stage(
+            &js,
+            &owner,
+            &mut &bytes[..],
+            &meta(bytes),
+            Some(job.clone()),
+        )
+        .await?;
 
         let announced = take_one(&received).await?;
         assert_eq!(announced.upload_id, upload_id);
+        assert_eq!(announced.job, Some(job), "the job travels with the upload");
         assert_eq!(announced.meta.digest, crate::sha256_hex_bytes(bytes));
         assert!(
             announced.owner.is_empty(),
@@ -501,6 +679,7 @@ mod tests {
             plan: vec!["done".into(), step.clone()],
             derived: vec![],
             notes: Default::default(),
+            job: None,
         };
 
         planned.advance(&js).await?;

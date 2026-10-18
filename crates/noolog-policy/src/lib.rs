@@ -24,7 +24,7 @@ pub enum PolicyMode {
 /// Content-addressable deliberation policy.
 /// Defines SLA, rounds, convergence, roles/agents, capabilities, and discovery tags.
 /// `policy_id = sha256(canonical JSON)` — same config produces the same hash.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct PolicyConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agents: Option<Vec<String>>,
@@ -125,7 +125,7 @@ impl PolicyConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct RoleConfig {
     pub role: String,
     #[serde(default = "default_role_count")]
@@ -143,7 +143,7 @@ pub struct RoleConfig {
     pub moderator: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct ContextRef {
     pub name: String,
     pub path: String,
