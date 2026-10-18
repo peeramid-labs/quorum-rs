@@ -51,6 +51,7 @@ pub mod multi_agent;
 pub mod nats_utils;
 pub mod orchestrator_registry;
 pub mod pipeline;
+pub mod plans;
 pub mod project_registry;
 pub mod prompts;
 pub mod providers;
