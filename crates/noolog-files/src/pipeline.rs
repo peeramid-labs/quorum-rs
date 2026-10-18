@@ -227,6 +227,8 @@ pub struct Verified<R> {
     seen: u64,
     digest: String,
     bytes: u64,
+    /// What the end of the stream showed, kept for every later read of it.
+    verdict: Option<bool>,
 }
 
 impl<R> Verified<R> {
@@ -238,13 +240,19 @@ impl<R> Verified<R> {
             seen: 0,
             digest: meta.digest.clone(),
             bytes: meta.bytes,
+            verdict: None,
         }
     }
 
     fn check(&mut self) -> std::io::Result<()> {
-        let hasher = std::mem::take(&mut self.hasher);
-        let digest = hex::encode(sha2::Digest::finalize(hasher));
-        if self.seen == self.bytes && digest == self.digest {
+        let digest = match self.verdict {
+            Some(true) => return Ok(()),
+            Some(false) => "altered".to_string(),
+            None => hex::encode(sha2::Digest::finalize(std::mem::take(&mut self.hasher))),
+        };
+        let matches = self.seen == self.bytes && digest == self.digest;
+        self.verdict = Some(matches);
+        if matches {
             return Ok(());
         }
         Err(std::io::Error::new(
@@ -363,6 +371,18 @@ mod tests {
         );
         let short = read_all(Verified::new(&b"the"[..], &good)).await;
         assert_eq!(short.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn reading_past_the_end_again_keeps_the_verdict() {
+        let mut reader = Verified::new(&b"the bytes"[..], &meta(b"the bytes"));
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.unwrap();
+        let mut more = [0u8; 8];
+        assert_eq!(reader.read(&mut more).await.unwrap(), 0, "still verified");
+        let mut altered = Verified::new(&b"the bytez"[..], &meta(b"the bytes"));
+        assert!(altered.read_to_end(&mut out).await.is_err());
+        assert!(altered.read(&mut more).await.is_err(), "still altered");
     }
 
     async fn broker() -> Option<jetstream::Context> {
