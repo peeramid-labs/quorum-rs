@@ -178,3 +178,29 @@ the process has no NATS the views degrade to empty rather than erroring.
   — fleet API-error feed handler
 - `crates/quorum-rs/src/config.rs::AgentFleetConfig` — `dashboard_port` field
 - `crates/quorum-rs/src/main.rs::Serve` — CLI flags
+
+## Files
+
+The dashboard's file routes act for the agent's operator. Uploads are staged in
+the [files pipeline](files-pipeline.md); everything else is the node's answer,
+asked with the operator's bearer. All three of `NSED_FILES_OWNER`,
+`NSED_FILES_NODE` and `NSED_FILES_TOKEN` must be set, or the routes answer `503`.
+
+| Variable | Meaning |
+|---|---|
+| `NSED_FILES_OWNER` | the operator principal uploads are staged for; the agent's NATS credentials must grant `files.received.<principal>` |
+| `NSED_FILES_NODE` | the node's URL |
+| `NSED_FILES_TOKEN` | a bearer the node accepts for that operator |
+| `NSED_MAX_UPLOAD_BYTES` | largest upload, 100 MiB by default |
+| `NSED_UPLOAD_SPOOL_DIR` | where an upload is hashed before staging; the platform temporary directory when unset |
+
+| Route | Does |
+|---|---|
+| `POST /api/content` | multipart `visibility` and `file`; stages the file, answers `{upload_id, digest, mime, bytes, visibility, state: "staged"}`. `413`, `415`, `400` as the upload layer refuses; `502` if staging fails |
+| `GET /api/content/{digest}/status` | the node's `GET /api/content/{digest}/status`: `staged`/`failed` with a reason, or the stored file with its link and `hls` |
+| `GET /api/content/{digest}` | the node's owner read, `Range` and `If-None-Match` forwarded |
+| `DELETE /api/content/{digest}` | the node's delete |
+| `GET /api/content/usage` | the node's `GET /api/operators/storage` |
+
+A malformed digest is refused (`400`) before anything reaches the node; a node
+that does not answer is `502`.
