@@ -170,6 +170,114 @@ pub async fn stage(
     Ok(upload_id)
 }
 
+/// The staged bytes of `staged`, checked as they are read.
+pub async fn open(
+    js: &jetstream::Context,
+    staged: &Staged,
+) -> Result<Verified<object_store::Object>> {
+    let inbox = js
+        .get_object_store(INBOX)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("open the files inbox")?;
+    let source = inbox
+        .get(staged.upload_id.as_str())
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("read staged upload {}", staged.upload_id))?;
+    Ok(Verified::new(source, &staged.meta))
+}
+
+/// Delete what `staged` holds in the inbox: its source and every derived
+/// object. Already-missing objects are not an error, so a retry is safe.
+pub async fn discard(js: &jetstream::Context, staged: &Staged) -> Result<()> {
+    let inbox = js
+        .get_object_store(INBOX)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("open the files inbox")?;
+    let derived = staged
+        .derived
+        .iter()
+        .map(|d| derived_name(&staged.upload_id, &d.filename));
+    for name in std::iter::once(staged.upload_id.clone()).chain(derived) {
+        if !inbox
+            .info(name.as_str())
+            .await
+            .is_ok_and(|info| !info.deleted)
+        {
+            continue;
+        }
+        inbox
+            .delete(name.as_str())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("discard staged {name}"))?;
+    }
+    Ok(())
+}
+
+/// Reads through to `inner` and, at its end, fails with `InvalidData` unless
+/// what passed was exactly `meta.bytes` long and hashed to `meta.digest`. A
+/// store writing from it errors before committing, so altered bytes never
+/// land under the digest they claim.
+pub struct Verified<R> {
+    inner: R,
+    hasher: sha2::Sha256,
+    seen: u64,
+    digest: String,
+    bytes: u64,
+}
+
+impl<R> Verified<R> {
+    /// Check `inner` against the length and digest `meta` claims.
+    pub fn new(inner: R, meta: &ObjectMeta) -> Self {
+        Self {
+            inner,
+            hasher: sha2::Digest::new(),
+            seen: 0,
+            digest: meta.digest.clone(),
+            bytes: meta.bytes,
+        }
+    }
+
+    fn check(&mut self) -> std::io::Result<()> {
+        let hasher = std::mem::take(&mut self.hasher);
+        let digest = hex::encode(sha2::Digest::finalize(hasher));
+        if self.seen == self.bytes && digest == self.digest {
+            return Ok(());
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "staged bytes ({} bytes, {digest}) are not the {} bytes of {}",
+                self.seen, self.bytes, self.digest
+            ),
+        ))
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for Verified<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if !matches!(polled, std::task::Poll::Ready(Ok(()))) {
+            return polled;
+        }
+        let read = &buf.filled()[before..];
+        if read.is_empty() && buf.remaining() > 0 {
+            return std::task::Poll::Ready(self.check());
+        }
+        sha2::Digest::update(&mut self.hasher, read);
+        self.seen += read.len() as u64;
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 async fn publish(js: &jetstream::Context, subject: &str, staged: &Staged) -> Result<()> {
     let payload = serde_json::to_vec(staged).context("encode a staged upload")?;
     js.publish(subject.to_string(), payload.into())
@@ -230,6 +338,31 @@ mod tests {
             bare.plan.is_empty() && bare.owner.is_empty(),
             "what a producer announces"
         );
+    }
+
+    async fn read_all(mut reader: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await?;
+        Ok(out)
+    }
+
+    #[tokio::test]
+    async fn verified_bytes_read_through_and_altered_ones_fail_at_the_end() {
+        let good = meta(b"the bytes");
+        assert_eq!(
+            read_all(Verified::new(&b"the bytes"[..], &good))
+                .await
+                .unwrap(),
+            b"the bytes"
+        );
+        let swapped = read_all(Verified::new(&b"the bytez"[..], &good)).await;
+        assert_eq!(
+            swapped.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData,
+            "same length, other bytes"
+        );
+        let short = read_all(Verified::new(&b"the"[..], &good)).await;
+        assert_eq!(short.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
     }
 
     async fn broker() -> Option<jetstream::Context> {
@@ -298,17 +431,36 @@ mod tests {
             .get_object_store(INBOX)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut staged = inbox
-            .get(upload_id.as_str())
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut back = Vec::new();
-        staged.read_to_end(&mut back).await?;
-        inbox
-            .delete(upload_id.as_str())
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let back = read_all(open(&js, &announced).await?).await?;
         assert_eq!(back, bytes);
+        let segment = derived_name(&upload_id, "seg0.m4s");
+        inbox
+            .put(segment.as_str(), &mut &b"seg"[..])
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let announced = Staged {
+            derived: vec![ObjectMeta {
+                filename: "seg0.m4s".into(),
+                ..meta(b"seg")
+            }],
+            ..announced
+        };
+        discard(&js, &announced).await?;
+        discard(&js, &announced).await?;
+        assert!(
+            inbox
+                .info(segment.as_str())
+                .await
+                .is_ok_and(|info| info.deleted),
+            "derived objects go with the source"
+        );
+        assert!(
+            inbox
+                .info(upload_id.as_str())
+                .await
+                .is_ok_and(|info| info.deleted),
+            "discarded, twice without error"
+        );
         Ok(())
     }
 
