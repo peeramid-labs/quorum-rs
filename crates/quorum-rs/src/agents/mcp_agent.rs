@@ -5707,7 +5707,7 @@ mod tests {
         use crate::agents::{DeliberationPhase, UserToolHandlerTrait};
 
         // 1. The request the TUI actually submits carries the tool.
-        let req = crate::cli::request::build_request_raw_policy_id("nsed:fast", "audit this");
+        let req = crate::request::build_request_raw_policy_id("nsed:fast", "audit this");
         let submitted = req.user_tools.expect("live request ships user tools");
         assert!(submitted.iter().any(|t| t.name == "ask_user"));
 

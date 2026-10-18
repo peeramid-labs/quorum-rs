@@ -19,3 +19,6 @@ re-exports this crate unchanged.
 A store implements `Blob`; `upload` and `hls` work over the trait, so a new
 store gets uploads and segmenting without changes here. The NATS tests need a
 broker at `NATS_URL` (default `nats://localhost:4222`).
+
+The files pipeline that stages uploads in NATS before a store keeps them is
+`quorum_rs::pipeline` ([reference](../../docs/reference/files-pipeline.md)).

@@ -23,6 +23,7 @@ pub mod api_error_middleware;
 /// Brand strings — banner ASCII, copy snippets used by `quorum
 /// init` and `quorum validate`. Kept in one module so a future
 /// rebrand changes one file, not 12 string-literal sites.
+#[cfg(feature = "cli")]
 pub mod brand;
 #[cfg(feature = "cli")]
 pub mod cli;
@@ -42,20 +43,24 @@ pub use noolog_files as files;
 /// composes: provider catalog, persona presets, yaml renderer,
 /// env-file merger, generic wizard helpers. No CLI surface —
 /// the binary-facing wizard lives at `cli::commands::init_wizard`.
+#[cfg(feature = "cli")]
 pub mod init;
 pub mod llms;
 pub mod middleware;
 pub mod multi_agent;
 pub mod nats_utils;
 pub mod orchestrator_registry;
+pub mod pipeline;
 pub mod project_registry;
 pub mod prompts;
 pub mod providers;
+pub mod request;
 pub mod scheduling;
 pub mod serve;
 pub mod status;
 pub mod telemetry;
 pub mod tools;
+#[cfg(feature = "cli")]
 pub mod version_check;
 pub mod workers;
 

@@ -1,7 +1,7 @@
 pub mod commands;
 pub mod endpoint;
 pub mod remote;
-pub mod request;
+pub use crate::request;
 pub mod thread;
 #[cfg(feature = "tui")]
 pub mod tui;

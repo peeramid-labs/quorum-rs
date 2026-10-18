@@ -5651,6 +5651,7 @@ mod tests {
     /// what peers see follows the key that actually signs. An agent with no usable
     /// reference announces nothing rather than an identity nobody can check.
     #[test]
+    #[cfg(feature = "audit")]
     fn the_announced_key_is_derived_from_the_configured_reference() {
         let seed_hex = "22".repeat(32);
         unsafe { std::env::set_var("SDK_TEST_HB_SEED", &seed_hex) };
