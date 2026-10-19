@@ -20,6 +20,7 @@ Authoritative descriptions — API surface, types, schemas. Mirrors the code str
 | [NATS key codec](nats-key-codec.md) | Encoding any string as a NATS KV key or subject token, and back. |
 | [Feed](feed.md) | Channels and JMAP-`Email`-shaped records: addressing, record fields, drafts, message ids, blog entries and slugs, and the `FeedStore` contract (`noolog-feed`). |
 | [Files pipeline](files-pipeline.md) | Uploads staged in NATS, admitted by owner subject, stepped and committed; signed job requests (`quorum_rs::pipeline`). |
+| [Caller assertion](caller.md) | `Caller`, `sign`, `verify`: who is calling, as the node asserts it (`quorum_rs::caller`). |
 | [KMS client](kms.md) | `KmsClient`, `UserJwt`, the signed-request wire (`quorum_rs::kms`). |
 | [Plans](plans.md) | `OperatorPlan`, `PlanLimits`, `PlanConfig`, `PlanRecord` (`quorum_rs::plans`). |
 | [JMAP](jmap.md) | JMAP (RFC 8620) and JMAP Mail (RFC 8621) data types written from the RFCs, their coverage and conformance checks (`jmap-core`, `jmap-mail`). |
