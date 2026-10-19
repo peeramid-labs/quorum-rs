@@ -45,6 +45,7 @@ pub use noolog_files as files;
 /// the binary-facing wizard lives at `cli::commands::init_wizard`.
 #[cfg(feature = "cli")]
 pub mod init;
+pub mod kms;
 pub mod llms;
 pub mod middleware;
 pub mod multi_agent;
