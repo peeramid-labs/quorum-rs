@@ -25,6 +25,7 @@ pub mod api_error_middleware;
 /// rebrand changes one file, not 12 string-literal sites.
 #[cfg(feature = "cli")]
 pub mod brand;
+pub mod caller;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod config;
