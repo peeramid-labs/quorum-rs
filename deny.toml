@@ -8,6 +8,11 @@
 version = 2
 yanked = "warn"
 ignore = [
+    "RUSTSEC-2026-0387",   # crypto-bigint 0.5.5 timing variability — via k256 0.13 → elliptic-curve 0.13 in quorum-crypto-core. Fixed only in 0.7.6 with no 0.5.x backport; reaching it means the k256/elliptic-curve 0.14 migration. Signing code: prioritise that migration, then REMOVE.
+    "RUSTSEC-2026-0367",   # zip 3.0.0 — build-dependency of utoipa-swagger-ui 9 only (status-server feature): its build script unpacks the crate's own vendored Swagger-UI archive, never attacker input, and zip is not in the runtime binary. Fixed upstream only in utoipa-swagger-ui 10, which requires utoipa 6. REMOVE with that migration.
+    "RUSTSEC-2026-0368",   # zip 3.0.0 symlink targets — same build-only root cause as -0367.
+    "RUSTSEC-2026-0369",   # zip 3.0.0 permissions through symlinks — same build-only root cause as -0367.
+    "RUSTSEC-2024-0449",   # unsafe-libyaml unmaintained (via serde_yaml, deprecated). No safe upgrade exists; parses our own config files only. REMOVE once serde_yaml is replaced.
     # rustpython-parser → unic-* crates (unmaintained, no fix available)
     # These are transitive deps; upstream rustpython-parser must migrate first
     "RUSTSEC-2025-0081",   # unic-char-property
