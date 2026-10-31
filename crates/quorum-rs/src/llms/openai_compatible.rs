@@ -9,8 +9,7 @@ use crate::llms::{
 use crate::telemetry::LlmError;
 use async_openai::types::{
     ChatChoice, ChatCompletionMessageToolCall, ChatCompletionToolType,
-    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
-    Role,
+    CreateChatCompletionResponse, FinishReason, FunctionCall, Role,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -460,7 +459,7 @@ impl AiModel for OpenAICompatibleModel {
                         }
                     }
 
-                    match serde_json::from_str::<CreateChatCompletionStreamResponse>(data) {
+                    match crate::llms::parse_stream_chunk(data) {
                         Err(e) => {
                             warn!("Failed to parse stream chunk: {}. Data: {}", e, data);
                         }

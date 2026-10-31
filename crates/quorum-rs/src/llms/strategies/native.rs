@@ -441,13 +441,7 @@ impl ChatStrategy for NativeStrategy {
         let mut value: serde_json::Value =
             serde_json::from_str(response_body).map_err(|e| LlmError::Parse(e.into()))?;
 
-        // Cloudflare returns "service_tier": "auto" which fails strict enum parsing in async-openai
-        if let Some(tier) = value.get("service_tier").and_then(|v| v.as_str())
-            && tier == "auto"
-            && let Some(obj) = value.as_object_mut()
-        {
-            obj.remove("service_tier");
-        }
+        crate::llms::drop_unknown_service_tier(&mut value);
 
         // A provider-executed tool is declared as `builtin_function` — that is what
         // tells the backend it owns execution. Some backends echo that type back on
@@ -1707,6 +1701,44 @@ mod tests {
 
         let response = strategy.parse_response(body).await.expect("Should parse");
         assert!(response.service_tier.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_service_tier_the_client_does_not_know_does_not_sink_the_response() {
+        // Groq answers "on_demand"; async-openai only knows scale/default/flex/
+        // priority, and the strict enum used to fail the whole completion.
+        let strategy = NativeStrategy::new("test");
+        let body = r#"{
+            "id": "test-id",
+            "created": 123,
+            "model": "openai/gpt-oss-20b",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}],
+            "service_tier": "on_demand"
+        }"#;
+
+        let response = strategy.parse_response(body).await.expect("Should parse");
+        assert!(response.service_tier.is_none());
+        assert_eq!(response.choices[0].message.content.as_deref(), Some("Hi"));
+    }
+
+    #[tokio::test]
+    async fn a_service_tier_the_client_knows_is_kept() {
+        let strategy = NativeStrategy::new("test");
+        let body = r#"{
+            "id": "test-id",
+            "created": 123,
+            "model": "m",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}],
+            "service_tier": "flex"
+        }"#;
+
+        let response = strategy.parse_response(body).await.expect("Should parse");
+        assert!(
+            response.service_tier.is_some(),
+            "flex is a tier the client models"
+        );
     }
 
     // --- extract_from_result_field tests ---
