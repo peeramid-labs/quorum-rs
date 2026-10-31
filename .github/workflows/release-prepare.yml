@@ -2,8 +2,11 @@ name: Prepare Release
 
 # Manually-triggered version-bump workflow. Picks a crate, computes
 # the next semver from conventional commits, bumps Cargo.toml + the
-# CHANGELOG, and opens a release/<crate>/v<X.Y.Z> PR against the
-# default branch. Merging that PR is what fires `release-publish.yml`.
+# CHANGELOG, and opens a release/<crate>/v<X.Y.Z> PR against the `base`
+# branch (default `dev`). Merging that PR is what fires `release-publish.yml`.
+#
+# A non-`dev` base cuts a maintenance release from a release line — e.g. a
+# hotfix branch off the commit production pins — without shipping `dev`.
 #
 # Ported from peeramid-labs/nsed/.github/workflows/release-prepare.yml
 # (issue #4) — crate set is the quorum-rs workspace
@@ -22,6 +25,19 @@ on:
           - quorum-crypto-core
           - quorum-rs
         default: quorum-rs
+      base:
+        description: 'Branch to release from and open the release PR against'
+        type: string
+        default: dev
+      bump:
+        description: 'Version bump; "auto" derives it from conventional commits since the last tag on `base`'
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+          - major
+        default: auto
 
 permissions:
   contents: write
@@ -40,16 +56,13 @@ jobs:
     name: Prepare Release PR
     runs-on: ubuntu-latest
     steps:
-      # `workflow_dispatch` can be fired from any ref via the
-      # GitHub UI. Without an explicit `ref:` the checkout uses
-      # whatever the operator was looking at, which means the
-      # release branch could be cut from an unrelated feature
-      # branch — and since the PR is hardcoded `--base dev`, the
-      # release PR would then carry every commit from that branch.
-      # Pinning to `dev` makes the release base unambiguous.
+      # `workflow_dispatch` can be fired from any ref via the UI. The
+      # checkout and the PR base both come from the explicit `base`
+      # input — never from whatever ref the operator was looking at — so
+      # a release branch is only ever cut from the branch named.
       - uses: actions/checkout@v4
         with:
-          ref: dev
+          ref: ${{ inputs.base }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -58,6 +71,8 @@ jobs:
       # newest commits and silently downgrades feat-eligible releases
       # to patch. Force a full fetch + verify how many commits we got.
       - name: Deepen history (act runner ignores fetch-depth)
+        env:
+          BASE: ${{ inputs.base }}
         run: |
           set -x
           echo "── before deepen ──"
@@ -70,7 +85,7 @@ jobs:
           else
             # Already deep, but some checkout setups omit older refs.
             # Refetch the branch with explicit deep depth to be safe.
-            git fetch --prune origin "+refs/heads/dev:refs/remotes/origin/dev" --depth=999999 || true
+            git fetch --prune origin "+refs/heads/${BASE}:refs/remotes/origin/${BASE}" --depth=999999 || true
           fi
           echo "── after deepen ──"
           git rev-list --count HEAD
@@ -110,6 +125,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CRATE: ${{ github.event.inputs.crate }}
           CRATE_DIR: ${{ steps.dir.outputs.crate_dir }}
+          BUMP_OVERRIDE: ${{ inputs.bump }}
         run: |
           CURRENT=$(grep -m1 '^version' "$CRATE_DIR/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
           echo "Current $CRATE_DIR version: $CURRENT"
@@ -140,7 +156,11 @@ jobs:
           else
             TAG_PATTERN="${CRATE}-v[0-9]*"
           fi
-          PREV_TAG=$(git tag --list --sort=-version:refname "$TAG_PATTERN" | head -1)
+          # Only tags on this branch's history, and only release tags: a tag
+          # cut on another release line, or a pin marker, would put the
+          # range's start outside HEAD.
+          PREV_TAG=$(git tag --merged HEAD --list --sort=-version:refname "$TAG_PATTERN" \
+            | grep -E 'v[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta)\.[0-9]+)?$' | head -1 || true)
 
           # Use slop-cli's pattern: walk subjects only (%s, one line
           # per commit, no body noise that tripped earlier %B-based
@@ -197,6 +217,12 @@ jobs:
             BUMP="major"
           fi
 
+          # A maintenance line inherits every feat since the last tag even
+          # when the release itself is one fix, so the operator may pin it.
+          if [ -n "$BUMP_OVERRIDE" ] && [ "$BUMP_OVERRIDE" != "auto" ]; then
+            echo "Bump override: $BUMP -> $BUMP_OVERRIDE"
+            BUMP="$BUMP_OVERRIDE"
+          fi
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
           case "$BUMP" in
             major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
@@ -204,6 +230,14 @@ jobs:
             patch) PATCH=$((PATCH + 1)) ;;
           esac
           NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          # Another release line may already own this version (a hotfix
+          # released off a maintenance branch); take the next free patch.
+          if [ "$CRATE" = "all" ]; then TAG_PREFIX="v"; else TAG_PREFIX="${CRATE}-v"; fi
+          while git rev-parse -q --verify "refs/tags/${TAG_PREFIX}${NEW_VERSION}" >/dev/null; do
+            echo "Tag ${TAG_PREFIX}${NEW_VERSION} already exists on another line — skipping past it"
+            PATCH=$((PATCH + 1))
+            NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          done
           echo "Bump: $BUMP ($CURRENT -> $NEW_VERSION)"
 
           # Skip if the release branch already exists
@@ -255,6 +289,7 @@ jobs:
           REPO: ${{ github.repository }}
           CRATE: ${{ github.event.inputs.crate }}
           VERSION: ${{ steps.bump.outputs.new_version }}
+          BASE: ${{ inputs.base }}
         run: |
           BRANCH="release/${CRATE}/v${VERSION}"
 
@@ -323,7 +358,7 @@ jobs:
           # final release notes come out nearly empty. A stable `vX.Y.Z`-style
           # tag is the right lower bound; before the first one exists, fall
           # back to the full history.
-          LAST_STABLE=$(git tag --list --sort=-version:refname \
+          LAST_STABLE=$(git tag --merged HEAD --list --sort=-version:refname \
             | grep -E '^([a-z0-9_-]+-)?v?[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
           if [ -n "$LAST_STABLE" ]; then RANGE="${LAST_STABLE}..HEAD"; else RANGE="HEAD"; fi
           echo "STEP: changelog range=${RANGE} (last stable tag: ${LAST_STABLE:-none})"
@@ -402,8 +437,8 @@ jobs:
 
           # ── Open the PR via REST ─────────────────────────────────
           PR_BODY=$(python3 -c 'import json,sys; print(json.dumps(open(sys.argv[1]).read()))' /tmp/pr-body.md)
-          PR_PAYLOAD=$(printf '{"title":"chore(release): v%s","head":"%s","base":"dev","body":%s}' \
-            "${VERSION}" "${BRANCH}" "${PR_BODY}")
+          PR_PAYLOAD=$(printf '{"title":"chore(release): v%s","head":"%s","base":"%s","body":%s}' \
+            "${VERSION}" "${BRANCH}" "${BASE}" "${PR_BODY}")
           PR_NUMBER=$(curl -fsSL -X POST \
             -H "Authorization: token ${FORGE_TOKEN}" \
             -H "Content-Type: application/json" \
