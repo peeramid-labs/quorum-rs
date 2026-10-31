@@ -8,6 +8,7 @@
 version = 2
 yanked = "warn"
 ignore = [
+    "RUSTSEC-2026-0387",   # crypto-bigint 0.5.5 timing variability — via k256 0.13 → elliptic-curve 0.13 in quorum-crypto-core. Fixed only in 0.7.6 with no 0.5.x backport; reaching it means the k256/elliptic-curve 0.14 migration. Signing code: prioritise that migration, then REMOVE.
     # rustpython-parser → unic-* crates (unmaintained, no fix available)
     # These are transitive deps; upstream rustpython-parser must migrate first
     "RUSTSEC-2025-0081",   # unic-char-property
