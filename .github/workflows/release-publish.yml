@@ -1,6 +1,7 @@
 name: Publish Release
 
-# Fires when a release/* PR is merged into the default branch. Creates
+# Fires when a release/* PR is merged into any branch — `dev`, or a
+# maintenance line `release-prepare.yml` was pointed at. Creates
 # the git tag from the branch name, then publishes the affected crates
 # to crates.io in topological order. Out of scope vs. the nsed parent:
 # Homebrew tap / apt repo / Docker images / binary tarballs — those
@@ -11,14 +12,17 @@ name: Publish Release
 
 on:
   pull_request:
-    branches: [dev]
     types: [closed]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to publish (e.g. v0.6.1). Must already exist or will be created from the current default branch."
+        description: "Tag to publish (e.g. v0.6.1). Published as-is if it exists; otherwise created on `ref`."
         required: true
         type: string
+      ref:
+        description: "Branch to tag when the tag does not exist yet (ignored when it does)."
+        type: string
+        default: dev
       dry_run:
         description: "Dry-run packaging only (skips `cargo publish`)."
         type: boolean
@@ -49,14 +53,14 @@ jobs:
       version: ${{ steps.extract.outputs.version }}
       crate: ${{ steps.extract.outputs.crate }}
     steps:
-      # PR-merge path checks out the merge commit. Dispatch path
-      # uses the repo's DEFAULT BRANCH, not `github.sha`: the
-      # latter resolves to whichever ref the operator was looking
-      # at when firing the workflow, which would let a manual
-      # dispatch tag and publish from an unintended branch.
+      # PR-merge path checks out the merge commit. Dispatch path uses the
+      # explicit `ref` input, not `github.sha`: the latter resolves to
+      # whichever ref the operator was looking at when firing the
+      # workflow, which would let a manual dispatch tag and publish from
+      # an unintended branch. An existing tag is published as-is.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha || github.event.repository.default_branch }}
+          ref: ${{ github.event.pull_request.merge_commit_sha || inputs.ref }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -285,7 +289,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ inputs.ref }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
