@@ -325,8 +325,49 @@ impl WorkerHook for SigningHook {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// The internal fleet's bearer token, derived from the NATS account seed so
+/// the seed is the only secret to manage: the orchestrator provisions this
+/// token and the fleet presents it, so both call this. HMAC-SHA256 of a fixed
+/// domain label keyed by the trimmed seed; one-way, so a leaked token does
+/// not reveal the seed.
+pub fn system_agent_token(account_seed: &str) -> String {
+    use hmac::{Hmac, Mac as _};
+    const DOMAIN: &[u8] = b"nsed-system-agent-v1";
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(account_seed.trim().as_bytes())
+        .expect("HMAC accepts any key length");
+    mac.update(DOMAIN);
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
 #[cfg(test)]
 mod tests {
+    /// The orchestrator provisions this token and the fleet presents it, so
+    /// both must derive it identically: pinned to an independent HMAC.
+    #[test]
+    fn the_system_agent_token_is_hmac_sha256_of_the_domain_under_the_seed() {
+        let seed = "SAABC1234567890";
+        assert_eq!(
+            super::system_agent_token(seed),
+            "34778fde3a360d9f9ead0ac361ded638d47a31551119939c9c16cdbc8908381f"
+        );
+        assert_eq!(
+            super::system_agent_token(seed),
+            super::system_agent_token(&format!("  {seed}\n")),
+            "env values often carry a trailing newline"
+        );
+        assert_ne!(
+            super::system_agent_token(seed),
+            super::system_agent_token("SAOTHER")
+        );
+    }
+
     /// A signing key is configured by reference so the seed lives in an env var or
     /// a key file, never in the config itself. The derived public key is what other
     /// parties see, and it must follow the seed rather than be declared beside it.
