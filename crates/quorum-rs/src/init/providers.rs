@@ -229,6 +229,23 @@ pub(super) fn build_simulated_provider() -> Provider {
     }
 }
 
+pub(super) fn build_openai_oauth_provider() -> Provider {
+    Provider {
+        id: "openai_oauth".to_string(),
+        base_url: String::new(),
+        api_key: None,
+        input_price: None,
+        output_price: None,
+        provider_type: "openai-oauth".to_string(),
+        models: vec![ModelInfo {
+            name: "gpt-5.5".to_string(),
+            input_price: None,
+            output_price: None,
+        }],
+        engine: None,
+    }
+}
+
 /// Detected exec-capable tool with version info.
 #[derive(Debug, Clone)]
 pub(super) struct DetectedTool {

@@ -341,7 +341,7 @@ The self-check runs only when the orchestrator is a reachable remote
 |---|---|
 | `no agents to run — fleet config has 0 agents` | `quorum.yml` parsed but no `agents:` section, or `--agent` filter matched nothing. Check `quorum serve --agent ALL --config quorum.yml`. |
 | `no agents successfully started` | Every fleet entry hit a build error. `RUST_LOG=info quorum serve` shows per-agent failures. |
-| `unknown provider_type — skipping` | A `type:` value the dispatcher doesn't know about — likely a typo. Supported types: `openai`, `ollama`, `simulated`, `exec`, `mcp`, `claude`. |
+| `unknown provider_type — skipping` | A `type:` value the dispatcher doesn't know about — likely a typo. Supported types include `openai`, `openai-oauth`, `ollama`, `simulated`, `exec`, `mcp`, `claude`. |
 | `Agent '<name>' failed ... NATS connection error` | NATS creds bad / orchestrator NATS URL wrong. Verify with `nats sub '>' --server <nats-url> --creds ~/.nsed/agent.creds` (needs `nats-cli`). |
 | Worker logs hang / never reconnect after SIGKILL | Use SIGTERM (`Ctrl-C`), not SIGKILL — the cancellation handler only fires on SIGTERM/SIGINT. |
 
