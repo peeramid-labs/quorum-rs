@@ -1391,6 +1391,7 @@ impl NsedAgent for ProposerEvaluatorAgent {
                 input_tokens: agent_response.input_tokens.unwrap_or(0),
                 output_tokens: agent_response.output_tokens.unwrap_or(0),
                 reported_cost_usd: agent_response.provider_usage.cost_usd,
+                estimated_cost_usd: agent_response.provider_usage.estimated_cost_usd,
                 cached_tokens: agent_response.provider_usage.cached_tokens,
                 cache_write_tokens: agent_response.provider_usage.cache_write_tokens,
             }),
@@ -1549,6 +1550,7 @@ impl NsedAgent for ProposerEvaluatorAgent {
                 .unwrap_or(0)
                 .saturating_add(requote_output_tokens),
             reported_cost_usd: batch_provider_usage.cost_usd,
+            estimated_cost_usd: batch_provider_usage.estimated_cost_usd,
             cached_tokens: batch_provider_usage.cached_tokens,
             cache_write_tokens: batch_provider_usage.cache_write_tokens,
         });
@@ -1860,6 +1862,8 @@ where
     // Accumulate tokens across retry attempts so failed-attempt tokens aren't lost
     let mut cumulative_input_tokens: u32 = 0;
     let mut cumulative_output_tokens: u32 = 0;
+    // And their cost, so a retried answer bills every attempt, not the last.
+    let mut cumulative_provider_usage = crate::llms::ProviderUsage::default();
     // Owned here so schema retries inherit prior tool-output bloat.
     let mut running_tool_output_bytes: u64 = 0;
 
@@ -1923,6 +1927,7 @@ where
         // Accumulate tokens from this attempt (including any failed attempts)
         cumulative_input_tokens += agent_response.input_tokens.unwrap_or(0);
         cumulative_output_tokens += agent_response.output_tokens.unwrap_or(0);
+        cumulative_provider_usage.accumulate(&agent_response.provider_usage);
 
         let mut cleaned_json = clean_json_string(
             &agent_response.content,
@@ -2255,6 +2260,7 @@ where
                 let mut final_response = agent_response;
                 final_response.input_tokens = Some(cumulative_input_tokens);
                 final_response.output_tokens = Some(cumulative_output_tokens);
+                final_response.provider_usage = cumulative_provider_usage;
                 return Ok((response, final_response));
             }
             Err(e) => {
@@ -2462,13 +2468,8 @@ where
                     } else {
                         RetryReason::SchemaError
                     };
-                    let cumulative_cost_usd = estimate_llm_cost_usd(
-                        &agent_config.model_name,
-                        cumulative_input_tokens,
-                        cumulative_output_tokens,
-                        0,
-                        0,
-                    );
+                    let cumulative_cost_usd =
+                        cumulative_provider_usage.resolved_cost_usd().unwrap_or(0.0);
 
                     emit_for!(
                         context,
@@ -2830,43 +2831,23 @@ fn extract_evaluation_sections(text: &str) -> String {
     }
 }
 
-/// Rough cost estimate for an LLM call in USD.
-/// Uses approximate per-model pricing; falls back to generic rates.
-fn estimate_llm_cost_usd(
-    model: &str,
+/// What a call would cost at the seat's configured rates, for a call the
+/// provider did not price. Cached prompt tokens are counted at the full input
+/// rate: the seat's config has no cache rate, and a fallback that guesses low
+/// would give work away. `None` when the seat has no price at all.
+fn configured_cost_usd(
+    agent_config: &AgentConfig,
     input_tokens: u32,
     output_tokens: u32,
-    _reasoning_tokens: u32,
-    cached_tokens: u32,
-) -> f64 {
-    // Pricing per 1M tokens (approximate, as of 2024-2025)
-    let (input_per_m, output_per_m, cached_discount) =
-        if model.contains("gpt-4") && model.contains("o") {
-            // GPT-4o: $2.50/$10 per 1M
-            (2.50, 10.0, 0.5)
-        } else if model.contains("gpt-4") {
-            // GPT-4: $10/$30 per 1M
-            (10.0, 30.0, 0.5)
-        } else if model.contains("gpt-3.5") {
-            // GPT-3.5-turbo: $0.50/$1.50 per 1M
-            (0.50, 1.50, 0.5)
-        } else if model.contains("claude") {
-            // Claude Sonnet: $3/$15 per 1M
-            (3.0, 15.0, 0.9)
-        } else if model.contains("gemini") {
-            // Gemini Flash: $0.075/$0.30 per 1M (very cheap)
-            (0.075, 0.30, 0.75)
-        } else {
-            // Generic fallback: $1/$3 per 1M
-            (1.0, 3.0, 0.5)
-        };
-
-    let non_cached_input = (input_tokens as u64).saturating_sub(cached_tokens as u64);
-    let cached_cost = (cached_tokens as f64 / 1_000_000.0) * input_per_m * cached_discount;
-    let non_cached_cost = (non_cached_input as f64 / 1_000_000.0) * input_per_m;
-    let output_cost = (output_tokens as f64 / 1_000_000.0) * output_per_m;
-
-    cached_cost + non_cached_cost + output_cost
+) -> Option<f64> {
+    if agent_config.input_price_per_mtok.is_none() && agent_config.output_price_per_mtok.is_none() {
+        return None;
+    }
+    let input_micro_usd =
+        agent_config.input_price_per_mtok.unwrap_or(0.0) * f64::from(input_tokens);
+    let output_micro_usd =
+        agent_config.output_price_per_mtok.unwrap_or(0.0) * f64::from(output_tokens);
+    Some((input_micro_usd + output_micro_usd) / 1_000_000.0)
 }
 
 /// Splits a `submit_proposal` whose whole answer sits in `thought_process`
@@ -3481,7 +3462,7 @@ async fn react_loop(
             (completed, _) => completed,
         };
 
-        let completion = match completed {
+        let mut completion = match completed {
             Ok(res) => res,
             Err(e) => {
                 span.fail(&e).await;
@@ -3531,45 +3512,35 @@ async fn react_loop(
             }
         };
 
+        // This call's tokens, as the provider counted them or, without a
+        // `usage` block, estimated from the prompt and the reply.
+        let (input_tokens, output_tokens) = match &completion.response.usage {
+            Some(u) => (u.prompt_tokens, u.completion_tokens),
+            None => {
+                let content_len = completion
+                    .response
+                    .choices
+                    .first()
+                    .and_then(|c| c.message.content.as_deref())
+                    .unwrap_or("")
+                    .len();
+                let cpt = agent_config.chars_per_token.unwrap_or(4.0).max(0.1);
+                let out_est = (content_len as f64 / cpt).ceil() as u32;
+                (estimated_input_tokens, out_est)
+            }
+        };
+        completion
+            .provider_usage
+            .price_unreported(configured_cost_usd(
+                agent_config,
+                input_tokens,
+                output_tokens,
+            ));
         total_provider_usage.accumulate(&completion.provider_usage);
         served_by = completion.provider_backend.clone().or(served_by);
 
-        // Complete LLM request span with telemetry
-        let cost_usd = {
-            let usage = completion.response.usage.clone();
-            let (input_tokens, output_tokens, reasoning_tokens, cached_tokens) =
-                if let Some(u) = &usage {
-                    let cached = u
-                        .prompt_tokens_details
-                        .as_ref()
-                        .and_then(|d| d.cached_tokens)
-                        .unwrap_or(0);
-                    let reasoning = u
-                        .completion_tokens_details
-                        .as_ref()
-                        .and_then(|d| d.reasoning_tokens)
-                        .unwrap_or(0);
-                    (u.prompt_tokens, u.completion_tokens, reasoning, cached)
-                } else {
-                    let content_len = completion
-                        .response
-                        .choices
-                        .first()
-                        .and_then(|c| c.message.content.as_deref())
-                        .unwrap_or("")
-                        .len();
-                    let cpt = agent_config.chars_per_token.unwrap_or(4.0).max(0.1);
-                    let out_est = (content_len as f64 / cpt).ceil() as u32;
-                    (estimated_input_tokens, out_est, 0, 0)
-                };
-            estimate_llm_cost_usd(
-                &agent_config.model_name,
-                input_tokens,
-                output_tokens,
-                reasoning_tokens,
-                cached_tokens,
-            )
-        };
+        // What this call cost: the provider's figure, else the seat's own price.
+        let cost_usd = completion.provider_usage.resolved_cost_usd().unwrap_or(0.0);
         // `messages_chars` is the byte-len of the same JSON we already
         // serialized for `estimated_input_tokens`. `max_tokens_requested`
         // is the agent's configured cap (strategy may override
@@ -8425,6 +8396,200 @@ mod tests {
             )
             .await
         }
+    }
+
+    /// Answers each request with the next scripted reply: its text or
+    /// `submit_proposal` call, its token counts, and the cost the provider
+    /// reported for it, if any.
+    #[derive(Clone, Debug)]
+    struct ScriptedCostModel {
+        replies: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<ScriptedReply>>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct ScriptedReply {
+        proposal_args: Option<&'static str>,
+        text: &'static str,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        cached_tokens: u32,
+        reported_cost_usd: Option<f64>,
+    }
+
+    #[async_trait]
+    impl AiModel for ScriptedCostModel {
+        async fn chat_completion(
+            &self,
+            _agent: &AgentConfig,
+            _request_config: RequestConfig,
+        ) -> Result<ChatCompletionResult, LlmError> {
+            let reply = self
+                .replies
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .expect("the script has a reply for every call");
+            Ok(ChatCompletionResult {
+                response: CreateChatCompletionResponse {
+                    id: "scripted".into(),
+                    object: "chat.completion".into(),
+                    created: 0,
+                    model: "scripted".into(),
+                    choices: vec![ChatChoice {
+                        index: 0,
+                        message: ChatCompletionResponseMessage {
+                            role: Role::Assistant,
+                            content: Some(reply.text.to_string()),
+                            tool_calls: reply.proposal_args.map(|args| {
+                                vec![ChatCompletionMessageToolCall {
+                                    id: "call_1".into(),
+                                    r#type: ChatCompletionToolType::Function,
+                                    function: FunctionCall {
+                                        name: "submit_proposal".into(),
+                                        arguments: args.into(),
+                                    },
+                                }]
+                            }),
+                            #[allow(deprecated)]
+                            function_call: None,
+                            refusal: None,
+                            audio: None,
+                        },
+                        finish_reason: Some(if reply.proposal_args.is_some() {
+                            OAFinishReason::ToolCalls
+                        } else {
+                            OAFinishReason::Stop
+                        }),
+                        logprobs: None,
+                    }],
+                    usage: Some(CompletionUsage {
+                        prompt_tokens: reply.prompt_tokens,
+                        completion_tokens: reply.completion_tokens,
+                        total_tokens: reply.prompt_tokens + reply.completion_tokens,
+                        prompt_tokens_details: Some(async_openai::types::PromptTokensDetails {
+                            audio_tokens: None,
+                            cached_tokens: Some(reply.cached_tokens),
+                        }),
+                        completion_tokens_details: None,
+                    }),
+                    service_tier: None,
+                    system_fingerprint: None,
+                },
+                raw_request: String::new(),
+                timing: TimingMetadata {
+                    ttft_ms: None,
+                    generation_ms: None,
+                },
+                provider_backend: None,
+                shrink_info: None,
+                provider_usage: crate::llms::ProviderUsage {
+                    cost_usd: reply.reported_cost_usd,
+                    cached_tokens: Some(reply.cached_tokens),
+                    ..Default::default()
+                },
+            })
+        }
+    }
+
+    fn proposer_with(
+        replies: Vec<ScriptedReply>,
+        input: Option<f64>,
+        output: Option<f64>,
+    ) -> super::ProposerEvaluatorAgent {
+        super::ProposerEvaluatorAgent::new(
+            AgentConfig {
+                name: "Jurist42".to_string(),
+                input_price_per_mtok: input,
+                output_price_per_mtok: output,
+                max_retries: Some(3),
+                ..Default::default()
+            },
+            Box::new(ScriptedCostModel {
+                replies: std::sync::Arc::new(std::sync::Mutex::new(replies.into())),
+            }),
+            Box::new(crate::prompts::defaults::DefaultPromptSet::default()),
+            vec![],
+            vec![],
+        )
+    }
+
+    const VALID_PROPOSAL: &str = r#"{"thought_process": "t", "solution_content": "s"}"#;
+
+    fn seat_context() -> AgentContext {
+        AgentContext {
+            session_id: Some("room-f83fbad4".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// A seat's cost is every call behind its answer: what the provider
+    /// reported where it did, the seat's own price against the call's tokens
+    /// where it did not — never nothing for a silent call, and never only the
+    /// attempt that finally parsed.
+    #[tokio::test]
+    async fn a_proposal_costs_every_call_reported_or_priced_at_the_seats_rate() {
+        let agent = proposer_with(
+            vec![
+                ScriptedReply {
+                    proposal_args: None,
+                    text: "not json at all",
+                    prompt_tokens: 1000,
+                    completion_tokens: 100,
+                    cached_tokens: 0,
+                    reported_cost_usd: Some(0.02),
+                },
+                ScriptedReply {
+                    proposal_args: Some(VALID_PROPOSAL),
+                    text: "",
+                    prompt_tokens: 2000,
+                    completion_tokens: 400,
+                    cached_tokens: 1000,
+                    reported_cost_usd: None,
+                },
+            ],
+            Some(2.0),
+            Some(10.0),
+        );
+        let proposal = crate::agents::NsedAgent::propose(&agent, &seat_context())
+            .await
+            .expect("the second attempt parses");
+        let usage = proposal.token_usage_stats.expect("usage");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (3000, 500));
+        assert_eq!(
+            usage.reported_cost_usd,
+            Some(0.02),
+            "the failed attempt's reported cost is kept"
+        );
+        // 2,000 input (its cached 1,000 included, at the full input rate) × $2/M
+        // + 400 output × $10/M.
+        let estimated = usage.estimated_cost_usd.expect("the silent call is priced");
+        assert!((estimated - 0.008).abs() < 1e-12, "{estimated}");
+    }
+
+    /// With no price on file a silent call cannot be valued: the seat says so
+    /// (`None`) rather than reporting it as free.
+    #[tokio::test]
+    async fn a_silent_call_on_a_seat_without_a_price_is_left_unknown() {
+        let agent = proposer_with(
+            vec![ScriptedReply {
+                proposal_args: Some(VALID_PROPOSAL),
+                text: "",
+                prompt_tokens: 2000,
+                completion_tokens: 400,
+                cached_tokens: 0,
+                reported_cost_usd: None,
+            }],
+            None,
+            None,
+        );
+        let proposal = crate::agents::NsedAgent::propose(&agent, &seat_context())
+            .await
+            .expect("parses");
+        let usage = proposal.token_usage_stats.expect("usage");
+        assert_eq!(
+            (usage.reported_cost_usd, usage.estimated_cost_usd),
+            (None, None)
+        );
     }
 
     /// Present so the room's tools are injected; never actually called here.

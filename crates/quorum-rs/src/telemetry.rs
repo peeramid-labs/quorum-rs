@@ -510,11 +510,14 @@ pub struct LlmRequestComplete {
     pub reasoning_tokens: u32,
     #[serde(default)]
     pub cached_tokens: u32,
+    /// What the call cost, in USD: `reported_cost_usd` when the provider
+    /// priced it, else the agent's configured rates against its tokens; 0
+    /// when it had neither.
     #[serde(default)]
     pub cost_usd: f64,
-    /// What the provider said the call cost, in USD. `cost_usd` above is our
-    /// own estimate from a price list; this is the charge itself. `None` for
-    /// backends that report no cost, which is most of them.
+    /// What the provider said the call cost, in USD: the charge itself. `None`
+    /// for backends that report no cost, and then `cost_usd` is the agent's
+    /// own estimate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported_cost_usd: Option<f64>,
     /// Prompt tokens the provider wrote into its cache on this call.
@@ -654,7 +657,8 @@ pub struct RetryLoopAttempt {
     pub attempt: u32,
     pub reason: RetryReason,
     pub cumulative_latency_ms: u64,
-    /// G4 — rollup cost across this task's attempts so far.
+    /// G4 — rollup cost across this task's attempts so far: each call's
+    /// reported cost, or its estimate at the agent's configured rates.
     #[serde(default)]
     pub cumulative_cost_usd: f64,
     #[serde(default)]
