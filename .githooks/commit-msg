@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
+[ -n "$QUORUM_COMMIT_MSG_DELEGATED" ] && exit 0
 global=$(git config --global --path core.hooksPath 2>/dev/null || true)
 if [ -n "$global" ] && [ -x "$global/commit-msg" ]; then
-  exec "$global/commit-msg" "$@"
+  QUORUM_COMMIT_MSG_DELEGATED=1 exec "$global/commit-msg" "$@"
 fi
