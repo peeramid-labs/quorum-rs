@@ -166,8 +166,65 @@ pub trait ChatStrategy: Send + Sync {
     }
 }
 
+/// Remove a `service_tier` async-openai cannot deserialize. Its enum knows
+/// `scale`, `default`, `flex` and `priority`; providers answer with their own
+/// (`auto` from Cloudflare, `on_demand` from Groq), and the strict enum would
+/// otherwise fail the whole completion over a field we never read.
+pub(crate) fn drop_unknown_service_tier(value: &mut serde_json::Value) {
+    let known = matches!(
+        value.get("service_tier").and_then(|t| t.as_str()),
+        None | Some("scale" | "default" | "flex" | "priority")
+    );
+    if !known && let Some(obj) = value.as_object_mut() {
+        obj.remove("service_tier");
+    }
+}
+
+/// Parse one streamed chat-completion chunk, tolerating provider-specific
+/// `service_tier` values (see [`drop_unknown_service_tier`]).
+pub(crate) fn parse_stream_chunk(
+    data: &str,
+) -> Result<async_openai::types::CreateChatCompletionStreamResponse, serde_json::Error> {
+    let mut value: serde_json::Value = serde_json::from_str(data)?;
+    drop_unknown_service_tier(&mut value);
+    serde_json::from_value(value)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_stream_chunk_with_a_provider_specific_service_tier_still_parses() {
+        // A chunk that fails to parse is skipped, so a Groq stream used to
+        // arrive with no content at all.
+        let chunk = r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"m",
+            "choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}],
+            "service_tier":"on_demand"}"#;
+        assert!(
+            serde_json::from_str::<async_openai::types::CreateChatCompletionStreamResponse>(chunk)
+                .is_err(),
+            "the raw chunk is what the stream used to drop"
+        );
+        let parsed = super::parse_stream_chunk(chunk).expect("parses");
+        assert_eq!(parsed.choices[0].delta.content.as_deref(), Some("Hi"));
+    }
+
+    #[test]
+    fn only_tiers_the_client_cannot_model_are_dropped() {
+        for (tier, kept) in [
+            ("on_demand", false),
+            ("auto", false),
+            ("flex", true),
+            ("default", true),
+        ] {
+            let mut v = serde_json::json!({ "service_tier": tier });
+            super::drop_unknown_service_tier(&mut v);
+            assert_eq!(v.get("service_tier").is_some(), kept, "{tier}");
+        }
+        let mut absent = serde_json::json!({});
+        super::drop_unknown_service_tier(&mut absent);
+        assert_eq!(absent, serde_json::json!({}));
+    }
+
     use super::*;
 
     /// Minimal strategy that only implements the required methods,

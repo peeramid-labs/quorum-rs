@@ -6578,6 +6578,14 @@ printf '%s' '{{"type":"result","subtype":"success","result":"ok","cost_usd":0.0,
         cmd.arg("-C")
             .arg(dir)
             .args(["-c", "user.email=t@e.test", "-c", "user.name=Tester"])
+            // A developer's global hooks (a commit-msg format check) and
+            // signing config would otherwise run against the fixture's commits.
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+            ])
             .args(args);
         // Under the pre-commit hook, git exports GIT_DIR/GIT_WORK_TREE (wrong repo) and
         // GIT_AUTHOR_*/GIT_COMMITTER_* (which override the -c user.* config above, so the
