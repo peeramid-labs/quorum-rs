@@ -32,3 +32,7 @@ jmap = ["dep:jmap-core", "dep:jmap-mail", "dep:base64"]
 jmap-client = { version = "0.4.3", default-features = false, features = ["async"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[[test]]
+name = "revisions"
+required-features = ["conformance"]

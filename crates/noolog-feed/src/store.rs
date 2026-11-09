@@ -78,6 +78,17 @@ pub trait FeedStore: Send + Sync {
         message_id: &str,
         id: u64,
     ) -> Result<()>;
+
+    /// Claim the right to replace record `id` with a revision; `false` when it
+    /// is claimed or replaced already.
+    async fn claim_revision(&self, address: &str, id: u64) -> Result<bool>;
+
+    /// Finish a claim: `Some(next)` records `next` as what replaced `id`,
+    /// `None` releases the claim because nothing did.
+    async fn complete_revision(&self, address: &str, id: u64, next: Option<u64>) -> Result<()>;
+
+    /// The record that replaced `id`, once a revision is written.
+    async fn revised_to(&self, address: &str, id: u64) -> Result<Option<u64>>;
 }
 
 // ── Memory ───────────────────────────────────────────────────────────────────
@@ -89,6 +100,8 @@ struct Memory {
     records: std::collections::HashMap<String, Vec<Record>>,
     slugs: std::collections::HashMap<(String, String), (SlugEntry, u64)>,
     message_ids: std::collections::HashMap<(String, Option<String>, String), u64>,
+    /// Per (channel, id), what replaced it; `None` while a revision is claimed.
+    revisions: std::collections::HashMap<(String, u64), Option<u64>>,
 }
 
 /// Everything in a mutex: the reference behaviour, and the store unit tests
@@ -262,6 +275,41 @@ impl FeedStore for MemoryFeedStore {
                 .or_insert(id);
         });
         Ok(())
+    }
+
+    async fn claim_revision(&self, address: &str, id: u64) -> Result<bool> {
+        Ok(self.with(|m| {
+            let key = (address.to_string(), id);
+            if m.revisions.contains_key(&key) {
+                return false;
+            }
+            m.revisions.insert(key, None);
+            true
+        }))
+    }
+
+    async fn complete_revision(&self, address: &str, id: u64, next: Option<u64>) -> Result<()> {
+        self.with(|m| {
+            let key = (address.to_string(), id);
+            match next {
+                Some(next) => {
+                    m.revisions.insert(key, Some(next));
+                }
+                None => {
+                    m.revisions.remove(&key);
+                }
+            }
+        });
+        Ok(())
+    }
+
+    async fn revised_to(&self, address: &str, id: u64) -> Result<Option<u64>> {
+        Ok(self.with(|m| {
+            m.revisions
+                .get(&(address.to_string(), id))
+                .copied()
+                .flatten()
+        }))
     }
 }
 

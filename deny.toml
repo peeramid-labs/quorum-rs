@@ -80,6 +80,7 @@ ignore = [
     "RUSTSEC-2026-0367",   # zip: SUID/SGID bits kept on extraction
     "RUSTSEC-2026-0368",   # zip: extracted symlinks may point outside the destination
     "RUSTSEC-2026-0369",   # zip: permissions applied through extracted symlinks
+    "RUSTSEC-2026-0429",   # zip: extract aborts on a symlink entry with a large declared size
 ]
 
 [bans]

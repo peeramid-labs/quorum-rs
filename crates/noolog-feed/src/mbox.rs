@@ -129,6 +129,7 @@ mod tests {
             in_reply_to: None,
             references: vec![],
             blog: None,
+            revision: None,
         }
     }
 

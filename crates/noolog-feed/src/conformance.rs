@@ -33,6 +33,7 @@ pub fn a_record(from: &str, to: &str, subject: &str) -> Record {
         in_reply_to: None,
         references: Vec::new(),
         blog: None,
+        revision: None,
     }
 }
 
@@ -358,5 +359,101 @@ pub async fn the_index_lists_registered_channels(
         listed.iter().any(|c| c.address == address),
         "a registered channel must appear in the index"
     );
+    Ok(())
+}
+
+/// Editing a post appends its next revision behind the same link: the
+/// revision names the one it replaces, the slug moves to it, the replaced one
+/// stays readable by its id and by its number, and a page lists the post once.
+pub async fn a_revision_replaces_a_record_behind_its_slug_and_links_back(
+    store: &dyn FeedStore,
+    address: &str,
+) -> Result<()> {
+    ensure_channel(store, &a_channel(address)).await?;
+    let mut first = a_record("acme@noolog.io", address, "v1");
+    first.blog = Some(crate::blog::Blog::with_slug("misty"));
+    let first = post(store, address, first).await?;
+    assert_eq!(
+        first.revision_number(),
+        1,
+        "a record nobody edited is revision 1"
+    );
+    assert_eq!(superseded_by(store, address, first.id).await?, None);
+
+    let mut edit = first.clone();
+    edit.subject = "v2".into();
+    let second = revise(
+        store,
+        address,
+        &first,
+        edit,
+        Some("fixed image URLs".into()),
+    )
+    .await?;
+    let rev = second
+        .revision
+        .as_ref()
+        .expect("a revision carries its link");
+    assert_eq!((rev.number, rev.previous), (2, first.id));
+    assert_eq!(rev.note.as_deref(), Some("fixed image URLs"));
+    assert_eq!(
+        superseded_by(store, address, first.id).await?,
+        Some(second.id)
+    );
+
+    assert_eq!(
+        get_by_slug(store, address, "misty").await?.map(|r| r.id),
+        Some(second.id),
+        "the slug follows the newest revision"
+    );
+    assert_eq!(
+        get_record(store, address, first.id)
+            .await?
+            .map(|r| r.subject),
+        Some("v1".into()),
+        "the replaced revision is still there by id"
+    );
+    assert_eq!(
+        revision(store, address, second.clone(), 1)
+            .await?
+            .map(|r| r.id),
+        Some(first.id)
+    );
+    assert!(revision(store, address, second.clone(), 3).await?.is_none());
+
+    let listed: Vec<u64> = page(store, address, None, 10)
+        .await?
+        .iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(
+        listed,
+        vec![second.id],
+        "a page lists an edited post once, newest"
+    );
+    Ok(())
+}
+
+/// Only the newest revision can be edited, and two edits of the same one
+/// cannot both win: the loser is told which revision is newest, and nothing it
+/// wrote is left behind.
+pub async fn only_the_newest_revision_can_be_revised(
+    store: &dyn FeedStore,
+    address: &str,
+) -> Result<()> {
+    ensure_channel(store, &a_channel(address)).await?;
+    let first = post(store, address, a_record("acme@noolog.io", address, "v1")).await?;
+    let second = revise(store, address, &first, first.clone(), None).await?;
+
+    let stale = revise(store, address, &first, first.clone(), None)
+        .await
+        .expect_err("revision 1 was already replaced");
+    let not_latest = stale
+        .downcast_ref::<NotLatest>()
+        .expect("a NotLatest refusal");
+    assert_eq!(not_latest.latest, Some(second.id));
+
+    let all = page(store, address, None, 10).await?;
+    assert_eq!(all.len(), 1, "the refused edit appended nothing: {all:?}");
     Ok(())
 }
