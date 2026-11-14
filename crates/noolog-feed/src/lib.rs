@@ -202,6 +202,30 @@ pub struct Record {
         skip_serializing_if = "Option::is_none"
     )]
     pub blog: Option<crate::blog::Blog>,
+    /// Which revision of a post this record is, on a record that replaced an
+    /// earlier one. Absent on a record nobody edited, which is revision 1.
+    #[serde(
+        rename = "noolog:revision",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub revision: Option<Revision>,
+}
+
+/// A post's revision: its number and the record it replaces. An edit appends
+/// the next revision rather than changing a record, the way a mailing list
+/// patch series sends `[PATCH v2]`: every earlier revision stays readable.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Revision {
+    /// 2 for the first edit. Revision 1 is the record as first posted.
+    pub number: u32,
+    /// The id of the revision this one replaces, in the same channel.
+    pub previous: u64,
+    pub edited_at: String,
+    /// What changed, in the author's words: `fixed image URLs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// The keyword marking a record as not yet published.
@@ -212,7 +236,40 @@ impl Record {
     pub fn is_draft(&self) -> bool {
         self.keywords.iter().any(|k| k == DRAFT)
     }
+
+    /// 1 for a record nobody edited.
+    pub fn revision_number(&self) -> u32 {
+        self.revision.as_ref().map_or(1, |r| r.number)
+    }
+
+    /// The id of the revision this record replaced, if it replaced one.
+    pub fn previous_revision(&self) -> Option<u64> {
+        self.revision.as_ref().map(|r| r.previous)
+    }
 }
+
+/// An edit of a revision that is no longer the newest.
+///
+/// Its own type so a handler can answer 409 with the revision to edit instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotLatest {
+    pub address: String,
+    pub id: u64,
+    /// The revision that replaced `id`, once it is written.
+    pub latest: Option<u64>,
+}
+
+impl std::fmt::Display for NotLatest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "record {} in {} was already revised",
+            self.id, self.address
+        )
+    }
+}
+
+impl std::error::Error for NotLatest {}
 
 /// A channel, as registered.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -443,7 +500,8 @@ async fn verdict_of(store: &dyn FeedStore, address: &str, slug: &str, from: &str
     }
 }
 
-/// One page of a channel, newest first.
+/// One page of a channel, newest first, an edited post once at its newest
+/// revision.
 ///
 /// `before` is exclusive, so paging is `before = the last id you saw`.
 /// Drafts are left out: they are stored so an author can finish them, not so
@@ -454,7 +512,13 @@ pub async fn page(
     before: Option<u64>,
     limit: usize,
 ) -> Result<Vec<Record>> {
-    store.newest_before(address, before, limit).await
+    let mut newest = Vec::new();
+    for record in store.newest_before(address, before, limit).await? {
+        if store.revised_to(address, record.id).await?.is_none() {
+            newest.push(record);
+        }
+    }
+    Ok(newest)
 }
 
 /// Records from id `first` on, oldest first, at most `limit`, drafts left out.
@@ -467,6 +531,72 @@ pub async fn page_from(
     limit: usize,
 ) -> Result<Vec<Record>> {
     store.oldest_from(address, first, limit).await
+}
+
+/// The record that replaced `id`, if an edit replaced it.
+pub async fn superseded_by(store: &dyn FeedStore, address: &str, id: u64) -> Result<Option<u64>> {
+    store.revised_to(address, id).await
+}
+
+/// Append `next` as the revision after `previous`, behind the same slug.
+///
+/// Claimed before it is written, so two edits of one revision cannot both
+/// land: the second is refused with [`NotLatest`]. A failed write releases
+/// the claim, since nothing replaced `previous`.
+pub async fn revise(
+    store: &dyn FeedStore,
+    address: &str,
+    previous: &Record,
+    mut next: Record,
+    note: Option<String>,
+) -> Result<Record> {
+    if !store.claim_revision(address, previous.id).await? {
+        return Err(NotLatest {
+            address: address.to_string(),
+            id: previous.id,
+            latest: store.revised_to(address, previous.id).await?,
+        }
+        .into());
+    }
+    next.revision = Some(Revision {
+        number: previous.revision_number() + 1,
+        previous: previous.id,
+        edited_at: chrono::Utc::now().to_rfc3339(),
+        note,
+    });
+    match post(store, address, next).await {
+        Ok(posted) => {
+            store
+                .complete_revision(address, previous.id, Some(posted.id))
+                .await?;
+            Ok(posted)
+        }
+        Err(e) => {
+            let _ = store.complete_revision(address, previous.id, None).await;
+            Err(e)
+        }
+    }
+}
+
+/// Revision `number` of the post whose newest revision is `latest`, walking
+/// back through what each revision replaced.
+pub async fn revision(
+    store: &dyn FeedStore,
+    address: &str,
+    latest: Record,
+    number: u32,
+) -> Result<Option<Record>> {
+    let mut at = latest;
+    while at.revision_number() > number {
+        let Some(previous) = at.previous_revision() else {
+            return Ok(None);
+        };
+        let Some(earlier) = get_record(store, address, previous).await? else {
+            return Ok(None);
+        };
+        at = earlier;
+    }
+    Ok((at.revision_number() == number).then_some(at))
 }
 
 /// One record by its id. A draft is not served.
@@ -510,7 +640,30 @@ mod tests {
         anybody_may_post_to_a_channel_and_the_first_use_registers_it,
         an_empty_channel_is_an_empty_page_not_a_failure,
         the_index_lists_registered_channels,
+        a_revision_replaces_a_record_behind_its_slug_and_links_back,
+        only_the_newest_revision_can_be_revised,
     );
+
+    #[test]
+    fn a_record_stored_before_revisions_existed_reads_as_the_first() {
+        let mut json = serde_json::to_value(a_record("a@noolog.io", "c@noolog.io", "old")).unwrap();
+        assert!(json.get("noolog:revision").is_none(), "absent, not null");
+        json.as_object_mut().unwrap().remove("noolog:revision");
+        let old: Record = serde_json::from_value(json).unwrap();
+        assert_eq!((old.revision_number(), old.previous_revision()), (1, None));
+
+        // The shape prod's orchestrator wrote, read back unchanged.
+        let edited: Record = serde_json::from_value(serde_json::json!({
+            "id": 9, "from": "peersky@noolog.io", "to": ["peeramid-labs@noolog.io"],
+            "subject": "Misty", "receivedAt": "2026-05-13T17:43:08Z", "size": 1,
+            "noolog:revision": {"number": 2, "previous": 7, "editedAt": "2026-10-19T15:32:31Z"}
+        }))
+        .unwrap();
+        assert_eq!(
+            (edited.revision_number(), edited.previous_revision()),
+            (2, Some(7))
+        );
+    }
 
     #[test]
     fn an_address_is_the_channels_name_and_nothing_else() {

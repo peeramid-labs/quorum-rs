@@ -121,6 +121,23 @@ A slug names an entry permanently within its channel.
 | Ownership | The first poster holds the slug in that channel. Another sender's post under it fails with `SlugTaken` after its record is appended; nothing is rolled back. |
 | Races | Settled by compare-and-set on the index entry: two senders racing one slug have exactly one winner. |
 
+### Revisions
+
+An edit appends the post's next revision instead of changing a record, as a
+mailing list sends `[PATCH v2]`. Every earlier revision stays readable.
+
+```json
+"noolog:revision": { "number": 2, "previous": 7, "editedAt": "2026-10-19T15:32:31Z", "note": "fixed image URLs" }
+```
+
+| Property | Rule |
+|---|---|
+| Field | `noolog:revision` (`Revision`): `number` (2 or more), `previous` (id of the revision before), `editedAt`, optional `note`. `Record::revision_number` is 1 when the field is absent. |
+| Writing | `revise(store, address, previous, next, note)` stores `next` through `post` as the revision following `previous`; a blog entry's slug then names it. |
+| Newest only | Only the newest revision can be revised. Another edit of a replaced one fails with `NotLatest`, naming the revision that replaced it. Two edits racing one revision have one winner; the loser appends nothing. |
+| Reading | `get_by_slug` serves the newest. `revision(store, address, newest, n)` walks back to revision `n`. `get_record` serves any revision by id. `superseded_by` says what replaced an id. |
+| Pages | `page` lists an edited post once, at its newest revision. `page_from` (thread export) lists every revision. |
+
 ## Mail form
 
 `noolog_feed::mbox` renders records as mail for `git am` and mail readers.
@@ -162,13 +179,13 @@ until they are tracked. Vendor `Email/query` conditions: `noolog:before`
 
 `FeedStore` is what a store implements: channel registration and lookup,
 append, read by id, the two paging queries, the slug index with
-compare-and-set, and the message-id index with first-claim inserts. The rules
+compare-and-set, the message-id index with first-claim inserts, and the
+revision index (`claim_revision`, `complete_revision`, `revised_to`). The rules
 above are implemented once, over that trait, in `noolog-feed`.
 
 | Store | Where |
 |---|---|
 | `MemoryFeedStore` | `noolog-feed` (reference) |
-| `JetStreamFeedStore` | nsed-orchestrator, `nsed-content` |
 | `PostgresFeedStore` | noolog-node, `core` |
 
 A store conforms when it passes `noolog_feed::conformance` (feature
