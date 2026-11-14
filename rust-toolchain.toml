@@ -1,0 +1,6 @@
+# The one Rust every build uses: local hooks (rustup reads this file), CI
+# (`dtolnay/rust-toolchain@1.99.0` in .github/workflows) and any image. Bump
+# all of them together.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]

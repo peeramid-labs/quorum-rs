@@ -24,7 +24,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig};
 use rmcp::transport::async_rw::AsyncRwTransport;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -350,7 +350,7 @@ impl NsedMcpServer {
         Parameters(input): Parameters<ProposeInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         if self.phase != ActivePhase::Proposing {
-            return Ok(CallToolResult::error(vec![Content::text(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "nsed_propose can only be called during the propose phase",
             )]));
         }
@@ -372,7 +372,7 @@ impl NsedMcpServer {
                 // Empty/`null`-only submission → reject (do NOT send on the channel)
                 // so Claude retries instead of an empty proposal entering deliberation.
                 None => {
-                    return Ok(CallToolResult::error(vec![Content::text(
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(
                         "nsed_propose requires a non-empty proposal — provide the fields \
                          defined by this tool's input schema",
                     )]));
@@ -385,7 +385,7 @@ impl NsedMcpServer {
         // deliberation (→ 0 ops applied, the turn silently discarded).
         if let Some(schema) = self.context.forced_proposal_schema.as_ref() {
             if let Err(reason) = validate_proposal_against_schema(&content, schema) {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "nsed_propose args did not match the required schema: {reason}. Re-emit the \
                      call as a single JSON object with the schema's fields (e.g. \
                      `{{\"reply\": \"…\", \"ops\": [ … ]}}`) — no prose or XML outside the JSON."
@@ -400,7 +400,7 @@ impl NsedMcpServer {
         if let Some(tx) = tx_guard.take() {
             let _ = tx.send(result);
         }
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             "Proposal submitted successfully",
         )]))
     }
@@ -416,7 +416,7 @@ impl NsedMcpServer {
         Parameters(mut input): Parameters<EvaluateInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         if self.phase != ActivePhase::Evaluating {
-            return Ok(CallToolResult::error(vec![Content::text(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "nsed_evaluate can only be called during the evaluate phase",
             )]));
         }
@@ -446,7 +446,7 @@ impl NsedMcpServer {
                     .map(|u| u.to_string())
                     .collect::<Vec<_>>()
                     .join("\n");
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "These claim citations do not match any span of the proposal they target. \
                      Quote each claim VERBATIM — copy-paste the exact text from the proposal \
                      (no paraphrase) — then resubmit nsed_evaluate:\n{detail}"
@@ -496,7 +496,7 @@ impl NsedMcpServer {
         if let Some(tx) = tx_guard.take() {
             let _ = tx.send(result);
         }
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             "Evaluations submitted successfully",
         )]))
     }
@@ -738,8 +738,9 @@ impl NsedMcpServer {
 }
 
 impl ServerHandler for NsedMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+    // slop:allow naming_slop: get_info is the name rmcp's ServerHandler trait requires
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "NSED Deliberation Server (hybrid protocol). The deliberation context was \
                  pushed to your stdin as a JSON line at startup. Use research tools \
                  (nsed_read_proposal, nsed_search, nsed_read_critiques, nsed_update_scratchpad) \
@@ -765,16 +766,14 @@ impl ServerHandler for NsedMcpServer {
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         // A `user_<name>` call goes to the operator via the user-tool handler and
         // returns their answer; anything else falls through to the static router.
         if let Some(answer) = self
             .dispatch_user_tool(&request.name, &request.arguments)
             .await
         {
-            return Ok(rmcp::model::CallToolResult::success(vec![
-                rmcp::model::Content::text(answer),
-            ]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(answer)]).into());
         }
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tcc).await
@@ -6578,6 +6577,14 @@ printf '%s' '{{"type":"result","subtype":"success","result":"ok","cost_usd":0.0,
         cmd.arg("-C")
             .arg(dir)
             .args(["-c", "user.email=t@e.test", "-c", "user.name=Tester"])
+            // A developer's global hooks (a commit-msg format check) and
+            // signing config would otherwise run against the fixture's commits.
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+            ])
             .args(args);
         // Under the pre-commit hook, git exports GIT_DIR/GIT_WORK_TREE (wrong repo) and
         // GIT_AUTHOR_*/GIT_COMMITTER_* (which override the -c user.* config above, so the
