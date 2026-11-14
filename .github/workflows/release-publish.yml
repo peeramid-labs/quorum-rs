@@ -65,7 +65,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
 
       # Tag scheme is crate-scoped to support independent release
       # streams: a `release/llm-repair/v0.7.0` PR creates the
@@ -171,7 +171,7 @@ jobs:
           ref: ${{ needs.tag.outputs.tag }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
@@ -292,7 +292,7 @@ jobs:
           ref: ${{ inputs.ref }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
 
       # Dry-runs are crate-gated to mirror the real publish steps:
       # an `llm-repair-v...` dispatch shouldn't fail because of an
