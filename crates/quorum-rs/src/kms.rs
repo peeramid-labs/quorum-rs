@@ -1,7 +1,9 @@
-//! Client for the key manager (noolog-node `kms/`), and the wire both sides
-//! speak. A service signs every request with its own nkey over a one-time
-//! nonce, the method, the path and the body; the KMS answers secrets derived
-//! from its root, its account's public key, and user JWTs it signs.
+//! Client for the key manager (mist-os `kms/`), and the wire both sides
+//! speak. A service's one credential is its NATS `.creds`: a user JWT the
+//! account signed, whose tags carry what the KMS lets it do, and the user nkey
+//! seed. Every request carries the JWT and is signed with that seed over a
+//! one-time nonce, the method, the path and the body; the KMS checks the JWT
+//! against its own account key, so it keeps no list of clients.
 //!
 //! The KMS listens on the internal network only; this client never reaches it
 //! through a public URL.
@@ -17,6 +19,29 @@ pub const KEY: &str = "x-kms-key";
 pub const NONCE: &str = "x-kms-nonce";
 /// Header carrying the hex signature over [`canonical`].
 pub const SIGNATURE: &str = "x-kms-signature";
+/// Header for the caller's account-signed JWT, whose tags are its grants.
+pub const JWT: &str = "x-kms-jwt";
+
+/// JWT tag letting its holder derive labels starting with what follows.
+pub const TAG_DERIVE: &str = "kms-derive:";
+/// JWT tag letting its holder have user JWTs signed.
+pub const TAG_SIGN_USERS: &str = "kms-sign-users";
+
+/// The user JWT and nkey seed of a `.creds` file.
+pub fn parse_creds(creds: &str) -> Result<(String, String)> {
+    let block = |begin: &str| {
+        creds
+            .lines()
+            .skip_while(|l| !l.contains(begin))
+            .skip(1)
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with("---"))
+            .map(str::to_string)
+    };
+    let jwt = block("BEGIN NATS USER JWT").context("no user JWT in the creds")?;
+    let seed = block("BEGIN USER NKEY SEED").context("no nkey seed in the creds")?;
+    Ok((jwt, seed))
+}
 
 /// Binding the method and path stops a signed `/derive` being replayed
 /// against `/user-jwt`; the body hash stops a label being swapped.
@@ -39,29 +64,39 @@ pub struct UserJwt {
     pub subscribe: Vec<String>,
 }
 
-/// A service's client: every call signed with the service's nkey.
+/// A service's client: every call carries its JWT and is signed with its seed.
 #[derive(Clone)]
 pub struct KmsClient {
     http: reqwest::Client,
     base: String,
+    jwt: std::sync::Arc<String>,
     key: std::sync::Arc<nkeys::KeyPair>,
 }
 
 impl KmsClient {
-    /// `base` is the KMS's internal address; `seed` the service's nkey seed.
-    pub fn new(base: &str, seed: &str) -> Result<Self> {
-        let key = nkeys::KeyPair::from_seed(seed.trim())
+    /// `base` is the KMS's internal address; `creds` the text of the service's
+    /// NATS `.creds` file.
+    pub fn from_creds(base: &str, creds: &str) -> Result<Self> {
+        let (jwt, seed) = parse_creds(creds)?;
+        let key = nkeys::KeyPair::from_seed(&seed)
             .map_err(|e| anyhow::anyhow!("{e}"))
-            .context("the service's KMS nkey seed")?;
+            .context("the nkey seed in the creds")?;
         Ok(Self {
             http: reqwest::Client::new(),
             base: base.trim_end_matches('/').to_string(),
+            jwt: std::sync::Arc::new(jwt),
             key: std::sync::Arc::new(key),
         })
     }
 
-    /// `hex(HMAC-SHA256(root, label))`; refused unless `label` is under this
-    /// service's prefixes in the KMS's clients file.
+    /// [`Self::from_creds`], reading the `.creds` file at `path`.
+    pub fn from_creds_file(base: &str, path: &str) -> Result<Self> {
+        let creds = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+        Self::from_creds(base, &creds)
+    }
+
+    /// `hex(HMAC-SHA256(root, label))`; refused unless the JWT carries a
+    /// [`TAG_DERIVE`] tag `label` starts with.
     pub async fn derive(&self, label: &str) -> Result<String> {
         #[derive(Deserialize)]
         struct Derived {
@@ -121,6 +156,7 @@ impl KmsClient {
             .http
             .request(method, format!("{}{path}", self.base))
             .header(KEY, self.key.public_key())
+            .header(JWT, self.jwt.as_str())
             .header(NONCE, nonce)
             .header(SIGNATURE, hex::encode(signature))
             .header("content-type", "application/json")
@@ -152,6 +188,7 @@ mod tests {
                 let header = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or("");
                 let signed = canonical(header(NONCE), method.as_str(), uri.path(), &body);
                 let verified = header(KEY) == client_key
+                    && header(JWT) == "the.user.jwt"
                     && hex::decode(header(SIGNATURE)).is_ok_and(|sig| {
                         nkeys::KeyPair::from_public_key(&client_key)
                             .is_ok_and(|k| k.verify(signed.as_bytes(), &sig).is_ok())
@@ -197,7 +234,7 @@ mod tests {
     async fn every_call_is_signed_and_answered() {
         let key = nkeys::KeyPair::new_user();
         let base = echo(key.public_key()).await;
-        let kms = KmsClient::new(&format!("{base}/"), &key.seed().unwrap()).unwrap();
+        let kms = KmsClient::from_creds(&format!("{base}/"), &creds_of(&key)).unwrap();
 
         assert_eq!(kms.derive("node/x").await.unwrap(), r#"{"label":"node/x"}"#);
         assert_eq!(kms.account_public_key().await.unwrap(), "AXYZ");
@@ -214,9 +251,37 @@ mod tests {
     async fn a_refusal_names_the_status() {
         let base = echo(nkeys::KeyPair::new_user().public_key()).await;
         let stranger = nkeys::KeyPair::new_user();
-        let kms = KmsClient::new(&base, &stranger.seed().unwrap()).unwrap();
+        let kms = KmsClient::from_creds(&base, &creds_of(&stranger)).unwrap();
         let refused = kms.derive("node/x").await.unwrap_err().to_string();
         assert!(refused.contains("401"), "{refused}");
-        assert!(KmsClient::new(&base, "not a seed").is_err());
+        assert!(KmsClient::from_creds(&base, "not creds").is_err());
+    }
+
+    /// A `.creds` file for `key`, its JWT a stand-in the echo server expects.
+    fn creds_of(key: &nkeys::KeyPair) -> String {
+        format!(
+            "-----BEGIN NATS USER JWT-----\nthe.user.jwt\n------END NATS USER JWT------\n\n\
+             ************************* IMPORTANT *************************\n\n\
+             -----BEGIN USER NKEY SEED-----\n{}\n------END USER NKEY SEED------\n",
+            key.seed().unwrap()
+        )
+    }
+
+    #[test]
+    fn creds_give_their_jwt_and_seed() {
+        let key = nkeys::KeyPair::new_user();
+        let (jwt, seed) = parse_creds(&creds_of(&key)).unwrap();
+        assert_eq!((jwt.as_str(), seed), ("the.user.jwt", key.seed().unwrap()));
+        assert!(parse_creds("-----BEGIN NATS USER JWT-----\nx\n").is_err());
+        assert!(parse_creds("").is_err());
+    }
+
+    #[test]
+    fn a_creds_file_is_read_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc.creds");
+        std::fs::write(&path, creds_of(&nkeys::KeyPair::new_user())).unwrap();
+        assert!(KmsClient::from_creds_file("http://kms", path.to_str().unwrap()).is_ok());
+        assert!(KmsClient::from_creds_file("http://kms", "/nonexistent").is_err());
     }
 }
