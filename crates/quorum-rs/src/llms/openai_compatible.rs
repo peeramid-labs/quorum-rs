@@ -9,8 +9,7 @@ use crate::llms::{
 use crate::telemetry::LlmError;
 use async_openai::types::{
     ChatChoice, ChatCompletionMessageToolCall, ChatCompletionToolType,
-    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
-    Role,
+    CreateChatCompletionResponse, FinishReason, FunctionCall, Role,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -536,7 +535,7 @@ impl AiModel for OpenAICompatibleModel {
                         }
                     }
 
-                    match serde_json::from_str::<CreateChatCompletionStreamResponse>(data) {
+                    match crate::llms::parse_stream_chunk(data) {
                         Err(e) => {
                             warn!("Failed to parse stream chunk: {}. Data: {}", e, data);
                         }
@@ -1759,5 +1758,47 @@ mod tests {
 
         assert_eq!(result.provider_usage.cost_usd, Some(1.5e-06));
         assert_eq!(result.provider_usage.cached_tokens, Some(3));
+    }
+
+    #[tokio::test]
+    async fn streaming_keeps_a_chunk_whose_service_tier_the_client_does_not_know() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Groq tags every chunk "on_demand"; the strict enum used to drop the
+        // chunk, and with it the answer's text.
+        let stream = concat!(
+            "data: {\"id\":\"g-3\",\"object\":\"chat.completion.chunk\",\"created\":0,",
+            "\"model\":\"openai/gpt-oss-20b\",\"service_tier\":\"on_demand\",",
+            "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n",
+            "data: {\"id\":\"g-3\",\"object\":\"chat.completion.chunk\",\"created\":0,",
+            "\"model\":\"openai/gpt-oss-20b\",\"service_tier\":\"on_demand\",",
+            "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(stream),
+            )
+            .mount(&server)
+            .await;
+        let model = OpenAICompatibleModel::new(server.uri(), "test-key".to_string(), None);
+        let agent = AgentConfig {
+            use_streaming: true,
+            ..hello_agent("Groq", "openai/gpt-oss-20b")
+        };
+        let result = model
+            .chat_completion(&agent, hello_request())
+            .await
+            .expect("stream must assemble");
+
+        assert_eq!(
+            result.response.choices[0].message.content.as_deref(),
+            Some("hi")
+        );
     }
 }

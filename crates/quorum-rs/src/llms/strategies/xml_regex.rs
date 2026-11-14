@@ -267,13 +267,7 @@ impl ChatStrategy for XmlRegexStrategy {
         let mut value: serde_json::Value =
             serde_json::from_str(response_body).map_err(|e| LlmError::Parse(e.into()))?;
 
-        // vLLM Responses API quirk: sometimes returns "service_tier": "auto" which async-openai rejects
-        if let Some(tier) = value.get("service_tier").and_then(|v| v.as_str())
-            && tier == "auto"
-            && let Some(obj) = value.as_object_mut()
-        {
-            obj.remove("service_tier");
-        }
+        crate::llms::drop_unknown_service_tier(&mut value);
 
         // Patch missing usage fields (vLLM/Cloudflare sometimes returns incomplete usage objects)
         if let Some(usage) = value.get_mut("usage").and_then(|u| u.as_object_mut()) {

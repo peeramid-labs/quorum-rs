@@ -21,6 +21,10 @@ pub struct ProviderUsage {
     pub cached_tokens: Option<u32>,
     /// Prompt tokens written into the provider's cache.
     pub cache_write_tokens: Option<u32>,
+    /// What a call the provider did not price would cost at the agent's own
+    /// configured rates ([`Self::price_unreported`]); kept apart from
+    /// `cost_usd` so a total always says how much of it was measured.
+    pub estimated_cost_usd: Option<f64>,
 }
 
 impl ProviderUsage {
@@ -37,6 +41,7 @@ impl ProviderUsage {
                 .filter(|c| c.is_finite() && *c >= 0.0),
             cached_tokens: token_count(usage, "cached_tokens"),
             cache_write_tokens: token_count(usage, "cache_write_tokens"),
+            estimated_cost_usd: None,
         }
     }
 
@@ -57,14 +62,37 @@ impl ProviderUsage {
         *self == Self::default()
     }
 
+    /// Price this call at `estimate` when the provider reported no cost for
+    /// it, so a silent call is never summed as free. A reported cost is the
+    /// money that moved and is never replaced.
+    pub fn price_unreported(&mut self, estimate: Option<f64>) {
+        if self.cost_usd.is_none() {
+            self.estimated_cost_usd = estimate.filter(|c| c.is_finite() && *c >= 0.0);
+        }
+    }
+
+    /// Every call's cost: reported where the provider said, estimated where it
+    /// did not. `None` only when no call could be valued at all.
+    pub fn resolved_cost_usd(&self) -> Option<f64> {
+        match (self.cost_usd, self.estimated_cost_usd) {
+            (None, None) => None,
+            (reported, estimated) => Some(reported.unwrap_or(0.0) + estimated.unwrap_or(0.0)),
+        }
+    }
+
     /// Fold one more call's figures into a running total.
     ///
     /// A field stays `None` until some call reports it, and thereafter sums
-    /// only the calls that did. An agent talks to one backend for the whole of
-    /// a turn, so in practice this is all-or-nothing; where it is not, a total
-    /// over the calls that reported still beats throwing the evidence away.
+    /// only the calls that did. Reported and estimated costs sum apart, so a
+    /// total over calls priced each way — call by call, by
+    /// [`Self::price_unreported`] — counts every call once.
     pub fn accumulate(&mut self, other: &Self) {
         add(&mut self.cost_usd, other.cost_usd, |a, b| a + b);
+        add(
+            &mut self.estimated_cost_usd,
+            other.estimated_cost_usd,
+            |a, b| a + b,
+        );
         add(
             &mut self.cached_tokens,
             other.cached_tokens,
@@ -199,15 +227,58 @@ mod tests {
             cost_usd: Some(0.001),
             cached_tokens: Some(10),
             cache_write_tokens: None,
+            estimated_cost_usd: None,
         });
         total.accumulate(&ProviderUsage {
             cost_usd: Some(0.002),
             cached_tokens: Some(5),
             cache_write_tokens: Some(7),
+            estimated_cost_usd: None,
         });
         assert_eq!(total.cost_usd, Some(0.003));
         assert_eq!(total.cached_tokens, Some(15));
         assert_eq!(total.cache_write_tokens, Some(7));
+    }
+
+    #[test]
+    fn an_unreported_call_is_priced_at_the_estimate_and_kept_apart() {
+        let mut reported = ProviderUsage {
+            cost_usd: Some(0.02),
+            ..Default::default()
+        };
+        reported.price_unreported(Some(9.0));
+        assert_eq!(
+            reported.estimated_cost_usd, None,
+            "a reported cost is never replaced"
+        );
+
+        let mut silent = ProviderUsage::default();
+        silent.price_unreported(Some(0.008));
+        assert_eq!(
+            (silent.cost_usd, silent.estimated_cost_usd),
+            (None, Some(0.008))
+        );
+
+        let mut total = ProviderUsage::default();
+        total.accumulate(&reported);
+        total.accumulate(&silent);
+        assert_eq!(total.cost_usd, Some(0.02), "what the provider said, alone");
+        assert_eq!(
+            total.estimated_cost_usd,
+            Some(0.008),
+            "what was priced, alone"
+        );
+        assert!(
+            (total.resolved_cost_usd().unwrap() - 0.028).abs() < 1e-12,
+            "every call, summed"
+        );
+    }
+
+    #[test]
+    fn a_call_that_cannot_be_priced_leaves_the_total_unknown() {
+        let mut silent = ProviderUsage::default();
+        silent.price_unreported(None);
+        assert_eq!(silent.resolved_cost_usd(), None);
     }
 
     #[test]

@@ -458,6 +458,12 @@ pub struct TokenUsage {
     /// back to pricing the token counts itself rather than reading it as free.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported_cost_usd: Option<f64>,
+    /// What the calls the provider did not price would cost at the agent's
+    /// configured rates, summed. The work's cost is this plus
+    /// `reported_cost_usd`; `None` when every call was reported, or when a
+    /// silent call had no price on file to value it by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
     /// Prompt tokens the provider served from its cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u32>,
