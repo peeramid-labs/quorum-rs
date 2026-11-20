@@ -16,6 +16,7 @@ Goal-oriented recipes. Assume reader is already competent — get them to the an
 | Guide | Goal |
 |---|---|
 | [Run an agent fleet via `quorum serve`](how-to/run-an-agent-fleet.md) | Load `quorum.yml`, dispatch each agent entry to the right implementation, run the lot |
+| [Read a deliberation's consensus](how-to/read-deliberation-consensus.md) | Which round values to show, and which are not agreement |
 | [Agent development guide](how-to/agent-development.md) | Build a deliberation agent — reference impl, custom Rust trait, or non-Rust via exec/MCP |
 | [Register a custom provider](how-to/register-a-custom-provider.md) | Make `quorum serve` recognise a `provider.type` the SDK doesn't ship — register a `ProviderFactory` without forking |
 | [Redeem an invite code](how-to/redeem-invite-code.md) | Bootstrap NATS credentials from a JWT invite code, one command |

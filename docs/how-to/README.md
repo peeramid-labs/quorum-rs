@@ -5,6 +5,7 @@ Goal-oriented recipes. Assume the reader is already competent — get them to th
 | Guide | When you reach for it |
 |---|---|
 | [Run an agent fleet via `quorum serve`](run-an-agent-fleet.md) | You have a `quorum.yml` and need to run every agent in it — multiple providers, multiple models, mixing LLM / exec / MCP / Claude CLI in one process. |
+| [Read a deliberation's consensus](read-deliberation-consensus.md) | Which round values to show, and which are not agreement |
 | [Smoke-test an agent](smoke-test-an-agent.md) | You want to verify a serving agent actually participates in real deliberations — `quorum smoke-test <agent_id>` runs the full protocol N times and reports a participation rate. |
 | [Limit an agent's concurrent jobs](limit-agent-job-concurrency.md) | An agent's jobs mutate shared state (e.g. a git repo a middleware resets per job) and concurrent jobs race — cap it with `max_concurrent_jobs`. |
 | [Agent development](agent-development.md) | You want to build a deliberation agent — reference impl, custom Rust trait, or non-Rust via exec/MCP. |
