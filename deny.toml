@@ -8,6 +8,9 @@
 version = 2
 yanked = "warn"
 ignore = [
+    "RUSTSEC-2026-0543",   # chrono unmaintained — no safe upgrade; via jmap-client, rmcp, schemars and our own code. Migrate to jiff or time, then REMOVE.
+    "RUSTSEC-2026-0545",   # zip 3.0.0 AES auth not checked on truncated entries — build-time only, utoipa-swagger-ui unpacks its own bundled UI, no AES. Bump utoipa-swagger-ui to 10 (zip >= 9), then REMOVE.
+    "RUSTSEC-2026-0548",   # zip 3.0.0 ZipStreamReader local-header names — same build-time path, no stream reader. Same fix, then REMOVE.
     "RUSTSEC-2026-0387",   # crypto-bigint 0.5.5 timing variability — via k256 0.13 → elliptic-curve 0.13 in quorum-crypto-core. Fixed only in 0.7.6 with no 0.5.x backport; reaching it means the k256/elliptic-curve 0.14 migration. Signing code: prioritise that migration, then REMOVE.
     # rustpython-parser → unic-* crates (unmaintained, no fix available)
     # These are transitive deps; upstream rustpython-parser must migrate first
