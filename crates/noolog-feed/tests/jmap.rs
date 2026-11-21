@@ -30,6 +30,7 @@ fn a_post() -> Record {
         disposition: Some("attachment".into()),
         url: Some("https://x/content/acme/ab12".into()),
         playlist_url: None,
+        poster_url: None,
     }];
     r.blog = Some(Blog::with_slug("change"));
     r

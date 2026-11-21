@@ -406,6 +406,23 @@ mod tests {
             }
             Ok(())
         }
+
+        async fn poster(&self, _input: &Path, out: &Path) -> Result<()> {
+            if self.fail {
+                anyhow::bail!("the transcoder gave up");
+            }
+            Ok(tokio::fs::write(out, "a frame").await?)
+        }
+    }
+
+    fn spec(visibility: Visibility) -> SegmentSpec<'static> {
+        SegmentSpec {
+            source_digest: SOURCE_DIGEST,
+            public_base: "https://cdn.test/content/acme",
+            uploaded_by: "agent-7",
+            visibility,
+            work_dir: None,
+        }
     }
 
     #[test]
@@ -434,11 +451,110 @@ mod tests {
     }
 
     #[test]
+    fn the_poster_is_one_scaled_frame_from_the_spooled_file_only() {
+        let args = Ffmpeg::poster_args(Path::new("/spool/in.mp4"), Path::new("/spool/p.jpg"));
+        let joined = args.join(" ");
+        assert!(joined.contains("-protocol_whitelist file"), "{joined}");
+        assert!(joined.contains("-frames:v 1"), "{joined}");
+        assert!(
+            joined.contains(&format!("min({POSTER_MAX_WIDTH},iw)")),
+            "{joined}"
+        );
+        assert!(joined.starts_with("-nostdin"), "{joined}");
+        assert!(joined.ends_with("/spool/p.jpg"), "{joined}");
+    }
+
+    #[tokio::test]
+    async fn a_transcoder_without_posters_says_so() {
+        struct SegmentsOnly;
+        #[async_trait::async_trait]
+        impl Transcoder for SegmentsOnly {
+            async fn segment(&self, _: &Path, _: &Path) -> Result<()> {
+                Ok(())
+            }
+        }
+        let err = SegmentsOnly
+            .poster(Path::new("in"), Path::new("out"))
+            .await
+            .expect_err("no posters");
+        assert!(err.to_string().contains("no posters"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_poster_is_stored_as_a_derived_jpeg_and_goes_with_its_video() {
+        let Some(blob) = blob_for("poster", 1024 * 1024).await else {
+            require_broker("storing a poster needs a broker");
+            return;
+        };
+        let source = tempfile::NamedTempFile::new().expect("source");
+        let digest = poster_and_store(
+            &blob,
+            &FakeTranscoder::ok(),
+            source.path(),
+            &spec(Visibility::Public),
+        )
+        .await
+        .expect("poster");
+
+        let meta = blob.head(&digest).await.expect("poster stored");
+        assert_eq!(meta.mime, "image/jpeg");
+        assert_eq!(meta.visibility, Visibility::Public);
+        assert_eq!(
+            meta.filename,
+            format!("{}{POSTER_NAME}", derived_prefix(SOURCE_DIGEST))
+        );
+
+        let mut body: &[u8] = b"the video";
+        blob.put_stream(
+            SOURCE_DIGEST,
+            &mut body,
+            &crate::blob::ObjectMeta {
+                digest: SOURCE_DIGEST.into(),
+                filename: "clip.mp4".into(),
+                mime: "video/mp4".into(),
+                bytes: 9,
+                visibility: Visibility::Public,
+                uploaded_by: "agent-7".into(),
+                created_at: crate::blob::stamped_now(),
+            },
+        )
+        .await
+        .expect("source stored");
+        delete_with_derived(&blob, SOURCE_DIGEST)
+            .await
+            .expect("deleted");
+        assert!(
+            blob.head(&digest).await.is_err(),
+            "the poster outlived its video"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_poster_stores_nothing() {
+        let Some(blob) = blob_for("posterfail", 1024 * 1024).await else {
+            require_broker("storing a poster needs a broker");
+            return;
+        };
+        let source = tempfile::NamedTempFile::new().expect("source");
+        let failing = FakeTranscoder {
+            files: vec![],
+            fail: true,
+        };
+        assert!(
+            poster_and_store(&blob, &failing, source.path(), &spec(Visibility::Public))
+                .await
+                .is_err()
+        );
+        assert!(blob.list().await.expect("list").is_empty());
+    }
+
+    #[test]
     fn produced_files_get_the_media_type_a_player_expects() {
         assert_eq!(segment_mime("index.m3u8"), "application/vnd.apple.mpegurl");
         assert_eq!(segment_mime("seg0.ts"), "video/mp2t");
         assert_eq!(segment_mime("seg0.m4s"), "video/mp4");
         assert_eq!(segment_mime("init.mp4"), "video/mp4");
+        assert_eq!(segment_mime(POSTER_NAME), "image/jpeg");
     }
 
     async fn blob_for(tag: &str, quota: i64) -> Option<NatsBlob> {
@@ -876,6 +992,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_ffmpeg_grabs_a_jpeg_poster() -> Result<()> {
+        let Some(blob) = blob_for("realposter", 4 * 1024 * 1024).await else {
+            require_broker("the real poster needs a broker");
+            return Ok(());
+        };
+        let Some((_dir, source)) = real_video().await? else {
+            return Ok(());
+        };
+        let digest = poster_and_store(
+            &blob,
+            &Ffmpeg::default(),
+            &source,
+            &spec(Visibility::Public),
+        )
+        .await
+        .expect("poster");
+        let meta = blob.head(&digest).await.expect("stored");
+        let (bytes, _) = blob.get_range(&digest, 0, meta.bytes).await.expect("read");
+        assert_eq!(&bytes[..2], &[0xFF, 0xD8], "not a JPEG");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_host_without_ffmpeg_reports_it_rather_than_failing() {
         // A library user who never asked for a media pipeline gets `Skipped`
         // and an intact original, not an error.
@@ -1058,6 +1197,15 @@ pub fn derived_prefix(source_digest: &str) -> String {
 pub const HLS_NOTE: &str = "hls";
 /// Where the produced playlist's digest is recorded against the original.
 pub const PLAYLIST_NOTE: &str = "playlist";
+/// Where the poster frame's digest is recorded against the original: the still
+/// a link preview or a player shows before playback.
+pub const POSTER_NOTE: &str = "poster";
+
+/// What the poster frame is written as.
+const POSTER_NAME: &str = "poster.jpg";
+
+/// The widest poster stored. Link previews show it at a few hundred pixels.
+const POSTER_MAX_WIDTH: u32 = 1280;
 
 /// What ffmpeg is told to write, and what the pipeline then looks for.
 const PLAYLIST_NAME: &str = "index.m3u8";
@@ -1078,6 +1226,11 @@ const TRANSCODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 pub trait Transcoder: Send + Sync {
     /// Write segments and a playlist named [`PLAYLIST_NAME`] into `out_dir`.
     async fn segment(&self, input: &std::path::Path, out_dir: &std::path::Path) -> Result<()>;
+
+    /// Write one representative frame of `input` to `out` as a JPEG.
+    async fn poster(&self, _input: &std::path::Path, _out: &std::path::Path) -> Result<()> {
+        anyhow::bail!("this transcoder makes no posters")
+    }
 }
 
 /// Segmenting by shelling out to ffmpeg.
@@ -1143,15 +1296,37 @@ impl Ffmpeg {
             s(&out_dir.join(PLAYLIST_NAME)),
         ]
     }
-}
 
-#[async_trait::async_trait]
-impl Transcoder for Ffmpeg {
-    async fn segment(&self, input: &std::path::Path, out_dir: &std::path::Path) -> Result<()> {
+    /// The poster's argument vector. `thumbnail` picks the most typical of the
+    /// first frames, so a fade-in from black does not become the poster.
+    fn poster_args(input: &std::path::Path, out: &std::path::Path) -> Vec<String> {
+        let s = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        vec![
+            "-nostdin".into(),
+            "-y".into(),
+            "-protocol_whitelist".into(),
+            "file".into(),
+            "-i".into(),
+            s(input),
+            "-map".into(),
+            "0:v:0".into(),
+            "-vf".into(),
+            format!("thumbnail,scale='min({POSTER_MAX_WIDTH},iw)':-2"),
+            "-frames:v".into(),
+            "1".into(),
+            "-update".into(),
+            "1".into(),
+            "-q:v".into(),
+            "3".into(),
+            s(out),
+        ]
+    }
+
+    async fn run(&self, args: Vec<String>) -> Result<()> {
         use tokio::io::AsyncReadExt as _;
 
         let mut child = tokio::process::Command::new(&self.binary)
-            .args(Self::args(input, out_dir))
+            .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -1197,11 +1372,23 @@ impl Transcoder for Ffmpeg {
     }
 }
 
+#[async_trait::async_trait]
+impl Transcoder for Ffmpeg {
+    async fn segment(&self, input: &std::path::Path, out_dir: &std::path::Path) -> Result<()> {
+        self.run(Self::args(input, out_dir)).await
+    }
+
+    async fn poster(&self, input: &std::path::Path, out: &std::path::Path) -> Result<()> {
+        self.run(Self::poster_args(input, out)).await
+    }
+}
+
 /// The media type of a file the transcoder produced.
 fn segment_mime(name: &str) -> &'static str {
     match name.rsplit('.').next().unwrap_or_default() {
         "m3u8" => "application/vnd.apple.mpegurl",
         "ts" => "video/mp2t",
+        "jpg" => "image/jpeg",
         _ => "video/mp4",
     }
 }
@@ -1261,18 +1448,7 @@ pub async fn segment_and_store(
     // needs room for the whole output. Unset it is the platform temporary
     // directory, which in a container is frequently a tmpfs sized for nothing
     // like a video — and a transcode that fills it reports only `failed`.
-    let work = match work_dir {
-        Some(dir) => tempfile::tempdir_in(dir),
-        None => tempfile::tempdir(),
-    }
-    .with_context(|| {
-        format!(
-            "make a working directory in {}",
-            work_dir
-                .map(|d| d.display().to_string())
-                .unwrap_or_else(|| std::env::temp_dir().display().to_string())
-        )
-    })?;
+    let work = work_in(work_dir)?;
     transcoder.segment(source, work.path()).await?;
 
     let produced = produced_files(work.path()).await?;
@@ -1319,6 +1495,45 @@ pub async fn segment_and_store(
     };
     stored.push(playlist.clone());
     Ok(Segmented { playlist, stored })
+}
+
+/// Grab a poster frame from `source` and store it, returning its digest.
+///
+/// Stored under the source's derived prefix, so deleting the video deletes it.
+/// `public_base` is unused: a poster names nothing.
+pub async fn poster_and_store(
+    blob: &dyn crate::blob::Blob,
+    transcoder: &dyn Transcoder,
+    source: &std::path::Path,
+    spec: &SegmentSpec<'_>,
+) -> Result<String> {
+    let work = work_in(spec.work_dir)?;
+    let out = work.path().join(POSTER_NAME);
+    transcoder.poster(source, &out).await?;
+    store_file(
+        blob,
+        &out,
+        spec.source_digest,
+        POSTER_NAME,
+        spec.uploaded_by,
+        spec.visibility,
+    )
+    .await
+}
+
+fn work_in(work_dir: Option<&std::path::Path>) -> Result<tempfile::TempDir> {
+    match work_dir {
+        Some(dir) => tempfile::tempdir_in(dir),
+        None => tempfile::tempdir(),
+    }
+    .with_context(|| {
+        format!(
+            "make a working directory in {}",
+            work_dir
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|| std::env::temp_dir().display().to_string())
+        )
+    })
 }
 
 /// The files the transcoder left behind, checked for a playlist among them.
