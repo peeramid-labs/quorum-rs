@@ -134,6 +134,11 @@ pub struct BodyPart {
     /// relation to the source's and must be read from the source's notes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub playlist_url: Option<String>,
+    /// Where a still from this video is, once one was grabbed: the image a
+    /// player and a link preview show before playback. Filled on read like
+    /// [`BodyPart::playlist_url`], and read from the source's notes the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poster_url: Option<String>,
 }
 
 /// A record posted to one or more channels.
@@ -692,6 +697,7 @@ mod tests {
         record.attachments = vec![BodyPart {
             url: None,
             playlist_url: None,
+            poster_url: None,
             blob_id: "a".repeat(64),
             media_type: "video/mp4".into(),
             size: 1024,
