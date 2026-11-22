@@ -1,5 +1,5 @@
-//! Interactive first-run setup wizard shared by `nsed-orchestrator init` and
-//! `nsed-agent init`.
+//! Interactive first-run setup wizard shared by `quorum init` and the agents
+//! repository's `nsed-agent init`.
 //!
 //! Produces:
 //!   `./docker-compose.yml`   — orchestrator (+ embedded NATS) and/or N agent services
