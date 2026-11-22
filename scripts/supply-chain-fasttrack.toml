@@ -48,3 +48,15 @@ name    = "rustls"
 version = "0.23.46"
 reason  = "RUSTSEC-2026-0346/0347/0348/0349 — secrets in Debug impls, ECH early data, unbounded Brotli decompression, ServerHello downgrade. 0.23.46 is the first patched release and cargo-deny rejects 0.23.45, so the cooldown would keep `cargo deny check` red on known advisories."
 expires = 2026-10-23
+
+[[fasttrack]]
+name    = "url"
+version = "2.5.9"
+reason  = "Advisory of 2026-11-22 (servo/rust-url#1186, RUSTSEC id pending): Url::origin() recursed once per nested blob: prefix and overflowed the stack. 2.5.9 is the first patched release and cargo-deny rejects 2.5.8."
+expires = 2026-11-29
+
+[[fasttrack]]
+name    = "form_urlencoded"
+version = "1.2.3"
+reason  = "Pulled in by url 2.5.9 (above), the patched release for the 2026-11-22 Url::origin() stack overflow advisory."
+expires = 2026-11-29
