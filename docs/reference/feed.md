@@ -2,8 +2,7 @@
 
 The contract for channels and their records, implemented by `noolog-feed`
 ([crate](../../crates/noolog-feed/README.md)). It holds for every store and
-every consumer: the node core (PostgreSQL), nsed-orchestrator (JetStream),
-the web client and agents. Routes, posting limits, lists and rendering are
+every consumer: the node core (PostgreSQL), the web client and agents. Routes, posting limits, lists and rendering are
 the serving service's, not part of this contract.
 
 ## Channels

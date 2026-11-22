@@ -522,7 +522,7 @@ fn build_config_embedded_orchestrator() {
     assert!(orch.config_file.is_some());
 }
 
-// ── render_default_orchestrator_config (reused from nsed-cli-common) ────────
+// ── render_default_orchestrator_config (from crate::init) ────────
 
 #[test]
 fn render_default_orchestrator_config_contains_sections() {

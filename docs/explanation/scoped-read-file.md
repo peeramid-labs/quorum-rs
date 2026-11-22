@@ -176,5 +176,5 @@ Two log-key conventions, depending on when the call failed:
   `read_file_roots`.
 
 A CLI ergonomics flag for setting roots from the command line
-(repeatable on `nsed run`) is a follow-up; today operators configure
+(repeatable on `quorum run`) is a follow-up; today operators configure
 roots directly in agent YAML.

@@ -2330,7 +2330,7 @@ mod tests {
             &mock_server.uri(),
             "eyJ.fake.invite.code",
             None,
-            Some("nsed init / wizard"),
+            Some("quorum init wizard"),
         )
         .await
         .expect("operator redeem must succeed on 200");

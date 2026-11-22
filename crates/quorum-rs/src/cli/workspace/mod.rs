@@ -23,7 +23,7 @@ pub struct WorkspaceConfig {
     pub shared: Option<Vec<ContextRef>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_room: Option<String>,
-    /// Agent fleet configuration reference (for `nsed serve`).
+    /// Agent fleet configuration reference (for `quorum serve`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agents: Option<AgentsConfig>,
 }
@@ -175,7 +175,8 @@ pub struct OrchestratorConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nats_url: Option<String>,
     /// Path to orchestrator settings YAML (relative to nsed.yaml parent).
-    /// If present, `nsed serve` starts this orchestrator as a subprocess.
+    /// Only the retired `nsed serve` acted on it (as an embedded orchestrator);
+    /// `quorum serve` ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_file: Option<String>,
 }

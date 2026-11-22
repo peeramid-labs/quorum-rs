@@ -1,9 +1,9 @@
-//! `nsed init` — interactive workspace setup wizard.
+//! `quorum init` — interactive workspace setup wizard.
 //!
 //! Generates `nsed.yaml` (and optionally `config/agent.yml`) by guiding the
 //! user through:
 //! 1. Orchestrator configuration (one or more, remote or embedded)
-//! 2. Agent setup (provider discovery + agent presets via nsed-cli-common)
+//! 2. Agent setup (provider discovery + agent presets from `crate::init`)
 //! 3. Policy creation (deliberation rules: rounds, convergence, SLA, mode)
 //! 4. Agent → policy assignment (for static-agent policies)
 //! 5. Room + default_room wiring
@@ -1239,7 +1239,7 @@ fn wizard_embedded_orchestrator() -> Result<Option<OrchestratorConfig>, String> 
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
             }
-            // Use the full template from nsed-cli-common (same as `nsed-orchestrator init`)
+            // The full orchestrator template, with no provider block yet.
             let content = crate::init::render_default_orchestrator_config(app_port, nats_port);
             write_orchestrator_config_file(config_path, &content)
                 .map_err(|e| format!("failed to write {}: {e}", config_file))?;
@@ -1453,7 +1453,7 @@ async fn redeem_operator_invite_in_wizard(
         orchestrator_url,
         &code,
         Some(&pub_key),
-        Some("nsed init wizard"),
+        Some("quorum init wizard"),
     )
     .await
     {

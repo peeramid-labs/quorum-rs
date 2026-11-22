@@ -1,5 +1,5 @@
-//! Interactive first-run setup wizard shared by `nsed-orchestrator init` and
-//! `nsed-agent init`.
+//! Interactive first-run setup wizard shared by `quorum init` and the agents
+//! repository's `nsed-agent init`.
 //!
 //! Produces:
 //!   `./docker-compose.yml`   — orchestrator (+ embedded NATS) and/or N agent services
@@ -40,7 +40,7 @@ use providers::*;
 use render::*;
 use wizard::*;
 
-// Public API: reusable rendering functions for other crates (e.g. `nsed init`).
+// Public API: reusable rendering functions for other crates (e.g. the `quorum init` wizard).
 pub use render::render_default_orchestrator_config;
 
 use crate::brand;

@@ -1,25 +1,25 @@
 //! `serve_fleet` — bring up multiple agents from a fleet config.
 //!
-//! This is the SDK analog of the proprietary `nsed serve` binary's
-//! agent-fleet half: load an [`AgentFleetConfig`], construct one
+//! The SDK's fleet runner (the orchestrator repo's `nsed serve` was the
+//! proprietary one; it is retired): load an [`AgentFleetConfig`], construct one
 //! [`NatsNsedWorker`] per agent (using `provider.provider_type` to
 //! pick the right [`NsedAgent`] implementation), wire them all into
 //! a [`MultiAgentRunner`], and `run().await` until SIGTERM.
 //!
-//! What's **out of scope** vs. the proprietary `nsed serve`:
+//! What's **out of scope**, all three things `nsed serve` did:
 //!
-//! - **Local orchestrator boot.** `nsed serve` can start an
+//! - **Local orchestrator boot.** `nsed serve` could start an
 //!   in-process `nsed-orchestrator` from a `config_file`; that
 //!   crate is proprietary. `serve_fleet` always talks to a remote
 //!   orchestrator's NATS bus via creds the operator already
 //!   redeemed (typically via `quorum redeem`).
-//! - **JWT challenge-response registration.** `nsed serve` can
+//! - **JWT challenge-response registration.** `nsed serve` could
 //!   register each agent with each orchestrator over HTTP and
 //!   receive per-agent NATS creds back. `serve_fleet` assumes the
 //!   operator has already obtained `.creds` (via `quorum redeem`
 //!   or otherwise) — one set of creds is used for all agents in
 //!   the fleet.
-//! - **Workspace policy push.** `nsed serve` writes policies to
+//! - **Workspace policy push.** `nsed serve` wrote policies to
 //!   the orchestrator's policy registry on startup. `serve_fleet`
 //!   assumes policies are configured server-side already.
 //!
@@ -179,9 +179,9 @@ fn redact_userinfo(url: &str) -> String {
 /// Each grant variant maps to one in-process tool. `ReadFile` /
 /// `Grep` route to the scoped sandbox impls in `crate::tools`;
 /// `PdfQuery` is skipped with a structured warning because the
-/// `ScopedPdfQueryTool` impl lives in the BUSL `nsed-agent` crate
-/// and hasn't been ported yet — operators needing `pdf_query` stay
-/// on `nsed serve` until the port lands.
+/// `ScopedPdfQueryTool` impl lives in the agents repository's BUSL
+/// `nsed-agent` and hasn't been ported yet — operators needing
+/// `pdf_query` run that binary until the port lands.
 ///
 /// Returns `Err(reason)` when a grant cannot be honoured at all
 /// (e.g. `Grep` roots that fail canonicalization). Callers skip the
@@ -198,8 +198,7 @@ pub(crate) fn instantiate_builtin_tools(
                 // ScopedReadFileTool::new is infallible — unresolvable
                 // roots are dropped with a warn, the read path then
                 // denies every call with READ_FILE_OUT_OF_SANDBOX if
-                // all roots were dropped. Matches the BUSL
-                // nsed-cli/serve.rs:931-938 semantic.
+                // all roots were dropped, as the retired nsed-cli did.
                 let root_paths: Vec<std::path::PathBuf> =
                     roots.iter().map(std::path::PathBuf::from).collect();
                 let tool = ScopedReadFileTool::new(agent_config.name.clone(), &root_paths)
@@ -228,8 +227,8 @@ pub(crate) fn instantiate_builtin_tools(
                 // wired guarantees confused LLM behaviour.
                 return Err(format!(
                     "builtin tool variant `{other:?}` is not supported by `quorum serve` yet \
-                     (likely PdfQuery — impl lives in the BUSL nsed-agent crate, port pending). \
-                     Run `nsed serve` for this agent until the port lands."
+                     (likely PdfQuery — impl lives in the BUSL nsed-agent, port pending). \
+                     Run the agents repository's `nsed-agent` for this agent until the port lands."
                 ));
             }
         }
@@ -901,7 +900,7 @@ api_key: "sk-test"
     }
 
     /// Unsupported variant (today: PdfQuery) → Err with a message
-    /// pointing operators at `nsed serve`. Caller of
+    /// pointing operators at the agents repository's `nsed-agent`. Caller of
     /// `instantiate_builtin_tools` will skip the whole agent.
     #[test]
     fn instantiate_builtin_tools_pdf_query_returns_err() {
@@ -916,8 +915,8 @@ api_key: "sk-test"
         let cfg = agent_with_grants("test-agent", grants);
         let err = super::instantiate_builtin_tools(&cfg).unwrap_err();
         assert!(
-            err.contains("PdfQuery") && err.contains("nsed serve"),
-            "error must name the variant + redirect to nsed serve; got: {err}"
+            err.contains("PdfQuery") && err.contains("nsed-agent") && !err.contains("nsed serve"),
+            "error must name the variant + redirect to the agents repo's nsed-agent; got: {err}"
         );
     }
 

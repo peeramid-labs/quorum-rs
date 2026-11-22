@@ -73,7 +73,7 @@ The structured answer produced by one agent in the propose phase. Contains the a
 The scoring mechanism used to aggregate evaluations. Raw evaluation scores are transformed so that extreme scores require more "votes" to express, reducing the impact of outlier evaluators. See the [whitepaper](https://arxiv.org/abs/2601.16863) for the scoring definitions.
 
 **Room**
-A named workspace endpoint combining a policy and an orchestrator. When a client runs `nsed run`, it targets a room. The room determines which policy governs the deliberation and which orchestrator processes it. Configured in `quorum.yml`.
+A named workspace endpoint combining a policy and an orchestrator. When a client runs `quorum run`, it targets a room. The room determines which policy governs the deliberation and which orchestrator processes it. Configured in `quorum.yml`.
 
 **Round**
 One full iteration of the propose + evaluate cycle. A deliberation runs 1 to N rounds (determined by the policy). If convergence is detected, the round loop terminates early.

@@ -16,7 +16,7 @@ Set `NSED_DUMP_PROMPTS_DIR` to a writable directory when you launch the agents
 
 ```bash
 NSED_DUMP_PROMPTS_DIR=/var/tmp/prompt-dumps \
-  nsed serve --config quorum.yml
+  quorum serve --config quorum.yml
 ```
 
 Unset (the default) → the feature is off, at zero cost. There is no YAML flag: the
