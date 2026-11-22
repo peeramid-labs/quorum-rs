@@ -47,6 +47,7 @@ pub struct RoundSummaryEvent {
     /// mass normalized by total absolute mass across all proposals.
     /// +1 = unanimous endorsement, 0 = split, -1 = unanimous rejection.
     /// Used in evidence accumulation: `Δe = w × u'(t)`.
+    /// Show as consensus: `(score + 1) / 2` %.
     pub convergence_score: f32,
     /// **Deprecated.** Previously `Σ|net_support[p]|`. Now set to `|w| × √P`
     /// for backward-compatible display. New consumers should use
@@ -68,6 +69,7 @@ pub struct RoundSummaryEvent {
     pub raw_distance: Option<f32>,
     /// Board-wide claim convergence: fraction of claims (with 2+ evaluators)
     /// that have unanimous verdict. None if no structured claims were present.
+    /// A diagnostic: do not show it as agreement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_convergence: Option<f32>,
     /// Total unique claims assessed by 2+ evaluators across all proposals.
@@ -75,6 +77,7 @@ pub struct RoundSummaryEvent {
     pub total_claims: Option<u32>,
     /// Leader-only claim convergence: fraction of the winning proposal's
     /// claims (with 2+ evaluators) that have unanimous verdict.
+    /// A diagnostic: do not show it as agreement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leader_claim_convergence: Option<f32>,
     /// Total unique claims assessed for the leader proposal only.
