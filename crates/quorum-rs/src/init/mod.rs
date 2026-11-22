@@ -40,7 +40,7 @@ use providers::*;
 use render::*;
 use wizard::*;
 
-// Public API: reusable rendering functions for other crates (e.g. `nsed init`).
+// Public API: reusable rendering functions for other crates (e.g. the `quorum init` wizard).
 pub use render::render_default_orchestrator_config;
 
 use crate::brand;

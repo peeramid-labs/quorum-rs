@@ -40,8 +40,8 @@ On boot, `serve` also:
 > + separate `agent.yml` pair is auto-detected and works
 > unchanged. New setups should use the single `quorum.yml`.
 
-Out of scope (use the proprietary `nsed serve` from the parent
-repo for these):
+Out of scope (run the orchestrator itself, `nsed-orchestrator`, for
+these):
 
 - Booting a local orchestrator.
 - Per-agent JWT challenge-response registration — `quorum serve`

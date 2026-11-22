@@ -3,7 +3,7 @@
 //! Writes a minimal `nsed.yaml` pointing at a remote orchestrator,
 //! room, and bearer-token env var. Designed for one-shot setups
 //! (demos, CI fixtures, new-machine onboarding) where the interactive
-//! wizard in `nsed init` would be too heavy.
+//! wizard in `quorum init` would be too heavy.
 //!
 //! The output is identical in shape to what `WorkspaceConfig`
 //! deserializes — `quorum status` / `quorum run` work against the

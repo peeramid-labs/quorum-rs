@@ -134,7 +134,7 @@ pub async fn run_tui(config_path: &Path) -> ExitCode {
     run_tui_loop(config, config_path, ViewId::Threads).await
 }
 
-/// Run the TUI with a pre-filled task (from `nsed run --tui`).
+/// Run the TUI with a pre-filled task (from `quorum run --tui`).
 ///
 /// Starts the main menu but auto-navigates to the Rooms view so the user
 /// can select a room and launch the deliberation with the provided task.

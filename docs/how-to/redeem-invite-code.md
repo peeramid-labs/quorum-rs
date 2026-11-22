@@ -66,7 +66,7 @@ quorum redeem eyJhbGc... --url https://orch.example.com
 URL resolution order: `--url` flag > `$ORCH_URL` env > built-in
 default. The default is `https://api.peeramid.xyz`; setting
 `NSED_ENV=local` (or `dev` / `development`, case-insensitive) flips
-it to `http://localhost:8080` so `nsed serve` on the same host
+it to `http://localhost:8080` so an orchestrator on the same host
 works without the flag.
 
 This:
@@ -207,7 +207,7 @@ let resp = redeem_operator_invite_with_orchestrator(
 
 Pass `Some(&pubkey)` unconditionally — chat-only codes silently
 ignore the field, so the same call site handles both flavours. The
-`nsed init` wizard uses exactly this pattern.
+`quorum init` wizard uses exactly this pattern.
 
 ## Config-free operator client — redeem, then just run
 

@@ -95,7 +95,7 @@ confusion is "which of these two rooms do you mean?".
 ### 1. The workspace room (client side, `quorum.yml`)
 
 On the client, a **room** is a named deliberation *scope* you target with
-`nsed run --room <name>`. In the unified `quorum.yml` workspace config a room
+`quorum run --room <name>`. In the unified `quorum.yml` workspace config a room
 binds together:
 
 - a **policy** (the recipe to run), and
@@ -113,7 +113,7 @@ visibility (public/private + grant tags, covered below). So the transcript of a
 deliberation is durable and access-controlled by the room, not thrown away.
 
 What a room does **not** do is thread successive submissions into one
-**conversation**. Each `nsed run` is a fresh job with a fresh query; the room
+**conversation**. Each `quorum run` is a fresh job with a fresh query; the room
 does not automatically feed the previous answer back in as context. If you want
 the second question to build on the first, that continuity is the client's job —
 pass the prior context into the next query. A room shares a recipe and a
@@ -158,7 +158,7 @@ flowchart LR
       WR["workspace room<br/>audit-q1"] -->|references| POL["policy<br/>security-audit"]
       WR -->|optionally pins| ORCH["orchestrator"]
     end
-    WR -->|nsed run → job with room_id=audit-q1| JOB["Job"]
+    WR -->|quorum run → job with room_id=audit-q1| JOB["Job"]
     subgraph Server["Orchestrator (tenancy registry)"]
       JOB -->|room_id lookup| RC["RoomConfig<br/>id=audit-q1<br/>tags, visibility"]
       RC -->|governs| VIS["who can see this job"]
@@ -279,7 +279,7 @@ things rooms do not do:
 
 1. **Conversation memory.** A room is not a chat thread. Each deliberation's
    transcript *is* stored (in NATS, visibility-gated — see above), but the room
-   does not thread successive `nsed run` invocations into one conversation: the
+   does not thread successive `quorum run` invocations into one conversation: the
    next job does not automatically get the previous answer as context. If you
    need the model to remember a prior exchange, pass that context into the query
    — cross-submission continuity is not an automatic property of the room.

@@ -272,7 +272,7 @@ async fn register_fleet_agents(
 }
 
 /// Default fleet-config search order — keep aligned with the layout
-/// `quorum init` writes and the layout `nsed serve` consumes in the
+/// `quorum init` writes and the layout the retired `nsed serve` consumed in the
 /// parent repo. If `--config` isn't passed, the CLI walks this list
 /// and uses the first match.
 const DEFAULT_FLEET_PATHS: &[&str] = &[

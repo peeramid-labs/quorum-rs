@@ -43,12 +43,12 @@ use crate::nats_utils::{
 
 /// Production orchestrator URL — the default `quorum redeem`
 /// points at when the operator hasn't passed `--url` or
-/// `$ORCH_URL`. Matches the URL the `nsed init` wizard suggests.
+/// `$ORCH_URL`. Matches the URL the `quorum init` wizard suggests.
 pub const PRODUCTION_ORCHESTRATOR_URL: &str = "https://api.peeramid.xyz";
 
 /// Local orchestrator URL — used by [`default_orchestrator_url`]
 /// when `NSED_ENV` is `local`/`dev`/`development`. Matches the
-/// default port `nsed serve` binds when run without overrides.
+/// default port the orchestrator binds when run without overrides.
 pub const LOCAL_ORCHESTRATOR_URL: &str = "http://localhost:8080";
 
 /// Resolve the default orchestrator URL based on `NSED_ENV`. The
